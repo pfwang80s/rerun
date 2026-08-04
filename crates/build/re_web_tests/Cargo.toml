@@ -22,8 +22,24 @@ all-features = true
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 re_server.workspace = true
 
+async-stream.workspace = true
 anyhow.workspace = true
 argh.workspace = true
+axum.workspace = true
+bytes.workspace = true
 cargo_metadata.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread"] }
+tokio = { workspace = true, features = [
+  "macros",
+  "net",
+  "process",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+reqwest = { workspace = true, features = ["json", "stream"] }

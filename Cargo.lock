@@ -9543,6 +9543,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "re_mcap_chrome_test"
+version = "0.36.0-alpha.1+dev"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+]
+
+[[package]]
 name = "re_memory"
 version = "0.36.0-alpha.1+dev"
 dependencies = [
@@ -11175,8 +11185,15 @@ version = "0.36.0-alpha.1+dev"
 dependencies = [
  "anyhow",
  "argh",
+ "async-stream",
+ "axum",
+ "bytes",
  "cargo_metadata",
+ "parking_lot",
+ "rand 0.9.4",
  "re_server",
+ "reqwest",
+ "serde",
  "serde_json",
  "tokio",
 ]

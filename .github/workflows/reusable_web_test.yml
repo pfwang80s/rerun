@@ -60,3 +60,34 @@ jobs:
 
       - name: Run Wasm browser tests
         run: pixi run web-test
+
+  chrome-mcap-range-test:
+    name: Chrome MCAP Range fixture
+    timeout-minutes: 20
+    runs-on: ubuntu-latest-16-cores
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.REF || (github.event_name == 'pull_request' && github.event.pull_request.head.ref) || '' }}
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache_key: "web-test-chrome-mcap-range"
+          save_cache: false
+          targets: wasm32-unknown-unknown
+          workload_identity_provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+
+      - uses: prefix-dev/setup-pixi@v0.10.0
+        with:
+          pixi-version: v0.71.3
+
+      - name: Set up Chrome and ChromeDriver
+        uses: browser-actions/setup-chrome@v2
+        with:
+          chrome-version: stable
+          install-chromedriver: true
+
+      - name: Run Chrome MCAP Range browser tests
+        run: pixi run web-test --browser chrome --package re_mcap_chrome_test
