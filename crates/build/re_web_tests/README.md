@@ -18,6 +18,16 @@ Tests must call `stop`, deliver any intended late callbacks, drop external handl
 This module does not implement remote-open, lifecycle, legacy-import or Store-mutation state machines.
 Those production components remain responsible for their own transitions and use these primitives only to expose and control their real callback boundaries in tests.
 
+## Resource and redaction assertions
+
+The platform-independent [resource assertions](src/resource_assertions.rs) module is available to native and Wasm tests.
+It provides checked count/byte reservation batches, disarmed prepare rollback, exact registry snapshots, inspectable zeroization, public-effect counters, interner-counter snapshots and bounded redacted labels.
+Redaction assertions report only a fixed sensitive-value category and byte offset, never the matching value.
+Leak-detector clones own independent sentinel copies, and deterministic dispose/Drop paths overwrite those copies before release.
+The shared [redaction leak corpus](test_data/redaction_leak_corpus_v1.tsv) covers URL, query, ETag, Topic, EntityPath, StoreId and internal-token sentinels.
+TypeScript tests use the matching [JavaScript assertions](../../../rerun_js/web-viewer/tests/support/resource_assertions.mjs), its adjacent declaration file and that same corpus.
+The JavaScript helpers additionally account prepared/reservation wrapper retention without relying on garbage collection, expose only self-clearing copies to zeroization inspectors and require explicit idempotent disposal for retained secret probes.
+
 ## Native test servers
 
 A package can request the existing Redap test server with the following metadata.

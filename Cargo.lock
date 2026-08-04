@@ -9547,6 +9547,7 @@ name = "re_mcap_chrome_test"
 version = "0.36.0-alpha.1+dev"
 dependencies = [
  "js-sys",
+ "re_web_tests",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
@@ -11198,6 +11199,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

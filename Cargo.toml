@@ -503,6 +503,7 @@ wgpu = { version = "29.0", default-features = false, features = [
 ] }
 xshell = "0.2.7"
 xxhash-rust = { version = "0.8.15", features = ["xxh32", "xxh64"] }
+zeroize = "1.8.2"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 # ---------------------------------------------------------------------------------

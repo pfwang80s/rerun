@@ -1,0 +1,9 @@
+# redaction-leak-corpus-v1
+# kind<TAB>sentinel. Sentinels are deliberately unique and must never be printed by failures.
+url	https://mcap-secret.invalid/private/object.mcap
+query	X_MCAP_QUERY_SENTINEL=presigned-credential
+etag	X_MCAP_ETAG_SENTINEL
+topic	/X_MCAP_TOPIC_SENTINEL/camera/raw
+entity_path	/world/X_MCAP_ENTITY_PATH_SENTINEL
+store_id	X_MCAP_STORE_ID_SENTINEL
+internal_token	X_MCAP_INTERNAL_TOKEN_SENTINEL
