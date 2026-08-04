@@ -2,6 +2,22 @@
 
 Discovers and runs browser-based Wasm tests in the Rerun workspace.
 
+## Deterministic asynchronous tests
+
+The [`deterministic_async`](src/deterministic_async.rs) module is a native, single-threaded test scheduler for local futures.
+It polls real [`Future`](https://doc.rust-lang.org/std/future/trait.Future.html) and [`Waker`](https://doc.rust-lang.org/std/task/struct.Waker.html) implementations while tests explicitly choose network, microtask, macrotask, animation-frame, Viewer-frame or Store-callback lanes.
+Its browser lanes are a deterministic model for unit tests, not evidence of Chrome event-loop behavior.
+The Chrome-only `re_mcap_chrome_test` package separately exercises a minimal adapter with real `queueMicrotask`, `setTimeout`, `requestAnimationFrame` and repaint callbacks.
+
+The harness provides generation-aware task slots, completion cells, named checkpoint gates, bounded ack-retaining queues, lease drain futures, manual monotonic and wall clocks, page-signal delivery, repaint/frame allowances and real `AbortHandle` cancellation.
+Queue deliveries carry a generation token and source-local sequence, and acknowledgement remains retryable so tests can prove wrong, duplicate and stale acknowledgements do not release replacement-generation ownership.
+Every retained task, waiter, owner, queue item, delivery, timer and lease is represented by RAII accounting with count and byte high-water marks.
+The scheduler has a mandatory step budget, a bounded enum-only diagnostic trace and stale-wakeup filtering for slot reuse.
+Tests must call `stop`, deliver any intended late callbacks, drop external handles and assert a zero-live-resource snapshot before returning.
+
+This module does not implement remote-open, lifecycle, legacy-import or Store-mutation state machines.
+Those production components remain responsible for their own transitions and use these primitives only to expose and control their real callback boundaries in tests.
+
 ## Native test servers
 
 A package can request the existing Redap test server with the following metadata.

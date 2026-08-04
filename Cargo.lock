@@ -11189,12 +11189,14 @@ dependencies = [
  "axum",
  "bytes",
  "cargo_metadata",
+ "futures",
  "parking_lot",
  "rand 0.9.4",
  "re_server",
  "reqwest",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
