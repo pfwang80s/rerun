@@ -442,3 +442,33 @@ mod serde {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ViewerEvent, ViewerEventKind};
+
+    #[test]
+    fn recording_open_public_json_shape() {
+        let event = ViewerEvent {
+            application_id: re_log_types::ApplicationId::try_new("test-app").unwrap(),
+            recording_id: re_log_types::RecordingId::from("test-recording"),
+            segment_id: None,
+            kind: ViewerEventKind::RecordingOpen {
+                source: "file".to_owned(),
+                version: Some("0.36.0".to_owned()),
+            },
+        };
+
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            serde_json::json!({
+                "application_id": "test-app",
+                "recording_id": "test-recording",
+                "segment_id": null,
+                "type": "recording_open",
+                "source": "file",
+                "version": "0.36.0",
+            })
+        );
+    }
+}

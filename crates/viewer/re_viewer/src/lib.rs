@@ -45,6 +45,8 @@ mod screenshotter;
 mod startup_options;
 mod texture_readback;
 mod ui;
+#[cfg(any(target_arch = "wasm32", test))]
+mod web_startup;
 
 #[cfg(feature = "analytics")]
 mod viewer_analytics;
@@ -77,6 +79,53 @@ pub use re_viewer_context::{
 pub use startup_options::{LoginOptions, StartupOptions};
 pub use ui::about_rerun_ui;
 pub(crate) use ui::dev_panel;
+
+/// Best-effort compatibility lookup for the legacy Web API.
+///
+/// Recording IDs are not unique, so this intentionally preserves the existing insertion-order,
+/// first-match behavior until callers migrate to exact [`re_log_types::StoreId`] handles.
+#[cfg(any(target_arch = "wasm32", test))]
+fn store_id_from_recording_id(
+    store_hub: &re_viewer_context::StoreHub,
+    recording_id: &str,
+) -> Option<re_log_types::StoreId> {
+    store_hub
+        .store_bundle()
+        .recordings()
+        .map(|entity_db| entity_db.store_id())
+        .find(|store_id| store_id.recording_id().as_str() == recording_id)
+        .cloned()
+}
+
+#[cfg(test)]
+mod web_recording_id_tests {
+    use re_entity_db::EntityDb;
+    use re_log_types::StoreId;
+    use re_viewer_context::StoreHub;
+
+    use super::store_id_from_recording_id;
+
+    #[test]
+    fn compatibility_recording_id_lookup_is_first_match_and_read_only() {
+        // Deliberately oppose lexical order so a future sorted lookup cannot pass accidentally.
+        let first = StoreId::recording("z-first-app", "duplicate");
+        let second = StoreId::recording("a-second-app", "duplicate");
+        let mut hub = StoreHub::test_hub();
+        hub.insert_entity_db(EntityDb::new(first.clone()));
+        hub.insert_entity_db(EntityDb::new(second.clone()));
+        let stores_before = hub.store_bundle().recordings().count();
+
+        assert_eq!(
+            store_id_from_recording_id(&hub, "duplicate"),
+            Some(first.clone())
+        );
+        assert_eq!(store_id_from_recording_id(&hub, "missing"), None);
+
+        assert_eq!(hub.store_bundle().recordings().count(), stores_before);
+        assert!(hub.entity_db(&first).is_some());
+        assert!(hub.entity_db(&second).is_some());
+    }
+}
 
 pub mod external {
     pub use re_chunk::external::*;

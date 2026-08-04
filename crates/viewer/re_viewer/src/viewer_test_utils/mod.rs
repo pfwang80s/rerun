@@ -26,6 +26,9 @@ pub struct HarnessOptions {
 
     /// Allows the test to set `AppOptions` at start.
     pub app_options_editor: Option<AppOptionsEditor>,
+
+    /// Receives the same Viewer events as an embedding host.
+    pub on_event: Option<crate::event::ViewerEventCallback>,
 }
 
 /// Convenience function for creating a kittest harness of the viewer App.
@@ -62,6 +65,7 @@ pub fn viewer_harness(options: &HarnessOptions) -> Harness<'static, App> {
                 // Don't show the welcome / example screen in tests.
                 // See also: https://github.com/rerun-io/rerun/issues/10989
                 hide_welcome_screen: true,
+                on_event: options.on_event.clone(),
                 ..Default::default()
             },
             cc,

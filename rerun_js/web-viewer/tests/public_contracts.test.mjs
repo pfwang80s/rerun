@@ -1,0 +1,441 @@
+import assert from "node:assert/strict";
+import { after, beforeEach, test } from "node:test";
+
+const original = {
+  compileStreaming: WebAssembly.compileStreaming,
+  fetch: globalThis.fetch,
+  requestAnimationFrame: globalThis.requestAnimationFrame,
+  setTimeout: globalThis.setTimeout,
+};
+
+class FakeClassList {
+  add() {}
+  remove() {}
+}
+
+class FakeElement {
+  constructor(tagName) {
+    this.tagName = tagName;
+    this.style = {};
+    this.classList = new FakeClassList();
+    this.children = [];
+    this.parentElement = null;
+    this.textContent = "";
+  }
+
+  append(child) {
+    child.parentElement = this;
+    this.children.push(child);
+  }
+
+  appendChild(child) {
+    this.append(child);
+  }
+
+  remove() {
+    if (this.parentElement) {
+      this.parentElement.children = this.parentElement.children.filter(
+        (child) => child !== this,
+      );
+      this.parentElement = null;
+    }
+  }
+
+  removeAttribute() {}
+  addEventListener() {}
+
+  querySelector() {
+    return new FakeElement("query-result");
+  }
+
+  getBoundingClientRect() {
+    return { left: 0, top: 0, width: 640, height: 360 };
+  }
+}
+
+function makeDocument() {
+  const body = new FakeElement("body");
+  const head = new FakeElement("head");
+
+  return {
+    body,
+    head,
+    documentElement: new FakeElement("html"),
+    createElement: (tagName) => new FakeElement(tagName),
+    createTextNode: (text) => ({ text }),
+    getElementById: (id) =>
+      head.children.find((child) => child.id === id) ?? null,
+  };
+}
+
+function resetState() {
+  const state = globalThis.__rerun_web_viewer_test_state ?? {};
+  for (const key of Object.keys(state)) {
+    delete state[key];
+  }
+  Object.assign(state, {
+    calls: [],
+    handles: [],
+    addReceiverCalls: 0,
+    addReceiverErrorAt: -1,
+    startError: null,
+    activeRecordingId: null,
+    activeTimeline: null,
+    currentTime: null,
+    playing: null,
+    timelineTimeRange: null,
+  });
+  globalThis.__rerun_web_viewer_test_state = state;
+}
+
+globalThis.document = makeDocument();
+globalThis.window = {
+  addEventListener() {},
+  location: {
+    href: "https://viewer.example.test/",
+    reload() {},
+  },
+};
+globalThis.requestAnimationFrame = (callback) => callback(0);
+globalThis.fetch = async () => new Response(new Uint8Array());
+WebAssembly.compileStreaming = async () => ({ fake: true });
+globalThis.setTimeout = (callback, delay, ...args) => {
+  if (delay >= 1000) {
+    return 0;
+  }
+  return original.setTimeout(callback, 0, ...args);
+};
+
+resetState();
+const { LogChannel, WebViewer } = await import("../index.js");
+
+beforeEach(() => {
+  resetState();
+  globalThis.document = makeDocument();
+});
+
+after(() => {
+  WebAssembly.compileStreaming = original.compileStreaming;
+  globalThis.fetch = original.fetch;
+  globalThis.requestAnimationFrame = original.requestAnimationFrame;
+  globalThis.setTimeout = original.setTimeout;
+});
+
+function callsNamed(name) {
+  return globalThis.__rerun_web_viewer_test_state.calls.filter(
+    (call) => call[0] === name,
+  );
+}
+
+async function startViewer(rrd = null, options = null) {
+  const viewer = new WebViewer();
+  await viewer.start(rrd, document.body, options);
+  assert.equal(viewer.ready, true);
+  return viewer;
+}
+
+test("start and open preserve per-item order across existing route families", async () => {
+  const startupUrls = [
+    "https://example.test/first.rrd",
+    "rerun+http://127.0.0.1:9876/proxy",
+    "rerun://127.0.0.1:1234/dataset/1830B33B45B963E7774455beb91701ae?segment_id=pid",
+  ];
+  const viewer = await startViewer(startupUrls);
+
+  assert.deepEqual(
+    callsNamed("add_receiver").map((call) => call[1]),
+    startupUrls,
+  );
+
+  viewer.open("https://example.test/later.rrd");
+  assert.deepEqual(
+    callsNamed("add_receiver").map((call) => call[1]),
+    [...startupUrls, "https://example.test/later.rrd"],
+  );
+  viewer.stop();
+});
+
+test("hidden startup URL remains a Wasm option and direct startup URLs open afterwards", async () => {
+  const hiddenUrls = [
+    "https://example.test/hidden-a.rrd",
+    "rerun+http://127.0.0.1:9876/proxy",
+  ];
+  const viewer = await startViewer("https://example.test/direct.rrd", {
+    url: hiddenUrls,
+  });
+
+  const construct = callsNamed("construct")[0];
+  assert.deepEqual(construct[1].url, hiddenUrls);
+  assert.deepEqual(
+    callsNamed("add_receiver").map((call) => call[1]),
+    ["https://example.test/direct.rrd"],
+  );
+  viewer.stop();
+});
+
+test("malformed array items do not stop compatibility dispatch", async () => {
+  const viewer = await startViewer();
+  const urls = [
+    "https://example.test/accepted.rrd",
+    "not a URL",
+    "rerun+http://127.0.0.1:9876/proxy",
+  ];
+
+  assert.doesNotThrow(() => viewer.open(urls));
+  assert.deepEqual(
+    callsNamed("add_receiver").map((call) => call[1]),
+    urls,
+  );
+  assert.equal(viewer.ready, true);
+  viewer.stop();
+});
+
+test("an exception in the second array item keeps the first call but stops the wrapper", async () => {
+  const viewer = await startViewer();
+  const state = globalThis.__rerun_web_viewer_test_state;
+  state.addReceiverErrorAt = 1;
+
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  try {
+    assert.throws(
+      () =>
+        viewer.open([
+          "https://example.test/accepted.rrd",
+          "https://example.test/fails.rrd",
+          "https://example.test/not-attempted.rrd",
+        ]),
+      /injected add_receiver failure/,
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+  assert.deepEqual(
+    callsNamed("add_receiver").map((call) => call[1]),
+    [
+      "https://example.test/accepted.rrd",
+      "https://example.test/fails.rrd",
+    ],
+  );
+  assert.equal(viewer.ready, false);
+  assert.equal(callsNamed("destroy").length, 1);
+  assert.equal(callsNamed("free").length, 1);
+});
+
+test("recording_open follows completion order and raw delivery is synchronous", async () => {
+  const viewer = await startViewer();
+  const delivery = [];
+  viewer._on_raw_event((event) => delivery.push(["raw", JSON.parse(event).source]));
+  viewer.on("recording_open", (event) => delivery.push(["parsed", event.source]));
+
+  const handle = globalThis.__rerun_web_viewer_test_state.handles[0];
+  handle.emit({
+    type: "recording_open",
+    application_id: "app",
+    recording_id: "second",
+    segment_id: null,
+    source: "second-completed",
+  });
+  delivery.push(["after-emit", "second-completed"]);
+  handle.emit({
+    type: "recording_open",
+    application_id: "app",
+    recording_id: "first",
+    segment_id: null,
+    source: "first-completed",
+  });
+
+  assert.deepEqual(delivery, [
+    ["raw", "second-completed"],
+    ["after-emit", "second-completed"],
+    ["raw", "first-completed"],
+  ]);
+  await new Promise((resolve) => original.setTimeout(resolve, 0));
+  assert.deepEqual(delivery.slice(3), [
+    ["parsed", "second-completed"],
+    ["parsed", "first-completed"],
+  ]);
+  viewer.stop();
+});
+
+test("one source may publish multiple recording_open events", async () => {
+  const viewer = await startViewer();
+  const opened = [];
+  viewer.on("recording_open", (event) => opened.push(event));
+
+  const handle = globalThis.__rerun_web_viewer_test_state.handles[0];
+  handle.emit({
+    type: "recording_open",
+    application_id: "app",
+    recording_id: "store-a",
+    segment_id: null,
+    source: "same-source",
+    version: "1.0.0",
+  });
+  handle.emit({
+    type: "recording_open",
+    application_id: "app",
+    recording_id: "store-b",
+    segment_id: null,
+    source: "same-source",
+    version: "2.0.0",
+  });
+  await new Promise((resolve) => original.setTimeout(resolve, 0));
+
+  assert.deepEqual(opened, [
+    {
+      type: "recording_open",
+      application_id: "app",
+      recording_id: "store-a",
+      segment_id: null,
+      source: "same-source",
+      version: "1.0.0",
+    },
+    {
+      type: "recording_open",
+      application_id: "app",
+      recording_id: "store-b",
+      segment_id: null,
+      source: "same-source",
+      version: "2.0.0",
+    },
+  ]);
+  viewer.stop();
+});
+
+test("close removes a source without stopping the viewer", async () => {
+  const viewer = await startViewer();
+  viewer.close([
+    "https://example.test/source.rrd",
+    "rerun+http://127.0.0.1:9876/proxy",
+  ]);
+
+  assert.deepEqual(
+    callsNamed("remove_receiver").map((call) => call[1]),
+    [
+      "https://example.test/source.rrd",
+      "rerun+http://127.0.0.1:9876/proxy",
+    ],
+  );
+  assert.equal(viewer.ready, true);
+  viewer.stop();
+});
+
+test("LogChannel is synchronous while ready and becomes inert after close or stop", async () => {
+  const viewer = await startViewer();
+  const channel = viewer.open_channel("characterization");
+  const rrd = new Uint8Array([1, 2, 3]);
+  const table = new Uint8Array([4, 5]);
+
+  assert.equal(channel.ready, true);
+  channel.send_rrd(rrd);
+  channel.send_table(table);
+  channel.close();
+  channel.send_rrd(new Uint8Array([6]));
+
+  assert.equal(callsNamed("open_channel").length, 1);
+  assert.strictEqual(callsNamed("send_rrd_to_channel")[0][2], rrd);
+  assert.strictEqual(callsNamed("send_table_to_channel")[0][2], table);
+  assert.equal(callsNamed("close_channel").length, 1);
+  assert.equal(callsNamed("send_rrd_to_channel").length, 1);
+  assert.equal(channel.ready, false);
+
+  const stoppedChannel = viewer.open_channel("stopped");
+  viewer.stop();
+  assert.equal(stoppedChannel.ready, false);
+  stoppedChannel.send_rrd(rrd);
+  stoppedChannel.close();
+  assert.equal(callsNamed("send_rrd_to_channel").length, 1);
+  assert.equal(callsNamed("close_channel").length, 1);
+});
+
+test("raw recording-ID controls forward exact IDs and retain fallback values", async () => {
+  const viewer = await startViewer();
+  const state = globalThis.__rerun_web_viewer_test_state;
+
+  viewer.set_active_recording_id("ambiguous-id");
+  viewer.set_playing("ambiguous-id", true);
+  viewer.set_active_timeline("ambiguous-id", "frame");
+  viewer.set_current_time("ambiguous-id", "frame", 42);
+
+  assert.deepEqual(callsNamed("set_active_recording_id")[0], [
+    "set_active_recording_id",
+    "ambiguous-id",
+  ]);
+  assert.deepEqual(callsNamed("set_playing")[0], [
+    "set_playing",
+    "ambiguous-id",
+    true,
+  ]);
+  assert.deepEqual(callsNamed("set_active_timeline")[0], [
+    "set_active_timeline",
+    "ambiguous-id",
+    "frame",
+  ]);
+  assert.deepEqual(callsNamed("set_time_for_timeline")[0], [
+    "set_time_for_timeline",
+    "ambiguous-id",
+    "frame",
+    42,
+  ]);
+
+  assert.equal(viewer.get_active_recording_id(), null);
+  assert.equal(viewer.get_playing("missing"), false);
+  assert.equal(viewer.get_active_timeline("missing"), null);
+  assert.equal(viewer.get_current_time("missing", "frame"), 0);
+
+  state.activeRecordingId = "present";
+  state.playing = true;
+  state.activeTimeline = "log_time";
+  state.currentTime = 12;
+  assert.equal(viewer.get_active_recording_id(), "present");
+  assert.equal(viewer.get_playing("present"), true);
+  assert.equal(viewer.get_active_timeline("present"), "log_time");
+  assert.equal(viewer.get_current_time("present", "log_time"), 12);
+  viewer.stop();
+});
+
+test("stopped-wrapper methods throw while stop remains idempotent", () => {
+  const viewer = new WebViewer();
+
+  assert.throws(() => viewer.open("https://example.test/data.rrd"), /stopped viewer/);
+  assert.throws(() => viewer.close("https://example.test/data.rrd"), /stopped viewer/);
+  assert.throws(() => viewer.open_channel("stopped"), /stopped web viewer/);
+  assert.throws(() => viewer.get_active_recording_id(), /stopped web viewer/);
+  assert.throws(
+    () => viewer.set_active_recording_id("recording"),
+    /stopped web viewer/,
+  );
+  assert.throws(() => viewer.set_playing("recording", true), /stopped web viewer/);
+  assert.throws(
+    () => viewer.set_current_time("recording", "frame", 1),
+    /stopped web viewer/,
+  );
+
+  viewer.stop();
+  viewer.stop();
+  assert.equal(callsNamed("destroy").length, 0);
+  assert.equal(callsNamed("free").length, 0);
+});
+
+test("LogChannel standalone contract is no-op unless ready", () => {
+  const calls = [];
+  let state = "starting";
+  const channel = new LogChannel(
+    (data) => calls.push(["rrd", data]),
+    (data) => calls.push(["table", data]),
+    () => calls.push(["close"]),
+    () => state,
+  );
+
+  channel.send_rrd(new Uint8Array([1]));
+  channel.send_table(new Uint8Array([2]));
+  channel.close();
+  assert.deepEqual(calls, []);
+
+  state = "ready";
+  channel.send_rrd(new Uint8Array([3]));
+  channel.close();
+  channel.close();
+  assert.deepEqual(calls.map((call) => call[0]), ["rrd", "close"]);
+});

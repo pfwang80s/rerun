@@ -16,6 +16,7 @@
     "build": "npm run build:wasm && npm run build:js",
     "build:wasm:debug": "node build-wasm.mjs --mode debug",
     "build:debug": "npm run build:wasm:debug && npm run build:js",
+    "test": "npm run build:js && node --import ./tests/register-loader.mjs --test ./tests/*.test.mjs",
     "pack": "yarn pack --filename web-viewer.tar.gz",
     "docs": "typedoc"
   },

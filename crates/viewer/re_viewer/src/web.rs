@@ -397,7 +397,7 @@ impl WebHandle {
             return;
         };
 
-        let Some(store_id) = store_id_from_recording_id(hub, recording_id) else {
+        let Some(store_id) = crate::store_id_from_recording_id(hub, recording_id) else {
             return;
         };
 
@@ -418,7 +418,7 @@ impl WebHandle {
         let app = self.runner.app_mut::<crate::App>()?;
         let hub = app.store_hub.as_ref()?;
 
-        let store_id = store_id_from_recording_id(hub, recording_id)?;
+        let store_id = crate::store_id_from_recording_id(hub, recording_id)?;
         let time_ctrl = app.state.time_control(&store_id)?;
         Some(time_ctrl.timeline_name().as_str().to_owned())
     }
@@ -437,7 +437,7 @@ impl WebHandle {
             return;
         };
 
-        let Some(recording_id) = store_id_from_recording_id(hub, recording_id) else {
+        let Some(recording_id) = crate::store_id_from_recording_id(hub, recording_id) else {
             return;
         };
 
@@ -461,7 +461,7 @@ impl WebHandle {
         let app = self.runner.app_mut::<crate::App>()?;
 
         let hub = app.store_hub.as_ref()?;
-        let store_id = store_id_from_recording_id(hub, recording_id)?;
+        let store_id = crate::store_id_from_recording_id(hub, recording_id)?;
         let time_ctrl = app.state.time_control(&store_id)?;
 
         let timeline_name = TimelineName::try_new(timeline_name).ok_or_log_error_once()?;
@@ -482,7 +482,7 @@ impl WebHandle {
             return;
         };
 
-        let Some(recording_id) = store_id_from_recording_id(hub, recording_id) else {
+        let Some(recording_id) = crate::store_id_from_recording_id(hub, recording_id) else {
             return;
         };
 
@@ -517,7 +517,7 @@ impl WebHandle {
             return JsValue::null();
         };
 
-        let Some(store_id) = store_id_from_recording_id(hub, recording_id) else {
+        let Some(store_id) = crate::store_id_from_recording_id(hub, recording_id) else {
             return JsValue::null();
         };
         let Some(recording) = hub.store_bundle().get(&store_id) else {
@@ -548,7 +548,7 @@ impl WebHandle {
         let app = self.runner.app_mut::<crate::App>()?;
         let hub = app.store_hub.as_ref()?;
 
-        let store_id = store_id_from_recording_id(hub, recording_id)?;
+        let store_id = crate::store_id_from_recording_id(hub, recording_id)?;
         if !hub.store_bundle().contains(&store_id) {
             return None;
         }
@@ -573,7 +573,7 @@ impl WebHandle {
         let Some(hub) = store_hub.as_ref() else {
             return;
         };
-        let Some(store_id) = store_id_from_recording_id(hub, recording_id) else {
+        let Some(store_id) = crate::store_id_from_recording_id(hub, recording_id) else {
             return;
         };
 
@@ -607,19 +607,6 @@ impl WebHandle {
         });
         egui_ctx.request_repaint();
     }
-}
-
-/// Best effort attempt at finding a store id based on the recording id.
-fn store_id_from_recording_id(
-    store_hub: &re_viewer_context::StoreHub,
-    recording_id: &str,
-) -> Option<re_log_types::StoreId> {
-    store_hub
-        .store_bundle()
-        .recordings()
-        .map(|entity_db| entity_db.store_id())
-        .find(|store_id| store_id.recording_id().as_str() == recording_id)
-        .cloned()
 }
 
 // TODO(jprochazk): figure out a way to auto-generate these types on JS side
@@ -822,23 +809,7 @@ fn create_app(
     }
 
     if let Some(urls) = url {
-        for url in urls.into_inner() {
-            match url.parse::<open_url::ViewerOpenUrl>() {
-                Ok(url) => {
-                    url.open(
-                        &app.egui_ctx,
-                        &open_url::OpenUrlOptions {
-                            recording_open_behavior: RecordingOpenBehavior::OpenAndSelect,
-                            show_loader: true,
-                        },
-                        &app.command_sender,
-                    );
-                }
-                Err(err) => {
-                    re_log::warn!(?url, "Failed to open URL: {err}");
-                }
-            }
-        }
+        crate::web_startup::dispatch_hidden_startup_urls(urls, &app.egui_ctx, &app.command_sender);
     }
 
     Ok(app)

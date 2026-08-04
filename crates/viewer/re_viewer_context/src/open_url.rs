@@ -906,8 +906,8 @@ mod tests {
         external::url::{self, Url},
     };
 
-    use super::{CHUNK_STORE_BROWSER_URL, ViewerOpenUrl};
-    use crate::{Item, Route, StoreHub};
+    use super::{CHUNK_STORE_BROWSER_URL, OpenUrlOptions, ViewerOpenUrl};
+    use crate::{Item, RedapEntryKind, Route, StoreHub, SystemCommand, command_channel};
 
     #[test]
     fn test_viewer_open_url_from_str() {
@@ -1056,6 +1056,173 @@ mod tests {
         for url in invalid_urls {
             let result = url.parse::<ViewerOpenUrl>();
             assert!(result.is_err(), "Expected error for {url}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn compatibility_web_open_route_matrix() {
+        fn dispatch(url: &str) -> Vec<SystemCommand> {
+            let (sender, receiver) = command_channel();
+            url.parse::<ViewerOpenUrl>().unwrap().open(
+                &egui::Context::default(),
+                &OpenUrlOptions {
+                    recording_open_behavior: RecordingOpenBehavior::OpenAndSelect,
+                    show_loader: true,
+                },
+                &sender,
+            );
+
+            std::iter::from_fn(|| receiver.recv_system().map(|(_, command)| command)).collect()
+        }
+
+        let http_url = Url::parse("https://example.com/recording.rrd").unwrap();
+        let http_commands = dispatch(http_url.as_str());
+        let [
+            SystemCommand::SetRoute(Route::Loading(loading_source)),
+            SystemCommand::LoadDataSource(re_data_source::LogDataSource::HttpUrl { url }),
+        ] = http_commands.as_slice()
+        else {
+            panic!("HTTP URL did not dispatch the expected data source");
+        };
+        assert_eq!(
+            **loading_source,
+            LogSource::HttpStream {
+                url: http_url.to_string()
+            }
+        );
+        assert_eq!(url, &http_url);
+
+        let proxy_uri: re_uri::ProxyUri = "rerun+http://127.0.0.1:9876/proxy".parse().unwrap();
+        let proxy_commands = dispatch(&proxy_uri.to_string());
+        assert!(matches!(
+            &proxy_commands[0],
+            SystemCommand::SetRoute(Route::Loading(source))
+                if **source == LogSource::MessageProxy(proxy_uri.clone())
+        ));
+        assert!(matches!(
+            &proxy_commands[1],
+            SystemCommand::LoadDataSource(re_data_source::LogDataSource::RedapProxy(uri))
+                if uri == &proxy_uri
+        ));
+        assert!(matches!(
+            &proxy_commands[2],
+            SystemCommand::SetSelection(selection)
+                if selection.selection == Item::RedapServer(proxy_uri.origin.clone()).into()
+        ));
+        assert_eq!(proxy_commands.len(), 3);
+
+        let catalog_uri: CatalogUri = "rerun://localhost:51234/catalog".parse().unwrap();
+        let catalog_commands = dispatch(&catalog_uri.to_string());
+        assert!(matches!(
+            &catalog_commands[0],
+            SystemCommand::AddRedapServer(origin) if origin == &catalog_uri.origin
+        ));
+        assert!(matches!(
+            &catalog_commands[1],
+            SystemCommand::RefreshRedapServer(origin) if origin == &catalog_uri.origin
+        ));
+        assert!(matches!(
+            &catalog_commands[2],
+            SystemCommand::SetSelection(selection)
+                if selection.selection == Item::RedapServer(catalog_uri.origin.clone()).into()
+        ));
+        assert!(matches!(
+            &catalog_commands[3],
+            SystemCommand::SetFocus(focus)
+                if focus.item == Item::RedapServer(catalog_uri.origin.clone())
+        ));
+        assert_eq!(catalog_commands.len(), 4);
+
+        let entry_uri: re_uri::EntryUri =
+            "rerun://localhost:51234/entry/1830B33B45B963E7774455beb91701ae"
+                .parse()
+                .unwrap();
+        let entry_commands = dispatch(&entry_uri.to_string());
+        assert!(matches!(
+            &entry_commands[0],
+            SystemCommand::AddRedapServer(origin) if origin == &entry_uri.origin
+        ));
+        assert!(matches!(
+            &entry_commands[1],
+            SystemCommand::RefreshRedapEntry { origin, entry_id }
+                if origin == &entry_uri.origin && entry_id == &entry_uri.entry_id
+        ));
+        let entry_item = Item::from(entry_uri.clone());
+        assert!(matches!(
+            &entry_commands[2],
+            SystemCommand::SetSelection(selection)
+                if selection.selection == entry_item.clone().into()
+        ));
+        assert!(matches!(
+            &entry_commands[3],
+            SystemCommand::SetFocus(focus) if focus.item == entry_item
+        ));
+        assert_eq!(entry_commands.len(), 4);
+
+        let folder_uri: re_uri::FolderUri = "rerun://localhost:51234/folder/perception.detection"
+            .parse()
+            .unwrap();
+        let folder_commands = dispatch(&folder_uri.to_string());
+        assert!(matches!(
+            &folder_commands[0],
+            SystemCommand::AddRedapServer(origin) if origin == &folder_uri.origin
+        ));
+        assert!(matches!(
+            &folder_commands[1],
+            SystemCommand::RefreshRedapServer(origin) if origin == &folder_uri.origin
+        ));
+        let folder_item = Item::RedapEntry {
+            origin: folder_uri.origin.clone(),
+            kind: RedapEntryKind::Folder(folder_uri.path.clone()),
+        };
+        assert!(matches!(
+            &folder_commands[2],
+            SystemCommand::SetSelection(selection)
+                if selection.selection == folder_item.clone().into()
+        ));
+        assert!(matches!(
+            &folder_commands[3],
+            SystemCommand::SetFocus(focus) if focus.item == folder_item
+        ));
+        assert_eq!(folder_commands.len(), 4);
+
+        let dataset_uri: DatasetSegmentUri =
+            "rerun://127.0.0.1:1234/dataset/1830B33B45B963E7774455beb91701ae?segment_id=pid"
+                .parse()
+                .unwrap();
+        let dataset_commands = dispatch(&dataset_uri.to_string());
+        let [
+            SystemCommand::SetRoute(Route::Loading(loading_source)),
+            SystemCommand::LoadDataSource(re_data_source::LogDataSource::RedapDatasetSegment {
+                uri,
+                open_behavior,
+            }),
+        ] = dataset_commands.as_slice()
+        else {
+            panic!("Redap dataset URL did not dispatch the expected data source");
+        };
+        assert!(matches!(
+            &**loading_source,
+            LogSource::RedapGrpcStream {
+                uri,
+                open_behavior: RecordingOpenBehavior::Background,
+                table_blueprint: None,
+            } if uri == &dataset_uri
+        ));
+        assert_eq!(uri, &dataset_uri);
+        assert_eq!(*open_behavior, RecordingOpenBehavior::OpenAndSelect);
+
+        for malformed in [
+            "",
+            "not a URL",
+            "https://example.com/extensionless",
+            "rerun+http://127.0.0.1:9876/not-a-proxy",
+            "rerun://localhost:51234/dataset/not-an-entry-id?segment_id=pid",
+        ] {
+            assert!(
+                malformed.parse::<ViewerOpenUrl>().is_err(),
+                "compatibility parsing unexpectedly accepted {malformed:?}"
+            );
         }
     }
 

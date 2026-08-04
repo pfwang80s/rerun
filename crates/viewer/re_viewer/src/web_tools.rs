@@ -4,7 +4,9 @@
 
 use re_log::ResultExt as _;
 use serde::Deserialize;
-use wasm_bindgen::{JsCast as _, JsValue};
+use wasm_bindgen::JsValue;
+
+pub(crate) use crate::web_startup::StringOrStringArray;
 
 pub trait JsResultExt<T> {
     /// Logs an error if the result is an error and returns the result.
@@ -64,49 +66,5 @@ impl Callback {
     pub fn call2(&self, arg0: &JsValue, arg1: &JsValue) -> Result<JsValue, re_web::Error> {
         let window: JsValue = re_web::browser::window()?.into();
         self.0.call2(&window, arg0, arg1).map_err(Into::into)
-    }
-}
-
-// Deserializes from JS string or array of strings.
-#[derive(Clone, Debug)]
-pub struct StringOrStringArray(Vec<String>);
-
-impl StringOrStringArray {
-    pub fn into_inner(self) -> Vec<String> {
-        self.0
-    }
-}
-
-impl std::ops::Deref for StringOrStringArray {
-    type Target = Vec<String>;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for StringOrStringArray {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        fn from_value(value: JsValue) -> Option<Vec<String>> {
-            if let Some(value) = value.as_string() {
-                return Some(vec![value]);
-            }
-
-            let array = value.dyn_into::<js_sys::Array>().ok()?;
-            let mut out = Vec::with_capacity(array.length() as usize);
-            for item in array {
-                out.push(item.as_string()?);
-            }
-            Some(out)
-        }
-
-        let value = serde_wasm_bindgen::preserve::deserialize(deserializer)?;
-        from_value(value)
-            .map(Self)
-            .ok_or_else(|| serde::de::Error::custom("value is not a string or array of strings"))
     }
 }

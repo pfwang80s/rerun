@@ -396,6 +396,11 @@ js-install = { cmd = "yarn install --cwd rerun_js", depends-on = ["js-setup"] }
 js-build-base = { cmd = "yarn --cwd rerun_js/web-viewer run build", depends-on = ["js-install"] }
 js-build-all = { cmd = "yarn --cwd rerun_js workspaces run build", depends-on = ["js-install"] }
 
+# Characterize the public web-viewer wrapper contract without rebuilding Wasm.
+js-test-web-viewer = { cmd = "yarn --cwd rerun_js/web-viewer test", depends-on = [
+  "js-install",
+] }
+
 # Build web-viewer and web-viewer-react without rebuilding re_viewer Wasm
 js-build-no-wasm = { cmd = "yarn --cwd rerun_js workspaces run build:js", depends-on = [
   "js-install",
