@@ -9515,9 +9515,11 @@ dependencies = [
  "anyhow",
  "arrow",
  "byteorder",
+ "crc32fast",
  "crossbeam",
  "insta",
  "itertools 0.14.0",
+ "lz4_flex",
  "mcap",
  "parking_lot",
  "prost-reflect",
@@ -9537,6 +9539,7 @@ dependencies = [
  "serde_bytes",
  "strum",
  "thiserror 2.0.18",
+ "zstd",
 ]
 
 [[package]]

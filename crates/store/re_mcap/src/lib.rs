@@ -15,6 +15,9 @@ mod recover;
 pub(crate) mod parsers;
 pub(crate) mod util;
 
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
 pub use decoders::{
     Decoder, DecoderIdentifier, DecoderRegistry, MessageDecoder, SelectedDecoders, TopicFilter,
 };
