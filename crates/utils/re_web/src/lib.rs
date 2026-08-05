@@ -23,6 +23,12 @@
 //! ```compile_fail,ignore-wasm32
 //! use re_web::strict_open_wire;
 //! ```
+//!
+//! Generation-aware Store publication identities are likewise Web-only:
+//!
+//! ```compile_fail,ignore-wasm32
+//! use re_web::store_publication;
+//! ```
 
 pub mod browser;
 
@@ -32,6 +38,8 @@ pub mod remote_limits;
 pub mod remote_validator;
 #[cfg(target_arch = "wasm32")]
 pub mod secret_url;
+#[cfg(target_arch = "wasm32")]
+pub mod store_publication;
 #[cfg(target_arch = "wasm32")]
 #[cfg_attr(
     not(test),
@@ -73,6 +81,14 @@ mod strict_open_wire;
     reason = "native tests exercise Web-only URL normalization without publishing its API"
 )]
 mod secret_url;
+
+// Host builds compile the module only for its unit tests and do not publish it to consumers.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[expect(
+    dead_code,
+    reason = "native tests exercise Web-only Store publication identities without publishing them"
+)]
+mod store_publication;
 
 #[cfg(target_arch = "wasm32")]
 mod error;
