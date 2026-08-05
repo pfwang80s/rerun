@@ -11,11 +11,19 @@
 //! ```compile_fail,ignore-wasm32
 //! use re_web::secret_url;
 //! ```
+//!
+//! Typed remote-object validators are likewise Web-only:
+//!
+//! ```compile_fail,ignore-wasm32
+//! use re_web::remote_validator;
+//! ```
 
 pub mod browser;
 
 #[cfg(target_arch = "wasm32")]
 pub mod remote_limits;
+#[cfg(target_arch = "wasm32")]
+pub mod remote_validator;
 #[cfg(target_arch = "wasm32")]
 pub mod secret_url;
 
@@ -26,6 +34,14 @@ pub mod secret_url;
     reason = "native tests exercise the Web-only schema without publishing its API"
 )]
 mod remote_limits;
+
+// Host builds compile the module only for its unit tests and do not publish it to consumers.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[expect(
+    dead_code,
+    reason = "native tests exercise Web-only validator parsing without publishing its API"
+)]
+mod remote_validator;
 
 // Host builds compile the module only for its unit tests and do not publish it to consumers.
 #[cfg(all(test, not(target_arch = "wasm32")))]

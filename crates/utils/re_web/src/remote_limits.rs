@@ -208,6 +208,7 @@ define_normative_requirements! {
     ConcurrentRangeRequests,
     InFlightRangeBytes,
     RangeByobOverlap,
+    RemoteValidatorByteString,
     ExtensionlessSniffer,
     OpenAdmission,
     OpenSourceIndexAndCatalog,
@@ -473,6 +474,15 @@ define_web_remote_limits! {
     RequestedRangeBytes => { name: "requested_range_bytes", domain: Transport, unit: Bytes, scope: RangeResponse, accounting: ScalarObservation, telemetry: MaximumObserved, requirement: phase_a() },
     ByobScratchBytes => { name: "byob_scratch_bytes", domain: Transport, unit: Bytes, scope: RangeResponse, accounting: ReclaimableConcurrent, telemetry: HighWatermark, requirement: phase_a() },
     RangeJsWasmOverlapBytes => { name: "range_js_wasm_overlap_bytes", domain: Transport, unit: Bytes, scope: RangeResponse, accounting: ReclaimableConcurrent, telemetry: HighWatermark, requirement: phase_a() },
+    RemoteValidatorIngressValues => { name: "remote_validator_ingress_values", domain: Transport, unit: Count, scope: WorkUnit, accounting: ScalarObservation, telemetry: MaximumObserved, requirement: design_constant(1, "MCAP-008 absent-or-single entity-tag header grammar") },
+    RemoteValidatorIngressWireBytes => { name: "remote_validator_ingress_wire_bytes", domain: Transport, unit: Bytes, scope: WorkUnit, accounting: ScalarObservation, telemetry: MaximumObserved, requirement: phase_a() },
+    RemoteValidatorIngressJsWasmOverlapBytes => { name: "remote_validator_ingress_js_wasm_overlap_bytes", domain: Transport, unit: Bytes, scope: WorkUnit, accounting: ReclaimableConcurrent, telemetry: HighWatermark, requirement: phase_a() },
+    RemoteValidatorIngressScratchBytes => { name: "remote_validator_ingress_scratch_bytes", domain: Transport, unit: Bytes, scope: WorkUnit, accounting: ReclaimableConcurrent, telemetry: HighWatermark, requirement: phase_a() },
+    RemoteValidatorRetainedBytes => { name: "remote_validator_retained_bytes", domain: Transport, unit: Bytes, scope: Session, accounting: ReclaimableConcurrent, telemetry: HighWatermark, requirement: phase_a() },
+    RemoteValidatorEgressValues => { name: "remote_validator_egress_values", domain: Transport, unit: Count, scope: RangeResponse, accounting: ReclaimableConcurrent, telemetry: HighWatermark, requirement: design_constant(1, "MCAP-008 one-shot If-Match owner per RangeResponse") },
+    RemoteValidatorEgressWireBytes => { name: "remote_validator_egress_wire_bytes", domain: Transport, unit: Bytes, scope: WorkUnit, accounting: ScalarObservation, telemetry: MaximumObserved, requirement: phase_a() },
+    RemoteValidatorEgressJsWasmOverlapBytes => { name: "remote_validator_egress_js_wasm_overlap_bytes", domain: Transport, unit: Bytes, scope: WorkUnit, accounting: ReclaimableConcurrent, telemetry: HighWatermark, requirement: phase_a() },
+    RemoteValidatorEgressScratchBytes => { name: "remote_validator_egress_scratch_bytes", domain: Transport, unit: Bytes, scope: WorkUnit, accounting: ReclaimableConcurrent, telemetry: HighWatermark, requirement: phase_a() },
     ExtensionlessSnifferBufferBytes => { name: "extensionless_sniffer_buffer_bytes", domain: Transport, unit: Bytes, scope: Request, accounting: ScalarObservation, telemetry: MaximumObserved, requirement: design_constant(8, "sections 5.1 and 9.1 extensionless application-visible prefix") },
     ByobPumpSliceBytes => { name: "byob_pump_slice_bytes", domain: Transport, unit: Bytes, scope: WorkUnit, accounting: ScalarObservation, telemetry: MaximumObserved, requirement: phase_a() },
     ByobPumpSliceDurationMicros => { name: "byob_pump_slice_duration_micros", domain: Transport, unit: Microseconds, scope: WorkUnit, accounting: ScalarObservation, telemetry: DeadlineOutcome, requirement: phase_a() },
@@ -657,7 +667,7 @@ define_web_remote_limits! {
 ///
 /// This is intentionally independent from the generated array length so adding or removing a key
 /// requires an explicit schema review and a matching metadata-fingerprint update.
-pub const EXPECTED_WEB_REMOTE_LIMIT_COUNT_V1: usize = 261;
+pub const EXPECTED_WEB_REMOTE_LIMIT_COUNT_V1: usize = 270;
 
 impl WebRemoteLimitKey {
     pub const fn design_requirement(self) -> NormativeResourceRequirement {
@@ -767,6 +777,15 @@ impl WebRemoteLimitKey {
             Self::RequestedRangeBytes | Self::ByobScratchBytes | Self::RangeJsWasmOverlapBytes => {
                 Requirement::RangeByobOverlap
             }
+            Self::RemoteValidatorIngressValues
+            | Self::RemoteValidatorIngressWireBytes
+            | Self::RemoteValidatorIngressJsWasmOverlapBytes
+            | Self::RemoteValidatorIngressScratchBytes
+            | Self::RemoteValidatorRetainedBytes
+            | Self::RemoteValidatorEgressValues
+            | Self::RemoteValidatorEgressWireBytes
+            | Self::RemoteValidatorEgressJsWasmOverlapBytes
+            | Self::RemoteValidatorEgressScratchBytes => Requirement::RemoteValidatorByteString,
             Self::ExtensionlessSnifferBufferBytes => Requirement::ExtensionlessSniffer,
             Self::ByobPumpSliceBytes | Self::ByobPumpSliceDurationMicros => Requirement::ByobPump,
             Self::MetadataOpeningBytes
@@ -1005,6 +1024,12 @@ const fn aggregate_reservation_family(
         | WebRemoteLimitKey::RemoteInternalRetainedBytes
         | WebRemoteLimitKey::ByobScratchBytes
         | WebRemoteLimitKey::RangeJsWasmOverlapBytes
+        | WebRemoteLimitKey::RemoteValidatorIngressJsWasmOverlapBytes
+        | WebRemoteLimitKey::RemoteValidatorIngressScratchBytes
+        | WebRemoteLimitKey::RemoteValidatorRetainedBytes
+        | WebRemoteLimitKey::RemoteValidatorEgressValues
+        | WebRemoteLimitKey::RemoteValidatorEgressJsWasmOverlapBytes
+        | WebRemoteLimitKey::RemoteValidatorEgressScratchBytes
         | WebRemoteLimitKey::MetadataOpeningBytes
         | WebRemoteLimitKey::RawCacheBytes
         | WebRemoteLimitKey::RemoteStagedTerminalBatchBytes
@@ -1714,6 +1739,9 @@ pub enum NormativeAggregateFormula {
     SessionDescriptorOriginArithmetic,
     RegistrationMetadataHeadroomReservation,
     RemoteInternalTotalGate,
+    RemoteValidatorIngressReservation,
+    RemoteValidatorRetainedReservation,
+    RemoteValidatorEgressReservation,
     LifecycleRetentionBundle,
     PresentationActivationReservation,
     PresentationLeaseReservation,
@@ -1738,6 +1766,9 @@ pub enum AggregateTypedEntryPoint {
     ValidateSessionDescriptorFormula,
     PrepareRegistrationMetadataFormula,
     PrepareRemoteInternalReservation,
+    PrepareRemoteValidatorIngress,
+    PrepareRemoteValidatorRetained,
+    PrepareRemoteValidatorEgress,
     PrepareLifecycleReservation,
     ActivatePresentation,
     AcquirePresentationLease,
@@ -1753,7 +1784,7 @@ pub enum AggregateTypedEntryPoint {
 }
 
 impl NormativeAggregateFormula {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 22] = [
         Self::ValidationEstimateAndActualDispatch,
         Self::DecoderAggregateReservation,
         Self::PlanningCrossProductArithmetic,
@@ -1761,6 +1792,9 @@ impl NormativeAggregateFormula {
         Self::SessionDescriptorOriginArithmetic,
         Self::RegistrationMetadataHeadroomReservation,
         Self::RemoteInternalTotalGate,
+        Self::RemoteValidatorIngressReservation,
+        Self::RemoteValidatorRetainedReservation,
+        Self::RemoteValidatorEgressReservation,
         Self::LifecycleRetentionBundle,
         Self::PresentationActivationReservation,
         Self::PresentationLeaseReservation,
@@ -1787,6 +1821,9 @@ impl NormativeAggregateFormula {
                 Requirement::RegistrationMetadataHeadroom
             }
             Self::RemoteInternalTotalGate => Requirement::RemoteInternalTotal,
+            Self::RemoteValidatorIngressReservation
+            | Self::RemoteValidatorRetainedReservation
+            | Self::RemoteValidatorEgressReservation => Requirement::RemoteValidatorByteString,
             Self::LifecycleRetentionBundle => Requirement::PublicLifecycle,
             Self::PresentationActivationReservation | Self::PresentationLeaseReservation => {
                 Requirement::PresentationQueryOwnership
@@ -1825,6 +1862,15 @@ impl NormativeAggregateFormula {
             }
             Self::RemoteInternalTotalGate => {
                 AggregateTypedEntryPoint::PrepareRemoteInternalReservation
+            }
+            Self::RemoteValidatorIngressReservation => {
+                AggregateTypedEntryPoint::PrepareRemoteValidatorIngress
+            }
+            Self::RemoteValidatorRetainedReservation => {
+                AggregateTypedEntryPoint::PrepareRemoteValidatorRetained
+            }
+            Self::RemoteValidatorEgressReservation => {
+                AggregateTypedEntryPoint::PrepareRemoteValidatorEgress
             }
             Self::LifecycleRetentionBundle => AggregateTypedEntryPoint::PrepareLifecycleReservation,
             Self::PresentationActivationReservation => {
@@ -2539,7 +2585,7 @@ struct ScopeAccountingState {
 /// An exact snapshot of scope ownership, usage, revisions, and active reservations.
 #[derive(Clone, PartialEq, Eq)]
 #[cfg(test)]
-struct ScopeAccountingSnapshot(ScopeAccountingState);
+pub(crate) struct ScopeAccountingSnapshot(ScopeAccountingState);
 
 #[cfg(test)]
 impl ScopeAccountingSnapshot {
@@ -2556,6 +2602,17 @@ impl ScopeAccountingSnapshot {
                 key,
             })
             .copied()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn same_except_revision_and_reservation_sequence(&self, other: &Self) -> bool {
+        let mut left = self.clone();
+        let mut right = other.clone();
+        left.0.revision = 0;
+        right.0.revision = 0;
+        left.0.next_reservation_sequence = 0;
+        right.0.next_reservation_sequence = 0;
+        left == right
     }
 }
 
@@ -3209,7 +3266,9 @@ impl ProductionWebRemoteLimitsV1 {
     }
 
     #[cfg(test)]
-    fn start_accounting_root(self) -> Result<WasmModuleLimitAccountingRoot, ScopeAccountingError> {
+    pub(crate) fn start_accounting_root(
+        self,
+    ) -> Result<WasmModuleLimitAccountingRoot, ScopeAccountingError> {
         self.start_accounting_root_inner()
     }
 }
@@ -3225,7 +3284,7 @@ impl WasmModuleLimitAccountingRoot {
     }
 
     #[cfg(test)]
-    fn snapshot(&self) -> ScopeAccountingSnapshot {
+    pub(crate) fn snapshot(&self) -> ScopeAccountingSnapshot {
         ScopeAccountingSnapshot(self.inner.state.borrow().clone())
     }
 
@@ -3544,6 +3603,84 @@ impl WasmModuleLimitAccountingRoot {
         plan.prepare()
     }
 
+    fn prepare_remote_validator_temporary_reservation(
+        &self,
+        work_unit: &WebRemoteAccountingScope,
+        overlap_key: WebRemoteLimitKey,
+        overlap_bytes: NonZeroU64,
+        scratch_key: WebRemoteLimitKey,
+        scratch_bytes: NonZeroU64,
+    ) -> Result<PreparedScopedReservations, ScopeAccountingError> {
+        let session = ancestor_scope(work_unit, WebRemoteLimitScope::Session)?;
+        let total = overlap_bytes
+            .get()
+            .checked_add(scratch_bytes.get())
+            .and_then(NonZeroU64::new)
+            .ok_or(ScopeAccountingError::ArithmeticOverflow)?;
+        let mut plan = self.begin_internal_reservation_plan(reservation_capacity(3))?;
+        plan.push(overlap_key, overlap_bytes.get(), work_unit)?;
+        plan.push(scratch_key, scratch_bytes.get(), work_unit)?;
+        plan.push(
+            WebRemoteLimitKey::RemoteInternalRetainedBytes,
+            total.get(),
+            &session,
+        )?;
+        plan.prepare()
+    }
+
+    fn prepare_remote_validator_retained_reservation(
+        &self,
+        work_unit: &WebRemoteAccountingScope,
+        retained_bytes: NonZeroU64,
+    ) -> Result<PreparedScopedReservations, ScopeAccountingError> {
+        let session = ancestor_scope(work_unit, WebRemoteLimitScope::Session)?;
+        let mut plan = self.begin_internal_reservation_plan(reservation_capacity(2))?;
+        plan.push(
+            WebRemoteLimitKey::RemoteValidatorRetainedBytes,
+            retained_bytes.get(),
+            &session,
+        )?;
+        plan.push(
+            WebRemoteLimitKey::RemoteInternalRetainedBytes,
+            retained_bytes.get(),
+            &session,
+        )?;
+        plan.prepare()
+    }
+
+    fn prepare_remote_validator_egress_reservation(
+        &self,
+        work_unit: &WebRemoteAccountingScope,
+        overlap_bytes: NonZeroU64,
+        scratch_bytes: NonZeroU64,
+    ) -> Result<PreparedScopedReservations, ScopeAccountingError> {
+        let session = ancestor_scope(work_unit, WebRemoteLimitScope::Session)?;
+        let range = ancestor_scope(work_unit, WebRemoteLimitScope::RangeResponse)?;
+        let total = overlap_bytes
+            .get()
+            .checked_add(scratch_bytes.get())
+            .and_then(NonZeroU64::new)
+            .ok_or(ScopeAccountingError::ArithmeticOverflow)?;
+        let mut plan = self.begin_internal_reservation_plan(reservation_capacity(4))?;
+        plan.push(WebRemoteLimitKey::RemoteValidatorEgressValues, 1, &range)?;
+        plan.push(
+            WebRemoteLimitKey::RemoteValidatorEgressJsWasmOverlapBytes,
+            overlap_bytes.get(),
+            work_unit,
+        )?;
+        plan.push(
+            WebRemoteLimitKey::RemoteValidatorEgressScratchBytes,
+            scratch_bytes.get(),
+            work_unit,
+        )?;
+        plan.push(
+            WebRemoteLimitKey::RemoteInternalRetainedBytes,
+            total.get(),
+            &session,
+        )?;
+        plan.prepare()
+    }
+
     fn prepare_shared_frame_work(
         &self,
         frame: &WebRemoteAccountingScope,
@@ -3780,6 +3917,168 @@ impl SessionAccountingScope {
         .ok_or(ScopeAccountingError::ArithmeticOverflow)?;
         let retained = NonZeroU64::new(retained).ok_or(ScopeAccountingError::EmptyReservation)?;
         self.prepare_registration_metadata_reservation(root, retained)
+    }
+}
+
+macro_rules! define_remote_validator_reservation_owner {
+    ($prepared:ident, $active:ident) => {
+        /// A checked but disarmed validator `ByteString` reservation.
+        pub struct $prepared {
+            inner: PreparedScopedReservations,
+            accounted_bytes: NonZeroU64,
+        }
+
+        impl fmt::Debug for $prepared {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter
+                    .debug_struct(stringify!($prepared))
+                    .field("accounted_bytes", &self.accounted_bytes)
+                    .finish_non_exhaustive()
+            }
+        }
+
+        impl $prepared {
+            pub const fn accounted_bytes(&self) -> NonZeroU64 {
+                self.accounted_bytes
+            }
+
+            pub fn commit(self) -> Result<$active, ScopeAccountingError> {
+                Ok($active {
+                    inner: Some(self.inner.commit()?),
+                    accounted_bytes: self.accounted_bytes,
+                })
+            }
+        }
+
+        /// Exact non-cloneable ownership of one active validator `ByteString` reservation.
+        pub struct $active {
+            inner: Option<ActiveScopedReservations>,
+            accounted_bytes: NonZeroU64,
+        }
+
+        impl fmt::Debug for $active {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter
+                    .debug_struct(stringify!($active))
+                    .field("accounted_bytes", &self.accounted_bytes)
+                    .field("active", &self.inner.is_some())
+                    .finish()
+            }
+        }
+
+        impl $active {
+            pub const fn accounted_bytes(&self) -> NonZeroU64 {
+                self.accounted_bytes
+            }
+
+            pub fn release(mut self) -> Result<(), ScopeAccountingError> {
+                self.inner
+                    .take()
+                    .expect("active typed reservation owns its inner reservation")
+                    .release()
+            }
+        }
+    };
+}
+
+define_remote_validator_reservation_owner!(
+    PreparedRemoteValidatorIngressReservation,
+    ActiveRemoteValidatorIngressReservation
+);
+define_remote_validator_reservation_owner!(
+    PreparedRemoteValidatorRetainedReservation,
+    ActiveRemoteValidatorRetainedReservation
+);
+define_remote_validator_reservation_owner!(
+    PreparedRemoteValidatorEgressReservation,
+    ActiveRemoteValidatorEgressReservation
+);
+
+impl WorkUnitAccountingScope {
+    /// Checks the observable shape before any validator `ByteString` copy or code-unit scan.
+    pub fn validate_remote_validator_ingress_shape(
+        &self,
+        visible_values: u64,
+        wire_bytes: u64,
+    ) -> Result<(), ScopeAccountingError> {
+        self.validate_scalar(
+            ScalarObservationKey::from_schema_key_internal(
+                WebRemoteLimitKey::RemoteValidatorIngressValues,
+            ),
+            visible_values,
+        )?;
+        self.validate_scalar(
+            ScalarObservationKey::from_schema_key_internal(
+                WebRemoteLimitKey::RemoteValidatorIngressWireBytes,
+            ),
+            wire_bytes,
+        )
+    }
+
+    /// Checks and atomically reserves the JavaScript-retained and Wasm scratch sides of one
+    /// `ByteString` ingress copy.
+    pub fn prepare_remote_validator_ingress(
+        &self,
+        root: &WasmModuleLimitAccountingRoot,
+        visible_values: NonZeroU64,
+        wire_bytes: NonZeroU64,
+    ) -> Result<PreparedRemoteValidatorIngressReservation, ScopeAccountingError> {
+        self.validate_remote_validator_ingress_shape(visible_values.get(), wire_bytes.get())?;
+        let js_utf16_bytes = wire_bytes
+            .get()
+            .checked_mul(size_of::<u16>() as u64)
+            .and_then(NonZeroU64::new)
+            .ok_or(ScopeAccountingError::ArithmeticOverflow)?;
+        let inner = root.prepare_remote_validator_temporary_reservation(
+            &self.0,
+            WebRemoteLimitKey::RemoteValidatorIngressJsWasmOverlapBytes,
+            js_utf16_bytes,
+            WebRemoteLimitKey::RemoteValidatorIngressScratchBytes,
+            wire_bytes,
+        )?;
+        Ok(PreparedRemoteValidatorIngressReservation {
+            inner,
+            accounted_bytes: wire_bytes,
+        })
+    }
+
+    /// Atomically reserves the final shared wire-byte owner and the session-wide remote total.
+    pub fn prepare_remote_validator_retained(
+        &self,
+        root: &WasmModuleLimitAccountingRoot,
+        retained_bytes: NonZeroU64,
+    ) -> Result<PreparedRemoteValidatorRetainedReservation, ScopeAccountingError> {
+        let inner = root.prepare_remote_validator_retained_reservation(&self.0, retained_bytes)?;
+        Ok(PreparedRemoteValidatorRetainedReservation {
+            inner,
+            accounted_bytes: retained_bytes,
+        })
+    }
+
+    /// Checks and atomically reserves the `JavaScript` `ByteString` plus `u16` construction scratch
+    /// used by one strong `If-Match` egress value.
+    pub(crate) fn prepare_remote_validator_egress(
+        &self,
+        root: &WasmModuleLimitAccountingRoot,
+        wire_bytes: NonZeroU64,
+    ) -> Result<PreparedRemoteValidatorEgressReservation, ScopeAccountingError> {
+        self.validate_scalar(
+            ScalarObservationKey::from_schema_key_internal(
+                WebRemoteLimitKey::RemoteValidatorEgressWireBytes,
+            ),
+            wire_bytes.get(),
+        )?;
+        let utf16_bytes = wire_bytes
+            .get()
+            .checked_mul(size_of::<u16>() as u64)
+            .and_then(NonZeroU64::new)
+            .ok_or(ScopeAccountingError::ArithmeticOverflow)?;
+        let inner =
+            root.prepare_remote_validator_egress_reservation(&self.0, utf16_bytes, utf16_bytes)?;
+        Ok(PreparedRemoteValidatorEgressReservation {
+            inner,
+            accounted_bytes: wire_bytes,
+        })
     }
 }
 
@@ -5829,7 +6128,7 @@ impl fmt::Display for ScopeAccountingError {
 impl std::error::Error for ScopeAccountingError {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn digest_for(key: WebRemoteLimitKey) -> MeasurementEvidenceDigest {
@@ -5921,7 +6220,7 @@ mod tests {
         draft.validate_complete().expect("complete test profile")
     }
 
-    fn complete_test_profile() -> ProductionWebRemoteLimitsV1 {
+    pub(crate) fn complete_test_profile() -> ProductionWebRemoteLimitsV1 {
         ProductionWebRemoteLimitsV1::from_validated_artifact_for_test(&complete_test_artifact())
     }
 
@@ -5929,7 +6228,9 @@ mod tests {
         complete_test_artifact().values
     }
 
-    fn test_profile_with(overrides: &[(WebRemoteLimitKey, u64)]) -> ProductionWebRemoteLimitsV1 {
+    pub(crate) fn test_profile_with(
+        overrides: &[(WebRemoteLimitKey, u64)],
+    ) -> ProductionWebRemoteLimitsV1 {
         let mut values = complete_test_values();
         for (key, value) in overrides {
             values[key.index()] = nz(*value);
@@ -6108,6 +6409,15 @@ mod tests {
         WebRemoteLimitKey::RequestedRangeBytes,
         WebRemoteLimitKey::ByobScratchBytes,
         WebRemoteLimitKey::RangeJsWasmOverlapBytes,
+        WebRemoteLimitKey::RemoteValidatorIngressValues,
+        WebRemoteLimitKey::RemoteValidatorIngressWireBytes,
+        WebRemoteLimitKey::RemoteValidatorIngressJsWasmOverlapBytes,
+        WebRemoteLimitKey::RemoteValidatorIngressScratchBytes,
+        WebRemoteLimitKey::RemoteValidatorRetainedBytes,
+        WebRemoteLimitKey::RemoteValidatorEgressValues,
+        WebRemoteLimitKey::RemoteValidatorEgressWireBytes,
+        WebRemoteLimitKey::RemoteValidatorEgressJsWasmOverlapBytes,
+        WebRemoteLimitKey::RemoteValidatorEgressScratchBytes,
         WebRemoteLimitKey::ExtensionlessSnifferBufferBytes,
         WebRemoteLimitKey::ByobPumpSliceBytes,
         WebRemoteLimitKey::ByobPumpSliceDurationMicros,
@@ -6314,6 +6624,16 @@ mod tests {
             WebRemoteLimitKey::ALL.as_slice(),
             REMOTE_MCAP_V1_KEY_ALLOWLIST
         );
+        let WebRemoteLimitState::Frozen(ingress_values) =
+            draft.state(WebRemoteLimitKey::RemoteValidatorIngressValues)
+        else {
+            panic!("the absent-or-single entity-tag grammar must be frozen");
+        };
+        assert_eq!(ingress_values.value, NonZeroU64::MIN);
+        assert!(matches!(
+            ingress_values.source,
+            FrozenLimitValueSource::DesignConstant { .. }
+        ));
 
         for key in WebRemoteLimitKey::ALL {
             let definition = key.definition();
@@ -6367,7 +6687,7 @@ mod tests {
             covered_requirements,
             NormativeResourceRequirement::ALL.into_iter().collect()
         );
-        assert_eq!(metadata_fingerprint(), 0x4487_9f9f_4746_d809);
+        assert_eq!(metadata_fingerprint(), 0x728e_56bd_a2c9_0eb8);
     }
 
     #[test]
@@ -6429,6 +6749,7 @@ mod tests {
             ConcurrentRangeRequests => (1, 0, 0),
             InFlightRangeBytes => (1, 0, 0),
             RangeByobOverlap => (3, 0, 0),
+            RemoteValidatorByteString => (9, 0, 3),
             ExtensionlessSniffer => (1, 0, 0),
             OpenAdmission => (11, 0, 1),
             OpenSourceIndexAndCatalog => (16, 1, 1),
@@ -6567,6 +6888,35 @@ mod tests {
                     Formula::RemoteInternalTotalGate,
                     Entry::PrepareRemoteInternalReservation,
                 )],
+            },
+            OwnerClosureGolden {
+                requirement: Requirement::RemoteValidatorByteString,
+                keys: &[
+                    Key::RemoteValidatorIngressValues,
+                    Key::RemoteValidatorIngressWireBytes,
+                    Key::RemoteValidatorIngressJsWasmOverlapBytes,
+                    Key::RemoteValidatorIngressScratchBytes,
+                    Key::RemoteValidatorRetainedBytes,
+                    Key::RemoteValidatorEgressValues,
+                    Key::RemoteValidatorEgressWireBytes,
+                    Key::RemoteValidatorEgressJsWasmOverlapBytes,
+                    Key::RemoteValidatorEgressScratchBytes,
+                ],
+                constraints: &[],
+                formulas: &[
+                    (
+                        Formula::RemoteValidatorIngressReservation,
+                        Entry::PrepareRemoteValidatorIngress,
+                    ),
+                    (
+                        Formula::RemoteValidatorRetainedReservation,
+                        Entry::PrepareRemoteValidatorRetained,
+                    ),
+                    (
+                        Formula::RemoteValidatorEgressReservation,
+                        Entry::PrepareRemoteValidatorEgress,
+                    ),
+                ],
             },
             OwnerClosureGolden {
                 requirement: Requirement::OpenAdmission,
@@ -7680,6 +8030,227 @@ mod tests {
         );
         assert_eq!(root.snapshot(), before_total_failure);
         drop(validation);
+    }
+
+    #[test]
+    fn remote_validator_reservations_are_atomic_typed_and_exactly_released() {
+        let root = test_profile_with(&[
+            (WebRemoteLimitKey::RemoteInternalRetainedBytes, 1_024),
+            (WebRemoteLimitKey::RemoteValidatorRetainedBytes, 512),
+        ])
+        .start_accounting_root()
+        .unwrap();
+        let viewer = root.create_viewer_scope().unwrap();
+        let source = viewer.create_source_scope().unwrap();
+        let session = source.create_session_scope().unwrap();
+        let range = session.create_range_response_scope().unwrap();
+        let work = range.create_work_unit_scope().unwrap();
+        let other_range = session.create_range_response_scope().unwrap();
+        let other_work = other_range.create_work_unit_scope().unwrap();
+        let initial = root.snapshot();
+
+        let prepared = work
+            .prepare_remote_validator_ingress(&root, nz(1), nz(8))
+            .unwrap();
+        drop(prepared);
+        assert_eq!(root.snapshot(), initial);
+
+        let ingress = work
+            .prepare_remote_validator_ingress(&root, nz(1), nz(8))
+            .unwrap()
+            .commit()
+            .unwrap();
+        let active_ingress = root.snapshot();
+        assert_eq!(ingress.accounted_bytes(), nz(8));
+        assert_eq!(
+            active_ingress
+                .usage(
+                    &work.0,
+                    WebRemoteLimitKey::RemoteValidatorIngressJsWasmOverlapBytes,
+                )
+                .unwrap()
+                .current,
+            16
+        );
+        assert_eq!(
+            active_ingress
+                .usage(
+                    &work.0,
+                    WebRemoteLimitKey::RemoteValidatorIngressScratchBytes,
+                )
+                .unwrap()
+                .current,
+            8
+        );
+        assert_eq!(
+            active_ingress
+                .usage(&session.0, WebRemoteLimitKey::RemoteInternalRetainedBytes)
+                .unwrap()
+                .current,
+            24
+        );
+
+        let retained = work
+            .prepare_remote_validator_retained(&root, nz(80))
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(retained.accounted_bytes(), nz(80));
+        assert_eq!(
+            root.snapshot()
+                .usage(&session.0, WebRemoteLimitKey::RemoteValidatorRetainedBytes,)
+                .unwrap()
+                .current,
+            80
+        );
+
+        let egress = work
+            .prepare_remote_validator_egress(&root, nz(8))
+            .unwrap()
+            .commit()
+            .unwrap();
+        let all_active = root.snapshot();
+        assert_eq!(egress.accounted_bytes(), nz(8));
+        assert_eq!(
+            all_active
+                .usage(&range.0, WebRemoteLimitKey::RemoteValidatorEgressValues)
+                .unwrap()
+                .current,
+            1
+        );
+        assert_eq!(
+            all_active
+                .usage(
+                    &work.0,
+                    WebRemoteLimitKey::RemoteValidatorEgressJsWasmOverlapBytes,
+                )
+                .unwrap()
+                .current,
+            16
+        );
+        assert_eq!(
+            all_active
+                .usage(
+                    &work.0,
+                    WebRemoteLimitKey::RemoteValidatorEgressScratchBytes,
+                )
+                .unwrap()
+                .current,
+            16
+        );
+        assert_eq!(
+            all_active
+                .usage(&session.0, WebRemoteLimitKey::RemoteInternalRetainedBytes)
+                .unwrap()
+                .current,
+            136
+        );
+
+        let before_same_range_failure = root.snapshot();
+        assert_eq!(
+            work.prepare_remote_validator_egress(&root, nz(8))
+                .unwrap_err(),
+            ScopeAccountingError::LimitExceeded
+        );
+        assert_eq!(root.snapshot(), before_same_range_failure);
+
+        let other_egress = other_work
+            .prepare_remote_validator_egress(&root, nz(8))
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(
+            root.snapshot()
+                .usage(
+                    &other_range.0,
+                    WebRemoteLimitKey::RemoteValidatorEgressValues,
+                )
+                .unwrap()
+                .current,
+            1
+        );
+        assert_eq!(
+            root.snapshot()
+                .usage(&session.0, WebRemoteLimitKey::RemoteInternalRetainedBytes)
+                .unwrap()
+                .current,
+            168
+        );
+
+        other_egress.release().unwrap();
+        egress.release().unwrap();
+        retained.release().unwrap();
+        ingress.release().unwrap();
+        let drained = root.snapshot();
+        let mut expected_drained = initial;
+        expected_drained.0.revision = drained.0.revision;
+        expected_drained.0.next_reservation_sequence = drained.0.next_reservation_sequence;
+        assert_eq!(drained, expected_drained);
+    }
+
+    #[test]
+    fn remote_validator_credit_failure_overflow_and_wrong_ancestry_are_rollbacks() {
+        let limited = test_profile_with(&[
+            (
+                WebRemoteLimitKey::RemoteValidatorIngressJsWasmOverlapBytes,
+                7,
+            ),
+            (WebRemoteLimitKey::RemoteInternalRetainedBytes, 1_024),
+        ])
+        .start_accounting_root()
+        .unwrap();
+        let viewer = limited.create_viewer_scope().unwrap();
+        let source = viewer.create_source_scope().unwrap();
+        let session = source.create_session_scope().unwrap();
+        let work = session.create_work_unit_scope().unwrap();
+        let before_limit = limited.snapshot();
+        assert_eq!(
+            work.prepare_remote_validator_ingress(&limited, nz(1), nz(4))
+                .unwrap_err(),
+            ScopeAccountingError::LimitExceeded
+        );
+        assert_eq!(limited.snapshot(), before_limit);
+
+        let overflow = test_profile_with(&[
+            (
+                WebRemoteLimitKey::RemoteValidatorIngressWireBytes,
+                u64::MAX - 1,
+            ),
+            (
+                WebRemoteLimitKey::RemoteValidatorIngressJsWasmOverlapBytes,
+                u64::MAX - 1,
+            ),
+            (
+                WebRemoteLimitKey::RemoteValidatorIngressScratchBytes,
+                u64::MAX - 1,
+            ),
+            (WebRemoteLimitKey::RemoteInternalRetainedBytes, u64::MAX - 1),
+        ])
+        .start_accounting_root()
+        .unwrap();
+        let viewer = overflow.create_viewer_scope().unwrap();
+        let source = viewer.create_source_scope().unwrap();
+        let session = source.create_session_scope().unwrap();
+        let work = session.create_work_unit_scope().unwrap();
+        let before_overflow = overflow.snapshot();
+        assert_eq!(
+            work.prepare_remote_validator_ingress(&overflow, nz(1), nz(u64::MAX / 2 + 1),)
+                .unwrap_err(),
+            ScopeAccountingError::ArithmeticOverflow
+        );
+        assert_eq!(overflow.snapshot(), before_overflow);
+
+        let root = complete_test_profile().start_accounting_root().unwrap();
+        let viewer = root.create_viewer_scope().unwrap();
+        let frame = viewer.create_frame_scope().unwrap();
+        let work = frame.create_work_unit_scope().unwrap();
+        let before_ancestry = root.snapshot();
+        assert_eq!(
+            work.prepare_remote_validator_egress(&root, nz(4))
+                .unwrap_err(),
+            ScopeAccountingError::AggregateAncestryMismatch
+        );
+        assert_eq!(root.snapshot(), before_ancestry);
     }
 
     #[test]
