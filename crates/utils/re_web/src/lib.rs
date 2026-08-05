@@ -17,6 +17,12 @@
 //! ```compile_fail,ignore-wasm32
 //! use re_web::remote_validator;
 //! ```
+//!
+//! Strict-open wire identities and envelopes are also absent from the native production API:
+//!
+//! ```compile_fail,ignore-wasm32
+//! use re_web::strict_open_wire;
+//! ```
 
 pub mod browser;
 
@@ -26,6 +32,15 @@ pub mod remote_limits;
 pub mod remote_validator;
 #[cfg(target_arch = "wasm32")]
 pub mod secret_url;
+#[cfg(target_arch = "wasm32")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the sealed strict-open decoder is foundational until its raw-JS adapter lands"
+    )
+)]
+pub mod strict_open_wire;
 
 // Host builds compile the module only for its unit tests and do not publish it to consumers.
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -42,6 +57,14 @@ mod remote_limits;
     reason = "native tests exercise Web-only validator parsing without publishing its API"
 )]
 mod remote_validator;
+
+// Host builds compile the module only for its unit tests and do not publish it to consumers.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[expect(
+    dead_code,
+    reason = "native tests exercise the Web-only strict-open codec without publishing its API"
+)]
+mod strict_open_wire;
 
 // Host builds compile the module only for its unit tests and do not publish it to consumers.
 #[cfg(all(test, not(target_arch = "wasm32")))]

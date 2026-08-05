@@ -4732,7 +4732,36 @@ pub struct OpenStatusReservationSpec {
     pub deferred_eviction_descriptor_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StrictOpenWireBatchLimits {
+    pub open_batch_urls: NonZeroU64,
+    pub preexisting_recording_attachments: NonZeroU64,
+    pub installation_acks: NonZeroU64,
+}
+
 impl AtomicBatchAccountingScope {
+    pub(crate) fn strict_open_wire_batch_limits(
+        &self,
+    ) -> Result<StrictOpenWireBatchLimits, ScopeAccountingError> {
+        let root = self
+            .0
+            .lease
+            .root
+            .upgrade()
+            .ok_or(ScopeAccountingError::RootStopped)?;
+        Ok(StrictOpenWireBatchLimits {
+            open_batch_urls: root
+                .limits
+                .raw_limit_value(WebRemoteLimitKey::OpenBatchUrls),
+            preexisting_recording_attachments: root
+                .limits
+                .raw_limit_value(WebRemoteLimitKey::PreexistingRecordingAttachments),
+            installation_acks: root
+                .limits
+                .raw_limit_value(WebRemoteLimitKey::InstallationAcks),
+        })
+    }
+
     pub fn prepare_open_admission_reservation(
         &self,
         root: &WasmModuleLimitAccountingRoot,
