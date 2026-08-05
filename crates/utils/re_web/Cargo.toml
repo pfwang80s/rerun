@@ -25,8 +25,10 @@ ignored = ["getrandom"] # enables the wasm backend used by re_tuid in tests
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 async-trait.workspace = true
 bytes.workspace = true
+constant_time_eq.workspace = true
 js-sys.workspace = true
 re_async.workspace = true
+url.workspace = true
 wasm-bindgen.workspace = true
 web-sys = { workspace = true, features = [
   "Blob",
@@ -48,8 +50,16 @@ web-sys = { workspace = true, features = [
   "Window",
   "WritableStream",
 ] }
+zeroize.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+constant_time_eq.workspace = true
+re_string_interner.workspace = true
+url.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 getrandom = { workspace = true, features = ["wasm_js"] }
+re_string_interner.workspace = true
 re_tuid.workspace = true
 wasm-bindgen-test.workspace = true

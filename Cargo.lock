@@ -11171,13 +11171,17 @@ version = "0.36.0-alpha.1+dev"
 dependencies = [
  "async-trait",
  "bytes",
+ "constant_time_eq",
  "getrandom 0.3.4",
  "js-sys",
  "re_async",
+ "re_string_interner",
  "re_tuid",
+ "url",
  "wasm-bindgen",
  "wasm-bindgen-test",
  "web-sys",
+ "zeroize",
 ]
 
 [[package]]
