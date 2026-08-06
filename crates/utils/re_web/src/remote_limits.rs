@@ -1743,6 +1743,7 @@ pub enum NormativeAggregateFormula {
     SessionPartitionArithmetic,
     SessionDescriptorOriginArithmetic,
     RegistrationMetadataHeadroomReservation,
+    RangeBodyPumpReservation,
     RemoteInternalTotalGate,
     RemoteValidatorIngressReservation,
     RemoteValidatorRetainedReservation,
@@ -1771,6 +1772,7 @@ pub enum AggregateTypedEntryPoint {
     ValidateSessionPartitionFormula,
     ValidateSessionDescriptorFormula,
     PrepareRegistrationMetadataFormula,
+    PrepareRangeBodyPumpReservation,
     PrepareRemoteInternalReservation,
     PrepareRemoteValidatorIngress,
     PrepareRemoteValidatorRetained,
@@ -1791,13 +1793,14 @@ pub enum AggregateTypedEntryPoint {
 }
 
 impl NormativeAggregateFormula {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::ValidationEstimateAndActualDispatch,
         Self::DecoderAggregateReservation,
         Self::PlanningCrossProductArithmetic,
         Self::SessionPartitionArithmetic,
         Self::SessionDescriptorOriginArithmetic,
         Self::RegistrationMetadataHeadroomReservation,
+        Self::RangeBodyPumpReservation,
         Self::RemoteInternalTotalGate,
         Self::RemoteValidatorIngressReservation,
         Self::RemoteValidatorRetainedReservation,
@@ -1828,6 +1831,7 @@ impl NormativeAggregateFormula {
             Self::RegistrationMetadataHeadroomReservation => {
                 Requirement::RegistrationMetadataHeadroom
             }
+            Self::RangeBodyPumpReservation => Requirement::RangeByobOverlap,
             Self::RemoteInternalTotalGate => Requirement::RemoteInternalTotal,
             Self::RemoteValidatorIngressReservation
             | Self::RemoteValidatorRetainedReservation
@@ -1868,6 +1872,9 @@ impl NormativeAggregateFormula {
             }
             Self::RegistrationMetadataHeadroomReservation => {
                 AggregateTypedEntryPoint::PrepareRegistrationMetadataFormula
+            }
+            Self::RangeBodyPumpReservation => {
+                AggregateTypedEntryPoint::PrepareRangeBodyPumpReservation
             }
             Self::RemoteInternalTotalGate => {
                 AggregateTypedEntryPoint::PrepareRemoteInternalReservation
@@ -3737,6 +3744,46 @@ impl WasmModuleLimitAccountingRoot {
         plan.prepare()
     }
 
+    fn prepare_range_body_pump_reservation(
+        &self,
+        range_response: &WebRemoteAccountingScope,
+        work_unit: &WebRemoteAccountingScope,
+        output_bytes: NonZeroU64,
+        scratch_bytes: NonZeroU64,
+    ) -> Result<PreparedScopedReservations, ScopeAccountingError> {
+        let work_range = ancestor_scope(work_unit, WebRemoteLimitScope::RangeResponse)?;
+        if work_range.lease.identity != range_response.lease.identity {
+            return Err(ScopeAccountingError::AggregateAncestryMismatch);
+        }
+        let session = ancestor_scope(range_response, WebRemoteLimitScope::Session)?;
+        let overlap_bytes = output_bytes
+            .get()
+            .checked_add(scratch_bytes.get())
+            .ok_or(ScopeAccountingError::ArithmeticOverflow)?;
+        let mut plan = self.begin_internal_reservation_plan(reservation_capacity(4))?;
+        plan.push(
+            WebRemoteLimitKey::FetchWasmRawRetainedBytes,
+            output_bytes.get(),
+            range_response,
+        )?;
+        plan.push(
+            WebRemoteLimitKey::ByobScratchBytes,
+            scratch_bytes.get(),
+            range_response,
+        )?;
+        plan.push(
+            WebRemoteLimitKey::RangeJsWasmOverlapBytes,
+            overlap_bytes,
+            range_response,
+        )?;
+        plan.push(
+            WebRemoteLimitKey::RemoteInternalRetainedBytes,
+            overlap_bytes,
+            &session,
+        )?;
+        plan.prepare()
+    }
+
     fn prepare_shared_frame_work(
         &self,
         frame: &WebRemoteAccountingScope,
@@ -3839,6 +3886,93 @@ impl WorkUnitAccountingScope {
             return Err(ScopeAccountingError::FormulaViolation);
         }
         Ok(())
+    }
+}
+
+/// The exact bytes reserved for one bounded Chrome body pump.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeBodyPumpReservationSpec {
+    pub output_bytes: NonZeroU64,
+    pub scratch_bytes: NonZeroU64,
+}
+
+/// A checked but disarmed reservation for one exact-length Chrome body pump.
+pub struct PreparedRangeBodyPumpReservation {
+    inner: PreparedScopedReservations,
+    spec: RangeBodyPumpReservationSpec,
+}
+
+impl fmt::Debug for PreparedRangeBodyPumpReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedRangeBodyPumpReservation")
+            .field("spec", &self.spec)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedRangeBodyPumpReservation {
+    pub fn commit(self) -> Result<ActiveRangeBodyPumpReservation, ScopeAccountingError> {
+        Ok(ActiveRangeBodyPumpReservation {
+            inner: Some(self.inner.commit()?),
+            spec: self.spec,
+        })
+    }
+}
+
+/// Exact non-cloneable ownership of one active Chrome body-pump reservation.
+pub struct ActiveRangeBodyPumpReservation {
+    inner: Option<ActiveScopedReservations>,
+    spec: RangeBodyPumpReservationSpec,
+}
+
+impl fmt::Debug for ActiveRangeBodyPumpReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActiveRangeBodyPumpReservation")
+            .field("spec", &self.spec)
+            .field("active", &self.inner.is_some())
+            .finish()
+    }
+}
+
+impl ActiveRangeBodyPumpReservation {
+    pub const fn spec(&self) -> RangeBodyPumpReservationSpec {
+        self.spec
+    }
+
+    pub fn release(mut self) -> Result<(), ScopeAccountingError> {
+        self.inner
+            .take()
+            .expect("active typed reservation owns its inner reservation")
+            .release()
+    }
+}
+
+impl RangeResponseAccountingScope {
+    /// Validates and atomically reserves the Wasm output, fixed scratch, peak overlap and session
+    /// total before the first body-pump allocation.
+    pub fn prepare_body_pump_reservation(
+        &self,
+        root: &WasmModuleLimitAccountingRoot,
+        work_unit: &WorkUnitAccountingScope,
+        spec: RangeBodyPumpReservationSpec,
+    ) -> Result<PreparedRangeBodyPumpReservation, ScopeAccountingError> {
+        self.validate_scalar(
+            ScalarObservationKey::from_schema_key_internal(WebRemoteLimitKey::RequestedRangeBytes),
+            spec.output_bytes.get(),
+        )?;
+        work_unit.validate_scalar(
+            ScalarObservationKey::from_schema_key_internal(WebRemoteLimitKey::ByobPumpSliceBytes),
+            spec.scratch_bytes.get(),
+        )?;
+        let inner = root.prepare_range_body_pump_reservation(
+            &self.0,
+            &work_unit.0,
+            spec.output_bytes,
+            spec.scratch_bytes,
+        )?;
+        Ok(PreparedRangeBodyPumpReservation { inner, spec })
     }
 }
 
@@ -4176,21 +4310,6 @@ define_remote_internal_method!(
     SessionAccountingScope,
     prepare_raw_cache_reservation,
     RawCacheBytes
-);
-define_remote_internal_method!(
-    RangeResponseAccountingScope,
-    prepare_byob_scratch_reservation,
-    ByobScratchBytes
-);
-define_remote_internal_method!(
-    RangeResponseAccountingScope,
-    prepare_range_overlap_reservation,
-    RangeJsWasmOverlapBytes
-);
-define_remote_internal_method!(
-    RangeResponseAccountingScope,
-    prepare_fetch_wasm_raw_reservation,
-    FetchWasmRawRetainedBytes
 );
 define_remote_internal_method!(
     GenerationAccountingScope,
@@ -6775,7 +6894,7 @@ pub(crate) mod tests {
             covered_requirements,
             NormativeResourceRequirement::ALL.into_iter().collect()
         );
-        assert_eq!(metadata_fingerprint(), 0xb09f_8b92_3e1b_bb55);
+        assert_eq!(metadata_fingerprint(), 0x5b71_6f50_4699_862c);
     }
 
     #[test]
@@ -6885,7 +7004,7 @@ pub(crate) mod tests {
             SessionResidentPhysicalRoots => (1, 0, 0),
             ConcurrentRangeRequests => (1, 0, 0),
             InFlightRangeBytes => (1, 0, 0),
-            RangeByobOverlap => (3, 0, 0),
+            RangeByobOverlap => (3, 0, 1),
             RemoteValidatorByteString => (9, 0, 3),
             ExtensionlessSniffer => (1, 0, 0),
             OpenAdmission => (11, 0, 1),
@@ -7008,6 +7127,19 @@ pub(crate) mod tests {
                 formulas: &[(
                     Formula::RegistrationMetadataHeadroomReservation,
                     Entry::PrepareRegistrationMetadataFormula,
+                )],
+            },
+            OwnerClosureGolden {
+                requirement: Requirement::RangeByobOverlap,
+                keys: &[
+                    Key::RequestedRangeBytes,
+                    Key::ByobScratchBytes,
+                    Key::RangeJsWasmOverlapBytes,
+                ],
+                constraints: &[],
+                formulas: &[(
+                    Formula::RangeBodyPumpReservation,
+                    Entry::PrepareRangeBodyPumpReservation,
                 )],
             },
             OwnerClosureGolden {
@@ -8345,6 +8477,96 @@ pub(crate) mod tests {
         expected_drained.0.revision = drained.0.revision;
         expected_drained.0.next_reservation_sequence = drained.0.next_reservation_sequence;
         assert_eq!(drained, expected_drained);
+    }
+
+    #[test]
+    fn range_body_pump_reservation_is_atomic_typed_and_exactly_released() {
+        let root = complete_test_profile().start_accounting_root().unwrap();
+        let viewer = root.create_viewer_scope().unwrap();
+        let source = viewer.create_source_scope().unwrap();
+        let session = source.create_session_scope().unwrap();
+        let range = session.create_range_response_scope().unwrap();
+        let work = range.create_work_unit_scope().unwrap();
+        let initial = root.snapshot();
+        let spec = RangeBodyPumpReservationSpec {
+            output_bytes: nz(8),
+            scratch_bytes: nz(4),
+        };
+
+        let prepared = range
+            .prepare_body_pump_reservation(&root, &work, spec)
+            .unwrap();
+        drop(prepared);
+        assert_eq!(root.snapshot(), initial);
+
+        let active = range
+            .prepare_body_pump_reservation(&root, &work, spec)
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(active.spec(), spec);
+        let snapshot = root.snapshot();
+        for (scope, key, expected) in [
+            (&range.0, WebRemoteLimitKey::FetchWasmRawRetainedBytes, 8),
+            (&range.0, WebRemoteLimitKey::ByobScratchBytes, 4),
+            (&range.0, WebRemoteLimitKey::RangeJsWasmOverlapBytes, 12),
+            (
+                &session.0,
+                WebRemoteLimitKey::RemoteInternalRetainedBytes,
+                12,
+            ),
+        ] {
+            assert_eq!(snapshot.usage(scope, key).unwrap().current, expected);
+        }
+
+        active.release().unwrap();
+        let drained = root.snapshot();
+        let mut expected_drained = initial;
+        expected_drained.0.revision = drained.0.revision;
+        expected_drained.0.next_reservation_sequence = drained.0.next_reservation_sequence;
+        assert_eq!(drained, expected_drained);
+    }
+
+    #[test]
+    fn range_body_pump_limit_and_ancestry_failures_are_exact_rollbacks() {
+        let root = complete_test_profile().start_accounting_root().unwrap();
+        let viewer = root.create_viewer_scope().unwrap();
+        let source = viewer.create_source_scope().unwrap();
+        let session = source.create_session_scope().unwrap();
+        let range = session.create_range_response_scope().unwrap();
+        let work = range.create_work_unit_scope().unwrap();
+        let other_range = session.create_range_response_scope().unwrap();
+        let other_work = other_range.create_work_unit_scope().unwrap();
+
+        let before_limit = root.snapshot();
+        assert!(matches!(
+            range.prepare_body_pump_reservation(
+                &root,
+                &work,
+                RangeBodyPumpReservationSpec {
+                    output_bytes: nz(65),
+                    scratch_bytes: nz(1),
+                },
+            ),
+            Err(ScopeAccountingError::LimitExceeded)
+        ));
+        assert_eq!(root.snapshot(), before_limit);
+
+        let before_ancestry = root.snapshot();
+        assert_eq!(
+            range
+                .prepare_body_pump_reservation(
+                    &root,
+                    &other_work,
+                    RangeBodyPumpReservationSpec {
+                        output_bytes: nz(8),
+                        scratch_bytes: nz(4),
+                    },
+                )
+                .unwrap_err(),
+            ScopeAccountingError::AggregateAncestryMismatch
+        );
+        assert_eq!(root.snapshot(), before_ancestry);
     }
 
     #[test]

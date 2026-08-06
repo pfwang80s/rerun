@@ -90,4 +90,6 @@ jobs:
           install-chromedriver: true
 
       - name: Run Chrome MCAP Range browser tests
-        run: pixi run web-test --browser chrome --package re_mcap_chrome_test
+        run: |
+          pixi run web-test --browser chrome --package re_mcap_chrome_test
+          pixi run web-test --browser chrome --package re_web

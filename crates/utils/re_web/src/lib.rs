@@ -29,9 +29,17 @@
 //! ```compile_fail,ignore-wasm32
 //! use re_web::store_publication;
 //! ```
+//!
+//! Exact-length Chrome BYOB body pumping is likewise Web-only:
+//!
+//! ```compile_fail,ignore-wasm32
+//! use re_web::chrome_byob;
+//! ```
 
 pub mod browser;
 
+#[cfg(target_arch = "wasm32")]
+pub mod chrome_byob;
 #[cfg(target_arch = "wasm32")]
 pub mod remote_limits;
 #[cfg(target_arch = "wasm32")]
@@ -57,6 +65,10 @@ pub mod strict_open_wire;
     reason = "native tests exercise the Web-only schema without publishing its API"
 )]
 mod remote_limits;
+
+// Host builds compile the pure pump state machine only for its unit tests and do not publish it.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod chrome_byob;
 
 // Host builds compile the module only for its unit tests and do not publish it to consumers.
 #[cfg(all(test, not(target_arch = "wasm32")))]
