@@ -55,6 +55,8 @@ pub mod chrome_byob;
 #[cfg(target_arch = "wasm32")]
 pub mod chrome_range;
 #[cfg(target_arch = "wasm32")]
+mod format_sniffer;
+#[cfg(target_arch = "wasm32")]
 #[cfg_attr(
     not(test),
     expect(

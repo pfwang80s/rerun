@@ -9,6 +9,9 @@ use crate::remote_validator::{
     RepresentationConsistency, RepresentationConsistencyPolicy, bind_representation_consistency,
 };
 
+#[cfg(target_arch = "wasm32")]
+pub(crate) const MCAP_MAGIC_BYTES: [u8; 8] = [0x89, b'M', b'C', b'A', b'P', b'0', b'\r', b'\n'];
+
 /// A required response header whose absence is observable after Fetch succeeds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequiredRangeResponseHeader {
@@ -429,9 +432,11 @@ mod web {
         validate_bound_validator,
     };
     use crate::chrome_byob::{
-        ExactLengthByobPumpConfig, ExactLengthByobPumpControl, ExactLengthByobPumpControlError,
-        ExactLengthRangeBody, PreparedExactLengthRangeBodyPump, prepare_exact_range_body_pump,
-        read_exact_range_body_prepared,
+        BoundedPrefixBody, ExactLengthBodyCompletion, ExactLengthByobPumpConfig,
+        ExactLengthByobPumpControl, ExactLengthByobPumpControlError, ExactLengthRangeBody,
+        PreparedExactLengthRangeBodyPump, prepare_exact_range_body_pump,
+        read_bounded_prefix_body_prepared, read_exact_range_body_prepared,
+        read_exact_range_body_prepared_with_completion,
     };
     use crate::range_retry::ChromeRangeAttemptAbortController;
     use crate::remote_limits::{
@@ -549,7 +554,7 @@ mod web {
             .map_err(|_error| ChromeRangeError::BrowserAdapterUnavailable)
     }
 
-    async fn finish_fetch_response(
+    async fn finish_fetch_response_unclassified(
         request: ChromeRangeRequestOwner,
         fetch: js_sys::Promise,
         abort_controller: &web_sys::AbortController,
@@ -569,6 +574,15 @@ mod web {
             abort_controller.abort();
             return Err(ChromeRangeError::BrowserFetchUnavailable);
         }
+        Ok(response)
+    }
+
+    async fn finish_fetch_response(
+        request: ChromeRangeRequestOwner,
+        fetch: js_sys::Promise,
+        abort_controller: &web_sys::AbortController,
+    ) -> Result<web_sys::Response, ChromeRangeError> {
+        let response = finish_fetch_response_unclassified(request, fetch, abort_controller).await?;
         if let Err(error) = map_visible_status(response.status()) {
             abort_controller.abort();
             return Err(error);
@@ -643,6 +657,24 @@ mod web {
             return Err(ChromeRangeError::UnsupportedContentEncoding);
         }
         Ok(parsed.total)
+    }
+
+    fn validate_full_sniff_headers(
+        response: &web_sys::Response,
+        root: &WasmModuleLimitAccountingRoot,
+        work: &WorkUnitAccountingScope,
+    ) -> Result<(), ChromeRangeError> {
+        if let Some(content_length) = raw_response_header(response, "Content-Length")? {
+            parse_content_length(&JsAsciiHeaderInput(&content_length))
+                .ok_or(ChromeRangeError::InvalidContentLength)?;
+        }
+        if let Some(content_encoding) = raw_response_header(response, "Content-Encoding")?
+            && !is_identity_encoding(&JsAsciiHeaderInput(&content_encoding))
+        {
+            return Err(ChromeRangeError::UnsupportedContentEncoding);
+        }
+        drop(parse_response_validator(response, root, work)?);
+        Ok(())
     }
 
     fn parse_response_validator(
@@ -746,6 +778,171 @@ mod web {
     pub(crate) struct PreparedChromeProbeRangeAttempt {
         transport: PreparedChromeRangeTransport,
         consistency_policy: RepresentationConsistencyPolicy,
+    }
+
+    /// Response shape accepted only by the strict extensionless format sniffer.
+    pub(crate) enum ChromeFormatSniffTransportOutcome {
+        PartialContent(ProbedChromeRangeBody),
+        FullContent(BoundedPrefixBody),
+    }
+
+    impl fmt::Debug for ChromeFormatSniffTransportOutcome {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::PartialContent(_) => formatter
+                    .debug_tuple("PartialContent")
+                    .field(&"<validated>")
+                    .finish(),
+                Self::FullContent(prefix) => {
+                    formatter.debug_tuple("FullContent").field(prefix).finish()
+                }
+            }
+        }
+    }
+
+    /// Sealed pre-Fetch owner for the strict-only extensionless 8-byte probe.
+    pub(crate) struct PreparedChromeFormatSniffRangeAttempt {
+        transport: PreparedChromeRangeTransport,
+        consistency_policy: RepresentationConsistencyPolicy,
+    }
+
+    impl PreparedChromeRangeIdentity<ChromeRangeAttemptAbortController>
+        for PreparedChromeFormatSniffRangeAttempt
+    {
+        fn prepared_range(&self) -> ChromeRangeRequest {
+            ChromeRangeRequest {
+                requested: self.transport.requested,
+            }
+        }
+
+        fn matches_abort_controller(&self, controller: &ChromeRangeAttemptAbortController) -> bool {
+            js_sys::Object::is(
+                self.transport.abort_controller.as_ref(),
+                controller.controller().as_ref(),
+            )
+        }
+
+        fn prepared_accounting_binding(
+            &self,
+        ) -> crate::remote_limits::RangeAttemptAccountingBinding {
+            self.transport.body_pump.accounting_binding()
+        }
+    }
+
+    /// Prepares the strict-only extensionless sniffer without starting Fetch.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the transport boundary keeps every capability and policy input explicit"
+    )]
+    pub(crate) fn prepare_format_sniff_range_attempt(
+        url: &SecretUrl,
+        request_range: ChromeRangeRequest,
+        consistency_policy: RepresentationConsistencyPolicy,
+        abort_controller: &web_sys::AbortController,
+        root: &WasmModuleLimitAccountingRoot,
+        range_scope: &RangeResponseAccountingScope,
+        work_scope: &WorkUnitAccountingScope,
+        pump_slice_bytes: NonZeroU64,
+    ) -> Result<PreparedChromeFormatSniffRangeAttempt, ChromeRangeError> {
+        Ok(PreparedChromeFormatSniffRangeAttempt {
+            transport: prepare_transport(
+                url,
+                request_range.requested,
+                None,
+                abort_controller,
+                root,
+                range_scope,
+                work_scope,
+                pump_slice_bytes,
+            )?,
+            consistency_policy,
+        })
+    }
+
+    impl PreparedChromeFormatSniffRangeAttempt {
+        /// Starts the one physical sniff Fetch after retry accounting has committed.
+        pub(crate) fn start<T, C>(
+            self,
+            mut control: C,
+            timeout: T,
+        ) -> impl Future<Output = Result<ChromeFormatSniffTransportOutcome, ChromeRangeError>> + use<T, C>
+        where
+            T: Future<Output = ()>,
+            C: ExactLengthByobPumpControl,
+        {
+            let Self {
+                transport,
+                consistency_policy,
+            } = self;
+            let PreparedChromeRangeTransport {
+                requested,
+                request,
+                body_pump,
+                window,
+                abort_controller,
+                root,
+                work_scope,
+            } = transport;
+            let fetch = window.fetch_with_request(request.request());
+            async move {
+                let response =
+                    finish_fetch_response_unclassified(request, fetch, &abort_controller).await?;
+                match response.status() {
+                    206 => {
+                        let object = abort_validation_failure(
+                            (|| {
+                                let object_length =
+                                    validate_common_headers(&response, requested, None)?;
+                                let observed =
+                                    parse_response_validator(&response, &root, &work_scope)?;
+                                bind_probe_validator(object_length, consistency_policy, observed)
+                            })(),
+                            &abort_controller,
+                        )?;
+                        let body = read_exact_range_body_prepared_with_completion(
+                            &response,
+                            &abort_controller,
+                            body_pump,
+                            &mut control,
+                            timeout,
+                            |body| {
+                                if body.as_slice() == super::MCAP_MAGIC_BYTES {
+                                    ExactLengthBodyCompletion::ReleaseReader
+                                } else {
+                                    ExactLengthBodyCompletion::CancelAndAbort
+                                }
+                            },
+                        )
+                        .await
+                        .map_err(ChromeRangeError::BodyPump)?;
+                        Ok(ChromeFormatSniffTransportOutcome::PartialContent(
+                            ProbedChromeRangeBody { body, object },
+                        ))
+                    }
+                    200 => {
+                        abort_validation_failure(
+                            validate_full_sniff_headers(&response, &root, &work_scope),
+                            &abort_controller,
+                        )?;
+                        let prefix = read_bounded_prefix_body_prepared(
+                            &response,
+                            &abort_controller,
+                            body_pump,
+                            &mut control,
+                            timeout,
+                        )
+                        .await
+                        .map_err(ChromeRangeError::BodyPump)?;
+                        Ok(ChromeFormatSniffTransportOutcome::FullContent(prefix))
+                    }
+                    status => {
+                        abort_controller.abort();
+                        Err(map_visible_status(status)
+                            .expect_err("format sniffer handles only visible 200/206 success"))
+                    }
+                }
+            }
+        }
     }
 
     impl fmt::Debug for PreparedChromeProbeRangeAttempt {

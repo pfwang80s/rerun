@@ -1145,6 +1145,16 @@ fn record_test_drop(was_zeroized: bool) {
     });
 }
 
+#[cfg(test)]
+pub(crate) fn reset_test_drop_counts() {
+    TEST_DROP_COUNTS.with(|counts| counts.set((0, 0)));
+}
+
+#[cfg(test)]
+pub(crate) fn test_drop_counts() -> (usize, usize) {
+    TEST_DROP_COUNTS.with(std::cell::Cell::get)
+}
+
 #[cfg(not(test))]
 fn record_test_drop(_was_zeroized: bool) {}
 
@@ -1183,11 +1193,11 @@ mod tests {
     }
 
     fn reset_drop_counts() {
-        TEST_DROP_COUNTS.with(|counts| counts.set((0, 0)));
+        reset_test_drop_counts();
     }
 
     fn drop_counts() -> (usize, usize) {
-        TEST_DROP_COUNTS.with(std::cell::Cell::get)
+        test_drop_counts()
     }
 
     fn reset_derived_allocations() {

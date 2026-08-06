@@ -412,6 +412,39 @@ mod web {
         after_bytes_drop_probe: Option<Box<dyn FnOnce()>>,
     }
 
+    /// A fixed-capacity application prefix whose unread response tail is never retained.
+    pub(crate) struct BoundedPrefixBody {
+        bytes: Option<ExactOutputBuffer>,
+        len: usize,
+        reservation: Option<ActiveRangeBodyPumpReservation>,
+    }
+
+    impl BoundedPrefixBody {
+        pub(crate) fn as_slice(&self) -> &[u8] {
+            &self
+                .bytes
+                .as_ref()
+                .expect("live bounded prefix owns its bytes")
+                .as_slice()[..self.len]
+        }
+    }
+
+    impl fmt::Debug for BoundedPrefixBody {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("BoundedPrefixBody")
+                .field("len", &self.len)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl Drop for BoundedPrefixBody {
+        fn drop(&mut self) {
+            drop(self.bytes.take());
+            drop(self.reservation.take());
+        }
+    }
+
     impl fmt::Debug for ExactLengthRangeBody {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter
@@ -464,6 +497,24 @@ mod web {
                 #[cfg(test)]
                 after_bytes_drop_probe: None,
             }
+        }
+
+        fn into_prefix(
+            mut self,
+            len: usize,
+        ) -> Result<BoundedPrefixBody, ExactLengthByobPumpError> {
+            if self
+                .output
+                .as_ref()
+                .is_none_or(|output| len > output.as_slice().len())
+            {
+                return Err(ExactLengthByobPumpError::InvalidByobReadResult);
+            }
+            Ok(BoundedPrefixBody {
+                bytes: self.output.take(),
+                len,
+                reservation: self.reservation.take(),
+            })
         }
     }
 
@@ -800,6 +851,37 @@ mod web {
         T: Future<Output = ()>,
         C: ExactLengthByobPumpControl,
     {
+        read_exact_range_body_prepared_with_completion(
+            response,
+            abort_controller,
+            prepared,
+            control,
+            timeout,
+            |_body| ExactLengthBodyCompletion::ReleaseReader,
+        )
+        .await
+    }
+
+    /// Reader disposition selected only after exact bytes and immediate EOF have been proven.
+    pub(crate) enum ExactLengthBodyCompletion {
+        ReleaseReader,
+        CancelAndAbort,
+    }
+
+    /// Exact-length pump variant whose caller can cancel a now-proven non-matching format before
+    /// the reader capability is released.
+    pub(crate) async fn read_exact_range_body_prepared_with_completion<T, C>(
+        response: &web_sys::Response,
+        abort_controller: &web_sys::AbortController,
+        prepared: PreparedExactLengthRangeBodyPump,
+        control: &mut C,
+        timeout: T,
+        completion: impl FnOnce(&ExactLengthRangeBody) -> ExactLengthBodyCompletion,
+    ) -> Result<ExactLengthRangeBody, ExactLengthByobPumpError>
+    where
+        T: Future<Output = ()>,
+        C: ExactLengthByobPumpControl,
+    {
         let PreparedExactLengthRangeBodyPump {
             config,
             mut resources,
@@ -854,10 +936,104 @@ mod web {
                     re_async::sleep(Duration::ZERO).await;
                 }
                 PumpStep::Complete => {
-                    cleanup.release_lock()?;
-                    return Ok(resources.into_body());
+                    let body = resources.into_body();
+                    match completion(&body) {
+                        ExactLengthBodyCompletion::ReleaseReader => cleanup.release_lock()?,
+                        ExactLengthBodyCompletion::CancelAndAbort => drop(cleanup),
+                    }
+                    return Ok(body);
                 }
             }
+        }
+    }
+
+    /// Reads at most the prepared fixed capacity and then always cancels the reader and aborts the
+    /// request.
+    ///
+    /// Unlike the exact Range pump this accepts early EOF and deliberately performs no trailing
+    /// EOF probe. It is reserved for the strict extensionless `200 OK` format-sniff exception.
+    pub(crate) async fn read_bounded_prefix_body_prepared<T, C>(
+        response: &web_sys::Response,
+        abort_controller: &web_sys::AbortController,
+        prepared: PreparedExactLengthRangeBodyPump,
+        control: &mut C,
+        timeout: T,
+    ) -> Result<BoundedPrefixBody, ExactLengthByobPumpError>
+    where
+        T: Future<Output = ()>,
+        C: ExactLengthByobPumpControl,
+    {
+        let PreparedExactLengthRangeBodyPump {
+            config,
+            mut resources,
+            scratch_constructor,
+            accounting: _,
+        } = prepared;
+        let capacity = config.expected_bytes().get();
+        let mut cleanup = ReaderCleanup::new(abort_controller);
+        let stream = response
+            .body()
+            .ok_or(ExactLengthByobPumpError::BrowserFetchUnavailable)?;
+        let reader = web_sys::ReadableStreamByobReader::new(&stream)
+            .map_err(|_error| ExactLengthByobPumpError::BrowserFetchUnavailable)?;
+        cleanup.install_reader(reader);
+        let mut written = 0u64;
+        pin_mut!(timeout);
+
+        loop {
+            let remaining = capacity
+                .checked_sub(written)
+                .ok_or(ExactLengthByobPumpError::InvalidByobReadResult)?;
+            if remaining == 0 {
+                return resources.into_prefix(
+                    usize::try_from(written)
+                        .map_err(|_error| ExactLengthByobPumpError::InvalidByobReadResult)?,
+                );
+            }
+            await_read_admission(control, timeout.as_mut()).await?;
+            let requested = NonZeroU64::new(remaining.min(config.pump_slice_bytes().get()))
+                .ok_or(ExactLengthByobPumpError::InvalidByobReadResult)?;
+            let scratch = scratch_constructor.allocate(requested)?;
+            let read = start_read(cleanup.reader(), &scratch)?;
+            let result = await_read_or_timeout(read, timeout.as_mut()).await?;
+            drop(scratch);
+            let parsed = ParsedRead::from_js(&result, requested)?;
+            if parsed.returned_bytes == 0 {
+                if parsed.done {
+                    return resources.into_prefix(
+                        usize::try_from(written)
+                            .map_err(|_error| ExactLengthByobPumpError::InvalidByobReadResult)?,
+                    );
+                }
+                return Err(ExactLengthByobPumpError::InvalidRangeBodyLength);
+            }
+            let offset = usize::try_from(written)
+                .map_err(|_error| ExactLengthByobPumpError::InvalidByobReadResult)?;
+            let len = usize::try_from(parsed.returned_bytes)
+                .map_err(|_error| ExactLengthByobPumpError::InvalidByobReadResult)?;
+            let end = offset
+                .checked_add(len)
+                .ok_or(ExactLengthByobPumpError::InvalidByobReadResult)?;
+            parsed
+                .view
+                .ok_or(ExactLengthByobPumpError::InvalidByobReadResult)?
+                .copy_to(
+                    resources
+                        .output_mut()
+                        .as_mut_slice()
+                        .get_mut(offset..end)
+                        .ok_or(ExactLengthByobPumpError::InvalidByobReadResult)?,
+                );
+            written = written
+                .checked_add(parsed.returned_bytes)
+                .ok_or(ExactLengthByobPumpError::InvalidByobReadResult)?;
+            if parsed.done || written == capacity {
+                return resources.into_prefix(
+                    usize::try_from(written)
+                        .map_err(|_error| ExactLengthByobPumpError::InvalidByobReadResult)?,
+                );
+            }
+            re_async::sleep(Duration::ZERO).await;
         }
     }
 }

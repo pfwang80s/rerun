@@ -854,6 +854,27 @@ type FactoryChromeSettlementCompletion<Source, Session, Representation, Demand, 
         >,
     >;
 
+#[cfg(target_arch = "wasm32")]
+type FactoryChromeSettlementWithController<
+    Source,
+    Session,
+    Representation,
+    Demand,
+    Factory,
+    Success,
+> = RangeAttemptTransportCompletionWithController<
+    Success,
+    <Factory as RangeAttemptAbortFactory>::Controller,
+    FactorySettledRangeAttempt<
+        Source,
+        Session,
+        Representation,
+        Demand,
+        Factory,
+        Result<Success, ChromeRangeError>,
+    >,
+>;
+
 /// A protocol rejection that returns the still-live attempt owner to the caller.
 pub(crate) struct RejectedRangeAttempt<Attempt> {
     error: RetryProtocolError,
@@ -861,11 +882,11 @@ pub(crate) struct RejectedRangeAttempt<Attempt> {
 }
 
 impl<Attempt> RejectedRangeAttempt<Attempt> {
-    fn error(&self) -> RetryProtocolError {
+    pub(crate) fn error(&self) -> RetryProtocolError {
         self.error
     }
 
-    fn into_attempt(self) -> Attempt {
+    pub(crate) fn into_attempt(self) -> Attempt {
         self.attempt
     }
 }
@@ -1469,7 +1490,7 @@ where
     }
 
     /// Closes a settled, not-yet-committed transport owner without publishing its output.
-    fn close_settled<Output>(
+    pub(crate) fn close_settled<Output>(
         &self,
         coordinator: &mut MetadataOpeningRetryCoordinator<Source, Session, Representation>,
         attempt: FactorySettledRangeAttempt<
@@ -1640,6 +1661,80 @@ where
         }
     }
 
+    /// Completes a Chrome settlement while transferring the matching successful attempt's abort
+    /// capability to a higher-level handoff owner.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn complete_chrome_settlement_with_controller<Success>(
+        &self,
+        coordinator: &mut MetadataOpeningRetryCoordinator<Source, Session, Representation>,
+        attempt: FactorySettledRangeAttempt<
+            Source,
+            Session,
+            Representation,
+            Demand,
+            Factory,
+            Result<Success, ChromeRangeError>,
+        >,
+    ) -> FactoryChromeSettlementWithController<
+        Source,
+        Session,
+        Representation,
+        Demand,
+        Factory,
+        Success,
+    > {
+        if let Err(error) = self.validate_settled_completion_attempt(coordinator, &attempt) {
+            return RangeAttemptTransportCompletionWithController::Rejected(RejectedRangeAttempt {
+                error,
+                attempt,
+            });
+        }
+
+        let observed_error = attempt
+            .output
+            .as_ref()
+            .and_then(|output| output.as_ref().err())
+            .copied();
+        if let Some(error) = observed_error {
+            return match self.complete_failure(coordinator, attempt, error) {
+                Ok(disposition) => {
+                    RangeAttemptTransportCompletionWithController::Failed(disposition)
+                }
+                Err(rejected) => RangeAttemptTransportCompletionWithController::Rejected(rejected),
+            };
+        }
+
+        if attempt.callback_identity().demand != self.demand || coordinator.terminal().is_some() {
+            attempt.abort_and_transition(OperationState::Cancelled);
+            return RangeAttemptTransportCompletionWithController::Failed(
+                RangeAttemptCompletionDisposition::Stale,
+            );
+        }
+
+        match attempt.into_success_output_and_controller() {
+            Some((Ok(output), controller)) => {
+                RangeAttemptTransportCompletionWithController::Succeeded(output, controller)
+            }
+            Some((Err(error), mut controller)) => {
+                controller.abort();
+                self.set_state(OperationState::OpeningFailed);
+                RangeAttemptTransportCompletionWithController::Failed(
+                    RangeAttemptCompletionDisposition::OpeningFailed(
+                        MetadataOpeningFailureSignal::NonRetryable(error),
+                    ),
+                )
+            }
+            None => {
+                self.set_state(OperationState::OpeningFailed);
+                RangeAttemptTransportCompletionWithController::Failed(
+                    RangeAttemptCompletionDisposition::OpeningFailed(
+                        MetadataOpeningFailureSignal::ResourceLimit,
+                    ),
+                )
+            }
+        }
+    }
+
     fn validate_owned_attempt<Payload>(
         &self,
         attempt: &FactoryStartedRangeAttempt<
@@ -1729,7 +1824,7 @@ where
         Ok(RangeAttemptCompletionDisposition::Cancelled)
     }
 
-    fn close_active<Payload>(
+    pub(crate) fn close_active<Payload>(
         &self,
         coordinator: &mut MetadataOpeningRetryCoordinator<Source, Session, Representation>,
         mut attempt: Pin<
@@ -1980,6 +2075,15 @@ where
         self.state_guard.disarm();
         self.output.take()
     }
+
+    #[cfg(target_arch = "wasm32")]
+    fn into_success_output_and_controller(mut self) -> Option<(Output, Controller)> {
+        let output = self.output.take()?;
+        let controller = self.controller.take()?;
+        self.state_guard.state.set(OperationState::Succeeded);
+        self.state_guard.disarm();
+        Some((output, controller))
+    }
 }
 
 /// State transition produced after consuming and cleaning up one attempt.
@@ -1996,6 +2100,14 @@ pub enum RangeAttemptCompletionDisposition {
 #[cfg(target_arch = "wasm32")]
 pub(crate) enum RangeAttemptTransportCompletion<Success, Attempt> {
     Succeeded(Success),
+    Failed(RangeAttemptCompletionDisposition),
+    Rejected(RejectedRangeAttempt<Attempt>),
+}
+
+/// Completion that preserves the successful physical attempt's abort capability for handoff.
+#[cfg(target_arch = "wasm32")]
+pub(crate) enum RangeAttemptTransportCompletionWithController<Success, Controller, Attempt> {
+    Succeeded(Success, Controller),
     Failed(RangeAttemptCompletionDisposition),
     Rejected(RejectedRangeAttempt<Attempt>),
 }
