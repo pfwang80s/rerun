@@ -125,13 +125,6 @@ impl StrongEntityTag {
 
     /// Prepares the crate-private, one-shot `If-Match` Headers owner.
     #[cfg(target_arch = "wasm32")]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "MCAP-014 will consume the disarmed If-Match owner"
-        )
-    )]
     pub(crate) fn prepare_if_match_headers(
         &self,
         root: &WasmModuleLimitAccountingRoot,
@@ -571,13 +564,6 @@ impl fmt::Debug for PreparedIfMatchHeadersOwner {
 }
 
 #[cfg(target_arch = "wasm32")]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "MCAP-014 will consume the disarmed If-Match owner"
-    )
-)]
 impl PreparedIfMatchHeadersOwner {
     /// Consumes the disarmed owner and installs the value exactly once into an internally-created
     /// Headers object.
@@ -787,6 +773,29 @@ impl Drop for BoundIfMatchHeadersOwner {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+impl BoundIfMatchHeadersOwner {
+    /// Consumes the unique Headers owner into one Request construction and transfers its active
+    /// egress reservation to the returned Request owner.
+    pub(crate) fn transfer_into_request<T, E>(
+        mut self,
+        build: impl FnOnce(&JsValue) -> Result<T, E>,
+    ) -> Result<(T, ActiveRemoteValidatorEgressReservation), E> {
+        let request = build(
+            self.headers
+                .as_ref()
+                .expect("bound If-Match owner has live Headers"),
+        )?;
+        drop(self.headers.take());
+        record_test_bound_headers_dropped_before_refund();
+        let reservation = self
+            .reservation
+            .take()
+            .expect("bound If-Match owner has an active reservation");
+        Ok((request, reservation))
+    }
+}
+
 #[cfg(all(test, target_arch = "wasm32"))]
 impl BoundIfMatchHeadersOwner {
     fn header_wire_for_test(&self) -> Result<Vec<u8>, RemoteValidatorError> {
@@ -806,7 +815,7 @@ impl BoundIfMatchHeadersOwner {
         (0..input.len()).map(|index| input.byte_at(index)).collect()
     }
 
-    fn copy_into_request_for_test(&self) -> Result<JsValue, RemoteValidatorError> {
+    fn copy_into_request_for_test(headers: &JsValue) -> Result<JsValue, RemoteValidatorError> {
         TEST_EGRESS_SCRATCH_LIVE.with(|state| assert!(!state.get()));
         TEST_STANDALONE_BYTE_STRING_LIVE.with(|state| assert!(!state.get()));
         let constructor = Reflect::get(&js_sys::global(), &JsValue::from_str("Request"))
@@ -814,14 +823,8 @@ impl BoundIfMatchHeadersOwner {
             .dyn_into::<Function>()
             .map_err(|_error| RemoteValidatorError::HeaderAdapterUnavailable)?;
         let init = js_sys::Object::new();
-        Reflect::set(
-            init.as_ref(),
-            &JsValue::from_str("headers"),
-            self.headers
-                .as_ref()
-                .ok_or(RemoteValidatorError::HeaderAdapterUnavailable)?,
-        )
-        .map_err(|_error| RemoteValidatorError::HeaderAdapterUnavailable)?;
+        Reflect::set(init.as_ref(), &JsValue::from_str("headers"), headers)
+            .map_err(|_error| RemoteValidatorError::HeaderAdapterUnavailable)?;
         let arguments = Array::new();
         arguments.push(&JsValue::from_str("https://example.invalid/"));
         arguments.push(init.as_ref());
@@ -904,7 +907,9 @@ fn record_test_secret_drop(was_zeroized: bool) {
 fn record_test_secret_drop(_was_zeroized: bool) {}
 
 #[cfg(test)]
-fn parse_wire_for_test(values: &[&[u8]]) -> Result<Option<ParsedEntityTag>, RemoteValidatorError> {
+pub(crate) fn parse_wire_for_test(
+    values: &[&[u8]],
+) -> Result<Option<ParsedEntityTag>, RemoteValidatorError> {
     let value = match values {
         [] => return Ok(None),
         [value] => *value,
@@ -1374,16 +1379,31 @@ mod wasm_tests {
             before_scalar.active_reservation_records + 2
         );
 
-        // This is the future consuming transfer's browser copy phase: the bound owner retains only
-        // Headers (2n), and Request construction creates the other 2n copy under the active 4n
-        // reservation. No standalone ByteString or Wasm scratch is live in this phase.
-        let request = bound.copy_into_request_for_test().unwrap();
+        // The consuming transfer's browser copy phase retains only Headers (2n), while Request
+        // construction creates the other 2n copy under the same active 4n reservation.
+        let (request, reservation) = bound
+            .transfer_into_request(BoundIfMatchHeadersOwner::copy_into_request_for_test)
+            .unwrap();
         TEST_EGRESS_SCRATCH_LIVE.with(|state| assert!(!state.get()));
         TEST_STANDALONE_BYTE_STRING_LIVE.with(|state| assert!(!state.get()));
-        drop(request);
-
-        drop(bound);
         TEST_BOUND_HEADERS_DROPPED_BEFORE_REFUND.with(|count| assert_eq!(count.get(), 1));
+        drop(request);
+        drop(reservation);
+        assert_eq!(
+            root.accounting_scalar_snapshot().active_reservation_records,
+            before_scalar.active_reservation_records + 1
+        );
+
+        let rejected = tag
+            .prepare_if_match_headers(&root, &work)
+            .unwrap()
+            .bind()
+            .unwrap()
+            .transfer_into_request(|_headers| {
+                Err::<JsValue, _>(RemoteValidatorError::HeaderRejected)
+            });
+        assert_eq!(rejected.unwrap_err(), RemoteValidatorError::HeaderRejected);
+        TEST_BOUND_HEADERS_DROPPED_BEFORE_REFUND.with(|count| assert_eq!(count.get(), 2));
         assert_eq!(
             root.accounting_scalar_snapshot().active_reservation_records,
             before_scalar.active_reservation_records + 1

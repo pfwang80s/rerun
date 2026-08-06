@@ -35,11 +35,19 @@
 //! ```compile_fail,ignore-wasm32
 //! use re_web::chrome_byob;
 //! ```
+//!
+//! Strict Chrome Range request/response validation is Web-only as well:
+//!
+//! ```compile_fail,ignore-wasm32
+//! use re_web::chrome_range;
+//! ```
 
 pub mod browser;
 
 #[cfg(target_arch = "wasm32")]
 pub mod chrome_byob;
+#[cfg(target_arch = "wasm32")]
+pub mod chrome_range;
 #[cfg(target_arch = "wasm32")]
 pub mod remote_limits;
 #[cfg(target_arch = "wasm32")]
@@ -69,6 +77,10 @@ mod remote_limits;
 // Host builds compile the pure pump state machine only for its unit tests and do not publish it.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod chrome_byob;
+
+// Host builds compile only the pure Range/header state machine for differential unit tests.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod chrome_range;
 
 // Host builds compile the module only for its unit tests and do not publish it to consumers.
 #[cfg(all(test, not(target_arch = "wasm32")))]

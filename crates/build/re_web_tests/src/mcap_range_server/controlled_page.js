@@ -9,6 +9,7 @@ const crossOriginObjectUrl = document.body.dataset.crossOriginObjectUrl;
 const MAX_EXPECTED_BYTES = 16 * 1024 * 1024;
 const SAFE_COMMANDS = new Set([
   "fetchByob",
+  "inspectResponse",
   "callArrayBuffer",
   "getInstrumentation",
   "registerServiceWorker",
@@ -362,12 +363,38 @@ async function callArrayBuffer(options = {}) {
   return { byteLength: bytes.byteLength, arrayBufferCallCount };
 }
 
+async function inspectSameOriginResponse() {
+  const controller = new AbortController();
+  let response;
+  try {
+    response = await fetch(sameOriginObjectUrl, {
+      method: "GET",
+      cache: "no-store",
+      credentials: "omit",
+      redirect: "error",
+      referrerPolicy: "no-referrer",
+      headers: { Range: "bytes=0-3" },
+      signal: controller.signal,
+    });
+    return {
+      status: response.status,
+      responseType: response.type,
+      contentEncoding: response.headers.get("content-encoding"),
+    };
+  } catch (_error) {
+    throw new FixtureCommandError("fetch_failed", "fetch");
+  } finally {
+    controller.abort();
+  }
+}
+
 function getInstrumentation() {
   return { arrayBufferCallCount, heartbeatCount, eventSinkFailureCount };
 }
 
 window.mcapRangeFixture = Object.freeze({
   fetchByob,
+  inspectSameOriginResponse,
   callArrayBuffer,
   getInstrumentation,
   registerServiceWorker,
@@ -389,6 +416,8 @@ window.addEventListener("message", async (message) => {
     let result;
     if (command === "fetchByob") {
       result = await fetchByob(message.data.options);
+    } else if (command === "inspectResponse") {
+      result = await inspectSameOriginResponse();
     } else if (command === "callArrayBuffer") {
       result = await callArrayBuffer(message.data.options);
     } else if (command === "getInstrumentation") {

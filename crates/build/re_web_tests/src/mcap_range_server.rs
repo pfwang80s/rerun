@@ -185,6 +185,7 @@ pub enum PreflightBehavior {
 pub enum ExposeHeaders {
     #[default]
     RequiredRangeHeaders,
+    RequiredRangeHeadersAndContentEncoding,
     ContentRangeOnly,
     EtagOnly,
     None,
@@ -1802,6 +1803,9 @@ fn cors_response(shared: &SharedState, cors: &CorsSpec, mut response: Response) 
     }
     let exposed = match cors.expose {
         ExposeHeaders::RequiredRangeHeaders => Some("content-range, content-length, etag"),
+        ExposeHeaders::RequiredRangeHeadersAndContentEncoding => {
+            Some("content-range, content-length, content-encoding, etag")
+        }
         ExposeHeaders::ContentRangeOnly => Some("content-range"),
         ExposeHeaders::EtagOnly => Some("etag"),
         ExposeHeaders::None => None,
@@ -2315,6 +2319,7 @@ mod tests {
         let mut spec = ScenarioSpec::exact_range(16, 1);
         spec.request.head = HeadBehavior::MethodNotAllowed;
         spec.cors.preflight = PreflightBehavior::AllowRequiredHeaders;
+        spec.cors.expose = ExposeHeaders::RequiredRangeHeadersAndContentEncoding;
         spec.etag = EtagSpec::Duplicate(vec!["\"v1\"".to_owned(), "W/\"v1\"".to_owned()]);
         spec.content_encoding = ContentEncodingSpec::Gzip;
         spec.content_length = ContentLengthSpec::Omit;
@@ -2361,6 +2366,10 @@ mod tests {
             .await
             .expect("redirect");
         assert_eq!(redirect.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            redirect.headers()[ACCESS_CONTROL_EXPOSE_HEADERS],
+            "content-range, content-length, content-encoding, etag"
+        );
         assert!(
             redirect.headers()[LOCATION]
                 .to_str()

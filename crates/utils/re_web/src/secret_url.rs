@@ -509,6 +509,18 @@ impl SecretUrl {
     pub fn expose_for_request<R>(&self, request: impl for<'url> FnOnce(&'url str) -> R) -> R {
         request(self.raw.as_str())
     }
+
+    #[cfg(test)]
+    pub(crate) fn parse_for_test(input: &str) -> Result<Self, SecretUrlError> {
+        const LIMITS: SecretUrlParserLimits = SecretUrlParserLimits::explicit_for_test(
+            4_096, 65_536, 1_024, 16, 256, 262_144, 1_048_576,
+        );
+        Self::parse(
+            input.as_bytes().to_vec().into_boxed_slice(),
+            HttpUrlIngress::DirectExternal,
+            &LIMITS,
+        )
+    }
 }
 
 impl fmt::Display for SecretUrl {
