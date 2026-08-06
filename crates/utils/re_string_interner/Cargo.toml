@@ -18,6 +18,8 @@ workspace = true
 [package.metadata.docs.rs]
 all-features = true
 
+[features]
+bounded_runtime_intern = ["dep:getrandom"]
 
 [dependencies]
 re_byte_size.workspace = true
@@ -28,3 +30,9 @@ parking_lot.workspace = true
 paste.workspace = true
 serde = { workspace = true, features = ["serde_derive"] }
 static_assertions.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"], optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true

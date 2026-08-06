@@ -14,6 +14,9 @@ pub mod external {
     pub use serde;
 }
 
+#[cfg(feature = "bounded_runtime_intern")]
+pub mod bounded_runtime_intern;
+
 /// Fast but high quality string hash
 #[inline]
 fn hash(value: impl std::hash::Hash) -> u64 {
@@ -585,16 +588,41 @@ macro_rules! declare_new_type_nonempty {
 // ----------------------------------------------------------------------------
 
 use parking_lot::Mutex;
+
+#[cfg(not(feature = "bounded_runtime_intern"))]
 static GLOBAL_INTERNER: std::sync::LazyLock<Mutex<StringInterner>> =
     std::sync::LazyLock::new(|| Mutex::new(StringInterner::default()));
 
+#[cfg(feature = "bounded_runtime_intern")]
+static GLOBAL_INTERNER: std::sync::LazyLock<
+    Mutex<bounded_runtime_intern::CoordinatedStringInterner>,
+> = std::sync::LazyLock::new(|| {
+    Mutex::new(bounded_runtime_intern::CoordinatedStringInterner::default())
+});
+
 pub fn bytes_used() -> usize {
-    GLOBAL_INTERNER.lock().bytes_used()
+    #[cfg(not(feature = "bounded_runtime_intern"))]
+    {
+        GLOBAL_INTERNER.lock().bytes_used()
+    }
+
+    #[cfg(feature = "bounded_runtime_intern")]
+    {
+        GLOBAL_INTERNER.lock().bytes_used()
+    }
 }
 
 /// global interning function.
 fn global_intern(string: &str) -> InternedString {
-    GLOBAL_INTERNER.lock().intern(string)
+    #[cfg(not(feature = "bounded_runtime_intern"))]
+    {
+        GLOBAL_INTERNER.lock().intern(string)
+    }
+
+    #[cfg(feature = "bounded_runtime_intern")]
+    {
+        GLOBAL_INTERNER.lock().intern_legacy(string)
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -617,6 +645,30 @@ fn test_interner() {
 
     assert!(a.hash == b.hash);
     assert!(a.hash != c.hash);
+}
+
+#[test]
+fn interned_string_serde_roundtrip_is_stable() {
+    let interned = InternedString::new("serde-roundtrip");
+    let json = serde_json::to_string(&interned).unwrap();
+    assert_eq!(json, "\"serde-roundtrip\"");
+    let roundtrip: InternedString = serde_json::from_str(&json).unwrap();
+    assert_eq!(roundtrip, interned);
+}
+
+#[cfg(not(feature = "bounded_runtime_intern"))]
+#[test]
+fn feature_off_bytes_used_keeps_tracking_legacy_insertions() {
+    let before = bytes_used();
+    let value = InternedString::new(
+        "feature-off-bytes-used-differential-with-enough-length-to-dominate-test-noise",
+    );
+    let after = bytes_used();
+    assert_eq!(
+        value.as_str(),
+        "feature-off-bytes-used-differential-with-enough-length-to-dominate-test-noise"
+    );
+    assert!(after >= before.saturating_add(value.as_str().len()));
 }
 
 #[test]

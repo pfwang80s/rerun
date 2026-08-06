@@ -30,6 +30,7 @@ getrandom = { workspace = true, features = ["wasm_js"] }
 js-sys.workspace = true
 re_async.workspace = true
 re_log_types.workspace = true
+re_string_interner = { workspace = true, features = ["bounded_runtime_intern"] }
 url.workspace = true
 wasm-bindgen.workspace = true
 web-sys = { workspace = true, features = [
@@ -57,11 +58,10 @@ zeroize.workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 constant_time_eq.workspace = true
 re_log_types.workspace = true
-re_string_interner.workspace = true
+re_string_interner = { workspace = true, features = ["bounded_runtime_intern"] }
 url.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-re_string_interner.workspace = true
 re_tuid.workspace = true
 wasm-bindgen-test.workspace = true

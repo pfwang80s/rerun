@@ -633,10 +633,11 @@ define_web_remote_limits! {
 
 
 
-    RuntimeInternStringBytes => { name: "runtime_intern_string_bytes", domain: RuntimeIntern, unit: Bytes, scope: WasmModuleLifetime, accounting: ModuleLifetimeBurn, telemetry: HighWatermark, requirement: phase_b() },
-    RuntimeInternEntryAndCapacityBytes => { name: "runtime_intern_entry_and_capacity_bytes", domain: RuntimeIntern, unit: Bytes, scope: WasmModuleLifetime, accounting: ModuleLifetimeBurn, telemetry: HighWatermark, requirement: phase_b() },
-    RuntimeInternCensusIdentifiers => { name: "runtime_intern_census_identifiers", domain: RuntimeIntern, unit: Count, scope: WorkUnit, accounting: ScalarObservation, telemetry: HighWatermark, requirement: phase_b() },
-    RuntimeInternCensusRetainedBytes => { name: "runtime_intern_census_retained_bytes", domain: RuntimeIntern, unit: Bytes, scope: WorkUnit, accounting: ReclaimableConcurrent, telemetry: HighWatermark, requirement: phase_b() },
+    RuntimeInternStringBytes => { name: "runtime_intern_string_bytes", domain: RuntimeIntern, unit: Bytes, scope: WasmModuleLifetime, accounting: ModuleLifetimeBurn, telemetry: HighWatermark, requirement: phase_a() },
+    RuntimeInternEntryAndCapacityBytes => { name: "runtime_intern_entry_and_capacity_bytes", domain: RuntimeIntern, unit: Bytes, scope: WasmModuleLifetime, accounting: ModuleLifetimeBurn, telemetry: HighWatermark, requirement: phase_a() },
+    RuntimeInternCensusIdentifiers => { name: "runtime_intern_census_identifiers", domain: RuntimeIntern, unit: Count, scope: WorkUnit, accounting: ScalarObservation, telemetry: HighWatermark, requirement: phase_a() },
+    RuntimeInternCensusRetainedBytes => { name: "runtime_intern_census_retained_bytes", domain: RuntimeIntern, unit: Bytes, scope: WorkUnit, accounting: ReclaimableConcurrent, telemetry: HighWatermark, requirement: phase_a() },
+    RuntimeInternCandidatePeakBytes => { name: "runtime_intern_candidate_peak_bytes", domain: RuntimeIntern, unit: Bytes, scope: WorkUnit, accounting: ReclaimableConcurrent, telemetry: HighWatermark, requirement: phase_a() },
 
     AddChunkInputBytes => { name: "add_chunk_input_bytes", domain: StoreMutation, unit: Bytes, scope: WorkUnit, accounting: ScalarObservation, telemetry: MaximumObserved, requirement: phase_a() },
     AddChunkRows => { name: "add_chunk_rows", domain: StoreMutation, unit: Rows, scope: WorkUnit, accounting: ScalarObservation, telemetry: MaximumObserved, requirement: phase_a() },
@@ -667,7 +668,7 @@ define_web_remote_limits! {
 ///
 /// This is intentionally independent from the generated array length so adding or removing a key
 /// requires an explicit schema review and a matching metadata-fingerprint update.
-pub const EXPECTED_WEB_REMOTE_LIMIT_COUNT_V1: usize = 270;
+pub const EXPECTED_WEB_REMOTE_LIMIT_COUNT_V1: usize = 271;
 
 impl WebRemoteLimitKey {
     pub const fn design_requirement(self) -> NormativeResourceRequirement {
@@ -924,7 +925,8 @@ impl WebRemoteLimitKey {
             Self::RuntimeInternStringBytes
             | Self::RuntimeInternEntryAndCapacityBytes
             | Self::RuntimeInternCensusIdentifiers
-            | Self::RuntimeInternCensusRetainedBytes => Requirement::RuntimeInternBudget,
+            | Self::RuntimeInternCensusRetainedBytes
+            | Self::RuntimeInternCandidatePeakBytes => Requirement::RuntimeInternBudget,
             Self::AddChunkInputBytes
             | Self::AddChunkRows
             | Self::AddChunkComponentCount
@@ -1660,10 +1662,11 @@ pub enum LimitProfileConstraint {
     GlobalScopeNodeBytesCoverNodes,
     ParentScopeNodeBytesCoverNodes,
     OperationSubscriptionsCoverRecordingHandles,
+    RuntimeInternMinimumSideMapFitsBudgets,
 }
 
 impl LimitProfileConstraint {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::BatchFitsTerminalRegistry,
         Self::TerminalRegistryFitsStatusRegistry,
         Self::TerminalRetainedBytesCoverTerminalEntries,
@@ -1689,6 +1692,7 @@ impl LimitProfileConstraint {
         Self::GlobalScopeNodeBytesCoverNodes,
         Self::ParentScopeNodeBytesCoverNodes,
         Self::OperationSubscriptionsCoverRecordingHandles,
+        Self::RuntimeInternMinimumSideMapFitsBudgets,
     ];
 
     pub const fn design_requirement(self) -> NormativeResourceRequirement {
@@ -1724,6 +1728,7 @@ impl LimitProfileConstraint {
             Self::GlobalScopeNodeBytesCoverNodes | Self::ParentScopeNodeBytesCoverNodes => {
                 Requirement::AccountingScopeOwnership
             }
+            Self::RuntimeInternMinimumSideMapFitsBudgets => Requirement::RuntimeInternBudget,
         }
     }
 }
@@ -1753,6 +1758,7 @@ pub enum NormativeAggregateFormula {
     OpenStatusReservation,
     UrlIndexReservation,
     ExistingIdentifierIndexReservation,
+    RuntimeInternInitializationProfile,
     MemoryHeadroomGate,
 }
 
@@ -1780,11 +1786,12 @@ pub enum AggregateTypedEntryPoint {
     PrepareOpenStatusReservation,
     PrepareUrlIndexReservation,
     PrepareExistingIdentifierIndexReservation,
+    ValidateRuntimeInternInitializationProfile,
     ValidateMemoryHeadroom,
 }
 
 impl NormativeAggregateFormula {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::ValidationEstimateAndActualDispatch,
         Self::DecoderAggregateReservation,
         Self::PlanningCrossProductArithmetic,
@@ -1806,6 +1813,7 @@ impl NormativeAggregateFormula {
         Self::OpenStatusReservation,
         Self::UrlIndexReservation,
         Self::ExistingIdentifierIndexReservation,
+        Self::RuntimeInternInitializationProfile,
         Self::MemoryHeadroomGate,
     ];
 
@@ -1836,6 +1844,7 @@ impl NormativeAggregateFormula {
             Self::OpenStatusReservation => Requirement::TerminalStatusRegistry,
             Self::UrlIndexReservation => Requirement::OpenSourceIndexAndCatalog,
             Self::ExistingIdentifierIndexReservation => Requirement::ExistingIdentifierIndex,
+            Self::RuntimeInternInitializationProfile => Requirement::RuntimeInternBudget,
             Self::MemoryHeadroomGate => Requirement::MemoryPressure,
         }
     }
@@ -1898,6 +1907,9 @@ impl NormativeAggregateFormula {
             Self::UrlIndexReservation => AggregateTypedEntryPoint::PrepareUrlIndexReservation,
             Self::ExistingIdentifierIndexReservation => {
                 AggregateTypedEntryPoint::PrepareExistingIdentifierIndexReservation
+            }
+            Self::RuntimeInternInitializationProfile => {
+                AggregateTypedEntryPoint::ValidateRuntimeInternInitializationProfile
             }
             Self::MemoryHeadroomGate => AggregateTypedEntryPoint::ValidateMemoryHeadroom,
         }
@@ -2048,6 +2060,31 @@ impl ProductionWebRemoteLimitsV1 {
         self.values[key.index()]
     }
 
+    /// Projects the frozen MCAP-006 values into the additive remote interner foundation.
+    ///
+    /// This does not initialize the module singleton or grant a decoder transaction.
+    #[cfg(any(test, target_arch = "wasm32"))]
+    #[cfg_attr(
+        all(target_arch = "wasm32", not(test)),
+        expect(
+            dead_code,
+            reason = "the remote decoder consumes this sealed projection in MCAP-079/081"
+        )
+    )]
+    pub(crate) fn remote_mcap_runtime_intern_limits(
+        &self,
+    ) -> re_string_interner::bounded_runtime_intern::RemoteMcapRuntimeInternLimits {
+        use WebRemoteLimitKey as Key;
+
+        re_string_interner::bounded_runtime_intern::RemoteMcapRuntimeInternLimits::from_profile_values(
+            self.raw_limit_value(Key::RuntimeInternStringBytes),
+            self.raw_limit_value(Key::RuntimeInternEntryAndCapacityBytes),
+            self.raw_limit_value(Key::RuntimeInternCensusIdentifiers),
+            self.raw_limit_value(Key::RuntimeInternCensusRetainedBytes),
+            self.raw_limit_value(Key::RuntimeInternCandidatePeakBytes),
+        )
+    }
+
     fn scalar_value(&self, key: ScalarObservationKey) -> ScalarObservationValue {
         ScalarObservationValue(self.raw_limit_value(key.schema_key()))
     }
@@ -2150,6 +2187,13 @@ fn validate_complete_profile(
     }
     Ok(())
 }
+
+// V1 uses a target-portable upper bound for one `(u64, &'static str)` entry (24 bytes),
+// four conservative buckets, an equal control/allocation allowance, and 64 fixed bytes.
+// This is stricter than the wasm32 representation and matches the lower-layer V1 formula on
+// 64-bit tooling hosts.
+const RUNTIME_INTERN_MINIMUM_SIDE_MAP_CAPACITY_BYTES_V1: u64 = 256;
+const RUNTIME_INTERN_MINIMUM_ENTRY_AND_CAPACITY_BYTES_V1: u64 = 280;
 
 fn validate_profile_constraint(
     values: &[NonZeroU64; WEB_REMOTE_LIMIT_COUNT],
@@ -2411,6 +2455,18 @@ fn validate_profile_constraint(
             require_less_or_equal(
                 get(WebRemoteLimitKey::PublicRecordingHandles),
                 capacity,
+                constraint,
+            )
+        }
+        LimitProfileConstraint::RuntimeInternMinimumSideMapFitsBudgets => {
+            require_less_or_equal(
+                RUNTIME_INTERN_MINIMUM_SIDE_MAP_CAPACITY_BYTES_V1,
+                get(WebRemoteLimitKey::RuntimeInternCandidatePeakBytes),
+                constraint,
+            )?;
+            require_less_or_equal(
+                RUNTIME_INTERN_MINIMUM_ENTRY_AND_CAPACITY_BYTES_V1,
+                get(WebRemoteLimitKey::RuntimeInternEntryAndCapacityBytes),
                 constraint,
             )
         }
@@ -6191,7 +6247,9 @@ pub(crate) mod tests {
 
     fn measured_value(key: WebRemoteLimitKey) -> NonZeroU64 {
         let value = match key {
-            WebRemoteLimitKey::OpenSourceStatusSlots => 512,
+            WebRemoteLimitKey::OpenSourceStatusSlots
+            | WebRemoteLimitKey::RuntimeInternEntryAndCapacityBytes
+            | WebRemoteLimitKey::RuntimeInternCandidatePeakBytes => 512,
             WebRemoteLimitKey::OpenSourceLiveStatusOwners
             | WebRemoteLimitKey::AccountingPreparedReservationRecords
             | WebRemoteLimitKey::AccountingActiveReservationRecords => 256,
@@ -6587,6 +6645,7 @@ pub(crate) mod tests {
         WebRemoteLimitKey::RuntimeInternEntryAndCapacityBytes,
         WebRemoteLimitKey::RuntimeInternCensusIdentifiers,
         WebRemoteLimitKey::RuntimeInternCensusRetainedBytes,
+        WebRemoteLimitKey::RuntimeInternCandidatePeakBytes,
         WebRemoteLimitKey::AddChunkInputBytes,
         WebRemoteLimitKey::AddChunkRows,
         WebRemoteLimitKey::AddChunkComponentCount,
@@ -6716,7 +6775,56 @@ pub(crate) mod tests {
             covered_requirements,
             NormativeResourceRequirement::ALL.into_iter().collect()
         );
-        assert_eq!(metadata_fingerprint(), 0x728e_56bd_a2c9_0eb8);
+        assert_eq!(metadata_fingerprint(), 0xb09f_8b92_3e1b_bb55);
+    }
+
+    #[test]
+    fn remote_runtime_intern_limits_are_projected_only_from_the_sealed_profile() {
+        for key in [
+            WebRemoteLimitKey::RuntimeInternStringBytes,
+            WebRemoteLimitKey::RuntimeInternEntryAndCapacityBytes,
+            WebRemoteLimitKey::RuntimeInternCensusIdentifiers,
+            WebRemoteLimitKey::RuntimeInternCensusRetainedBytes,
+            WebRemoteLimitKey::RuntimeInternCandidatePeakBytes,
+        ] {
+            assert!(matches!(
+                key.definition().requirement,
+                WebRemoteLimitRequirement::Measurement {
+                    stage: MeasurementStage::PhaseAReleaseWasmChrome,
+                    evidence: EvidenceKind::ReleaseWasmChromeBenchmark,
+                }
+            ));
+        }
+        let limits = complete_test_profile().remote_mcap_runtime_intern_limits();
+        re_string_interner::bounded_runtime_intern::validate_remote_mcap_runtime_intern_profile(
+            limits,
+        )
+        .expect("the complete production profile can prepare the fixed side-map");
+        assert_eq!(
+            format!("{limits:?}"),
+            "RemoteMcapRuntimeInternLimits { values: \"<sealed>\" }"
+        );
+    }
+
+    #[test]
+    fn runtime_intern_cross_key_minimums_fail_during_profile_validation() {
+        for (key, value) in [
+            (
+                WebRemoteLimitKey::RuntimeInternCandidatePeakBytes,
+                RUNTIME_INTERN_MINIMUM_SIDE_MAP_CAPACITY_BYTES_V1 - 1,
+            ),
+            (
+                WebRemoteLimitKey::RuntimeInternEntryAndCapacityBytes,
+                RUNTIME_INTERN_MINIMUM_ENTRY_AND_CAPACITY_BYTES_V1 - 1,
+            ),
+        ] {
+            assert_constraint_error(
+                &[(key, value)],
+                LimitProfileCompletionError::ConstraintViolation {
+                    constraint: LimitProfileConstraint::RuntimeInternMinimumSideMapFitsBudgets,
+                },
+            );
+        }
     }
 
     #[test]
@@ -6803,7 +6911,7 @@ pub(crate) mod tests {
             AccountingScopeOwnership => (5, 2, 1),
             ExternalStrings => (16, 0, 0),
             ExistingIdentifierIndex => (6, 0, 1),
-            RuntimeInternBudget => (4, 0, 0),
+            RuntimeInternBudget => (5, 1, 1),
             RemoteInternalTotal => (6, 0, 1),
             AccountingSelfOwnership => (15, 0, 1),
         };
@@ -7204,6 +7312,21 @@ pub(crate) mod tests {
                     Entry::PrepareExistingIdentifierIndexReservation,
                 )],
             },
+            OwnerClosureGolden {
+                requirement: Requirement::RuntimeInternBudget,
+                keys: &[
+                    Key::RuntimeInternStringBytes,
+                    Key::RuntimeInternEntryAndCapacityBytes,
+                    Key::RuntimeInternCensusIdentifiers,
+                    Key::RuntimeInternCensusRetainedBytes,
+                    Key::RuntimeInternCandidatePeakBytes,
+                ],
+                constraints: &[Constraint::RuntimeInternMinimumSideMapFitsBudgets],
+                formulas: &[(
+                    Formula::RuntimeInternInitializationProfile,
+                    Entry::ValidateRuntimeInternInitializationProfile,
+                )],
+            },
         ];
 
         let mut requirements = BTreeSet::new();
@@ -7570,6 +7693,13 @@ pub(crate) mod tests {
                     (WebRemoteLimitKey::OperationRecordingSubscriptions, 1),
                 ],
                 LimitProfileConstraint::OperationSubscriptionsCoverRecordingHandles,
+            ),
+            (
+                &[(
+                    WebRemoteLimitKey::RuntimeInternEntryAndCapacityBytes,
+                    RUNTIME_INTERN_MINIMUM_ENTRY_AND_CAPACITY_BYTES_V1 - 1,
+                )],
+                LimitProfileConstraint::RuntimeInternMinimumSideMapFitsBudgets,
             ),
         ];
         let mut covered = BTreeSet::new();

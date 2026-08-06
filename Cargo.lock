@@ -10244,11 +10244,13 @@ name = "re_string_interner"
 version = "0.36.0-alpha.1+dev"
 dependencies = [
  "ahash",
+ "getrandom 0.3.4",
  "nohash-hasher",
  "parking_lot",
  "paste",
  "re_byte_size",
  "serde",
+ "serde_json",
  "static_assertions",
 ]
 
