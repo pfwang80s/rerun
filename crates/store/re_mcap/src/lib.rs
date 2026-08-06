@@ -7,6 +7,12 @@
 //! ```compile_fail,ignore-wasm32
 //! use re_mcap::remote_time;
 //! ```
+//!
+//! Remote fixed-layout validation is likewise absent from the native production API:
+//!
+//! ```compile_fail,ignore-wasm32
+//! use re_mcap::remote_fixed_layout;
+//! ```
 
 /// Every MCAP record is framed by a fixed header containing a one-byte opcode followed by an
 /// eight-byte little-endian `u64` body length.
@@ -25,6 +31,14 @@ pub mod remote_time;
 // Host builds compile this Web-only module only for its unit tests.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod remote_time;
+
+/// Checked fixed-layout and checksum validation for Web remote-MCAP inputs.
+#[cfg(target_arch = "wasm32")]
+pub mod remote_fixed_layout;
+
+// Host builds compile this Web-only module only for its unit tests.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod remote_fixed_layout;
 
 pub(crate) mod parsers;
 pub(crate) mod util;
