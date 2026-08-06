@@ -41,6 +41,12 @@
 //! ```compile_fail,ignore-wasm32
 //! use re_web::chrome_range;
 //! ```
+//!
+//! Metadata-opening Range retry ownership is likewise Web-only and production-disarmed:
+//!
+//! ```compile_fail,ignore-wasm32
+//! use re_web::range_retry;
+//! ```
 
 pub mod browser;
 
@@ -48,6 +54,15 @@ pub mod browser;
 pub mod chrome_byob;
 #[cfg(target_arch = "wasm32")]
 pub mod chrome_range;
+#[cfg(target_arch = "wasm32")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the sealed metadata retry foundation is wired to page execution later"
+    )
+)]
+pub(crate) mod range_retry;
 #[cfg(target_arch = "wasm32")]
 pub mod remote_limits;
 #[cfg(target_arch = "wasm32")]
@@ -81,6 +96,10 @@ mod chrome_byob;
 // Host builds compile only the pure Range/header state machine for differential unit tests.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod chrome_range;
+
+// Host builds compile only the pure metadata retry state machine for differential unit tests.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod range_retry;
 
 // Host builds compile the module only for its unit tests and do not publish it to consumers.
 #[cfg(all(test, not(target_arch = "wasm32")))]

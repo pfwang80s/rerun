@@ -4,7 +4,7 @@
 //! It is deliberately not connected to any production data path until every limit in a profile
 //! has been frozen with the evidence required by its definition.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroU64;
@@ -207,6 +207,7 @@ define_normative_requirements! {
     SessionResidentPhysicalRoots,
     ConcurrentRangeRequests,
     InFlightRangeBytes,
+    RangeRetry,
     RangeByobOverlap,
     RemoteValidatorByteString,
     ExtensionlessSniffer,
@@ -471,6 +472,7 @@ define_web_remote_limits! {
 
     ConcurrentRangeRequests => { name: "concurrent_range_requests", domain: Transport, unit: Count, scope: ViewerInstance, accounting: ReclaimableConcurrent, telemetry: HighWatermark, requirement: phase_a() },
     InFlightRangeBytes => { name: "in_flight_range_bytes", domain: Transport, unit: Bytes, scope: ViewerInstance, accounting: ReclaimableConcurrent, telemetry: HighWatermark, requirement: phase_a() },
+    RangeRetryAttemptsPerOperation => { name: "range_retry_attempts_per_operation", domain: Transport, unit: Count, scope: Operation, accounting: ScalarObservation, telemetry: HighWatermark, requirement: phase_a() },
     RequestedRangeBytes => { name: "requested_range_bytes", domain: Transport, unit: Bytes, scope: RangeResponse, accounting: ScalarObservation, telemetry: MaximumObserved, requirement: phase_a() },
     ByobScratchBytes => { name: "byob_scratch_bytes", domain: Transport, unit: Bytes, scope: RangeResponse, accounting: ReclaimableConcurrent, telemetry: HighWatermark, requirement: phase_a() },
     RangeJsWasmOverlapBytes => { name: "range_js_wasm_overlap_bytes", domain: Transport, unit: Bytes, scope: RangeResponse, accounting: ReclaimableConcurrent, telemetry: HighWatermark, requirement: phase_a() },
@@ -668,7 +670,7 @@ define_web_remote_limits! {
 ///
 /// This is intentionally independent from the generated array length so adding or removing a key
 /// requires an explicit schema review and a matching metadata-fingerprint update.
-pub const EXPECTED_WEB_REMOTE_LIMIT_COUNT_V1: usize = 271;
+pub const EXPECTED_WEB_REMOTE_LIMIT_COUNT_V1: usize = 272;
 
 impl WebRemoteLimitKey {
     pub const fn design_requirement(self) -> NormativeResourceRequirement {
@@ -775,6 +777,7 @@ impl WebRemoteLimitKey {
             | Self::FetchWasmRawRetainedBytes => Requirement::RemoteInternalTotal,
             Self::ConcurrentRangeRequests => Requirement::ConcurrentRangeRequests,
             Self::InFlightRangeBytes => Requirement::InFlightRangeBytes,
+            Self::RangeRetryAttemptsPerOperation => Requirement::RangeRetry,
             Self::RequestedRangeBytes | Self::ByobScratchBytes | Self::RangeJsWasmOverlapBytes => {
                 Requirement::RangeByobOverlap
             }
@@ -2721,6 +2724,7 @@ struct AccountingScopeLease {
     root: Weak<ScopeAccountingRootInner>,
     identity: AccountingScopeIdentity,
     kind: WebRemoteLimitScope,
+    internal_projection_claims: Cell<u8>,
     _parent_lease: Option<Rc<Self>>,
 }
 
@@ -3319,6 +3323,7 @@ impl ProductionWebRemoteLimitsV1 {
                 root: Rc::downgrade(&inner),
                 identity: module_identity,
                 kind: WebRemoteLimitScope::WasmModuleLifetime,
+                internal_projection_claims: Cell::new(0),
                 _parent_lease: None,
             }),
         };
@@ -3926,6 +3931,24 @@ pub struct ActiveRangeBodyPumpReservation {
     spec: RangeBodyPumpReservationSpec,
 }
 
+/// Opaque proof of the exact source/session/range/work ancestry charged by one body pump.
+///
+/// The identity is minted only after every scope is proven live, rooted in the same accounting
+/// allocator, and the work unit is proven to be a child of the exact Range-response scope.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RangeAttemptAccountingBinding {
+    source: AccountingScopeIdentity,
+    session: AccountingScopeIdentity,
+    range_response: AccountingScopeIdentity,
+    work_unit: AccountingScopeIdentity,
+}
+
+impl fmt::Debug for RangeAttemptAccountingBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RangeAttemptAccountingBinding(<opaque>)")
+    }
+}
+
 impl fmt::Debug for ActiveRangeBodyPumpReservation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -3950,6 +3973,36 @@ impl ActiveRangeBodyPumpReservation {
 }
 
 impl RangeResponseAccountingScope {
+    pub(crate) fn range_attempt_accounting_binding(
+        &self,
+        work_unit: &WorkUnitAccountingScope,
+    ) -> Result<RangeAttemptAccountingBinding, ScopeAccountingError> {
+        let root = self
+            .0
+            .lease
+            .root
+            .upgrade()
+            .ok_or(ScopeAccountingError::RootStopped)?;
+        validate_scope_identity(&root, &self.0, WebRemoteLimitScope::RangeResponse)?;
+        validate_scope_identity(&root, &work_unit.0, WebRemoteLimitScope::WorkUnit)?;
+
+        let range_session = ancestor_scope(&self.0, WebRemoteLimitScope::Session)?;
+        validate_scope_identity(&root, &range_session, WebRemoteLimitScope::Session)?;
+        let session_source = ancestor_scope(&range_session, WebRemoteLimitScope::Source)?;
+        validate_scope_identity(&root, &session_source, WebRemoteLimitScope::Source)?;
+        let work_range = ancestor_scope(&work_unit.0, WebRemoteLimitScope::RangeResponse)?;
+        if work_range.lease.identity != self.0.lease.identity {
+            return Err(ScopeAccountingError::AggregateAncestryMismatch);
+        }
+
+        Ok(RangeAttemptAccountingBinding {
+            source: session_source.lease.identity,
+            session: range_session.lease.identity,
+            range_response: self.0.lease.identity,
+            work_unit: work_unit.0.lease.identity,
+        })
+    }
+
     /// Validates and atomically reserves the Wasm output, fixed scratch, peak overlap and session
     /// total before the first body-pump allocation.
     pub fn prepare_body_pump_reservation(
@@ -3973,6 +4026,374 @@ impl RangeResponseAccountingScope {
             spec.scratch_bytes,
         )?;
         Ok(PreparedRangeBodyPumpReservation { inner, spec })
+    }
+}
+
+/// Failure to prepare one irreversible physical Range-attempt burn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RangeAttemptBurnError {
+    AttemptLimitExhausted,
+    MetadataOpeningRangeLimitExhausted,
+    ArithmeticOverflow,
+    AccountingUnavailable(ScopeAccountingError),
+}
+
+impl fmt::Display for RangeAttemptBurnError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AttemptLimitExhausted => {
+                formatter.write_str("remote Range retry attempt limit exhausted")
+            }
+            Self::MetadataOpeningRangeLimitExhausted => {
+                formatter.write_str("remote metadata-opening Range limit exhausted")
+            }
+            Self::ArithmeticOverflow => {
+                formatter.write_str("remote Range attempt accounting overflow")
+            }
+            Self::AccountingUnavailable(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for RangeAttemptBurnError {}
+
+/// Sealed, non-cloneable attempt budget for one exact Range operation.
+///
+/// The value can only be projected from a production limits capability (or its test-only
+/// equivalent) through an [`OperationAccountingScope`].
+pub(crate) struct RangeRetryAttemptBudget {
+    operation: OperationAccountingScope,
+    limit: NonZeroU64,
+    burned: u64,
+}
+
+impl fmt::Debug for RangeRetryAttemptBudget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RangeRetryAttemptBudget")
+            .field("burned", &self.burned)
+            .field("limit", &"<sealed>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RangeRetryAttemptBudget {
+    pub const fn burned(&self) -> u64 {
+        self.burned
+    }
+
+    /// Proves that the transport scopes belong to the same source as this operation and its
+    /// source-owned metadata-opening budget before any prepared owner or burn is accepted.
+    pub(crate) fn bind_metadata_opening_transport(
+        &self,
+        range_response: &RangeResponseAccountingScope,
+        work_unit: &WorkUnitAccountingScope,
+    ) -> Result<RangeAttemptAccountingBinding, RangeAttemptBurnError> {
+        let operation_source = ancestor_scope(&self.operation.0, WebRemoteLimitScope::Source)
+            .map_err(RangeAttemptBurnError::AccountingUnavailable)?;
+        let binding = range_response
+            .range_attempt_accounting_binding(work_unit)
+            .map_err(RangeAttemptBurnError::AccountingUnavailable)?;
+        if binding.source != operation_source.lease.identity {
+            return Err(RangeAttemptBurnError::AccountingUnavailable(
+                ScopeAccountingError::AggregateAncestryMismatch,
+            ));
+        }
+        Ok(binding)
+    }
+
+    /// Checks both cumulative counters and returns a zero-burn composite guard.
+    pub fn prepare_metadata_opening_attempt<'a>(
+        &'a mut self,
+        phase: &'a mut MetadataOpeningRangeBudgetOwner,
+    ) -> Result<PreparedRangeAttemptBurn<'a>, RangeAttemptBurnError> {
+        let operation_source = ancestor_scope(&self.operation.0, WebRemoteLimitScope::Source)
+            .map_err(RangeAttemptBurnError::AccountingUnavailable)?;
+        if operation_source.lease.identity != phase.source.0.lease.identity {
+            return Err(RangeAttemptBurnError::AccountingUnavailable(
+                ScopeAccountingError::AggregateAncestryMismatch,
+            ));
+        }
+
+        let next_attempt = self
+            .burned
+            .checked_add(1)
+            .ok_or(RangeAttemptBurnError::ArithmeticOverflow)?;
+        if next_attempt > self.limit.get() {
+            return Err(RangeAttemptBurnError::AttemptLimitExhausted);
+        }
+        let next_phase_range = phase
+            .burned
+            .checked_add(1)
+            .ok_or(RangeAttemptBurnError::ArithmeticOverflow)?;
+        if next_phase_range > phase.limit.get() {
+            return Err(RangeAttemptBurnError::MetadataOpeningRangeLimitExhausted);
+        }
+
+        let next_attempt = NonZeroU64::new(next_attempt)
+            .expect("zero plus one cannot produce a zero attempt ordinal");
+        self.operation
+            .validate_scalar(
+                ScalarObservationKey::from_schema_key_internal(
+                    WebRemoteLimitKey::RangeRetryAttemptsPerOperation,
+                ),
+                next_attempt.get(),
+            )
+            .map_err(RangeAttemptBurnError::AccountingUnavailable)?;
+        phase
+            .source
+            .validate_scalar(
+                ScalarObservationKey::from_schema_key_internal(
+                    WebRemoteLimitKey::MetadataOpeningRangeRequests,
+                ),
+                next_phase_range,
+            )
+            .map_err(RangeAttemptBurnError::AccountingUnavailable)?;
+
+        Ok(PreparedRangeAttemptBurn {
+            attempt: self,
+            phase,
+            next_attempt,
+            next_phase_range,
+        })
+    }
+}
+
+/// Non-cloneable cumulative physical-Range owner for one metadata-opening source.
+pub(crate) struct MetadataOpeningRangeBudgetOwner {
+    source: SourceAccountingScope,
+    limit: NonZeroU64,
+    burned: u64,
+}
+
+impl fmt::Debug for MetadataOpeningRangeBudgetOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetadataOpeningRangeBudgetOwner")
+            .field("burned", &self.burned)
+            .field("limit", &"<sealed>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl MetadataOpeningRangeBudgetOwner {
+    pub const fn burned(&self) -> u64 {
+        self.burned
+    }
+}
+
+/// State returned after charging visible-only metadata-opening time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MetadataOpeningDeadlineState {
+    Active,
+    Expired,
+}
+
+/// Non-cloneable active-visible deadline owner for one metadata-opening source.
+///
+/// This owner intentionally knows nothing about `document.visibilityState` or browser execution
+/// epochs. The page-execution coordinator added later supplies only visible elapsed time.
+pub(crate) struct MetadataOpeningActiveVisibleDeadlineOwner {
+    source: SourceAccountingScope,
+    limit_millis: NonZeroU64,
+    elapsed_millis: u64,
+}
+
+impl fmt::Debug for MetadataOpeningActiveVisibleDeadlineOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetadataOpeningActiveVisibleDeadlineOwner")
+            .field("elapsed_millis", &self.elapsed_millis)
+            .field("limit_millis", &"<sealed>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl MetadataOpeningActiveVisibleDeadlineOwner {
+    #[cfg(test)]
+    pub const fn elapsed_millis(&self) -> u64 {
+        self.elapsed_millis
+    }
+
+    pub const fn state(&self) -> MetadataOpeningDeadlineState {
+        if self.elapsed_millis >= self.limit_millis.get() {
+            MetadataOpeningDeadlineState::Expired
+        } else {
+            MetadataOpeningDeadlineState::Active
+        }
+    }
+
+    /// Charges only time that the caller has already established was active and visible.
+    pub fn advance_visible(
+        &mut self,
+        elapsed_millis: u64,
+    ) -> Result<MetadataOpeningDeadlineState, ScopeAccountingError> {
+        let next = self
+            .elapsed_millis
+            .checked_add(elapsed_millis)
+            .ok_or(ScopeAccountingError::ArithmeticOverflow)?
+            .min(self.limit_millis.get());
+        self.source.validate_scalar(
+            ScalarObservationKey::from_schema_key_internal(
+                WebRemoteLimitKey::MetadataOpeningVisibleDeadlineMillis,
+            ),
+            next,
+        )?;
+        self.elapsed_millis = next;
+        Ok(self.state())
+    }
+}
+
+/// A checked, zero-burn coupling of an operation attempt and its caller phase Range count.
+///
+/// Dropping this guard preserves both owners bit-for-bit. [`Self::commit`] has no fallible work
+/// after either counter is changed.
+pub(crate) struct PreparedRangeAttemptBurn<'a> {
+    attempt: &'a mut RangeRetryAttemptBudget,
+    phase: &'a mut MetadataOpeningRangeBudgetOwner,
+    next_attempt: NonZeroU64,
+    next_phase_range: u64,
+}
+
+impl fmt::Debug for PreparedRangeAttemptBurn<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedRangeAttemptBurn")
+            .field("next_attempt", &self.next_attempt)
+            .field("next_phase_range", &self.next_phase_range)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedRangeAttemptBurn<'_> {
+    pub const fn next_attempt(&self) -> NonZeroU64 {
+        self.next_attempt
+    }
+
+    /// Atomically and irreversibly consumes both scalar counters.
+    pub fn commit(self) -> CommittedRangeAttemptBurn {
+        self.attempt.burned = self.next_attempt.get();
+        self.phase.burned = self.next_phase_range;
+        CommittedRangeAttemptBurn {
+            attempt: self.next_attempt,
+            metadata_opening_range: self.next_phase_range,
+        }
+    }
+}
+
+/// Receipt for one irreversible physical Fetch attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CommittedRangeAttemptBurn {
+    attempt: NonZeroU64,
+    metadata_opening_range: u64,
+}
+
+impl CommittedRangeAttemptBurn {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the disarmed retry receipt is consumed by the future production frame driver"
+        )
+    )]
+    pub const fn attempt(self) -> NonZeroU64 {
+        self.attempt
+    }
+
+    #[cfg(test)]
+    pub const fn metadata_opening_range(self) -> u64 {
+        self.metadata_opening_range
+    }
+}
+
+const RANGE_RETRY_ATTEMPT_PROJECTION: u8 = 1 << 0;
+const METADATA_OPENING_PROJECTION: u8 = 1 << 1;
+
+fn claim_internal_projection(
+    lease: &AccountingScopeLease,
+    claim: u8,
+) -> Result<(), ScopeAccountingError> {
+    let current = lease.internal_projection_claims.get();
+    if current & claim != 0 {
+        return Err(ScopeAccountingError::ScopeBusy);
+    }
+    lease.internal_projection_claims.set(current | claim);
+    Ok(())
+}
+
+impl OperationAccountingScope {
+    /// Projects the sealed per-operation retry limit into one non-cloneable owner.
+    pub(crate) fn range_retry_attempt_budget(
+        &self,
+    ) -> Result<RangeRetryAttemptBudget, ScopeAccountingError> {
+        let root = self
+            .0
+            .lease
+            .root
+            .upgrade()
+            .ok_or(ScopeAccountingError::RootStopped)?;
+        validate_scope_and_key(
+            &root,
+            &self.0,
+            WebRemoteLimitKey::RangeRetryAttemptsPerOperation,
+            WebRemoteAccountingKind::ScalarObservation,
+        )?;
+        claim_internal_projection(&self.0.lease, RANGE_RETRY_ATTEMPT_PROJECTION)?;
+        Ok(RangeRetryAttemptBudget {
+            operation: self.clone(),
+            limit: root
+                .limits
+                .raw_limit_value(WebRemoteLimitKey::RangeRetryAttemptsPerOperation),
+            burned: 0,
+        })
+    }
+}
+
+impl SourceAccountingScope {
+    /// Projects the two sealed metadata-opening limits into source-owned, non-cloneable owners.
+    pub(crate) fn metadata_opening_range_and_deadline_owners(
+        &self,
+    ) -> Result<
+        (
+            MetadataOpeningRangeBudgetOwner,
+            MetadataOpeningActiveVisibleDeadlineOwner,
+        ),
+        ScopeAccountingError,
+    > {
+        let root = self
+            .0
+            .lease
+            .root
+            .upgrade()
+            .ok_or(ScopeAccountingError::RootStopped)?;
+        for key in [
+            WebRemoteLimitKey::MetadataOpeningRangeRequests,
+            WebRemoteLimitKey::MetadataOpeningVisibleDeadlineMillis,
+        ] {
+            validate_scope_and_key(
+                &root,
+                &self.0,
+                key,
+                WebRemoteAccountingKind::ScalarObservation,
+            )?;
+        }
+        claim_internal_projection(&self.0.lease, METADATA_OPENING_PROJECTION)?;
+        Ok((
+            MetadataOpeningRangeBudgetOwner {
+                source: self.clone(),
+                limit: root
+                    .limits
+                    .raw_limit_value(WebRemoteLimitKey::MetadataOpeningRangeRequests),
+                burned: 0,
+            },
+            MetadataOpeningActiveVisibleDeadlineOwner {
+                source: self.clone(),
+                limit_millis: root
+                    .limits
+                    .raw_limit_value(WebRemoteLimitKey::MetadataOpeningVisibleDeadlineMillis),
+                elapsed_millis: 0,
+            },
+        ))
     }
 }
 
@@ -5906,6 +6327,7 @@ fn create_child_scope(
             root: Rc::downgrade(root),
             identity,
             kind,
+            internal_projection_claims: Cell::new(0),
             _parent_lease: Some(Rc::clone(parent)),
         }),
     })
@@ -6612,6 +7034,7 @@ pub(crate) mod tests {
         WebRemoteLimitKey::FetchWasmRawRetainedBytes,
         WebRemoteLimitKey::ConcurrentRangeRequests,
         WebRemoteLimitKey::InFlightRangeBytes,
+        WebRemoteLimitKey::RangeRetryAttemptsPerOperation,
         WebRemoteLimitKey::RequestedRangeBytes,
         WebRemoteLimitKey::ByobScratchBytes,
         WebRemoteLimitKey::RangeJsWasmOverlapBytes,
@@ -6894,7 +7317,7 @@ pub(crate) mod tests {
             covered_requirements,
             NormativeResourceRequirement::ALL.into_iter().collect()
         );
-        assert_eq!(metadata_fingerprint(), 0x5b71_6f50_4699_862c);
+        assert_eq!(metadata_fingerprint(), 0xc975_59dc_064b_9d7c);
     }
 
     #[test]
@@ -7004,6 +7427,7 @@ pub(crate) mod tests {
             SessionResidentPhysicalRoots => (1, 0, 0),
             ConcurrentRangeRequests => (1, 0, 0),
             InFlightRangeBytes => (1, 0, 0),
+            RangeRetry => (1, 0, 0),
             RangeByobOverlap => (3, 0, 1),
             RemoteValidatorByteString => (9, 0, 3),
             ExtensionlessSniffer => (1, 0, 0),
@@ -8567,6 +8991,164 @@ pub(crate) mod tests {
             ScopeAccountingError::AggregateAncestryMismatch
         );
         assert_eq!(root.snapshot(), before_ancestry);
+    }
+
+    #[test]
+    fn metadata_range_attempt_burn_is_atomic_irreversible_and_source_scoped() {
+        let root = test_profile_with(&[
+            (WebRemoteLimitKey::RangeRetryAttemptsPerOperation, 2),
+            (WebRemoteLimitKey::MetadataOpeningRangeRequests, 3),
+        ])
+        .start_accounting_root()
+        .unwrap();
+        let viewer = root.create_viewer_scope().unwrap();
+        let source = viewer.create_source_scope().unwrap();
+        let operation = source.create_operation_scope().unwrap();
+        let mut attempts = operation.range_retry_attempt_budget().unwrap();
+        let (mut ranges, _deadline) = source.metadata_opening_range_and_deadline_owners().unwrap();
+
+        let before_prepare = root.snapshot();
+        {
+            let _prepared = attempts
+                .prepare_metadata_opening_attempt(&mut ranges)
+                .unwrap();
+        }
+        assert_eq!(attempts.burned(), 0);
+        assert_eq!(ranges.burned(), 0);
+        assert_eq!(root.snapshot(), before_prepare);
+
+        let first = attempts
+            .prepare_metadata_opening_attempt(&mut ranges)
+            .unwrap()
+            .commit();
+        assert_eq!(first.attempt().get(), 1);
+        assert_eq!(first.metadata_opening_range(), 1);
+        let second = attempts
+            .prepare_metadata_opening_attempt(&mut ranges)
+            .unwrap()
+            .commit();
+        assert_eq!(second.attempt().get(), 2);
+        assert_eq!(second.metadata_opening_range(), 2);
+        assert_eq!(attempts.burned(), 2);
+        assert_eq!(ranges.burned(), 2);
+
+        assert_eq!(
+            attempts
+                .prepare_metadata_opening_attempt(&mut ranges)
+                .unwrap_err(),
+            RangeAttemptBurnError::AttemptLimitExhausted
+        );
+        assert_eq!(attempts.burned(), 2);
+        assert_eq!(ranges.burned(), 2);
+
+        let other_source = viewer.create_source_scope().unwrap();
+        let (mut other_ranges, _other_deadline) = other_source
+            .metadata_opening_range_and_deadline_owners()
+            .unwrap();
+        assert_eq!(
+            attempts
+                .prepare_metadata_opening_attempt(&mut other_ranges)
+                .unwrap_err(),
+            RangeAttemptBurnError::AccountingUnavailable(
+                ScopeAccountingError::AggregateAncestryMismatch
+            )
+        );
+        assert_eq!(other_ranges.burned(), 0);
+    }
+
+    #[test]
+    fn metadata_range_limit_failure_does_not_partially_burn_attempt() {
+        let root = test_profile_with(&[
+            (WebRemoteLimitKey::RangeRetryAttemptsPerOperation, 3),
+            (WebRemoteLimitKey::MetadataOpeningRangeRequests, 1),
+        ])
+        .start_accounting_root()
+        .unwrap();
+        let viewer = root.create_viewer_scope().unwrap();
+        let source = viewer.create_source_scope().unwrap();
+        let first_operation = source.create_operation_scope().unwrap();
+        let second_operation = source.create_operation_scope().unwrap();
+        let mut first_attempts = first_operation.range_retry_attempt_budget().unwrap();
+        let mut second_attempts = second_operation.range_retry_attempt_budget().unwrap();
+        let (mut ranges, _deadline) = source.metadata_opening_range_and_deadline_owners().unwrap();
+
+        first_attempts
+            .prepare_metadata_opening_attempt(&mut ranges)
+            .unwrap()
+            .commit();
+        assert_eq!(
+            second_attempts
+                .prepare_metadata_opening_attempt(&mut ranges)
+                .unwrap_err(),
+            RangeAttemptBurnError::MetadataOpeningRangeLimitExhausted
+        );
+        assert_eq!(second_attempts.burned(), 0);
+        assert_eq!(ranges.burned(), 1);
+    }
+
+    #[test]
+    fn retry_and_metadata_owners_are_projected_once_across_scope_clones() {
+        let root = test_profile_with(&[]).start_accounting_root().unwrap();
+        let viewer = root.create_viewer_scope().unwrap();
+        let source = viewer.create_source_scope().unwrap();
+        let source_clone = source.clone();
+        let operation = source.create_operation_scope().unwrap();
+        let operation_clone = operation.clone();
+
+        let attempts = operation.range_retry_attempt_budget().unwrap();
+        assert_eq!(
+            operation_clone.range_retry_attempt_budget().unwrap_err(),
+            ScopeAccountingError::ScopeBusy
+        );
+        drop(attempts);
+        assert_eq!(
+            operation.range_retry_attempt_budget().unwrap_err(),
+            ScopeAccountingError::ScopeBusy
+        );
+
+        let owners = source.metadata_opening_range_and_deadline_owners().unwrap();
+        assert_eq!(
+            source_clone
+                .metadata_opening_range_and_deadline_owners()
+                .unwrap_err(),
+            ScopeAccountingError::ScopeBusy
+        );
+        drop(owners);
+        assert_eq!(
+            source
+                .metadata_opening_range_and_deadline_owners()
+                .unwrap_err(),
+            ScopeAccountingError::ScopeBusy
+        );
+    }
+
+    #[test]
+    fn metadata_active_visible_deadline_counts_only_explicit_visible_time() {
+        let root =
+            test_profile_with(&[(WebRemoteLimitKey::MetadataOpeningVisibleDeadlineMillis, 10)])
+                .start_accounting_root()
+                .unwrap();
+        let viewer = root.create_viewer_scope().unwrap();
+        let source = viewer.create_source_scope().unwrap();
+        let (_ranges, mut deadline) = source.metadata_opening_range_and_deadline_owners().unwrap();
+
+        assert_eq!(deadline.state(), MetadataOpeningDeadlineState::Active);
+        assert_eq!(
+            deadline.advance_visible(4).unwrap(),
+            MetadataOpeningDeadlineState::Active
+        );
+        // Hidden wall time is represented by not calling `advance_visible`.
+        assert_eq!(deadline.elapsed_millis(), 4);
+        assert_eq!(
+            deadline.advance_visible(6).unwrap(),
+            MetadataOpeningDeadlineState::Expired
+        );
+        assert_eq!(deadline.elapsed_millis(), 10);
+        assert_eq!(
+            deadline.advance_visible(u64::MAX).unwrap_err(),
+            ScopeAccountingError::ArithmeticOverflow
+        );
+        assert_eq!(deadline.elapsed_millis(), 10);
     }
 
     #[test]

@@ -146,6 +146,15 @@ impl ChromeRangeRequest {
     }
 }
 
+/// Crate-private identity reported by a sealed, fully prepared Chrome Range owner.
+pub(crate) trait PreparedChromeRangeIdentity<Controller> {
+    fn prepared_range(&self) -> ChromeRangeRequest;
+
+    fn matches_abort_controller(&self, controller: &Controller) -> bool;
+
+    fn prepared_accounting_binding(&self) -> crate::remote_limits::RangeAttemptAccountingBinding;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ParsedContentRange {
     start: u64,
@@ -281,6 +290,7 @@ pub struct BoundChromeRangeObject {
 }
 
 /// A byte range checked against, and borrowing, one bound object capability.
+#[derive(Clone, Copy)]
 pub struct BoundChromeRangeRequest<'object> {
     object: &'object BoundChromeRangeObject,
     requested: RequestedRange,
@@ -403,6 +413,7 @@ fn validate_bound_validator(
 
 #[cfg(target_arch = "wasm32")]
 mod web {
+    use std::fmt;
     use std::future::Future;
 
     use js_sys::{Function, JsString, Reflect};
@@ -411,15 +422,18 @@ mod web {
 
     use super::{
         AsciiHeaderInput, BoundChromeRangeObject, BoundChromeRangeRequest, ChromeRangeError,
-        ChromeRangeRequest, NonZeroU64, ParsedEntityTag, RemoteObjectValidator,
-        RepresentationConsistencyPolicy, RequestedRange, RequiredRangeResponseHeader,
-        bind_probe_validator, is_identity_encoding, map_validator_error, map_visible_status,
-        parse_content_length, parse_content_range, validate_bound_validator,
+        ChromeRangeRequest, NonZeroU64, ParsedEntityTag, PreparedChromeRangeIdentity,
+        RemoteObjectValidator, RepresentationConsistencyPolicy, RequestedRange,
+        RequiredRangeResponseHeader, bind_probe_validator, is_identity_encoding,
+        map_validator_error, map_visible_status, parse_content_length, parse_content_range,
+        validate_bound_validator,
     };
     use crate::chrome_byob::{
-        ExactLengthByobPumpConfig, ExactLengthByobPumpControl, ExactLengthRangeBody,
-        read_exact_range_body,
+        ExactLengthByobPumpConfig, ExactLengthByobPumpControl, ExactLengthByobPumpControlError,
+        ExactLengthRangeBody, PreparedExactLengthRangeBodyPump, prepare_exact_range_body_pump,
+        read_exact_range_body_prepared,
     };
+    use crate::range_retry::ChromeRangeAttemptAbortController;
     use crate::remote_limits::{
         ActiveRemoteValidatorEgressReservation, RangeResponseAccountingScope,
         WasmModuleLimitAccountingRoot, WorkUnitAccountingScope,
@@ -535,15 +549,11 @@ mod web {
             .map_err(|_error| ChromeRangeError::BrowserAdapterUnavailable)
     }
 
-    async fn fetch_response(
+    async fn finish_fetch_response(
         request: ChromeRangeRequestOwner,
+        fetch: js_sys::Promise,
         abort_controller: &web_sys::AbortController,
     ) -> Result<web_sys::Response, ChromeRangeError> {
-        let Some(window) = web_sys::window() else {
-            abort_controller.abort();
-            return Err(ChromeRangeError::BrowserAdapterUnavailable);
-        };
-        let fetch = window.fetch_with_request(request.request());
         let response = abort_validation_failure(
             classify_fetch_settlement(JsFuture::from(fetch).await),
             abort_controller,
@@ -660,6 +670,304 @@ mod web {
         result
     }
 
+    struct PreparedChromeRangeTransport {
+        requested: RequestedRange,
+        request: ChromeRangeRequestOwner,
+        body_pump: PreparedExactLengthRangeBodyPump,
+        window: web_sys::Window,
+        abort_controller: web_sys::AbortController,
+        root: WasmModuleLimitAccountingRoot,
+        work_scope: WorkUnitAccountingScope,
+    }
+
+    struct BorrowedPumpControl<'control, C>(&'control mut C);
+
+    #[async_trait::async_trait(?Send)]
+    impl<C> ExactLengthByobPumpControl for BorrowedPumpControl<'_, C>
+    where
+        C: ExactLengthByobPumpControl,
+    {
+        async fn wait_until_read_allowed(&mut self) -> Result<(), ExactLengthByobPumpControlError> {
+            self.0.wait_until_read_allowed().await
+        }
+    }
+
+    impl fmt::Debug for PreparedChromeRangeTransport {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("PreparedChromeRangeTransport")
+                .field("requested", &self.requested)
+                .finish_non_exhaustive()
+        }
+    }
+
+    fn prepare_transport(
+        url: &SecretUrl,
+        requested: RequestedRange,
+        validator: Option<&RemoteObjectValidator>,
+        abort_controller: &web_sys::AbortController,
+        root: &WasmModuleLimitAccountingRoot,
+        range_scope: &RangeResponseAccountingScope,
+        work_scope: &WorkUnitAccountingScope,
+        pump_slice_bytes: NonZeroU64,
+    ) -> Result<PreparedChromeRangeTransport, ChromeRangeError> {
+        let result = (|| {
+            let window = web_sys::window().ok_or(ChromeRangeError::BrowserAdapterUnavailable)?;
+            let config =
+                ExactLengthByobPumpConfig::new(requested.as_exclusive_range(), pump_slice_bytes)
+                    .map_err(ChromeRangeError::BodyPump)?;
+            let request = build_request(
+                url,
+                requested,
+                validator,
+                abort_controller,
+                root,
+                work_scope,
+            )?;
+            let body_pump = prepare_exact_range_body_pump(root, range_scope, work_scope, config)
+                .map_err(ChromeRangeError::BodyPump)?;
+            Ok(PreparedChromeRangeTransport {
+                requested,
+                request,
+                body_pump,
+                window,
+                abort_controller: abort_controller.clone(),
+                root: root.clone(),
+                work_scope: work_scope.clone(),
+            })
+        })();
+        if result.is_err() {
+            abort_controller.abort();
+        }
+        result
+    }
+
+    /// Sealed pre-Fetch owner for a strict metadata probe.
+    pub(crate) struct PreparedChromeProbeRangeAttempt {
+        transport: PreparedChromeRangeTransport,
+        consistency_policy: RepresentationConsistencyPolicy,
+    }
+
+    impl fmt::Debug for PreparedChromeProbeRangeAttempt {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("PreparedChromeProbeRangeAttempt")
+                .field("transport", &self.transport)
+                .field("consistency_policy", &self.consistency_policy)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl PreparedChromeRangeIdentity<ChromeRangeAttemptAbortController>
+        for PreparedChromeProbeRangeAttempt
+    {
+        fn prepared_range(&self) -> ChromeRangeRequest {
+            ChromeRangeRequest {
+                requested: self.transport.requested,
+            }
+        }
+
+        fn matches_abort_controller(&self, controller: &ChromeRangeAttemptAbortController) -> bool {
+            js_sys::Object::is(
+                self.transport.abort_controller.as_ref(),
+                controller.controller().as_ref(),
+            )
+        }
+
+        fn prepared_accounting_binding(
+            &self,
+        ) -> crate::remote_limits::RangeAttemptAccountingBinding {
+            self.transport.body_pump.accounting_binding()
+        }
+    }
+
+    /// Completes all fallible Request/Header/output/reservation preparation without starting Fetch.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the transport boundary keeps every capability and policy input explicit"
+    )]
+    pub(crate) fn prepare_probe_exact_range_attempt(
+        url: &SecretUrl,
+        request_range: ChromeRangeRequest,
+        consistency_policy: RepresentationConsistencyPolicy,
+        abort_controller: &web_sys::AbortController,
+        root: &WasmModuleLimitAccountingRoot,
+        range_scope: &RangeResponseAccountingScope,
+        work_scope: &WorkUnitAccountingScope,
+        pump_slice_bytes: NonZeroU64,
+    ) -> Result<PreparedChromeProbeRangeAttempt, ChromeRangeError> {
+        Ok(PreparedChromeProbeRangeAttempt {
+            transport: prepare_transport(
+                url,
+                request_range.requested,
+                None,
+                abort_controller,
+                root,
+                range_scope,
+                work_scope,
+                pump_slice_bytes,
+            )?,
+            consistency_policy,
+        })
+    }
+
+    impl PreparedChromeProbeRangeAttempt {
+        /// Consumes the sealed owner and synchronously crosses the irreversible Fetch boundary.
+        pub(crate) fn start<T, C>(
+            self,
+            mut control: C,
+            timeout: T,
+        ) -> impl Future<Output = Result<ProbedChromeRangeBody, ChromeRangeError>>
+        where
+            T: Future<Output = ()>,
+            C: ExactLengthByobPumpControl,
+        {
+            let Self {
+                transport,
+                consistency_policy,
+            } = self;
+            let PreparedChromeRangeTransport {
+                requested,
+                request,
+                body_pump,
+                window,
+                abort_controller,
+                root,
+                work_scope,
+            } = transport;
+            // This is the single irreversible transport boundary. All typed failures and generic
+            // ownership preparation completed before the caller committed its attempt burn.
+            let fetch = window.fetch_with_request(request.request());
+            async move {
+                let response = finish_fetch_response(request, fetch, &abort_controller).await?;
+                let object = abort_validation_failure(
+                    (|| {
+                        let object_length = validate_common_headers(&response, requested, None)?;
+                        let observed = parse_response_validator(&response, &root, &work_scope)?;
+                        bind_probe_validator(object_length, consistency_policy, observed)
+                    })(),
+                    &abort_controller,
+                )?;
+                let body = read_exact_range_body_prepared(
+                    &response,
+                    &abort_controller,
+                    body_pump,
+                    &mut control,
+                    timeout,
+                )
+                .await
+                .map_err(ChromeRangeError::BodyPump)?;
+                Ok(ProbedChromeRangeBody { body, object })
+            }
+        }
+    }
+
+    /// Sealed pre-Fetch owner for a Range against one already-bound object capability.
+    pub(crate) struct PreparedChromeBoundRangeAttempt<'object> {
+        transport: PreparedChromeRangeTransport,
+        object: &'object BoundChromeRangeObject,
+    }
+
+    impl PreparedChromeRangeIdentity<ChromeRangeAttemptAbortController>
+        for PreparedChromeBoundRangeAttempt<'_>
+    {
+        fn prepared_range(&self) -> ChromeRangeRequest {
+            ChromeRangeRequest {
+                requested: self.transport.requested,
+            }
+        }
+
+        fn matches_abort_controller(&self, controller: &ChromeRangeAttemptAbortController) -> bool {
+            js_sys::Object::is(
+                self.transport.abort_controller.as_ref(),
+                controller.controller().as_ref(),
+            )
+        }
+
+        fn prepared_accounting_binding(
+            &self,
+        ) -> crate::remote_limits::RangeAttemptAccountingBinding {
+            self.transport.body_pump.accounting_binding()
+        }
+    }
+
+    /// Completes all fallible preparation for a bound Range without starting Fetch.
+    pub(crate) fn prepare_bound_exact_range_attempt<'object>(
+        url: &SecretUrl,
+        request_range: BoundChromeRangeRequest<'object>,
+        abort_controller: &web_sys::AbortController,
+        root: &WasmModuleLimitAccountingRoot,
+        range_scope: &RangeResponseAccountingScope,
+        work_scope: &WorkUnitAccountingScope,
+        pump_slice_bytes: NonZeroU64,
+    ) -> Result<PreparedChromeBoundRangeAttempt<'object>, ChromeRangeError> {
+        let BoundChromeRangeRequest { object, requested } = request_range;
+        Ok(PreparedChromeBoundRangeAttempt {
+            transport: prepare_transport(
+                url,
+                requested,
+                Some(object.validator()),
+                abort_controller,
+                root,
+                range_scope,
+                work_scope,
+                pump_slice_bytes,
+            )?,
+            object,
+        })
+    }
+
+    impl<'object> PreparedChromeBoundRangeAttempt<'object> {
+        /// Consumes the sealed owner and synchronously crosses the irreversible Fetch boundary.
+        pub(crate) fn start<T, C>(
+            self,
+            mut control: C,
+            timeout: T,
+        ) -> impl Future<Output = Result<ExactLengthRangeBody, ChromeRangeError>> + 'object
+        where
+            T: Future<Output = ()> + 'object,
+            C: ExactLengthByobPumpControl + 'object,
+        {
+            let Self { transport, object } = self;
+            let PreparedChromeRangeTransport {
+                requested,
+                request,
+                body_pump,
+                window,
+                abort_controller,
+                root,
+                work_scope,
+            } = transport;
+            // See the probe path: this call is intentionally synchronous and infallible at the
+            // Rust type boundary after the prepared owner has been consumed.
+            let fetch = window.fetch_with_request(request.request());
+            async move {
+                let response = finish_fetch_response(request, fetch, &abort_controller).await?;
+                abort_validation_failure(
+                    (|| {
+                        validate_common_headers(
+                            &response,
+                            requested,
+                            Some(object.object_length()),
+                        )?;
+                        let observed = parse_response_validator(&response, &root, &work_scope)?;
+                        validate_bound_validator(object, observed)
+                    })(),
+                    &abort_controller,
+                )?;
+                read_exact_range_body_prepared(
+                    &response,
+                    &abort_controller,
+                    body_pump,
+                    &mut control,
+                    timeout,
+                )
+                .await
+                .map_err(ChromeRangeError::BodyPump)
+            }
+        }
+    }
+
     /// A successfully probed body and the validator/length capability bound by its headers.
     pub struct ProbedChromeRangeBody {
         body: ExactLengthRangeBody,
@@ -701,35 +1009,17 @@ mod web {
         T: Future<Output = ()>,
         C: ExactLengthByobPumpControl,
     {
-        let requested = request_range.requested;
-        let request = build_request(url, requested, None, abort_controller, root, work_scope)?;
-        let response = fetch_response(request, abort_controller).await?;
-        let object = abort_validation_failure(
-            (|| {
-                let object_length = validate_common_headers(&response, requested, None)?;
-                let observed = parse_response_validator(&response, root, work_scope)?;
-                bind_probe_validator(object_length, consistency_policy, observed)
-            })(),
-            abort_controller,
-        )?;
-        let config = abort_validation_failure(
-            ExactLengthByobPumpConfig::new(requested.as_exclusive_range(), pump_slice_bytes)
-                .map_err(ChromeRangeError::BodyPump),
-            abort_controller,
-        )?;
-        let body = read_exact_range_body(
-            &response,
+        let prepared = prepare_probe_exact_range_attempt(
+            url,
+            request_range,
+            consistency_policy,
             abort_controller,
             root,
             range_scope,
             work_scope,
-            config,
-            control,
-            timeout,
-        )
-        .await
-        .map_err(ChromeRangeError::BodyPump)?;
-        Ok(ProbedChromeRangeBody { body, object })
+            pump_slice_bytes,
+        )?;
+        prepared.start(BorrowedPumpControl(control), timeout).await
     }
 
     /// Performs one strict Range against an already-bound object capability.
@@ -752,41 +1042,16 @@ mod web {
         T: Future<Output = ()>,
         C: ExactLengthByobPumpControl,
     {
-        let BoundChromeRangeRequest { object, requested } = request_range;
-        let request = build_request(
+        let prepared = prepare_bound_exact_range_attempt(
             url,
-            requested,
-            Some(object.validator()),
-            abort_controller,
-            root,
-            work_scope,
-        )?;
-        let response = fetch_response(request, abort_controller).await?;
-        abort_validation_failure(
-            (|| {
-                validate_common_headers(&response, requested, Some(object.object_length()))?;
-                let observed = parse_response_validator(&response, root, work_scope)?;
-                validate_bound_validator(object, observed)
-            })(),
-            abort_controller,
-        )?;
-        let config = abort_validation_failure(
-            ExactLengthByobPumpConfig::new(requested.as_exclusive_range(), pump_slice_bytes)
-                .map_err(ChromeRangeError::BodyPump),
-            abort_controller,
-        )?;
-        read_exact_range_body(
-            &response,
+            request_range,
             abort_controller,
             root,
             range_scope,
             work_scope,
-            config,
-            control,
-            timeout,
-        )
-        .await
-        .map_err(ChromeRangeError::BodyPump)
+            pump_slice_bytes,
+        )?;
+        prepared.start(BorrowedPumpControl(control), timeout).await
     }
 }
 
@@ -804,9 +1069,16 @@ mod wasm_tests {
 
     use super::{
         ChromeRangeError, ChromeRangeRequest, RepresentationConsistency,
-        RepresentationConsistencyPolicy, RequiredRangeResponseHeader, probe_exact_range,
-        read_bound_exact_range,
+        RepresentationConsistencyPolicy, RequiredRangeResponseHeader,
+        prepare_probe_exact_range_attempt, probe_exact_range, read_bound_exact_range,
     };
+    use crate::range_retry::{
+        ChromeRangeAttemptAbortController, ChromeRangeAttemptAbortFactory,
+        MetadataOpeningFailureSignal, MetadataOpeningRetryCoordinator,
+        RangeAttemptCompletionDisposition, RangeAttemptStartError, RemoteRangeLiveIdentity,
+        RemoteRangeRetryOperation,
+    };
+    use crate::remote_limits::WebRemoteLimitKey;
 
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
@@ -814,6 +1086,7 @@ mod wasm_tests {
         const RANGE_FIXTURE_PROTOCOL = "mcap-range-fixture-v1";
         let requestInstrumentation;
         let bodyInstrumentation;
+        let preparationFailureInstrumentation;
 
         function fixturePort() {
             const raw = new URLSearchParams(window.location.search).get("mcap_fixture_page_port");
@@ -1069,6 +1342,13 @@ mod wasm_tests {
             requestInstrumentation = { original, observations };
         }
 
+        export function rangeRequestObservationCount() {
+            if (requestInstrumentation === undefined) {
+                throw new Error("Range request instrumentation not active");
+            }
+            return requestInstrumentation.observations.length;
+        }
+
         export function finishRangeRequestInstrumentation(
             expectedIfMatch,
             expectedSignalAborted,
@@ -1086,22 +1366,64 @@ mod wasm_tests {
             if (expectedRequestCount === 0) {
                 return true;
             }
-            if (expectedRequestCount !== 1) {
-                throw new Error("unsupported expected production Fetch count");
-            }
-            const request = observations[0];
             const expected = expectedIfMatch === "" ? null : expectedIfMatch;
-            return request.method === "GET"
-                && request.mode === "cors"
-                && request.credentials === "omit"
-                && request.cache === "no-store"
-                && request.redirect === "error"
-                && request.referrerPolicy === "no-referrer"
-                && request.range === "bytes=0-3"
-                && request.ifMatch === expected
-                && request.signal instanceof AbortSignal
-                && !request.signalWasAborted
-                && request.signal.aborted === expectedSignalAborted;
+            return new Set(observations.map((request) => request.signal)).size === observations.length
+                && observations.every((request) => request.method === "GET"
+                    && request.mode === "cors"
+                    && request.credentials === "omit"
+                    && request.cache === "no-store"
+                    && request.redirect === "error"
+                    && request.referrerPolicy === "no-referrer"
+                    && request.range === "bytes=0-3"
+                    && request.ifMatch === expected
+                    && request.signal instanceof AbortSignal
+                    && !request.signalWasAborted
+                    && request.signal.aborted === expectedSignalAborted);
+        }
+
+        export function armRangePreparationFailure(stage) {
+            if (preparationFailureInstrumentation !== undefined) {
+                throw new Error("Range preparation failure already armed");
+            }
+            let hits = 0;
+            if (stage === "header") {
+                const original = Headers.prototype.set;
+                Headers.prototype.set = function(name, value) {
+                    if (hits === 0 && name === "Range") {
+                        hits += 1;
+                        throw new TypeError("scripted header failure");
+                    }
+                    return original.call(this, name, value);
+                };
+                preparationFailureInstrumentation = {
+                    hits: () => hits,
+                    restore: () => { Headers.prototype.set = original; },
+                };
+                return;
+            }
+            if (stage === "request") {
+                const original = window.Request;
+                window.Request = function(..._args) {
+                    hits += 1;
+                    throw new TypeError("scripted Request failure");
+                };
+                preparationFailureInstrumentation = {
+                    hits: () => hits,
+                    restore: () => { window.Request = original; },
+                };
+                return;
+            }
+            throw new Error("unknown Range preparation failure stage");
+        }
+
+        export function finishRangePreparationFailure() {
+            if (preparationFailureInstrumentation === undefined) {
+                throw new Error("Range preparation failure not armed");
+            }
+            const state = preparationFailureInstrumentation;
+            preparationFailureInstrumentation = undefined;
+            state.restore();
+            return state.hits() === 1;
         }
 
         export function beginRangeBodyInstrumentation() {
@@ -1148,11 +1470,14 @@ mod wasm_tests {
         fn delete_range_scenario(url: &str) -> js_sys::Promise;
         fn range_scenario_observed_cancellation(url: &str) -> js_sys::Promise;
         fn begin_range_request_instrumentation();
+        fn range_request_observation_count() -> u32;
         fn finish_range_request_instrumentation(
             expected_if_match: &str,
             expected_signal_aborted: bool,
             expected_request_count: u32,
         ) -> bool;
+        fn arm_range_preparation_failure(stage: &str);
+        fn finish_range_preparation_failure() -> bool;
         fn begin_range_body_instrumentation();
         fn finish_range_body_instrumentation() -> bool;
     }
@@ -1215,6 +1540,25 @@ mod wasm_tests {
         }
     }
 
+    struct DownstreamLikeControl;
+
+    // Compile-time compatibility fixture: downstream crates may already implement the public
+    // trait specifically for their local `&mut Control` type. A public blanket impl would overlap.
+    #[async_trait::async_trait(?Send)]
+    impl crate::chrome_byob::ExactLengthByobPumpControl for &mut DownstreamLikeControl {
+        async fn wait_until_read_allowed(
+            &mut self,
+        ) -> Result<(), crate::chrome_byob::ExactLengthByobPumpControlError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn downstream_mut_reference_control_impl_remains_coherent() {
+        let mut control = DownstreamLikeControl;
+        let _borrowed: &mut DownstreamLikeControl = &mut control;
+    }
+
     fn scopes() -> (
         crate::remote_limits::WasmModuleLimitAccountingRoot,
         crate::remote_limits::RangeResponseAccountingScope,
@@ -1268,6 +1612,465 @@ mod wasm_tests {
         )
         .await;
         (result, controller, root)
+    }
+
+    fn prepare_strict_retry_probe(
+        scenario: &Scenario,
+        request: ChromeRangeRequest,
+        root: &crate::remote_limits::WasmModuleLimitAccountingRoot,
+        range: &crate::remote_limits::RangeResponseAccountingScope,
+        work: &crate::remote_limits::WorkUnitAccountingScope,
+        controller: &ChromeRangeAttemptAbortController,
+    ) -> Result<super::PreparedChromeProbeRangeAttempt, ChromeRangeError> {
+        let url = scenario.cross_origin_secret();
+        prepare_probe_exact_range_attempt(
+            &url,
+            request,
+            RepresentationConsistencyPolicy::RequireStrongValidator,
+            controller.controller(),
+            root,
+            range,
+            work,
+            NonZeroU64::new(2).expect("test pump slice is non-zero"),
+        )
+    }
+
+    async fn settle_started_task<Source, Session, Representation, Demand, Controller, Payload>(
+        attempt: crate::range_retry::StartedRangeAttempt<
+            Source,
+            Session,
+            Representation,
+            Demand,
+            Controller,
+            Payload,
+        >,
+    ) -> crate::range_retry::SettledRangeAttempt<
+        Source,
+        Session,
+        Representation,
+        Demand,
+        Controller,
+        Payload::Output,
+    >
+    where
+        Controller: crate::range_retry::RangeAttemptAbortController,
+        Payload: std::future::Future,
+    {
+        let mut attempt = std::pin::pin!(attempt);
+        std::future::poll_fn(|context| match attempt.as_mut().poll_settlement(context) {
+            std::task::Poll::Ready(result) => {
+                std::task::Poll::Ready(result.expect("a matching test task settles exactly once"))
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        })
+        .await
+    }
+
+    async fn exercise_strict_retry_scenario(
+        kind: &str,
+        status: u16,
+        expected: ChromeRangeError,
+        should_retry: bool,
+    ) {
+        let scenario = Scenario::register(kind, status).await;
+        let root = crate::remote_limits::tests::test_profile_with(&[
+            (
+                crate::remote_limits::WebRemoteLimitKey::RangeRetryAttemptsPerOperation,
+                2,
+            ),
+            (
+                crate::remote_limits::WebRemoteLimitKey::MetadataOpeningRangeRequests,
+                2,
+            ),
+        ])
+        .start_accounting_root()
+        .expect("retry test profile starts");
+        let viewer = root.create_viewer_scope().expect("viewer scope");
+        let source = viewer.create_source_scope().expect("source scope");
+        let session = source.create_session_scope().expect("session scope");
+        let range = session.create_range_response_scope().expect("range scope");
+        let work = range.create_work_unit_scope().expect("work scope");
+        let operation_scope = source.create_operation_scope().expect("operation scope");
+        let mut issuer =
+            crate::range_retry::test_execution_support::TestVisibleExecutionIssuer::new(1);
+        let binding = issuer.binding();
+        let live = RemoteRangeLiveIdentity::new(1_u64, 1_u64, 1_u64);
+        let mut coordinator = MetadataOpeningRetryCoordinator::new(&source, live.clone(), binding)
+            .expect("metadata coordinator");
+        let mut operation = RemoteRangeRetryOperation::new(
+            &operation_scope,
+            &range,
+            &work,
+            live,
+            ChromeRangeRequest::new(0..4).expect("exact test range"),
+            1_u64,
+            ChromeRangeAttemptAbortFactory,
+        )
+        .expect("retry operation");
+
+        begin_range_request_instrumentation();
+        let first = operation
+            .start_initial(
+                &mut coordinator,
+                binding,
+                |controller, request| {
+                    prepare_strict_retry_probe(&scenario, request, &root, &range, &work, controller)
+                },
+                |_controller, prepared, receipt| {
+                    assert_eq!(receipt.attempt().get(), 1);
+                    assert_eq!(receipt.metadata_opening_range(), 1);
+                    prepared.start(AlwaysAllowed, future::pending())
+                },
+            )
+            .expect("initial strict attempt starts");
+        assert_eq!(operation.attempts_burned(), 1);
+        assert_eq!(coordinator.range_count(), 1);
+        assert_eq!(range_request_observation_count(), 1);
+        let first = settle_started_task(first).await;
+        assert_eq!(range_request_observation_count(), 1);
+        let crate::range_retry::RangeAttemptTransportCompletion::Failed(disposition) =
+            operation.complete_chrome_settlement(&mut coordinator, first)
+        else {
+            panic!("scripted strict attempt must fail with matching ownership");
+        };
+
+        if should_retry {
+            assert_eq!(disposition, RangeAttemptCompletionDisposition::RetryPending);
+            let external_turn = issuer.turn();
+            let mut permit = coordinator
+                .project_retry_turn(&external_turn)
+                .expect("next external turn projects once");
+            let second = operation
+                .start_retry_on_turn(
+                    &mut coordinator,
+                    &mut permit,
+                    |controller, request| {
+                        prepare_strict_retry_probe(
+                            &scenario, request, &root, &range, &work, controller,
+                        )
+                    },
+                    |_controller, prepared, receipt| {
+                        assert_eq!(receipt.attempt().get(), 2);
+                        assert_eq!(receipt.metadata_opening_range(), 2);
+                        prepared.start(AlwaysAllowed, future::pending())
+                    },
+                )
+                .expect("strict retry starts on the next external turn");
+            assert_eq!(range_request_observation_count(), 2);
+            let second = settle_started_task(second).await;
+            assert_eq!(range_request_observation_count(), 2);
+            let crate::range_retry::RangeAttemptTransportCompletion::Failed(retry_disposition) =
+                operation.complete_chrome_settlement(&mut coordinator, second)
+            else {
+                panic!("scripted strict retry must fail with matching ownership");
+            };
+            assert_eq!(
+                retry_disposition,
+                RangeAttemptCompletionDisposition::RetryPending
+            );
+            assert!(finish_range_request_instrumentation("", true, 2));
+        } else {
+            assert_eq!(
+                disposition,
+                RangeAttemptCompletionDisposition::OpeningFailed(
+                    MetadataOpeningFailureSignal::NonRetryable(expected)
+                )
+            );
+            assert!(finish_range_request_instrumentation("", true, 1));
+        }
+        if status == 503 {
+            assert!(scenario.observed_cancellation().await);
+        }
+        scenario.remove().await;
+    }
+
+    async fn exercise_zero_burn_preparation_failure(
+        stage: Option<&str>,
+        expected: ChromeRangeError,
+    ) {
+        let scenario = Scenario::register("exact_strong", 0).await;
+        let mut overrides = vec![
+            (WebRemoteLimitKey::RangeRetryAttemptsPerOperation, 2),
+            (WebRemoteLimitKey::MetadataOpeningRangeRequests, 2),
+        ];
+        if stage.is_none() {
+            overrides.push((WebRemoteLimitKey::RequestedRangeBytes, 3));
+        }
+        let root = crate::remote_limits::tests::test_profile_with(&overrides)
+            .start_accounting_root()
+            .expect("preparation failure profile starts");
+        let viewer = root.create_viewer_scope().expect("viewer scope");
+        let source = viewer.create_source_scope().expect("source scope");
+        let session = source.create_session_scope().expect("session scope");
+        let range = session.create_range_response_scope().expect("range scope");
+        let work = range.create_work_unit_scope().expect("work scope");
+        let operation_scope = source.create_operation_scope().expect("operation scope");
+        let mut issuer =
+            crate::range_retry::test_execution_support::TestVisibleExecutionIssuer::new(1);
+        let binding = issuer.binding();
+        let live = RemoteRangeLiveIdentity::new(1_u64, 1_u64, 1_u64);
+        let mut coordinator = MetadataOpeningRetryCoordinator::new(&source, live.clone(), binding)
+            .expect("metadata coordinator");
+        let mut operation = RemoteRangeRetryOperation::new(
+            &operation_scope,
+            &range,
+            &work,
+            live,
+            ChromeRangeRequest::new(0..4).expect("exact test range"),
+            1_u64,
+            ChromeRangeAttemptAbortFactory,
+        )
+        .expect("retry operation");
+
+        begin_range_request_instrumentation();
+        if let Some(stage) = stage {
+            arm_range_preparation_failure(stage);
+        }
+        let result = operation.start_initial(
+            &mut coordinator,
+            binding,
+            |controller, request| {
+                prepare_strict_retry_probe(&scenario, request, &root, &range, &work, controller)
+            },
+            |_controller, _prepared, _receipt| {
+                panic!("Fetch boundary must remain disarmed after preparation failure")
+            },
+        );
+        let Err(crate::range_retry::RangeAttemptStartFailure::Request(
+            RangeAttemptStartError::OpeningFailed(MetadataOpeningFailureSignal::NonRetryable(
+                observed,
+            )),
+        )) = result
+        else {
+            panic!("preparation failure must be typed and request-local");
+        };
+        assert_eq!(observed, expected);
+        assert_eq!(operation.attempts_burned(), 0);
+        assert_eq!(coordinator.range_count(), 0);
+        assert_eq!(range_request_observation_count(), 0);
+        if stage.is_some() {
+            assert!(finish_range_preparation_failure());
+        }
+        assert!(finish_range_request_instrumentation("", true, 0));
+        // The preparation path must not consume a future external retry turn either.
+        let turn = issuer.turn();
+        let _permit = coordinator
+            .project_retry_turn(&turn)
+            .expect("zero-burn failure leaves the external turn unclaimed");
+        scenario.remove().await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn strict_preparation_failure_matrix_is_zero_burn_and_zero_fetch() {
+        if !is_chrome_range_runtime() {
+            return;
+        }
+        for stage in ["header", "request"] {
+            exercise_zero_burn_preparation_failure(
+                Some(stage),
+                ChromeRangeError::BrowserAdapterUnavailable,
+            )
+            .await;
+        }
+        exercise_zero_burn_preparation_failure(
+            None,
+            ChromeRangeError::BodyPump(
+                crate::chrome_byob::ExactLengthByobPumpError::ResourceLimitExceeded,
+            ),
+        )
+        .await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn strict_controlled_transport_drives_retry_classifier_and_burn_boundary() {
+        if !is_chrome_range_runtime() {
+            return;
+        }
+        for status in [429, 500, 502, 503, 504] {
+            exercise_strict_retry_scenario(
+                "status",
+                status,
+                ChromeRangeError::UnexpectedHttpStatus(status),
+                true,
+            )
+            .await;
+        }
+        for status in [501, 505] {
+            exercise_strict_retry_scenario(
+                "status",
+                status,
+                ChromeRangeError::UnexpectedHttpStatus(status),
+                false,
+            )
+            .await;
+        }
+        exercise_strict_retry_scenario(
+            "cors_reject",
+            0,
+            ChromeRangeError::BrowserFetchUnavailable,
+            true,
+        )
+        .await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn strict_success_then_injected_byob_read_failure_remains_nonretryable() {
+        if !is_chrome_range_runtime() {
+            return;
+        }
+        // The controlled fixture cannot force Chrome's BYOB reader promise to reject after a
+        // valid strict response. Drive one real production request first, then inject only the
+        // typed pump settlement at the retry-classifier boundary.
+        let scenario = Scenario::register("exact_strong", 0).await;
+        let root = crate::remote_limits::tests::test_profile_with(&[
+            (WebRemoteLimitKey::RangeRetryAttemptsPerOperation, 2),
+            (WebRemoteLimitKey::MetadataOpeningRangeRequests, 2),
+        ])
+        .start_accounting_root()
+        .expect("BYOB classifier profile starts");
+        let viewer = root.create_viewer_scope().expect("viewer scope");
+        let source = viewer.create_source_scope().expect("source scope");
+        let session = source.create_session_scope().expect("session scope");
+        let range = session.create_range_response_scope().expect("range scope");
+        let work = range.create_work_unit_scope().expect("work scope");
+        let operation_scope = source.create_operation_scope().expect("operation scope");
+        let mut issuer =
+            crate::range_retry::test_execution_support::TestVisibleExecutionIssuer::new(1);
+        let binding = issuer.binding();
+        let live = RemoteRangeLiveIdentity::new(1_u64, 1_u64, 1_u64);
+        let mut coordinator = MetadataOpeningRetryCoordinator::new(&source, live.clone(), binding)
+            .expect("metadata coordinator");
+        let mut operation = RemoteRangeRetryOperation::new(
+            &operation_scope,
+            &range,
+            &work,
+            live,
+            ChromeRangeRequest::new(0..4).expect("exact test range"),
+            1_u64,
+            ChromeRangeAttemptAbortFactory,
+        )
+        .expect("retry operation");
+
+        begin_range_request_instrumentation();
+        let started = operation
+            .start_initial(
+                &mut coordinator,
+                binding,
+                |controller, request| {
+                    prepare_strict_retry_probe(&scenario, request, &root, &range, &work, controller)
+                },
+                |_controller, prepared, receipt| {
+                    assert_eq!(receipt.attempt().get(), 1);
+                    assert_eq!(receipt.metadata_opening_range(), 1);
+                    let strict = prepared.start(AlwaysAllowed, future::pending());
+                    async move {
+                        let probed = strict.await?;
+                        drop(probed);
+                        Err::<super::ProbedChromeRangeBody, _>(ChromeRangeError::BodyPump(
+                            crate::chrome_byob::ExactLengthByobPumpError::ReadFailed,
+                        ))
+                    }
+                },
+            )
+            .expect("strict request starts");
+        assert_eq!(range_request_observation_count(), 1);
+        let settled = settle_started_task(started).await;
+        assert!(matches!(
+            operation.complete_chrome_settlement(&mut coordinator, settled),
+            crate::range_retry::RangeAttemptTransportCompletion::Failed(
+                RangeAttemptCompletionDisposition::OpeningFailed(
+                    MetadataOpeningFailureSignal::NonRetryable(ChromeRangeError::BodyPump(
+                        crate::chrome_byob::ExactLengthByobPumpError::ReadFailed,
+                    ))
+                )
+            )
+        ));
+        let turn = issuer.turn();
+        let mut permit = coordinator
+            .project_retry_turn(&turn)
+            .expect("future visible turn projects after terminal settlement");
+        assert!(matches!(
+            operation.start_retry_on_turn(
+                &mut coordinator,
+                &mut permit,
+                |_controller, _request| -> Result<super::PreparedChromeProbeRangeAttempt, _> {
+                    panic!("terminal BYOB failure must not prepare a retry")
+                },
+                |_controller, _prepared, _receipt| (),
+            ),
+            Err(crate::range_retry::RangeAttemptStartFailure::Request(
+                RangeAttemptStartError::Protocol(
+                    crate::range_retry::RetryProtocolError::OperationAlreadyTerminal
+                )
+            ))
+        ));
+        assert_eq!(operation.attempts_burned(), 1);
+        assert_eq!(coordinator.range_count(), 1);
+        assert!(finish_range_request_instrumentation("", true, 1));
+        scenario.remove().await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn strict_success_settles_with_output_and_controller_in_one_transition() {
+        if !is_chrome_range_runtime() {
+            return;
+        }
+        let scenario = Scenario::register("exact_strong", 0).await;
+        let root = crate::remote_limits::tests::test_profile_with(&[
+            (WebRemoteLimitKey::RangeRetryAttemptsPerOperation, 1),
+            (WebRemoteLimitKey::MetadataOpeningRangeRequests, 1),
+        ])
+        .start_accounting_root()
+        .expect("success settlement profile starts");
+        let viewer = root.create_viewer_scope().expect("viewer scope");
+        let source = viewer.create_source_scope().expect("source scope");
+        let session = source.create_session_scope().expect("session scope");
+        let range = session.create_range_response_scope().expect("range scope");
+        let work = range.create_work_unit_scope().expect("work scope");
+        let operation_scope = source.create_operation_scope().expect("operation scope");
+        let issuer = crate::range_retry::test_execution_support::TestVisibleExecutionIssuer::new(1);
+        let binding = issuer.binding();
+        let live = RemoteRangeLiveIdentity::new(1_u64, 1_u64, 1_u64);
+        let mut coordinator = MetadataOpeningRetryCoordinator::new(&source, live.clone(), binding)
+            .expect("metadata coordinator");
+        let mut operation = RemoteRangeRetryOperation::new(
+            &operation_scope,
+            &range,
+            &work,
+            live,
+            ChromeRangeRequest::new(0..4).expect("exact test range"),
+            1_u64,
+            ChromeRangeAttemptAbortFactory,
+        )
+        .expect("retry operation");
+
+        begin_range_request_instrumentation();
+        let started = operation
+            .start_initial(
+                &mut coordinator,
+                binding,
+                |controller, request| {
+                    prepare_strict_retry_probe(&scenario, request, &root, &range, &work, controller)
+                },
+                |_controller, prepared, receipt| {
+                    assert_eq!(receipt.attempt().get(), 1);
+                    assert_eq!(receipt.metadata_opening_range(), 1);
+                    prepared.start(AlwaysAllowed, future::pending())
+                },
+            )
+            .expect("strict success starts");
+        let settled = settle_started_task(started).await;
+        let crate::range_retry::RangeAttemptTransportCompletion::Succeeded(probed) =
+            operation.complete_chrome_settlement(&mut coordinator, settled)
+        else {
+            panic!("successful transport must atomically publish its output");
+        };
+        assert_eq!(probed.body().as_slice(), &[10, 11, 12, 13]);
+        assert_eq!(operation.attempts_burned(), 1);
+        assert_eq!(coordinator.range_count(), 1);
+        assert!(finish_range_request_instrumentation("", false, 1));
+        drop(probed);
+        scenario.remove().await;
     }
 
     #[wasm_bindgen_test]

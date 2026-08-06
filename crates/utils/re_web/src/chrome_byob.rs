@@ -308,8 +308,9 @@ mod web {
 
     use super::{ExactLengthPumpState, ExactOutputBuffer, PumpStateError, PumpStep};
     use crate::remote_limits::{
-        ActiveRangeBodyPumpReservation, RangeBodyPumpReservationSpec, RangeResponseAccountingScope,
-        ScopeAccountingError, WasmModuleLimitAccountingRoot, WorkUnitAccountingScope,
+        ActiveRangeBodyPumpReservation, RangeAttemptAccountingBinding,
+        RangeBodyPumpReservationSpec, RangeResponseAccountingScope, ScopeAccountingError,
+        WasmModuleLimitAccountingRoot, WorkUnitAccountingScope,
     };
 
     /// The exact requested range and fixed per-read scratch ceiling for one body pump.
@@ -440,6 +441,52 @@ mod web {
         pub(super) fn install_after_bytes_drop_probe(&mut self, probe: impl FnOnce() + 'static) {
             assert!(self.after_bytes_drop_probe.is_none());
             self.after_bytes_drop_probe = Some(Box::new(probe));
+        }
+    }
+
+    struct PreparedPumpResources {
+        // Field order is normative: bytes are released before their accounting permit.
+        output: Option<ExactOutputBuffer>,
+        reservation: Option<ActiveRangeBodyPumpReservation>,
+    }
+
+    impl PreparedPumpResources {
+        fn output_mut(&mut self) -> &mut ExactOutputBuffer {
+            self.output
+                .as_mut()
+                .expect("prepared body pump owns exact output")
+        }
+
+        fn into_body(mut self) -> ExactLengthRangeBody {
+            ExactLengthRangeBody {
+                bytes: self.output.take(),
+                reservation: self.reservation.take(),
+                #[cfg(test)]
+                after_bytes_drop_probe: None,
+            }
+        }
+    }
+
+    /// Non-cloneable, fully fallible pre-Fetch preparation for one exact-length body pump.
+    pub(crate) struct PreparedExactLengthRangeBodyPump {
+        config: ExactLengthByobPumpConfig,
+        resources: PreparedPumpResources,
+        scratch_constructor: Uint8ArrayConstructor,
+        accounting: RangeAttemptAccountingBinding,
+    }
+
+    impl fmt::Debug for PreparedExactLengthRangeBodyPump {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("PreparedExactLengthRangeBodyPump")
+                .field("config", &self.config)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl PreparedExactLengthRangeBodyPump {
+        pub(crate) const fn accounting_binding(&self) -> RangeAttemptAccountingBinding {
+            self.accounting
         }
     }
 
@@ -671,6 +718,45 @@ mod web {
         }
     }
 
+    /// Reserves accounting, allocates exact output, and resolves browser constructors before a
+    /// physical Fetch-attempt burn can commit.
+    pub(crate) fn prepare_exact_range_body_pump(
+        root: &WasmModuleLimitAccountingRoot,
+        range_scope: &RangeResponseAccountingScope,
+        work_scope: &WorkUnitAccountingScope,
+        config: ExactLengthByobPumpConfig,
+    ) -> Result<PreparedExactLengthRangeBodyPump, ExactLengthByobPumpError> {
+        let expected_bytes = config.expected_bytes();
+        let expected_len = usize::try_from(expected_bytes.get())
+            .map_err(|_error| ExactLengthByobPumpError::InvalidConfiguration)?;
+        let accounting = range_scope
+            .range_attempt_accounting_binding(work_scope)
+            .map_err(map_accounting_error)?;
+        let reservation = range_scope
+            .prepare_body_pump_reservation(
+                root,
+                work_scope,
+                RangeBodyPumpReservationSpec {
+                    output_bytes: expected_bytes,
+                    scratch_bytes: config.pump_slice_bytes(),
+                },
+            )
+            .and_then(|prepared| prepared.commit())
+            .map_err(map_accounting_error)?;
+        let output = ExactOutputBuffer::try_new_zeroed(expected_len)
+            .map_err(|_allocation_error| ExactLengthByobPumpError::AllocationFailed)?;
+        let scratch_constructor = Uint8ArrayConstructor::from_global()?;
+        Ok(PreparedExactLengthRangeBodyPump {
+            config,
+            resources: PreparedPumpResources {
+                output: Some(output),
+                reservation: Some(reservation),
+            },
+            scratch_constructor,
+            accounting,
+        })
+    }
+
     /// Reads one already-validated `206` response body into an exact Wasm-owned buffer.
     ///
     /// `timeout` must use the caller's active-visible deadline rather than raw hidden-page wall
@@ -689,21 +775,8 @@ mod web {
         T: Future<Output = ()>,
         C: ExactLengthByobPumpControl,
     {
-        let expected_bytes = config.expected_bytes();
-        let expected_len = usize::try_from(expected_bytes.get())
-            .map_err(|_error| ExactLengthByobPumpError::InvalidConfiguration)?;
-        let reservation = range_scope
-            .prepare_body_pump_reservation(
-                root,
-                work_scope,
-                RangeBodyPumpReservationSpec {
-                    output_bytes: expected_bytes,
-                    scratch_bytes: config.pump_slice_bytes(),
-                },
-            )
-            .and_then(|prepared| prepared.commit())
-            .map_err(map_accounting_error);
-        let reservation = match reservation {
+        let prepared = prepare_exact_range_body_pump(root, range_scope, work_scope, config);
+        let prepared = match prepared {
             Ok(reservation) => reservation,
             Err(error) => {
                 abort_controller.abort();
@@ -711,17 +784,37 @@ mod web {
             }
         };
 
-        let mut cleanup = ReaderCleanup::new(abort_controller);
-        let mut output = ExactOutputBuffer::try_new_zeroed(expected_len)
-            .map_err(|_allocation_error| ExactLengthByobPumpError::AllocationFailed)?;
+        read_exact_range_body_prepared(response, abort_controller, prepared, control, timeout).await
+    }
 
+    /// Pumps a response using a capability whose accounting, exact output allocation, and browser
+    /// constructor lookup all completed before Fetch started.
+    pub(crate) async fn read_exact_range_body_prepared<T, C>(
+        response: &web_sys::Response,
+        abort_controller: &web_sys::AbortController,
+        prepared: PreparedExactLengthRangeBodyPump,
+        control: &mut C,
+        timeout: T,
+    ) -> Result<ExactLengthRangeBody, ExactLengthByobPumpError>
+    where
+        T: Future<Output = ()>,
+        C: ExactLengthByobPumpControl,
+    {
+        let PreparedExactLengthRangeBodyPump {
+            config,
+            mut resources,
+            scratch_constructor,
+            accounting: _,
+        } = prepared;
+        let expected_bytes = config.expected_bytes();
+
+        let mut cleanup = ReaderCleanup::new(abort_controller);
         let stream = response
             .body()
             .ok_or(ExactLengthByobPumpError::BrowserFetchUnavailable)?;
         let reader = web_sys::ReadableStreamByobReader::new(&stream)
             .map_err(|_error| ExactLengthByobPumpError::BrowserFetchUnavailable)?;
         cleanup.install_reader(reader);
-        let scratch_constructor = Uint8ArrayConstructor::from_global()?;
         let mut state = ExactLengthPumpState::new(expected_bytes);
         pin_mut!(timeout);
 
@@ -749,7 +842,8 @@ mod web {
                     let end = offset
                         .checked_add(len)
                         .ok_or(ExactLengthByobPumpError::InvalidByobReadResult)?;
-                    let destination = output
+                    let destination = resources
+                        .output_mut()
                         .as_mut_slice()
                         .get_mut(offset..end)
                         .ok_or(ExactLengthByobPumpError::InvalidByobReadResult)?;
@@ -761,12 +855,7 @@ mod web {
                 }
                 PumpStep::Complete => {
                     cleanup.release_lock()?;
-                    return Ok(ExactLengthRangeBody {
-                        bytes: Some(output),
-                        reservation: Some(reservation),
-                        #[cfg(test)]
-                        after_bytes_drop_probe: None,
-                    });
+                    return Ok(resources.into_body());
                 }
             }
         }

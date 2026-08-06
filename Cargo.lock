@@ -11177,6 +11177,7 @@ dependencies = [
  "futures",
  "getrandom 0.3.4",
  "js-sys",
+ "pin-project-lite",
  "re_async",
  "re_log_types",
  "re_string_interner",

@@ -15,6 +15,9 @@ version.workspace = true
 [lints]
 workspace = true
 
+[dependencies]
+pin-project-lite.workspace = true
+
 [package.metadata.docs.rs]
 all-features = true
 targets = ["wasm32-unknown-unknown"]
