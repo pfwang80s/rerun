@@ -175,6 +175,24 @@ pub(crate) enum IndexConsistencyViolation {
     MessageIndexResultRetainedByteLimitExceeded,
     MessageIndexResultReservationLimitExceeded,
     MessageIndexResultAllocationFailed,
+    AmbiguousZeroChunkLimitExceeded,
+    AmbiguousZeroMessageIndexShapeInvalid,
+    AmbiguousZeroMessageIndexByteLimitExceeded,
+    AmbiguousZeroEntryUpperLimitExceeded,
+    AmbiguousZeroMessageIndexRangeLimitExceeded,
+    AmbiguousZeroRetainedByteLimitExceeded,
+    AmbiguousZeroStage1ReservationLimitExceeded,
+    AmbiguousZeroStage1AllocationFailed,
+    AmbiguousZeroIndexTimeMismatch,
+    AmbiguousZeroObservedEntryUpperExceeded,
+    AmbiguousZeroUnresolvedChunkLimitExceeded,
+    AmbiguousZeroChunkRangeByteLimitExceeded,
+    AmbiguousZeroCompressedByteLimitExceeded,
+    AmbiguousZeroUncompressedByteLimitExceeded,
+    AmbiguousZeroChunkRangeLimitExceeded,
+    AmbiguousZeroScanByteLimitExceeded,
+    AmbiguousZeroScanRecordLimitExceeded,
+    AmbiguousZeroStage2ReservationLimitExceeded,
 }
 
 impl std::fmt::Display for IndexConsistencyViolation {
@@ -270,6 +288,60 @@ impl std::fmt::Display for IndexConsistencyViolation {
             Self::MessageIndexResultAllocationFailed => {
                 "remote MCAP MessageIndex parsed-result allocation failed"
             }
+            Self::AmbiguousZeroChunkLimitExceeded => {
+                "remote MCAP ambiguous-zero Chunk count exceeds its limit"
+            }
+            Self::AmbiguousZeroMessageIndexShapeInvalid => {
+                "remote MCAP ambiguous-zero MessageIndex region cannot contain its declared records"
+            }
+            Self::AmbiguousZeroMessageIndexByteLimitExceeded => {
+                "remote MCAP ambiguous-zero MessageIndex bytes exceed their opening limit"
+            }
+            Self::AmbiguousZeroEntryUpperLimitExceeded => {
+                "remote MCAP ambiguous-zero MessageIndex entry upper bound exceeds its opening limit"
+            }
+            Self::AmbiguousZeroMessageIndexRangeLimitExceeded => {
+                "remote MCAP ambiguous-zero MessageIndex Range count exceeds its opening limit"
+            }
+            Self::AmbiguousZeroRetainedByteLimitExceeded => {
+                "remote MCAP ambiguous-zero classification retention exceeds its opening limit"
+            }
+            Self::AmbiguousZeroStage1ReservationLimitExceeded => {
+                "remote MCAP ambiguous-zero first-stage reservation exceeds its capacity"
+            }
+            Self::AmbiguousZeroStage1AllocationFailed => {
+                "remote MCAP ambiguous-zero first-stage allocation failed"
+            }
+            Self::AmbiguousZeroIndexTimeMismatch => {
+                "remote MCAP ambiguous-zero MessageIndex contains a nonzero time"
+            }
+            Self::AmbiguousZeroObservedEntryUpperExceeded => {
+                "remote MCAP ambiguous-zero MessageIndex exceeds its reserved entry upper bound"
+            }
+            Self::AmbiguousZeroUnresolvedChunkLimitExceeded => {
+                "remote MCAP ambiguous-zero unresolved Chunk count exceeds its limit"
+            }
+            Self::AmbiguousZeroChunkRangeByteLimitExceeded => {
+                "remote MCAP ambiguous-zero Chunk Range bytes exceed their opening limit"
+            }
+            Self::AmbiguousZeroCompressedByteLimitExceeded => {
+                "remote MCAP ambiguous-zero compressed bytes exceed their opening limit"
+            }
+            Self::AmbiguousZeroUncompressedByteLimitExceeded => {
+                "remote MCAP ambiguous-zero uncompressed bytes exceed their opening limit"
+            }
+            Self::AmbiguousZeroChunkRangeLimitExceeded => {
+                "remote MCAP ambiguous-zero Chunk Range count exceeds its opening limit"
+            }
+            Self::AmbiguousZeroScanByteLimitExceeded => {
+                "remote MCAP ambiguous-zero scan bytes exceed their opening limit"
+            }
+            Self::AmbiguousZeroScanRecordLimitExceeded => {
+                "remote MCAP ambiguous-zero scan record upper bound exceeds its opening limit"
+            }
+            Self::AmbiguousZeroStage2ReservationLimitExceeded => {
+                "remote MCAP ambiguous-zero second-stage reservation exceeds its capacity"
+            }
         })
     }
 }
@@ -331,6 +403,20 @@ impl<'a> ValidatedPhysicalRegions<'a> {
             message_index_region: unit.message_index_region.clone(),
             unit_range: unit.unit_range.clone(),
         })
+    }
+
+    pub(crate) fn region(&self, canonical_ordinal: usize) -> Option<CanonicalPhysicalRegion<'_>> {
+        self.units
+            .get(canonical_ordinal)
+            .map(|unit| CanonicalPhysicalRegion {
+                raw_descriptor: descriptor_at(
+                    self.definitions.materialized().records(),
+                    unit.source_record_index,
+                ),
+                chunk_range: unit.chunk_range.clone(),
+                message_index_region: unit.message_index_region.clone(),
+                unit_range: unit.unit_range.clone(),
+            })
     }
 }
 

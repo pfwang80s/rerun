@@ -68,18 +68,26 @@ impl std::fmt::Debug for MessageIndexRegionBudget {
 }
 
 impl MessageIndexRegionBudget {
+    pub(crate) fn bind(&self) -> MessageIndexRegionBudgetBinding {
+        MessageIndexRegionBudgetBinding {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl MessageIndexRegionBudgetState {
     fn try_reserve_raw(
-        &self,
+        self: &Arc<Self>,
         raw_input_bytes: u64,
     ) -> Result<MessageIndexRawReservation, IndexConsistencyViolation> {
-        let mut usage = self.state.usage.lock();
+        let mut usage = self.usage.lock();
         let next = MessageIndexRegionBudgetUsage {
             active_raw_inputs: checked_add(usage.active_raw_inputs, 1)?,
             raw_input_bytes: checked_add(usage.raw_input_bytes, raw_input_bytes)?,
             ..*usage
         };
-        if next.active_raw_inputs > self.state.capacity.max_active_raw_inputs
-            || next.raw_input_bytes > self.state.capacity.max_raw_input_bytes
+        if next.active_raw_inputs > self.capacity.max_active_raw_inputs
+            || next.raw_input_bytes > self.capacity.max_raw_input_bytes
         {
             return Err(IndexConsistencyViolation::MessageIndexRawReservationLimitExceeded);
         }
@@ -87,13 +95,11 @@ impl MessageIndexRegionBudget {
         drop(usage);
 
         Ok(MessageIndexRawReservation {
-            state: Arc::clone(&self.state),
+            state: Arc::clone(self),
             raw_input_bytes,
         })
     }
-}
 
-impl MessageIndexRegionBudgetState {
     fn try_reserve_result(
         self: &Arc<Self>,
         census: MessageIndexRegionCensus,
@@ -121,6 +127,11 @@ impl MessageIndexRegionBudgetState {
             census,
         })
     }
+}
+
+/// Move-only binding to the exact parser-budget profile selected before a multi-region flow.
+pub(crate) struct MessageIndexRegionBudgetBinding {
+    state: Arc<MessageIndexRegionBudgetState>,
 }
 
 /// Move-only ownership of one exact queued raw-region claim.
@@ -205,6 +216,10 @@ impl std::fmt::Debug for PreparedMessageIndexRegionParse<'_> {
 }
 
 impl<'a> PreparedMessageIndexRegionParse<'a> {
+    pub(crate) fn expected_range(&self) -> Range<u64> {
+        self.expected_range.clone()
+    }
+
     /// Installs a stable backing owner without copying its bytes.
     pub(crate) fn install_raw(
         self,
@@ -414,16 +429,31 @@ pub(crate) fn prepare_message_index_region<'a>(
     canonical_ordinal: usize,
     budget: &MessageIndexRegionBudget,
 ) -> Result<PreparedMessageIndexRegionParse<'a>, IndexConsistencyViolation> {
+    prepare_message_index_region_with_state(physical, canonical_ordinal, &budget.state)
+}
+
+pub(crate) fn prepare_message_index_region_with_binding<'a>(
+    physical: ValidatedPhysicalRegions<'a>,
+    canonical_ordinal: usize,
+    binding: &MessageIndexRegionBudgetBinding,
+) -> Result<PreparedMessageIndexRegionParse<'a>, IndexConsistencyViolation> {
+    prepare_message_index_region_with_state(physical, canonical_ordinal, &binding.state)
+}
+
+fn prepare_message_index_region_with_state<'a>(
+    physical: ValidatedPhysicalRegions<'a>,
+    canonical_ordinal: usize,
+    budget_state: &Arc<MessageIndexRegionBudgetState>,
+) -> Result<PreparedMessageIndexRegionParse<'a>, IndexConsistencyViolation> {
     let expected_range = physical
-        .regions()
-        .nth(canonical_ordinal)
+        .region(canonical_ordinal)
         .ok_or(IndexConsistencyViolation::UnknownCanonicalRegion)?
         .message_index_region();
     let raw_bytes = expected_range
         .end
         .checked_sub(expected_range.start)
         .ok_or(IndexConsistencyViolation::ArithmeticOverflow)?;
-    let raw_reservation = budget.try_reserve_raw(raw_bytes)?;
+    let raw_reservation = budget_state.try_reserve_raw(raw_bytes)?;
 
     Ok(PreparedMessageIndexRegionParse {
         physical,
@@ -438,8 +468,7 @@ fn descriptor_for<'physical>(
     canonical_ordinal: usize,
 ) -> Result<&'physical mcap::records::ChunkIndex, IndexConsistencyViolation> {
     physical
-        .regions()
-        .nth(canonical_ordinal)
+        .region(canonical_ordinal)
         .map(|region| region.raw_descriptor())
         .ok_or(IndexConsistencyViolation::UnknownCanonicalRegion)
 }

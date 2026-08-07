@@ -11,6 +11,7 @@
 
 use crate::remote_fixed_layout::{RemoteMcapSlice, ValidatedFixedLayout};
 
+mod ambiguous_zero;
 mod definitions;
 mod materialization;
 mod message_index;
@@ -469,6 +470,10 @@ mod tests {
     use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet};
 
+    use super::ambiguous_zero::{
+        AmbiguousZeroBudget, AmbiguousZeroLimits, AmbiguousZeroStage1, AmbiguousZeroStage1Turn,
+        PreparedAmbiguousZeroBodyPlan, prepare_ambiguous_zero_stage1,
+    };
     use super::definitions::{
         ChunkDefinitionAccumulator, ChunkDefinitionEvent, DefinitionConsistencyError,
         NonDefinitionChunkRecord, ValidatedSummaryDefinitions, validate_summary_definitions,
@@ -492,7 +497,7 @@ mod tests {
     use crate::testing::{
         AdversarialMcapFixture, AdversarialMcapFixtureBuilder, CompressionFixture,
         FixtureCardinality, FixtureChannel, FixtureChunk, FixtureCrc, FixtureMessage,
-        MessageIndexFault, PhysicalLayoutFault,
+        MessageIndexFault, PhysicalLayoutFault, RawTimeRange,
     };
 
     struct TrackingAllocator;
@@ -958,6 +963,47 @@ mod tests {
 
     fn generous_message_index_budget() -> MessageIndexRegionBudget {
         message_index_budget(generous_message_index_limits())
+    }
+
+    fn generous_ambiguous_zero_limits() -> AmbiguousZeroLimits {
+        AmbiguousZeroLimits::for_test(
+            [1_000, 10_000_000, 1_000_000, 1_000, 1_000_000],
+            [
+                1_000,
+                100_000_000,
+                100_000_000,
+                100_000_000,
+                1_000,
+                100_000_000,
+                10_000_000,
+            ],
+        )
+    }
+
+    fn ambiguous_zero_budget(limits: AmbiguousZeroLimits) -> AmbiguousZeroBudget {
+        AmbiguousZeroBudget::for_test(limits, 1_000, 1_000, 1_000)
+    }
+
+    fn drive_ambiguous_zero_stage1<'fixture>(
+        fixture: &'fixture AdversarialMcapFixture,
+        mut stage1: AmbiguousZeroStage1<'fixture>,
+    ) -> Result<PreparedAmbiguousZeroBodyPlan<'fixture>, IndexConsistencyViolation> {
+        loop {
+            match stage1.next()? {
+                AmbiguousZeroStage1Turn::MessageIndex(prepared) => {
+                    let range = prepared.expected_range();
+                    let start = usize::try_from(range.start).unwrap();
+                    let end = usize::try_from(range.end).unwrap();
+                    stage1 = prepared
+                        .install_raw(
+                            range.start,
+                            fixture.bytes[start..end].to_vec().into_boxed_slice(),
+                        )?
+                        .execute()?;
+                }
+                AmbiguousZeroStage1Turn::BodyPlan(plan) => return Ok(plan),
+            }
+        }
     }
 
     fn validate_fixture_physical(
@@ -3899,6 +3945,432 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_zero_index_nonempty_is_raw_zero_and_never_enters_the_body_plan() {
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_channels([
+                FixtureChannel::schema_less(1, "/one"),
+                FixtureChannel::schema_less(2, "/two"),
+            ])
+            .with_chunks([
+                FixtureChunk::single(FixtureMessage::new(1, 0, 0)),
+                FixtureChunk::empty(),
+                FixtureChunk::single(FixtureMessage::new(2, 1, 0)),
+                FixtureChunk::single(FixtureMessage::new(1, 2, 10)),
+            ])
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+        let (physical, materialization_budget, physical_budget) =
+            validate_fixture_physical(&fixture);
+        let physical = physical.unwrap();
+        let retained_summary = physical
+            .definitions()
+            .materialized()
+            .prepared()
+            .fixed_layout()
+            .summary_bytes()
+            .as_ptr();
+        let expected_index_ranges: Vec<_> = physical
+            .regions()
+            .enumerate()
+            .filter(|(ordinal, _region)| matches!(ordinal, 0 | 2))
+            .map(|(_ordinal, region)| region.message_index_region())
+            .collect();
+        let budget = ambiguous_zero_budget(generous_ambiguous_zero_limits());
+        let message_index_budget = generous_message_index_budget();
+        let stage1 =
+            prepare_ambiguous_zero_stage1(physical, &budget, &message_index_budget).unwrap();
+        assert_eq!(budget.usage_for_test()[0], 1);
+
+        let AmbiguousZeroStage1Turn::MessageIndex(first) = stage1.next().unwrap() else {
+            panic!("the first nonempty index must be one work unit");
+        };
+        assert_eq!(first.expected_range(), expected_index_ranges[0]);
+        let first_range = first.expected_range();
+        let first_start = usize::try_from(first_range.start).unwrap();
+        let first_end = usize::try_from(first_range.end).unwrap();
+        let stage1 = first
+            .install_raw(
+                first_range.start,
+                fixture.bytes[first_start..first_end]
+                    .to_vec()
+                    .into_boxed_slice(),
+            )
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(message_index_budget.usage_for_test(), (0, 0, 0, 0, 0, 0));
+
+        let AmbiguousZeroStage1Turn::MessageIndex(second) = stage1.next().unwrap() else {
+            panic!("the second nonempty index must be a later work unit");
+        };
+        assert_eq!(second.expected_range(), expected_index_ranges[1]);
+        let second_range = second.expected_range();
+        let second_start = usize::try_from(second_range.start).unwrap();
+        let second_end = usize::try_from(second_range.end).unwrap();
+        let stage1 = second
+            .install_raw(
+                second_range.start,
+                fixture.bytes[second_start..second_end]
+                    .to_vec()
+                    .into_boxed_slice(),
+            )
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(message_index_budget.usage_for_test(), (0, 0, 0, 0, 0, 0));
+
+        let AmbiguousZeroStage1Turn::BodyPlan(plan) = stage1.next().unwrap() else {
+            panic!("all index work must finish before the body plan exists");
+        };
+        assert_eq!(
+            plan.index_nonempty_zero_ordinals().collect::<Vec<_>>(),
+            [0, 2]
+        );
+        assert!(
+            plan.index_nonempty_zero()
+                .all(|resolution| resolution.raw_time_extent() == (0..=0))
+        );
+        let requests: Vec<_> = plan.unresolved_chunks().collect();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].canonical_ordinal(), 1);
+        assert!(!requests[0].chunk_range().is_empty());
+        assert_eq!(requests[0].compression(), "");
+        assert_eq!(
+            requests[0].compressed_size(),
+            requests[0].uncompressed_size()
+        );
+        assert_eq!(plan.index_nonempty_zero_count(), 2);
+        assert_eq!(plan.unresolved_count(), 1);
+        assert_eq!(plan.reservation_census_for_test().0[0], 3);
+        assert_eq!(plan.reservation_census_for_test().0[3], 2);
+        assert_eq!(plan.reservation_census_for_test().1[0], 1);
+        assert_eq!(plan.reservation_census_for_test().1[4], 1);
+        assert_eq!(
+            plan.physical()
+                .definitions()
+                .materialized()
+                .prepared()
+                .fixed_layout()
+                .summary_bytes()
+                .as_ptr(),
+            retained_summary
+        );
+        drop(requests);
+        drop(plan);
+        assert_eq!(budget.usage_for_test(), [0; 14]);
+        assert_eq!(message_index_budget.usage_for_test(), (0, 0, 0, 0, 0, 0));
+        assert_eq!(
+            materialization_budget.usage_for_test(),
+            (0, NestedPreflightCensus::default())
+        );
+        assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+    }
+
+    #[test]
+    fn ambiguous_zero_nonzero_index_time_rejects_the_entire_evidence_chain() {
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_chunks([FixtureChunk::single(FixtureMessage::new(1, 0, 9))
+                .with_index_range(RawTimeRange::new(0, 0))])
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+        let (physical, materialization_budget, physical_budget) =
+            validate_fixture_physical(&fixture);
+        let budget = ambiguous_zero_budget(generous_ambiguous_zero_limits());
+        let message_index_budget = generous_message_index_budget();
+        let stage1 =
+            prepare_ambiguous_zero_stage1(physical.unwrap(), &budget, &message_index_budget)
+                .unwrap();
+        assert_eq!(
+            drive_ambiguous_zero_stage1(&fixture, stage1).unwrap_err(),
+            IndexConsistencyViolation::AmbiguousZeroIndexTimeMismatch
+        );
+        assert_eq!(budget.usage_for_test(), [0; 14]);
+        assert_eq!(message_index_budget.usage_for_test(), (0, 0, 0, 0, 0, 0));
+        assert_eq!(
+            materialization_budget.usage_for_test(),
+            (0, NestedPreflightCensus::default())
+        );
+        assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+    }
+
+    #[test]
+    fn ambiguous_zero_entry_upper_covers_eventually_rejected_index_shapes() {
+        let base = AdversarialMcapFixtureBuilder::new()
+            .with_channels([
+                FixtureChannel::schema_less(1, "/one"),
+                FixtureChannel::schema_less(2, "/two"),
+            ])
+            .with_chunks([FixtureChunk::new([
+                FixtureMessage::new(1, 0, 0),
+                FixtureMessage::new(1, 1, 0),
+            ])])
+            .with_summary_crc(FixtureCrc::Zero)
+            .with_summary_offsets(false)
+            .build()
+            .unwrap();
+        let mut descriptor = fixture_chunk_index(&base.layout.chunk_indexes[0]);
+        let actual_record_start = descriptor.message_index_offsets[&1];
+        descriptor
+            .message_index_offsets
+            .insert(2, actual_record_start + 1);
+        let fixture = fixture_with_chunk_indexes(base, &[descriptor]);
+        let (physical, materialization_budget, physical_budget) =
+            validate_fixture_physical(&fixture);
+        let budget = ambiguous_zero_budget(generous_ambiguous_zero_limits());
+        let message_index_budget = generous_message_index_budget();
+        let stage1 =
+            prepare_ambiguous_zero_stage1(physical.unwrap(), &budget, &message_index_budget)
+                .unwrap();
+        assert!(budget.usage_for_test()[3] >= 2);
+        let AmbiguousZeroStage1Turn::MessageIndex(prepared) = stage1.next().unwrap() else {
+            panic!("the malformed nonempty region still requires one bounded parser work unit");
+        };
+        let range = prepared.expected_range();
+        let start = usize::try_from(range.start).unwrap();
+        let end = usize::try_from(range.end).unwrap();
+        assert_eq!(
+            prepared
+                .install_raw(
+                    range.start,
+                    fixture.bytes[start..end].to_vec().into_boxed_slice(),
+                )
+                .unwrap()
+                .execute()
+                .unwrap_err(),
+            IndexConsistencyViolation::MessageIndexMappingMismatch
+        );
+        assert_eq!(budget.usage_for_test(), [0; 14]);
+        assert_eq!(message_index_budget.usage_for_test(), (0, 0, 0, 0, 0, 0));
+        assert_eq!(
+            materialization_budget.usage_for_test(),
+            (0, NestedPreflightCensus::default())
+        );
+        assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+    }
+
+    #[test]
+    fn ambiguous_zero_stage1_aggregates_before_any_message_index_claim() {
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_chunks([
+                FixtureChunk::single(FixtureMessage::new(1, 0, 0)),
+                FixtureChunk::single(FixtureMessage::new(1, 1, 0)),
+            ])
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+        let (physical, materialization_budget, physical_budget) =
+            validate_fixture_physical(&fixture);
+        let probe_budget = ambiguous_zero_budget(generous_ambiguous_zero_limits());
+        let probe_message_index_budget = generous_message_index_budget();
+        let probe = prepare_ambiguous_zero_stage1(
+            physical.unwrap(),
+            &probe_budget,
+            &probe_message_index_budget,
+        )
+        .unwrap();
+        let usage = probe_budget.usage_for_test();
+        let exact_stage1 = [usage[1], usage[2], usage[3], usage[4], usage[5]];
+        assert!(exact_stage1.iter().all(|value| *value > 0));
+        assert_eq!(
+            probe_message_index_budget.usage_for_test(),
+            (0, 0, 0, 0, 0, 0)
+        );
+        drop(probe);
+        assert_eq!(probe_budget.usage_for_test(), [0; 14]);
+        assert_eq!(
+            materialization_budget.usage_for_test(),
+            (0, NestedPreflightCensus::default())
+        );
+        assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+
+        let expected = [
+            IndexConsistencyViolation::AmbiguousZeroChunkLimitExceeded,
+            IndexConsistencyViolation::AmbiguousZeroMessageIndexByteLimitExceeded,
+            IndexConsistencyViolation::AmbiguousZeroEntryUpperLimitExceeded,
+            IndexConsistencyViolation::AmbiguousZeroMessageIndexRangeLimitExceeded,
+            IndexConsistencyViolation::AmbiguousZeroRetainedByteLimitExceeded,
+        ];
+        for index in 0..exact_stage1.len() {
+            let mut rejected_stage1 = exact_stage1;
+            rejected_stage1[index] -= 1;
+            let limits = AmbiguousZeroLimits::for_test(
+                rejected_stage1,
+                [
+                    1_000,
+                    100_000_000,
+                    100_000_000,
+                    100_000_000,
+                    1_000,
+                    100_000_000,
+                    10_000_000,
+                ],
+            );
+            let budget = ambiguous_zero_budget(limits);
+            let message_index_budget = generous_message_index_budget();
+            let (physical, materialization_budget, physical_budget) =
+                validate_fixture_physical(&fixture);
+            assert_eq!(
+                prepare_ambiguous_zero_stage1(physical.unwrap(), &budget, &message_index_budget,)
+                    .unwrap_err(),
+                expected[index]
+            );
+            assert_eq!(budget.usage_for_test(), [0; 14]);
+            assert_eq!(message_index_budget.usage_for_test(), (0, 0, 0, 0, 0, 0));
+            assert_eq!(
+                materialization_budget.usage_for_test(),
+                (0, NestedPreflightCensus::default())
+            );
+            assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+        }
+
+        let limits = AmbiguousZeroLimits::for_test(
+            exact_stage1,
+            [
+                1_000,
+                100_000_000,
+                100_000_000,
+                100_000_000,
+                1_000,
+                100_000_000,
+                10_000_000,
+            ],
+        );
+        let contention = AmbiguousZeroBudget::for_test(limits, 2, 2, 1);
+        let first_message_index_budget = generous_message_index_budget();
+        let (first, first_materialization, first_physical) = validate_fixture_physical(&fixture);
+        let first =
+            prepare_ambiguous_zero_stage1(first.unwrap(), &contention, &first_message_index_budget)
+                .unwrap();
+        let first_usage = contention.usage_for_test();
+        let second_message_index_budget = generous_message_index_budget();
+        let (second, second_materialization, second_physical) = validate_fixture_physical(&fixture);
+        assert_eq!(
+            prepare_ambiguous_zero_stage1(
+                second.unwrap(),
+                &contention,
+                &second_message_index_budget,
+            )
+            .unwrap_err(),
+            IndexConsistencyViolation::AmbiguousZeroStage1ReservationLimitExceeded
+        );
+        assert_eq!(contention.usage_for_test(), first_usage);
+        drop(first);
+        assert_eq!(contention.usage_for_test(), [0; 14]);
+        for budget in [first_materialization, second_materialization] {
+            assert_eq!(
+                budget.usage_for_test(),
+                (0, NestedPreflightCensus::default())
+            );
+        }
+        assert_eq!(first_physical.usage_for_test(), (0, 0, 0));
+        assert_eq!(second_physical.usage_for_test(), (0, 0, 0));
+    }
+
+    #[test]
+    fn ambiguous_zero_stage2_aggregates_only_unresolved_chunks_before_body_authority() {
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_chunks([FixtureChunk::empty(), FixtureChunk::empty()])
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+        let (physical, materialization_budget, physical_budget) =
+            validate_fixture_physical(&fixture);
+        let probe_budget = ambiguous_zero_budget(generous_ambiguous_zero_limits());
+        let probe_message_index_budget = generous_message_index_budget();
+        let probe = drive_ambiguous_zero_stage1(
+            &fixture,
+            prepare_ambiguous_zero_stage1(
+                physical.unwrap(),
+                &probe_budget,
+                &probe_message_index_budget,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let (exact_stage1, exact_stage2) = probe.reservation_census_for_test();
+        assert!(exact_stage1[0] > 0);
+        assert!(exact_stage1[4] > 0);
+        assert!(exact_stage2.iter().all(|value| *value > 0));
+        assert_eq!(probe.index_nonempty_zero_count(), 0);
+        assert_eq!(probe.unresolved_count(), 2);
+        drop(probe);
+        assert_eq!(probe_budget.usage_for_test(), [0; 14]);
+        assert_eq!(
+            materialization_budget.usage_for_test(),
+            (0, NestedPreflightCensus::default())
+        );
+        assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+
+        let expected = [
+            IndexConsistencyViolation::AmbiguousZeroUnresolvedChunkLimitExceeded,
+            IndexConsistencyViolation::AmbiguousZeroChunkRangeByteLimitExceeded,
+            IndexConsistencyViolation::AmbiguousZeroCompressedByteLimitExceeded,
+            IndexConsistencyViolation::AmbiguousZeroUncompressedByteLimitExceeded,
+            IndexConsistencyViolation::AmbiguousZeroChunkRangeLimitExceeded,
+            IndexConsistencyViolation::AmbiguousZeroScanByteLimitExceeded,
+            IndexConsistencyViolation::AmbiguousZeroScanRecordLimitExceeded,
+        ];
+        for index in 0..exact_stage2.len() {
+            let mut rejected_stage2 = exact_stage2;
+            rejected_stage2[index] -= 1;
+            let limits = AmbiguousZeroLimits::for_test(exact_stage1, rejected_stage2);
+            let budget = ambiguous_zero_budget(limits);
+            let message_index_budget = generous_message_index_budget();
+            let (physical, materialization_budget, physical_budget) =
+                validate_fixture_physical(&fixture);
+            let stage1 =
+                prepare_ambiguous_zero_stage1(physical.unwrap(), &budget, &message_index_budget)
+                    .unwrap();
+            assert_eq!(stage1.next().unwrap_err(), expected[index]);
+            assert_eq!(budget.usage_for_test(), [0; 14]);
+            assert_eq!(message_index_budget.usage_for_test(), (0, 0, 0, 0, 0, 0));
+            assert_eq!(
+                materialization_budget.usage_for_test(),
+                (0, NestedPreflightCensus::default())
+            );
+            assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+        }
+
+        let doubled_stage1 = exact_stage1.map(|value| value.checked_mul(2).unwrap());
+        let limits = AmbiguousZeroLimits::for_test(doubled_stage1, exact_stage2);
+        let contention = AmbiguousZeroBudget::for_test(limits, 2, 2, 1);
+        let first_message_index_budget = generous_message_index_budget();
+        let (first, first_materialization, first_physical) = validate_fixture_physical(&fixture);
+        let first = drive_ambiguous_zero_stage1(
+            &fixture,
+            prepare_ambiguous_zero_stage1(first.unwrap(), &contention, &first_message_index_budget)
+                .unwrap(),
+        )
+        .unwrap();
+        let first_usage = contention.usage_for_test();
+        let second_message_index_budget = generous_message_index_budget();
+        let (second, second_materialization, second_physical) = validate_fixture_physical(&fixture);
+        let second = prepare_ambiguous_zero_stage1(
+            second.unwrap(),
+            &contention,
+            &second_message_index_budget,
+        )
+        .unwrap();
+        assert_eq!(
+            second.next().unwrap_err(),
+            IndexConsistencyViolation::AmbiguousZeroStage2ReservationLimitExceeded
+        );
+        assert_eq!(contention.usage_for_test(), first_usage);
+        drop(first);
+        assert_eq!(contention.usage_for_test(), [0; 14]);
+        for budget in [first_materialization, second_materialization] {
+            assert_eq!(
+                budget.usage_for_test(),
+                (0, NestedPreflightCensus::default())
+            );
+        }
+        assert_eq!(first_physical.usage_for_test(), (0, 0, 0));
+        assert_eq!(second_physical.usage_for_test(), (0, 0, 0));
+    }
+
+    #[test]
     fn implementation_has_no_upstream_materialization_calls() {
         let source = include_str!("remote_summary.rs");
         let production_source = source
@@ -4008,6 +4480,13 @@ mod tests {
         assert!(message_index_source.contains("bytes: Option<Box<[u8]>>"));
         assert!(!message_index_source.contains("AsRef<[u8]>"));
         assert!(!message_index_source.contains("MessageIndexRegionParse<'a, B>"));
+        assert!(!message_index_source.contains(".nth(canonical_ordinal)"));
+        assert_eq!(
+            message_index_source
+                .matches(".region(canonical_ordinal)")
+                .count(),
+            2
+        );
         assert!(message_index_source.contains("pub(crate) struct ValidatedMessageIndexRegion<'a>"));
         let whole_preflight = message_index_source
             .find("let census = preflight_region(")
@@ -4022,5 +4501,68 @@ mod tests {
         assert!(result_reservation < result_materialization);
         assert!(production_source.contains("mod message_index;"));
         assert!(!production_source.contains("prepare_message_index_region("));
+
+        let ambiguous_source = include_str!("remote_summary/ambiguous_zero.rs");
+        for forbidden in [
+            "ehttp",
+            "window.fetch",
+            "mcap::parse_record",
+            "CanonicalChunkTimeExtent",
+            "KnownEmpty",
+            "SourceUnitId",
+            "TimeInt",
+            "ExactOutput",
+            "PhysicalChunkValidation",
+            "drive_cpu",
+        ] {
+            assert!(!ambiguous_source.contains(forbidden));
+        }
+        let stage1_prepare_start = ambiguous_source
+            .find("pub(crate) fn prepare_ambiguous_zero_stage1")
+            .expect("ambiguous-zero stage 1 prepare exists");
+        let stage1_preflight_start = ambiguous_source
+            .find("fn preflight_stage1(")
+            .expect("ambiguous-zero stage 1 preflight exists");
+        let stage1_prepare = &ambiguous_source[stage1_prepare_start..stage1_preflight_start];
+        let stage1_preflight = stage1_prepare
+            .find("let census = preflight_stage1(")
+            .expect("stage 1 aggregate preflight is first");
+        let stage1_reservation = stage1_prepare
+            .find("reservation: budget.state.try_reserve_stage1(census)")
+            .expect("stage 1 aggregate reservation exists");
+        let stage1_materialization = stage1_prepare
+            .find("materialize_stage1(&physical, token)")
+            .expect("stage 1 token-gated allocation exists");
+        assert!(stage1_preflight < stage1_reservation);
+        assert!(stage1_reservation < stage1_materialization);
+        assert!(!stage1_prepare.contains("prepare_message_index_region_with_binding"));
+
+        let stage2_prepare_start = ambiguous_source
+            .find("fn prepare_stage2(")
+            .expect("ambiguous-zero stage 2 prepare exists");
+        let stage2_preflight_start = ambiguous_source
+            .find("fn preflight_stage2(")
+            .expect("ambiguous-zero stage 2 preflight exists");
+        let stage2_prepare = &ambiguous_source[stage2_prepare_start..stage2_preflight_start];
+        let stage2_preflight = stage2_prepare
+            .find("let census = preflight_stage2(")
+            .expect("stage 2 aggregate preflight exists");
+        let stage2_reservation = stage2_prepare
+            .find("state.reservation.state.try_reserve_stage2(census)")
+            .expect("stage 2 aggregate reservation exists");
+        assert!(stage2_preflight < stage2_reservation);
+
+        let body_plan_start = ambiguous_source
+            .find("impl<'a> PreparedAmbiguousZeroBodyPlan<'a>")
+            .expect("sealed body plan implementation exists");
+        let body_request_start = ambiguous_source
+            .find("pub(crate) struct AmbiguousZeroUnresolvedChunk<'a>")
+            .expect("bounded unresolved Chunk descriptor exists");
+        let body_plan_api = &ambiguous_source[body_plan_start..body_request_start];
+        assert!(!body_plan_api.contains("into_physical"));
+        assert!(!body_plan_api.contains("install_raw"));
+        assert!(!body_plan_api.contains("execute"));
+        assert!(production_source.contains("mod ambiguous_zero;"));
+        assert!(!production_source.contains("prepare_ambiguous_zero_stage1("));
     }
 }
