@@ -11,6 +11,7 @@
 
 use crate::remote_fixed_layout::{RemoteMcapSlice, ValidatedFixedLayout};
 
+mod definitions;
 mod materialization;
 
 const RECORD_ENVELOPE_LEN: usize = super::RECORD_HEADER_LEN;
@@ -466,11 +467,15 @@ mod tests {
     use std::cell::Cell;
     use std::collections::BTreeMap;
 
+    use super::definitions::{
+        ChunkDefinitionAccumulator, ChunkDefinitionEvent, DefinitionConsistencyError,
+        NonDefinitionChunkRecord, ValidatedSummaryDefinitions, validate_summary_definitions,
+    };
     use super::materialization::{
-        BoundedSummaryRecord, MessageIndexPreflightLimits, NestedPreflightCensus,
-        SummaryMaterializationBudget, SummaryMaterializationError, SummaryMaterializationLimits,
-        SummaryMaterializationToken, materialize_summary_records, preflight_message_index_records,
-        preflight_summary_records,
+        BoundedSummaryRecord, MaterializedSummaryRecords, MessageIndexPreflightLimits,
+        NestedPreflightCensus, SummaryMaterializationBudget, SummaryMaterializationError,
+        SummaryMaterializationLimits, SummaryMaterializationToken, materialize_summary_records,
+        preflight_message_index_records, preflight_summary_records,
     };
     use super::*;
     use crate::remote_fixed_layout::{RemoteMcapSlice, prepare_fixed_layout};
@@ -802,6 +807,25 @@ mod tests {
         let prepared = prepare(&fixture, &generous_limits(&fixture)).unwrap();
         let budget = materialization_budget(*limits);
         preflight_with_allocation_check(prepared, &budget).map(|_token| ())
+    }
+
+    fn materialize_fixture(
+        fixture: &AdversarialMcapFixture,
+    ) -> (MaterializedSummaryRecords<'_>, SummaryMaterializationBudget) {
+        let prepared = prepare(fixture, &generous_limits(fixture)).unwrap();
+        let budget = generous_materialization_budget();
+        let token = preflight_with_allocation_check(prepared, &budget).unwrap();
+        (materialize_summary_records(token).unwrap(), budget)
+    }
+
+    fn validate_fixture_definitions(
+        fixture: &AdversarialMcapFixture,
+    ) -> (
+        ValidatedSummaryDefinitions<'_>,
+        SummaryMaterializationBudget,
+    ) {
+        let (materialized, budget) = materialize_fixture(fixture);
+        (validate_summary_definitions(materialized).unwrap(), budget)
     }
 
     fn summary_records(fixture: &AdversarialMcapFixture) -> impl Iterator<Item = u8> + '_ {
@@ -2159,6 +2183,400 @@ mod tests {
     }
 
     #[test]
+    fn definition_canonicalization_retains_source_multiplicity_evidence_and_budget() {
+        let schema = schema_body(1, b"schema", b"jsonschema", b"exact-data");
+        let channel = channel_body(2, 1, b"/topic", b"json", &[(b"key", b"value")]);
+        let fixture = fixture_with_custom_summary(&[
+            encode_record(mcap::records::op::SCHEMA, &schema),
+            encode_record(mcap::records::op::SCHEMA, &schema),
+            encode_record(mcap::records::op::CHANNEL, &channel),
+            encode_record(mcap::records::op::CHANNEL, &channel),
+        ]);
+        let (materialized, budget) = materialize_fixture(&fixture);
+        let original_census = materialized.nested_census();
+        assert_eq!(original_census.main_summary_records, 4);
+
+        let guard = AllocationGuard::start();
+        let definitions = validate_summary_definitions(materialized).unwrap();
+        let allocations = AllocationGuard::count();
+        drop(guard);
+        assert_eq!(
+            allocations, 0,
+            "definition canonicalization must not allocate"
+        );
+
+        assert_eq!(definitions.canonical_schema_count(), 1);
+        assert_eq!(definitions.canonical_channel_count(), 1);
+        assert_eq!(definitions.materialized().records().len(), 4);
+        assert_eq!(definitions.materialized().nested_census(), original_census);
+        assert_eq!(budget.usage_for_test(), (1, original_census));
+        let canonical_schema = definitions.schema(1).unwrap();
+        assert_eq!(canonical_schema.header.name, "schema");
+        assert_eq!(canonical_schema.header.encoding, "jsonschema");
+        assert_eq!(canonical_schema.data, b"exact-data");
+        let canonical_channel = definitions.channel(2).unwrap();
+        assert_eq!(canonical_channel.schema_id, 1);
+        assert_eq!(canonical_channel.topic, "/topic");
+        assert_eq!(canonical_channel.message_encoding, "json");
+        assert_eq!(
+            canonical_channel.metadata,
+            BTreeMap::from([("key".to_owned(), "value".to_owned())])
+        );
+        assert!(std::ptr::eq(
+            definitions
+                .materialized()
+                .prepared()
+                .summary_bytes()
+                .as_ptr(),
+            fixture.bytes[fixture.layout.summary_start..].as_ptr()
+        ));
+
+        drop(definitions);
+        assert_eq!(
+            budget.usage_for_test(),
+            (0, NestedPreflightCensus::default())
+        );
+    }
+
+    #[test]
+    fn every_summary_definition_field_conflict_and_reference_rule_is_exact() {
+        let schema = schema_body(1, b"schema", b"jsonschema", b"exact-data");
+        let schema_conflicts = [
+            schema_body(1, b"schema-conflict", b"jsonschema", b"exact-data"),
+            schema_body(1, b"schema", b"encoding-conflict", b"exact-data"),
+            schema_body(1, b"schema", b"jsonschema", b"different-data"),
+        ];
+        for conflict in schema_conflicts {
+            let fixture = fixture_with_custom_summary(&[
+                encode_record(mcap::records::op::SCHEMA, &schema),
+                encode_record(mcap::records::op::SCHEMA, &conflict),
+            ]);
+            let (materialized, budget) = materialize_fixture(&fixture);
+            let guard = AllocationGuard::start();
+            let error = validate_summary_definitions(materialized).unwrap_err();
+            let allocations = AllocationGuard::count();
+            drop(guard);
+            assert_eq!(allocations, 0);
+            assert_eq!(
+                error,
+                DefinitionConsistencyError::ConflictingSchemaDefinition
+            );
+            assert_eq!(
+                budget.usage_for_test(),
+                (0, NestedPreflightCensus::default())
+            );
+        }
+
+        let channel = channel_body(2, 0, b"/topic", b"raw", &[(b"key", b"value")]);
+        let channel_conflicts = [
+            channel_body(2, 1, b"/topic", b"raw", &[(b"key", b"value")]),
+            channel_body(2, 0, b"/topic-conflict", b"raw", &[(b"key", b"value")]),
+            channel_body(2, 0, b"/topic", b"encoding-conflict", &[(b"key", b"value")]),
+            channel_body(2, 0, b"/topic", b"raw", &[(b"key", b"different")]),
+        ];
+        for conflict in channel_conflicts {
+            let fixture = fixture_with_custom_summary(&[
+                encode_record(mcap::records::op::CHANNEL, &channel),
+                encode_record(mcap::records::op::CHANNEL, &conflict),
+            ]);
+            let (materialized, budget) = materialize_fixture(&fixture);
+            let guard = AllocationGuard::start();
+            let error = validate_summary_definitions(materialized).unwrap_err();
+            let allocations = AllocationGuard::count();
+            drop(guard);
+            assert_eq!(allocations, 0);
+            assert_eq!(
+                error,
+                DefinitionConsistencyError::ConflictingChannelDefinition
+            );
+            assert_eq!(
+                budget.usage_for_test(),
+                (0, NestedPreflightCensus::default())
+            );
+        }
+
+        let schema_less = fixture_with_custom_summary(&[
+            encode_record(mcap::records::op::CHANNEL, &channel),
+            encode_record(
+                mcap::records::op::CHUNK_INDEX,
+                &chunk_index_body(&[(2, 10)], b""),
+            ),
+        ]);
+        let (definitions, _budget) = validate_fixture_definitions(&schema_less);
+        assert_eq!(definitions.channel(2).unwrap().schema_id, 0);
+
+        let missing_schema_channel = channel_body(2, 99, b"/topic", b"raw", &[]);
+        let missing = fixture_with_custom_summary(&[
+            encode_record(mcap::records::op::CHANNEL, &missing_schema_channel),
+            encode_record(
+                mcap::records::op::CHUNK_INDEX,
+                &chunk_index_body(&[(2, 10)], b""),
+            ),
+        ]);
+        let (materialized, budget) = materialize_fixture(&missing);
+        let guard = AllocationGuard::start();
+        let error = validate_summary_definitions(materialized).unwrap_err();
+        let allocations = AllocationGuard::count();
+        drop(guard);
+        assert_eq!(allocations, 0);
+        assert_eq!(error, DefinitionConsistencyError::MissingReferencedSchema);
+        assert_eq!(
+            budget.usage_for_test(),
+            (0, NestedPreflightCensus::default())
+        );
+
+        // Summary groups may appear in either order; closure runs only after all definitions.
+        let channel_with_schema = channel_body(2, 1, b"/topic", b"json", &[]);
+        let late_schema = fixture_with_custom_summary(&[
+            encode_record(mcap::records::op::CHANNEL, &channel_with_schema),
+            encode_record(mcap::records::op::SCHEMA, &schema),
+            encode_record(
+                mcap::records::op::CHUNK_INDEX,
+                &chunk_index_body(&[(2, 10)], b""),
+            ),
+        ]);
+        let (definitions, _budget) = validate_fixture_definitions(&late_schema);
+        assert_eq!(definitions.channel(2).unwrap().schema_id, 1);
+        assert!(definitions.schema(1).is_some());
+
+        let missing_index_channel = fixture_with_custom_summary(&[encode_record(
+            mcap::records::op::CHUNK_INDEX,
+            &chunk_index_body(&[(99, 10)], b""),
+        )]);
+        let (materialized, budget) = materialize_fixture(&missing_index_channel);
+        let guard = AllocationGuard::start();
+        let error = validate_summary_definitions(materialized).unwrap_err();
+        let allocations = AllocationGuard::count();
+        drop(guard);
+        assert_eq!(allocations, 0);
+        assert_eq!(
+            error,
+            DefinitionConsistencyError::MissingMessageIndexChannel
+        );
+        assert_eq!(
+            budget.usage_for_test(),
+            (0, NestedPreflightCensus::default())
+        );
+
+        // MCAP-021 owns descriptor canonicalization. This pass must still inspect every original
+        // duplicate so a valid first record cannot hide a later missing Channel reference.
+        let duplicate_indexes = fixture_with_custom_summary(&[
+            encode_record(mcap::records::op::CHANNEL, &channel),
+            encode_record(
+                mcap::records::op::CHUNK_INDEX,
+                &chunk_index_body(&[(2, 10)], b""),
+            ),
+            encode_record(
+                mcap::records::op::CHUNK_INDEX,
+                &chunk_index_body(&[(99, 20)], b""),
+            ),
+        ]);
+        let (materialized, budget) = materialize_fixture(&duplicate_indexes);
+        let guard = AllocationGuard::start();
+        let error = validate_summary_definitions(materialized).unwrap_err();
+        let allocations = AllocationGuard::count();
+        drop(guard);
+        assert_eq!(allocations, 0);
+        assert_eq!(
+            error,
+            DefinitionConsistencyError::MissingMessageIndexChannel
+        );
+        assert_eq!(
+            budget.usage_for_test(),
+            (0, NestedPreflightCensus::default())
+        );
+    }
+
+    #[test]
+    fn chunk_definition_semantics_are_reference_driven_typed_and_permanently_poisoned() {
+        let schema = schema_body(1, b"schema", b"jsonschema", b"exact-data");
+        let channel = channel_body(2, 1, b"/topic", b"json", &[(b"key", b"value")]);
+        let fixture = fixture_with_custom_summary(&[
+            encode_record(mcap::records::op::SCHEMA, &schema),
+            encode_record(mcap::records::op::CHANNEL, &channel),
+        ]);
+        let (definitions, _budget) = validate_fixture_definitions(&fixture);
+        let known_schema = definitions.schema(1).unwrap();
+        let known_channel = definitions.channel(2).unwrap();
+        let unknown_schema = mcap::records::SchemaHeader {
+            id: 99,
+            name: "unknown".to_owned(),
+            encoding: "raw".to_owned(),
+        };
+        let unknown_channel = mcap::records::Channel {
+            id: 99,
+            schema_id: 99,
+            topic: "/unknown".to_owned(),
+            message_encoding: "raw".to_owned(),
+            metadata: BTreeMap::new(),
+        };
+
+        let mut accumulator = ChunkDefinitionAccumulator::new(&definitions);
+        accumulator
+            .observe(ChunkDefinitionEvent::Schema {
+                header: known_schema.header,
+                data: known_schema.data,
+            })
+            .unwrap();
+        accumulator
+            .observe(ChunkDefinitionEvent::Schema {
+                header: known_schema.header,
+                data: known_schema.data,
+            })
+            .unwrap();
+        accumulator
+            .observe(ChunkDefinitionEvent::Channel(known_channel))
+            .unwrap();
+        accumulator
+            .observe(ChunkDefinitionEvent::Channel(known_channel))
+            .unwrap();
+        accumulator
+            .observe(ChunkDefinitionEvent::Schema {
+                header: &unknown_schema,
+                data: b"ignored",
+            })
+            .unwrap();
+        accumulator
+            .observe(ChunkDefinitionEvent::Channel(&unknown_channel))
+            .unwrap();
+        accumulator
+            .observe(ChunkDefinitionEvent::Other(
+                NonDefinitionChunkRecord::try_from_opcode(0x80).unwrap(),
+            ))
+            .unwrap();
+        accumulator
+            .observe(ChunkDefinitionEvent::Message { channel_id: 2 })
+            .unwrap();
+        let semantic = accumulator.finish().unwrap();
+        assert!(std::ptr::eq(semantic.summary(), &definitions));
+        assert_eq!(semantic.observations_seen(), 8);
+        assert_eq!(semantic.messages_seen(), 1);
+
+        for opcode in [
+            mcap::records::op::SCHEMA,
+            mcap::records::op::CHANNEL,
+            mcap::records::op::MESSAGE,
+        ] {
+            assert_eq!(
+                NonDefinitionChunkRecord::try_from_opcode(opcode).unwrap_err(),
+                DefinitionConsistencyError::DefinitionRecordMisroutedAsOther
+            );
+        }
+
+        let mut prefix = ChunkDefinitionAccumulator::new(&definitions);
+        prefix
+            .observe(ChunkDefinitionEvent::Message { channel_id: 2 })
+            .unwrap();
+        let prefix_semantics = prefix.finish().unwrap();
+        assert_eq!(prefix_semantics.observations_seen(), 1);
+        assert_eq!(prefix_semantics.messages_seen(), 1);
+
+        let mut referenced_unknown = ChunkDefinitionAccumulator::new(&definitions);
+        referenced_unknown
+            .observe(ChunkDefinitionEvent::Schema {
+                header: &unknown_schema,
+                data: b"ignored",
+            })
+            .unwrap();
+        referenced_unknown
+            .observe(ChunkDefinitionEvent::Channel(&unknown_channel))
+            .unwrap();
+        assert_eq!(
+            referenced_unknown
+                .observe(ChunkDefinitionEvent::Message { channel_id: 99 })
+                .unwrap_err(),
+            DefinitionConsistencyError::UnknownReferencedChannel
+        );
+        assert_eq!(
+            referenced_unknown.finish().unwrap_err(),
+            DefinitionConsistencyError::UnknownReferencedChannel,
+            "ignoring an observation error must permanently poison the semantic accumulator"
+        );
+
+        for (header, data) in [
+            (
+                mcap::records::SchemaHeader {
+                    name: "name-conflict".to_owned(),
+                    ..known_schema.header.clone()
+                },
+                known_schema.data,
+            ),
+            (
+                mcap::records::SchemaHeader {
+                    encoding: "encoding-conflict".to_owned(),
+                    ..known_schema.header.clone()
+                },
+                known_schema.data,
+            ),
+            (known_schema.header.clone(), b"data-conflict"),
+        ] {
+            let mut accumulator = ChunkDefinitionAccumulator::new(&definitions);
+            assert_eq!(
+                accumulator
+                    .observe(ChunkDefinitionEvent::Schema {
+                        header: &header,
+                        data,
+                    })
+                    .unwrap_err(),
+                DefinitionConsistencyError::ConflictingSchemaDefinition
+            );
+        }
+
+        let mut schema_conflict = known_channel.clone();
+        schema_conflict.schema_id = 0;
+        let mut topic_conflict = known_channel.clone();
+        topic_conflict.topic.push_str("-conflict");
+        let mut encoding_conflict = known_channel.clone();
+        encoding_conflict.message_encoding.push_str("-conflict");
+        let mut metadata_conflict = known_channel.clone();
+        metadata_conflict
+            .metadata
+            .insert("conflict".to_owned(), "true".to_owned());
+        for conflict in [
+            schema_conflict,
+            topic_conflict.clone(),
+            encoding_conflict,
+            metadata_conflict,
+        ] {
+            let mut accumulator = ChunkDefinitionAccumulator::new(&definitions);
+            assert_eq!(
+                accumulator
+                    .observe(ChunkDefinitionEvent::Channel(&conflict))
+                    .unwrap_err(),
+                DefinitionConsistencyError::ConflictingChannelDefinition
+            );
+        }
+
+        // Selection never enters this accumulator, so an unselected definition cannot be skipped.
+        let mut unselected = ChunkDefinitionAccumulator::new(&definitions);
+        assert_eq!(
+            unselected
+                .observe(ChunkDefinitionEvent::Channel(&topic_conflict))
+                .unwrap_err(),
+            DefinitionConsistencyError::ConflictingChannelDefinition
+        );
+
+        // A conflict after messages and unrelated records permanently poisons the accumulator.
+        let mut tail = ChunkDefinitionAccumulator::new(&definitions);
+        tail.observe(ChunkDefinitionEvent::Message { channel_id: 2 })
+            .unwrap();
+        tail.observe(ChunkDefinitionEvent::Other(
+            NonDefinitionChunkRecord::try_from_opcode(0x80).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(
+            tail.observe(ChunkDefinitionEvent::Channel(&topic_conflict))
+                .unwrap_err(),
+            DefinitionConsistencyError::ConflictingChannelDefinition
+        );
+        assert_eq!(
+            tail.finish().unwrap_err(),
+            DefinitionConsistencyError::ConflictingChannelDefinition,
+            "a tail conflict must permanently poison the semantic accumulator"
+        );
+    }
+
+    #[test]
     fn implementation_has_no_upstream_materialization_calls() {
         let source = include_str!("remote_summary.rs");
         let production_source = source
@@ -2184,5 +2602,38 @@ mod tests {
             .rfind("mcap::parse_record")
             .expect("known materialization uses the bounded upstream parser");
         assert!(last_parse < unknown_branch);
+
+        let definitions_source = include_str!("remote_summary/definitions.rs");
+        for forbidden in [
+            "mcap::parse_record",
+            "SummaryReader",
+            "ChunkReader",
+            "into_owned(",
+        ] {
+            assert!(!definitions_source.contains(forbidden));
+        }
+        assert!(definitions_source.contains("materialized: MaterializedSummaryRecords<'a>"));
+        assert!(definitions_source.contains("first_error: Option<DefinitionConsistencyError>"));
+        assert!(definitions_source.contains("pub(crate) enum ChunkDefinitionEvent<'record>"));
+        for forbidden in [
+            "ValidatedChunkDefinitionReferences",
+            "ChunkDefinitionValidator",
+            "expected_records",
+            "pub(crate) fn observe_schema",
+            "pub(crate) fn observe_channel",
+            "pub(crate) fn observe_message",
+            "pub(crate) fn observe_other_record",
+            "fn source_unit",
+            "fn generation",
+            "fn exhaustion",
+            "fn authorize",
+            "fn publish",
+        ] {
+            assert!(!definitions_source.contains(forbidden));
+        }
+
+        assert!(production_source.contains("mod definitions;"));
+        assert!(!production_source.contains("validate_summary_definitions("));
+        assert!(!production_source.contains("ChunkDefinitionSemanticSummary"));
     }
 }
