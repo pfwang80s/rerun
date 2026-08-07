@@ -19,6 +19,12 @@
 //! ```compile_fail
 //! use re_mcap::remote_summary;
 //! ```
+//!
+//! Exact-output remote Chunk decompression also remains sealed inside `re_mcap`:
+//!
+//! ```compile_fail
+//! use re_mcap::remote_decompression;
+//! ```
 
 /// Every MCAP record is framed by a fixed header containing a one-byte opcode followed by an
 /// eight-byte little-endian `u64` body length.
@@ -49,6 +55,11 @@ mod remote_fixed_layout;
 // The first remote Summary parsing stage remains crate-private and production-disarmed.
 #[cfg(any(target_arch = "wasm32", test))]
 mod remote_summary;
+
+// Exact-output decompression remains crate-private and production-disarmed until the remote
+// resource profile and physical Chunk scanner are sealed.
+#[cfg(any(target_arch = "wasm32", test))]
+mod remote_decompression;
 
 pub(crate) mod parsers;
 pub(crate) mod util;
