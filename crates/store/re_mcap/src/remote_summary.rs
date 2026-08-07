@@ -13,6 +13,7 @@ use crate::remote_fixed_layout::{RemoteMcapSlice, ValidatedFixedLayout};
 
 mod definitions;
 mod materialization;
+mod message_index;
 mod physical_regions;
 
 const RECORD_ENVELOPE_LEN: usize = super::RECORD_HEADER_LEN;
@@ -478,6 +479,10 @@ mod tests {
         SummaryMaterializationLimits, SummaryMaterializationToken, materialize_summary_records,
         preflight_message_index_records, preflight_summary_records,
     };
+    use super::message_index::{
+        MessageIndexRegionBudget, MessageIndexRegionLimits, ValidatedMessageIndexRegion,
+        prepare_message_index_region,
+    };
     use super::physical_regions::{
         IndexConsistencyViolation, PhysicalRegionBudget, PhysicalRegionLimits,
         ValidatedPhysicalRegions, validate_physical_regions,
@@ -486,8 +491,8 @@ mod tests {
     use crate::remote_fixed_layout::{RemoteMcapSlice, prepare_fixed_layout};
     use crate::testing::{
         AdversarialMcapFixture, AdversarialMcapFixtureBuilder, CompressionFixture,
-        FixtureCardinality, FixtureChunk, FixtureCrc, FixtureMessage, MessageIndexFault,
-        PhysicalLayoutFault,
+        FixtureCardinality, FixtureChannel, FixtureChunk, FixtureCrc, FixtureMessage,
+        MessageIndexFault, PhysicalLayoutFault,
     };
 
     struct TrackingAllocator;
@@ -941,6 +946,20 @@ mod tests {
         physical_budget(generous_physical_limits())
     }
 
+    fn generous_message_index_limits() -> MessageIndexRegionLimits {
+        MessageIndexRegionLimits::for_test(1_000, 1_000, 10_000, 1_000_000)
+    }
+
+    fn message_index_budget(limits: MessageIndexRegionLimits) -> MessageIndexRegionBudget {
+        MessageIndexRegionBudget::for_test(
+            limits, 1_000, 1_000_000, 1_000, 10_000, 100_000, 10_000_000,
+        )
+    }
+
+    fn generous_message_index_budget() -> MessageIndexRegionBudget {
+        message_index_budget(generous_message_index_limits())
+    }
+
     fn validate_fixture_physical(
         fixture: &AdversarialMcapFixture,
     ) -> (
@@ -952,6 +971,44 @@ mod tests {
         let physical_budget = generous_physical_budget();
         let result = validate_physical_regions(definitions, &physical_budget);
         (result, materialization_budget, physical_budget)
+    }
+
+    fn boxed_region_bytes(
+        fixture: &AdversarialMcapFixture,
+        physical: &ValidatedPhysicalRegions<'_>,
+        canonical_ordinal: usize,
+    ) -> (u64, Box<[u8]>) {
+        let range = physical
+            .regions()
+            .nth(canonical_ordinal)
+            .unwrap()
+            .message_index_region();
+        let start = usize::try_from(range.start).unwrap();
+        let end = usize::try_from(range.end).unwrap();
+        (
+            range.start,
+            fixture.bytes[start..end].to_vec().into_boxed_slice(),
+        )
+    }
+
+    type FixtureMessageIndexResult<'fixture> = (
+        Result<ValidatedMessageIndexRegion<'fixture>, IndexConsistencyViolation>,
+        SummaryMaterializationBudget,
+        PhysicalRegionBudget,
+    );
+
+    fn execute_fixture_message_index<'fixture>(
+        fixture: &'fixture AdversarialMcapFixture,
+        canonical_ordinal: usize,
+        budget: &MessageIndexRegionBudget,
+    ) -> FixtureMessageIndexResult<'fixture> {
+        let (physical, materialization_budget, physical_budget) =
+            validate_fixture_physical(fixture);
+        let physical = physical.unwrap();
+        let (start, bytes) = boxed_region_bytes(fixture, &physical, canonical_ordinal);
+        let prepared = prepare_message_index_region(physical, canonical_ordinal, budget).unwrap();
+        let work = prepared.install_raw(start, bytes).unwrap();
+        (work.execute(), materialization_budget, physical_budget)
     }
 
     fn summary_records(fixture: &AdversarialMcapFixture) -> impl Iterator<Item = u8> + '_ {
@@ -3286,6 +3343,562 @@ mod tests {
     }
 
     #[test]
+    fn message_index_region_retains_exact_evidence_and_matches_upstream_multi_channel_oracle() {
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_channels([
+                FixtureChannel::schema_less(1, "/one"),
+                FixtureChannel::schema_less(2, "/two"),
+            ])
+            .with_chunks([FixtureChunk::new([
+                FixtureMessage::new(1, 0, 10),
+                FixtureMessage::new(2, 1, 20),
+                FixtureMessage::new(1, 2, 30),
+            ])])
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+        let (physical, materialization_budget, physical_budget) =
+            validate_fixture_physical(&fixture);
+        let physical = physical.unwrap();
+        let retained_summary = physical
+            .definitions()
+            .materialized()
+            .prepared()
+            .fixed_layout()
+            .summary_bytes()
+            .as_ptr();
+        let (start, bytes) = boxed_region_bytes(&fixture, &physical, 0);
+        let input_len = bytes.len();
+        let message_index_budget = generous_message_index_budget();
+        let prepared = prepare_message_index_region(physical, 0, &message_index_budget).unwrap();
+        assert_eq!(
+            message_index_budget.usage_for_test(),
+            (1, u64::try_from(input_len).unwrap(), 0, 0, 0, 0)
+        );
+        let work = prepared.install_raw(start, bytes).unwrap();
+        let validated = work.execute().unwrap();
+        assert_eq!(
+            validated
+                .physical()
+                .definitions()
+                .materialized()
+                .prepared()
+                .fixed_layout()
+                .summary_bytes()
+                .as_ptr(),
+            retained_summary
+        );
+
+        let mut upstream = Vec::new();
+        for index in &fixture.layout.chunks[0].message_index_records {
+            let body = &fixture.bytes[index.record.body_start..index.record.end];
+            let mcap::records::Record::MessageIndex(index) =
+                mcap::parse_record(mcap::records::op::MESSAGE_INDEX, body).unwrap()
+            else {
+                panic!("upstream MessageIndex oracle returned a different record");
+            };
+            upstream.push(index);
+        }
+        assert_eq!(validated.channels().len(), upstream.len());
+        for (actual, expected) in validated.channels().iter().zip(&upstream) {
+            assert_eq!(actual.channel_id(), expected.channel_id);
+            assert_eq!(actual.entries(), expected.records);
+            assert_eq!(
+                actual.absolute_record_start(),
+                fixture.layout.chunks[0]
+                    .message_index_offsets
+                    .get(&expected.channel_id)
+                    .copied()
+                    .unwrap()
+            );
+        }
+        let usage = message_index_budget.usage_for_test();
+        assert_eq!(usage.0, 0);
+        assert_eq!(usage.1, 0);
+        assert_eq!(usage.2, 1);
+        assert_eq!(usage.3, 2);
+        assert_eq!(usage.4, 3);
+        assert!(usage.5 > 0);
+        assert_ne!(materialization_budget.usage_for_test().0, 0);
+        assert_ne!(physical_budget.usage_for_test().0, 0);
+
+        let physical = validated.into_physical();
+        assert_eq!(message_index_budget.usage_for_test(), (0, 0, 0, 0, 0, 0));
+        assert_ne!(materialization_budget.usage_for_test().0, 0);
+        assert_ne!(physical_budget.usage_for_test().0, 0);
+        drop(physical);
+        assert_eq!(
+            materialization_budget.usage_for_test(),
+            (0, NestedPreflightCensus::default())
+        );
+        assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+    }
+
+    #[test]
+    fn message_index_record_starts_and_descriptor_mapping_are_bidirectional() {
+        let two_channel = || {
+            AdversarialMcapFixtureBuilder::new()
+                .with_channels([
+                    FixtureChannel::schema_less(1, "/one"),
+                    FixtureChannel::schema_less(2, "/two"),
+                ])
+                .with_chunks([FixtureChunk::new([
+                    FixtureMessage::new(1, 0, 10),
+                    FixtureMessage::new(2, 1, 20),
+                ])])
+                .with_summary_crc(FixtureCrc::Zero)
+                .with_summary_offsets(false)
+        };
+        for (fault, expected) in [
+            (
+                MessageIndexFault::WrongOpcode,
+                IndexConsistencyViolation::MessageIndexRecordWrongOpcode,
+            ),
+            (
+                MessageIndexFault::RecordCrossesOwningRegion,
+                IndexConsistencyViolation::MessageIndexRecordOutOfBounds,
+            ),
+            (
+                MessageIndexFault::DescriptorOffsetIntoRecordBody,
+                IndexConsistencyViolation::MessageIndexMappingMismatch,
+            ),
+            (
+                MessageIndexFault::Duplicate,
+                IndexConsistencyViolation::MessageIndexMappingMismatch,
+            ),
+        ] {
+            let fixture = two_channel()
+                .with_message_index_fault(fault)
+                .build()
+                .unwrap();
+            let budget = generous_message_index_budget();
+            let (result, materialization_budget, physical_budget) =
+                execute_fixture_message_index(&fixture, 0, &budget);
+            assert_eq!(result.unwrap_err(), expected, "{fault:?}");
+            assert_eq!(budget.usage_for_test(), (0, 0, 0, 0, 0, 0));
+            assert_eq!(
+                materialization_budget.usage_for_test(),
+                (0, NestedPreflightCensus::default())
+            );
+            assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+        }
+
+        let map_key_fixture = AdversarialMcapFixtureBuilder::new()
+            .with_channels([
+                FixtureChannel::schema_less(1, "/one"),
+                FixtureChannel::schema_less(2, "/two"),
+            ])
+            .with_chunks([FixtureChunk::single(FixtureMessage::new(1, 0, 10))])
+            .with_summary_crc(FixtureCrc::Zero)
+            .with_message_index_fault(MessageIndexFault::MapKeyMismatch)
+            .build()
+            .unwrap();
+        let budget = generous_message_index_budget();
+        let (result, materialization_budget, physical_budget) =
+            execute_fixture_message_index(&map_key_fixture, 0, &budget);
+        assert_eq!(
+            result.unwrap_err(),
+            IndexConsistencyViolation::MessageIndexMappingMismatch
+        );
+        assert_eq!(budget.usage_for_test(), (0, 0, 0, 0, 0, 0));
+        assert_eq!(
+            materialization_budget.usage_for_test(),
+            (0, NestedPreflightCensus::default())
+        );
+        assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+
+        let base = AdversarialMcapFixtureBuilder::new()
+            .with_summary_crc(FixtureCrc::Zero)
+            .with_summary_offsets(false)
+            .build()
+            .unwrap();
+        let canonical = fixture_chunk_index(&base.layout.chunk_indexes[0]);
+        let canonical_offset = *canonical.message_index_offsets.values().next().unwrap();
+        for delta in [1, 5, 9, 10] {
+            let mut misaligned = canonical.clone();
+            *misaligned
+                .message_index_offsets
+                .values_mut()
+                .next()
+                .unwrap() = canonical_offset + delta;
+            let fixture = fixture_with_chunk_indexes(base.clone(), &[misaligned]);
+            let budget = generous_message_index_budget();
+            let (result, materialization_budget, physical_budget) =
+                execute_fixture_message_index(&fixture, 0, &budget);
+            assert_eq!(
+                result.unwrap_err(),
+                IndexConsistencyViolation::MessageIndexMappingMismatch,
+                "offset delta {delta} must not gain record-start authority"
+            );
+            assert_eq!(budget.usage_for_test(), (0, 0, 0, 0, 0, 0));
+            assert_eq!(
+                materialization_budget.usage_for_test(),
+                (0, NestedPreflightCensus::default())
+            );
+            assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+        }
+
+        let two_channel_fixture = two_channel().build().unwrap();
+        let mut missing_map = fixture_chunk_index(&two_channel_fixture.layout.chunk_indexes[0]);
+        missing_map.message_index_offsets.remove(&2);
+        let missing_fixture =
+            fixture_with_chunk_indexes(two_channel_fixture.clone(), &[missing_map]);
+        let budget = generous_message_index_budget();
+        let (result, materialization_budget, physical_budget) =
+            execute_fixture_message_index(&missing_fixture, 0, &budget);
+        assert_eq!(
+            result.unwrap_err(),
+            IndexConsistencyViolation::MessageIndexMappingMismatch
+        );
+        assert_eq!(budget.usage_for_test(), (0, 0, 0, 0, 0, 0));
+        assert_eq!(
+            materialization_budget.usage_for_test(),
+            (0, NestedPreflightCensus::default())
+        );
+        assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+
+        let mut extra_map = canonical.clone();
+        extra_map
+            .message_index_offsets
+            .insert(2, canonical_offset + 1);
+        let extra_fixture = fixture_with_chunk_indexes(base, &[extra_map]);
+        let budget = generous_message_index_budget();
+        let (result, materialization_budget, physical_budget) =
+            execute_fixture_message_index(&extra_fixture, 0, &budget);
+        assert_eq!(
+            result.unwrap_err(),
+            IndexConsistencyViolation::MessageIndexMappingMismatch
+        );
+        assert_eq!(budget.usage_for_test(), (0, 0, 0, 0, 0, 0));
+        assert_eq!(
+            materialization_budget.usage_for_test(),
+            (0, NestedPreflightCensus::default())
+        );
+        assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+    }
+
+    #[test]
+    fn message_index_region_sequence_and_exact_raw_owner_fail_before_materialization() {
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_channels([
+                FixtureChannel::schema_less(1, "/one"),
+                FixtureChannel::schema_less(2, "/two"),
+            ])
+            .with_chunks([FixtureChunk::new([
+                FixtureMessage::new(1, 0, 10),
+                FixtureMessage::new(2, 1, 20),
+            ])])
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+
+        for (mutation, expected) in [
+            (
+                0_u8,
+                IndexConsistencyViolation::MessageIndexRecordWrongOpcode,
+            ),
+            (1, IndexConsistencyViolation::MessageIndexRecordOutOfBounds),
+            (2, IndexConsistencyViolation::MessageIndexRecordBodyInvalid),
+            (3, IndexConsistencyViolation::MessageIndexRecordBodyInvalid),
+            (4, IndexConsistencyViolation::MessageIndexRecordWrongOpcode),
+        ] {
+            let (physical, materialization_budget, physical_budget) =
+                validate_fixture_physical(&fixture);
+            let physical = physical.unwrap();
+            let (start, mut bytes) = boxed_region_bytes(&fixture, &physical, 0);
+            match mutation {
+                0 => bytes[0] = mcap::records::op::CHANNEL,
+                1 => bytes[1..RECORD_ENVELOPE_LEN].copy_from_slice(&u64::MAX.to_le_bytes()),
+                2 => bytes[1..RECORD_ENVELOPE_LEN].copy_from_slice(&0_u64.to_le_bytes()),
+                3 => {
+                    let encoded_len = u32::from_le_bytes(
+                        bytes[RECORD_ENVELOPE_LEN + size_of::<u16>()
+                            ..RECORD_ENVELOPE_LEN + size_of::<u16>() + size_of::<u32>()]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    bytes[RECORD_ENVELOPE_LEN + size_of::<u16>()
+                        ..RECORD_ENVELOPE_LEN + size_of::<u16>() + size_of::<u32>()]
+                        .copy_from_slice(&(encoded_len - 1).to_le_bytes());
+                }
+                4 => {
+                    let second = fixture.layout.chunks[0].message_index_records[1]
+                        .record
+                        .start
+                        - usize::try_from(start).unwrap();
+                    bytes[second] = 0x80;
+                }
+                _ => unreachable!(),
+            }
+            let budget = generous_message_index_budget();
+            let prepared = prepare_message_index_region(physical, 0, &budget).unwrap();
+            let work = prepared.install_raw(start, bytes).unwrap();
+            let guard = AllocationGuard::start();
+            let error = work.execute().unwrap_err();
+            let allocations = AllocationGuard::count();
+            drop(guard);
+            assert_eq!(error, expected, "mutation {mutation}");
+            assert_eq!(allocations, 0, "whole-region preflight is allocation-free");
+            assert_eq!(budget.usage_for_test(), (0, 0, 0, 0, 0, 0));
+            assert_eq!(
+                materialization_budget.usage_for_test(),
+                (0, NestedPreflightCensus::default())
+            );
+            assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+        }
+
+        for delta in [1_i64, -1] {
+            let (physical, materialization_budget, physical_budget) =
+                validate_fixture_physical(&fixture);
+            let physical = physical.unwrap();
+            let (start, bytes) = boxed_region_bytes(&fixture, &physical, 0);
+            let budget = generous_message_index_budget();
+            let prepared = prepare_message_index_region(physical, 0, &budget).unwrap();
+            let wrong_start = if delta > 0 { start + 1 } else { start - 1 };
+            assert_eq!(
+                prepared.install_raw(wrong_start, bytes).unwrap_err(),
+                IndexConsistencyViolation::MessageIndexRawInputMismatch
+            );
+            assert_eq!(budget.usage_for_test(), (0, 0, 0, 0, 0, 0));
+            assert_eq!(
+                materialization_budget.usage_for_test(),
+                (0, NestedPreflightCensus::default())
+            );
+            assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+        }
+
+        let (physical, materialization_budget, physical_budget) =
+            validate_fixture_physical(&fixture);
+        let physical = physical.unwrap();
+        let (start, bytes) = boxed_region_bytes(&fixture, &physical, 0);
+        let short = bytes[..bytes.len() - 1].to_vec().into_boxed_slice();
+        let budget = generous_message_index_budget();
+        assert_eq!(
+            prepare_message_index_region(physical, 0, &budget)
+                .unwrap()
+                .install_raw(start, short)
+                .unwrap_err(),
+            IndexConsistencyViolation::MessageIndexRawInputMismatch
+        );
+        assert_eq!(budget.usage_for_test(), (0, 0, 0, 0, 0, 0));
+        assert_eq!(
+            materialization_budget.usage_for_test(),
+            (0, NestedPreflightCensus::default())
+        );
+        assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+
+        let (physical, materialization_budget, physical_budget) =
+            validate_fixture_physical(&fixture);
+        let physical = physical.unwrap();
+        let (start, bytes) = boxed_region_bytes(&fixture, &physical, 0);
+        let exact_pointer = bytes.as_ptr();
+        let exact_len = bytes.len();
+        let budget = generous_message_index_budget();
+        let prepared = prepare_message_index_region(physical, 0, &budget).unwrap();
+        let guard = AllocationGuard::start();
+        let work = prepared.install_raw(start, bytes).unwrap();
+        let installation_allocations = AllocationGuard::count();
+        drop(guard);
+        assert_eq!(installation_allocations, 0);
+        assert_eq!(work.raw_identity_for_test(), (exact_pointer, exact_len));
+        let validated = work.execute().unwrap();
+        assert_eq!(budget.usage_for_test().0, 0);
+        assert_eq!(budget.usage_for_test().1, 0);
+        drop(validated);
+        assert_eq!(budget.usage_for_test(), (0, 0, 0, 0, 0, 0));
+        assert_eq!(
+            materialization_budget.usage_for_test(),
+            (0, NestedPreflightCensus::default())
+        );
+        assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+    }
+
+    #[test]
+    fn message_index_caps_contention_and_drop_release_every_reservation() {
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+        for (limits, expected) in [
+            (
+                MessageIndexRegionLimits::for_test(0, 1_000, 1_000, 1_000_000),
+                IndexConsistencyViolation::MessageIndexRecordLimitExceeded,
+            ),
+            (
+                MessageIndexRegionLimits::for_test(1_000, 0, 1_000, 1_000_000),
+                IndexConsistencyViolation::MessageIndexEntryLimitExceeded,
+            ),
+            (
+                MessageIndexRegionLimits::for_test(1_000, 1_000, 0, 1_000_000),
+                IndexConsistencyViolation::MessageIndexAggregateEntryLimitExceeded,
+            ),
+            (
+                MessageIndexRegionLimits::for_test(1_000, 1_000, 1_000, 0),
+                IndexConsistencyViolation::MessageIndexResultRetainedByteLimitExceeded,
+            ),
+        ] {
+            let budget = message_index_budget(limits);
+            let (result, materialization_budget, physical_budget) =
+                execute_fixture_message_index(&fixture, 0, &budget);
+            assert_eq!(result.unwrap_err(), expected);
+            assert_eq!(budget.usage_for_test(), (0, 0, 0, 0, 0, 0));
+            assert_eq!(
+                materialization_budget.usage_for_test(),
+                (0, NestedPreflightCensus::default())
+            );
+            assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+        }
+
+        let (physical, materialization_budget, physical_budget) =
+            validate_fixture_physical(&fixture);
+        let physical = physical.unwrap();
+        let region = physical.regions().next().unwrap().message_index_region();
+        let region_len = region.end - region.start;
+        let raw_limited = MessageIndexRegionBudget::for_test(
+            generous_message_index_limits(),
+            1,
+            region_len - 1,
+            1,
+            1_000,
+            1_000,
+            1_000_000,
+        );
+        assert_eq!(
+            prepare_message_index_region(physical, 0, &raw_limited).unwrap_err(),
+            IndexConsistencyViolation::MessageIndexRawReservationLimitExceeded
+        );
+        assert_eq!(raw_limited.usage_for_test(), (0, 0, 0, 0, 0, 0));
+        assert_eq!(
+            materialization_budget.usage_for_test(),
+            (0, NestedPreflightCensus::default())
+        );
+        assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+
+        let contention = MessageIndexRegionBudget::for_test(
+            generous_message_index_limits(),
+            1,
+            1_000_000,
+            1,
+            1_000,
+            1_000,
+            1_000_000,
+        );
+        let (first, first_materialization, first_physical) = validate_fixture_physical(&fixture);
+        let first = prepare_message_index_region(first.unwrap(), 0, &contention).unwrap();
+        let first_usage = contention.usage_for_test();
+        let (second, second_materialization, second_physical) = validate_fixture_physical(&fixture);
+        assert_eq!(
+            prepare_message_index_region(second.unwrap(), 0, &contention).unwrap_err(),
+            IndexConsistencyViolation::MessageIndexRawReservationLimitExceeded
+        );
+        assert_eq!(contention.usage_for_test(), first_usage);
+        drop(first);
+        assert_eq!(contention.usage_for_test(), (0, 0, 0, 0, 0, 0));
+        for budget in [first_materialization, second_materialization] {
+            assert_eq!(
+                budget.usage_for_test(),
+                (0, NestedPreflightCensus::default())
+            );
+        }
+        assert_eq!(first_physical.usage_for_test(), (0, 0, 0));
+        assert_eq!(second_physical.usage_for_test(), (0, 0, 0));
+
+        let result_limited = MessageIndexRegionBudget::for_test(
+            generous_message_index_limits(),
+            1,
+            1_000_000,
+            1,
+            1_000,
+            0,
+            1_000_000,
+        );
+        let (result, materialization_budget, physical_budget) =
+            execute_fixture_message_index(&fixture, 0, &result_limited);
+        assert_eq!(
+            result.unwrap_err(),
+            IndexConsistencyViolation::MessageIndexResultReservationLimitExceeded
+        );
+        assert_eq!(result_limited.usage_for_test(), (0, 0, 0, 0, 0, 0));
+        assert_eq!(
+            materialization_budget.usage_for_test(),
+            (0, NestedPreflightCensus::default())
+        );
+        assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+    }
+
+    #[test]
+    fn empty_message_index_and_sequential_single_region_work_units_are_explicit() {
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_summary_crc(FixtureCrc::Zero)
+            .with_summary_offsets(false)
+            .build()
+            .unwrap();
+        let header_end = u64::try_from(
+            fixture
+                .layout
+                .records
+                .iter()
+                .find(|record| record.opcode == mcap::records::op::HEADER)
+                .unwrap()
+                .end,
+        )
+        .unwrap();
+        let empty = minimal_chunk_index(header_end, u64::try_from(RECORD_ENVELOPE_LEN).unwrap());
+        let empty_fixture = fixture_with_chunk_indexes(fixture, &[empty]);
+        let budget = generous_message_index_budget();
+        let (validated, materialization_budget, physical_budget) =
+            execute_fixture_message_index(&empty_fixture, 0, &budget);
+        let validated = validated.unwrap();
+        assert!(validated.channels().is_empty());
+        assert_eq!(budget.usage_for_test(), (0, 0, 1, 0, 0, 0));
+        let physical = validated.into_physical();
+        assert_eq!(budget.usage_for_test(), (0, 0, 0, 0, 0, 0));
+        drop(physical);
+        assert_eq!(
+            materialization_budget.usage_for_test(),
+            (0, NestedPreflightCensus::default())
+        );
+        assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_chunks([
+                FixtureChunk::single(FixtureMessage::new(1, 0, 10)),
+                FixtureChunk::single(FixtureMessage::new(1, 1, 20)),
+            ])
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+        let (physical, materialization_budget, physical_budget) =
+            validate_fixture_physical(&fixture);
+        let physical = physical.unwrap();
+        let budget = generous_message_index_budget();
+        let (second_start, second_bytes) = boxed_region_bytes(&fixture, &physical, 1);
+        let second = prepare_message_index_region(physical, 1, &budget)
+            .unwrap()
+            .install_raw(second_start, second_bytes)
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(second.channels()[0].entries()[0].log_time, 20);
+        let physical = second.into_physical();
+        let (first_start, first_bytes) = boxed_region_bytes(&fixture, &physical, 0);
+        let first = prepare_message_index_region(physical, 0, &budget)
+            .unwrap()
+            .install_raw(first_start, first_bytes)
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(first.channels()[0].entries()[0].log_time, 10);
+        drop(first);
+        assert_eq!(budget.usage_for_test(), (0, 0, 0, 0, 0, 0));
+        assert_eq!(
+            materialization_budget.usage_for_test(),
+            (0, NestedPreflightCensus::default())
+        );
+        assert_eq!(physical_budget.usage_for_test(), (0, 0, 0));
+    }
+
+    #[test]
     fn implementation_has_no_upstream_materialization_calls() {
         let source = include_str!("remote_summary.rs");
         let production_source = source
@@ -3369,5 +3982,45 @@ mod tests {
         assert!(reservation < allocation);
         assert!(production_source.contains("mod physical_regions;"));
         assert!(!production_source.contains("validate_physical_regions("));
+
+        let message_index_source = include_str!("remote_summary/message_index.rs");
+        for forbidden in [
+            "ehttp",
+            "window.fetch",
+            "TimeInt",
+            "CanonicalTime",
+            "AmbiguousZero",
+            "IntervalIndex",
+            "SourceUnitId",
+            "drive_cpu",
+            "mcap::parse_record",
+        ] {
+            assert!(!message_index_source.contains(forbidden));
+        }
+        assert!(message_index_source.contains("physical: ValidatedPhysicalRegions<'a>"));
+        assert!(message_index_source.contains("pub(crate) struct MessageIndexRegionParse<'a>"));
+        assert!(message_index_source.contains(concat!(
+            "pub(crate) fn install_raw(\n",
+            "        self,\n",
+            "        file_start: u64,\n",
+            "        bytes: Box<[u8]>,\n",
+        )));
+        assert!(message_index_source.contains("bytes: Option<Box<[u8]>>"));
+        assert!(!message_index_source.contains("AsRef<[u8]>"));
+        assert!(!message_index_source.contains("MessageIndexRegionParse<'a, B>"));
+        assert!(message_index_source.contains("pub(crate) struct ValidatedMessageIndexRegion<'a>"));
+        let whole_preflight = message_index_source
+            .find("let census = preflight_region(")
+            .expect("whole-region preflight exists");
+        let result_reservation = message_index_source
+            .find("reservation: budget_state.try_reserve_result(census)")
+            .expect("parsed-result reservation exists");
+        let result_materialization = message_index_source
+            .find("materialize_region(bytes, expected_range.start, descriptor, materialization)")
+            .expect("token-gated result materialization exists");
+        assert!(whole_preflight < result_reservation);
+        assert!(result_reservation < result_materialization);
+        assert!(production_source.contains("mod message_index;"));
+        assert!(!production_source.contains("prepare_message_index_region("));
     }
 }

@@ -161,6 +161,20 @@ pub(crate) enum IndexConsistencyViolation {
     PhysicalRegionOverlap,
     DescriptorReservationLimitExceeded,
     DescriptorAllocationFailed,
+    UnknownCanonicalRegion,
+    MessageIndexRawReservationLimitExceeded,
+    MessageIndexRawInputMismatch,
+    MessageIndexRecordEnvelopeInvalid,
+    MessageIndexRecordWrongOpcode,
+    MessageIndexRecordOutOfBounds,
+    MessageIndexRecordBodyInvalid,
+    MessageIndexRecordLimitExceeded,
+    MessageIndexEntryLimitExceeded,
+    MessageIndexAggregateEntryLimitExceeded,
+    MessageIndexMappingMismatch,
+    MessageIndexResultRetainedByteLimitExceeded,
+    MessageIndexResultReservationLimitExceeded,
+    MessageIndexResultAllocationFailed,
 }
 
 impl std::fmt::Display for IndexConsistencyViolation {
@@ -214,6 +228,48 @@ impl std::fmt::Display for IndexConsistencyViolation {
                 "remote MCAP physical descriptor reservation exceeds its capacity"
             }
             Self::DescriptorAllocationFailed => "remote MCAP physical descriptor allocation failed",
+            Self::UnknownCanonicalRegion => {
+                "remote MCAP canonical physical region selection is invalid"
+            }
+            Self::MessageIndexRawReservationLimitExceeded => {
+                "remote MCAP MessageIndex raw-input reservation exceeds its capacity"
+            }
+            Self::MessageIndexRawInputMismatch => {
+                "remote MCAP MessageIndex raw input does not match its owning region"
+            }
+            Self::MessageIndexRecordEnvelopeInvalid => {
+                "remote MCAP MessageIndex record envelope is invalid"
+            }
+            Self::MessageIndexRecordWrongOpcode => {
+                "remote MCAP MessageIndex region contains a forbidden record"
+            }
+            Self::MessageIndexRecordOutOfBounds => {
+                "remote MCAP MessageIndex record exceeds its owning region"
+            }
+            Self::MessageIndexRecordBodyInvalid => {
+                "remote MCAP MessageIndex record body is invalid"
+            }
+            Self::MessageIndexRecordLimitExceeded => {
+                "remote MCAP MessageIndex record count exceeds its limit"
+            }
+            Self::MessageIndexEntryLimitExceeded => {
+                "remote MCAP MessageIndex record entry count exceeds its limit"
+            }
+            Self::MessageIndexAggregateEntryLimitExceeded => {
+                "remote MCAP MessageIndex region entry count exceeds its limit"
+            }
+            Self::MessageIndexMappingMismatch => {
+                "remote MCAP MessageIndex records and descriptor map are inconsistent"
+            }
+            Self::MessageIndexResultRetainedByteLimitExceeded => {
+                "remote MCAP MessageIndex parsed result exceeds its retained-byte limit"
+            }
+            Self::MessageIndexResultReservationLimitExceeded => {
+                "remote MCAP MessageIndex parsed-result reservation exceeds its capacity"
+            }
+            Self::MessageIndexResultAllocationFailed => {
+                "remote MCAP MessageIndex parsed-result allocation failed"
+            }
         })
     }
 }
