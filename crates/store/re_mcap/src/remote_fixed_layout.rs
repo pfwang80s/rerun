@@ -27,6 +27,14 @@ impl<'a> RemoteMcapSlice<'a> {
     pub const fn new(offset: u64, bytes: &'a [u8]) -> Self {
         Self { offset, bytes }
     }
+
+    pub(crate) const fn offset(self) -> u64 {
+        self.offset
+    }
+
+    pub(crate) const fn bytes(self) -> &'a [u8] {
+        self.bytes
+    }
 }
 
 /// The validation state of an optional MCAP CRC field.
