@@ -49,6 +49,76 @@ impl<'a> ValidatedSummaryDefinitions<'a> {
             self.materialized.records().len(),
         )
     }
+
+    pub(crate) fn projection_records(
+        &self,
+    ) -> impl Iterator<Item = SummaryDefinitionProjectionRecord> + '_ {
+        self.materialized
+            .records()
+            .iter()
+            .enumerate()
+            .filter_map(|(record_index, record)| match record {
+                BoundedSummaryRecord::Known(mcap::records::Record::Schema { header, .. }) => {
+                    Some(SummaryDefinitionProjectionRecord::Schema {
+                        id: header.id,
+                        record_index,
+                    })
+                }
+                BoundedSummaryRecord::Known(mcap::records::Record::Channel(channel)) => {
+                    Some(SummaryDefinitionProjectionRecord::Channel {
+                        id: channel.id,
+                        record_index,
+                    })
+                }
+                _ => None,
+            })
+    }
+
+    pub(crate) fn schema_at_record(
+        &self,
+        record_index: usize,
+    ) -> Option<CanonicalSchemaDefinition<'_>> {
+        let BoundedSummaryRecord::Known(mcap::records::Record::Schema { header, data }) =
+            self.materialized.records().get(record_index)?
+        else {
+            return None;
+        };
+        Some(CanonicalSchemaDefinition {
+            header,
+            data: data.as_ref(),
+        })
+    }
+
+    pub(crate) fn channel_at_record(&self, record_index: usize) -> Option<&mcap::records::Channel> {
+        let BoundedSummaryRecord::Known(mcap::records::Record::Channel(channel)) =
+            self.materialized.records().get(record_index)?
+        else {
+            return None;
+        };
+        Some(channel)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SummaryDefinitionProjectionRecord {
+    Schema { id: u16, record_index: usize },
+    Channel { id: u16, record_index: usize },
+}
+
+pub(crate) trait SummaryDefinitionLookup {
+    fn schema(&self, id: u16) -> Option<CanonicalSchemaDefinition<'_>>;
+
+    fn channel(&self, id: u16) -> Option<&mcap::records::Channel>;
+}
+
+impl SummaryDefinitionLookup for ValidatedSummaryDefinitions<'_> {
+    fn schema(&self, id: u16) -> Option<CanonicalSchemaDefinition<'_>> {
+        Self::schema(self, id)
+    }
+
+    fn channel(&self, id: u16) -> Option<&mcap::records::Channel> {
+        Self::channel(self, id)
+    }
 }
 
 /// A definition/reference consistency failure.
@@ -249,14 +319,14 @@ pub(crate) enum ChunkDefinitionEvent<'record> {
 /// This type has no Chunk identity or exact-exhaustion witness. Its result is not a validation or
 /// publication capability. MCAP-025 must own this accumulator inside its exact scanner and combine
 /// the semantic result with sealed source identity and exhaustion evidence before publication.
-pub(crate) struct ChunkDefinitionAccumulator<'summary, 'input> {
-    summary: &'summary ValidatedSummaryDefinitions<'input>,
+pub(crate) struct ChunkDefinitionAccumulator<'summary, Lookup: ?Sized> {
+    summary: &'summary Lookup,
     observations_seen: u64,
     messages_seen: u64,
     first_error: Option<DefinitionConsistencyError>,
 }
 
-impl std::fmt::Debug for ChunkDefinitionAccumulator<'_, '_> {
+impl<Lookup: ?Sized> std::fmt::Debug for ChunkDefinitionAccumulator<'_, Lookup> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ChunkDefinitionAccumulator")
@@ -268,8 +338,10 @@ impl std::fmt::Debug for ChunkDefinitionAccumulator<'_, '_> {
     }
 }
 
-impl<'summary, 'input> ChunkDefinitionAccumulator<'summary, 'input> {
-    pub(crate) const fn new(summary: &'summary ValidatedSummaryDefinitions<'input>) -> Self {
+impl<'summary, Lookup: SummaryDefinitionLookup + ?Sized>
+    ChunkDefinitionAccumulator<'summary, Lookup>
+{
+    pub(crate) const fn new(summary: &'summary Lookup) -> Self {
         Self {
             summary,
             observations_seen: 0,
@@ -357,7 +429,7 @@ impl<'summary, 'input> ChunkDefinitionAccumulator<'summary, 'input> {
 
     pub(crate) fn finish(
         self,
-    ) -> Result<ChunkDefinitionSemanticSummary<'summary, 'input>, DefinitionConsistencyError> {
+    ) -> Result<ChunkDefinitionSemanticSummary<'summary, Lookup>, DefinitionConsistencyError> {
         if let Some(error) = self.first_error {
             return Err(error);
         }
@@ -373,13 +445,13 @@ impl<'summary, 'input> ChunkDefinitionAccumulator<'summary, 'input> {
 ///
 /// A prefix can produce this summary. It proves neither Chunk identity nor exact exhaustion and
 /// must never authorize decode, partition publication, or Store mutation by itself.
-pub(crate) struct ChunkDefinitionSemanticSummary<'summary, 'input> {
-    summary: &'summary ValidatedSummaryDefinitions<'input>,
+pub(crate) struct ChunkDefinitionSemanticSummary<'summary, Lookup: ?Sized> {
+    summary: &'summary Lookup,
     observations_seen: u64,
     messages_seen: u64,
 }
 
-impl std::fmt::Debug for ChunkDefinitionSemanticSummary<'_, '_> {
+impl<Lookup: ?Sized> std::fmt::Debug for ChunkDefinitionSemanticSummary<'_, Lookup> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ChunkDefinitionSemanticSummary")
@@ -390,8 +462,8 @@ impl std::fmt::Debug for ChunkDefinitionSemanticSummary<'_, '_> {
     }
 }
 
-impl<'summary, 'input> ChunkDefinitionSemanticSummary<'summary, 'input> {
-    pub(crate) const fn summary(&self) -> &'summary ValidatedSummaryDefinitions<'input> {
+impl<'summary, Lookup: ?Sized> ChunkDefinitionSemanticSummary<'summary, Lookup> {
+    pub(crate) const fn summary(&self) -> &'summary Lookup {
         self.summary
     }
 

@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use crate::remote_chunk_scan::{HeaderValidated, PhysicalChunkReadLease};
 use crate::remote_fixed_layout::OptionalCrcValidation;
 
 const OVERFLOW_DETECTION_SCRATCH_BYTES: u64 = 1;
@@ -279,9 +280,43 @@ impl Drop for ChunkDecompressionOutputReservation {
 /// There is deliberately no production constructor while that adapter remains disarmed.
 /// The identity cannot be copied, cloned, compared from a caller-supplied scalar, or rebound to
 /// another payload after it enters this module.
-#[derive(Debug)]
-pub(crate) struct PhysicalChunkReadIdentity {
-    opaque: u128,
+pub(crate) enum PhysicalChunkReadIdentity<'a> {
+    Lease(PhysicalChunkReadLease<'a, HeaderValidated>),
+    #[cfg(test)]
+    CodecUnit {
+        opaque: u128,
+    },
+}
+
+impl std::fmt::Debug for PhysicalChunkReadIdentity<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PhysicalChunkReadIdentity")
+            .field("identity", &"<opaque move-only owner>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PhysicalChunkReadIdentity<'_> {
+    fn ensure_current(&self) -> Result<(), ChunkDecompressionError> {
+        match self {
+            Self::Lease(lease) => lease
+                .ensure_current()
+                .map_err(|_error| ChunkDecompressionError::PhysicalReadNotCurrent),
+            #[cfg(test)]
+            Self::CodecUnit { .. } => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl PhysicalChunkReadIdentity<'_> {
+    fn codec_test_opaque(&self) -> u128 {
+        match self {
+            Self::CodecUnit { opaque } => *opaque,
+            Self::Lease(_) => panic!("the codec-unit assertion received a physical read lease"),
+        }
+    }
 }
 
 /// Move-only ownership of one exact compressed backing claim.
@@ -305,13 +340,15 @@ impl Drop for CompressedChunkInputReservation {
 }
 
 /// A sealed upstream physical-read handoff acquired before an exact Range backing is installed.
-struct PreparedExactCompressedChunkInput<'a> {
-    identity: PhysicalChunkReadIdentity,
-    compression: &'a str,
+pub(super) struct PreparedExactCompressedChunkInput<'a> {
+    // Keep the reservation before the lease-owning identity: Rust drops fields in declaration
+    // order, so abandoning a prepared handoff releases accounting before its physical read claim.
+    reservation: CompressedChunkInputReservation,
+    identity: PhysicalChunkReadIdentity<'a>,
+    codec: ChunkCompressionCodec,
     expected_compressed_bytes: u64,
     declared_uncompressed_size: u64,
     declared_uncompressed_crc: u32,
-    reservation: CompressedChunkInputReservation,
 }
 
 impl std::fmt::Debug for PreparedExactCompressedChunkInput<'_> {
@@ -319,7 +356,7 @@ impl std::fmt::Debug for PreparedExactCompressedChunkInput<'_> {
         formatter
             .debug_struct("PreparedExactCompressedChunkInput")
             .field("identity", &"<opaque>")
-            .field("compression", &self.compression)
+            .field("codec", &self.codec)
             .field("expected_compressed_bytes", &self.expected_compressed_bytes)
             .field(
                 "declared_uncompressed_size",
@@ -332,10 +369,11 @@ impl std::fmt::Debug for PreparedExactCompressedChunkInput<'_> {
 
 impl<'a> PreparedExactCompressedChunkInput<'a> {
     /// Installs the only accepted production-shaped backing: an exact-sized `Box<[u8]>`.
-    fn install(
+    pub(super) fn install(
         self,
         compressed_payload: Box<[u8]>,
     ) -> Result<ExactCompressedChunkInput<'a>, ChunkDecompressionError> {
+        self.identity.ensure_current()?;
         let actual_bytes = u64::try_from(compressed_payload.len())
             .map_err(|_overflow| ChunkDecompressionError::CompressedBytesLimitExceeded)?;
         if actual_bytes != self.expected_compressed_bytes {
@@ -347,33 +385,54 @@ impl<'a> PreparedExactCompressedChunkInput<'a> {
             compressed_payload: Some(compressed_payload),
             reservation: Some(self.reservation),
             identity: Some(self.identity),
-            compression: self.compression,
+            codec: self.codec,
             declared_uncompressed_size: self.declared_uncompressed_size,
             declared_uncompressed_crc: self.declared_uncompressed_crc,
         })
     }
 }
 
+pub(super) fn prepare_header_validated_compressed_chunk_input(
+    lease: PhysicalChunkReadLease<'_, HeaderValidated>,
+    codec: ChunkCompressionCodec,
+    expected_compressed_bytes: u64,
+    declared_uncompressed_size: u64,
+    declared_uncompressed_crc: u32,
+) -> Result<PreparedExactCompressedChunkInput<'_>, ChunkDecompressionError> {
+    let reservation = lease
+        .decompression_budget()
+        .state
+        .try_reserve_input(expected_compressed_bytes)?;
+    Ok(PreparedExactCompressedChunkInput {
+        identity: PhysicalChunkReadIdentity::Lease(lease),
+        codec,
+        expected_compressed_bytes,
+        declared_uncompressed_size,
+        declared_uncompressed_crc,
+        reservation,
+    })
+}
+
 // This is test-only until the exact physical-Range adapter can move its own sealed response owner
 // into this module. Keeping the builder private prevents crate siblings from asserting metadata or
 // rebinding an arbitrary same-length backing to a trusted identity.
 #[cfg(test)]
-fn prepare_exact_compressed_chunk_input<'a>(
-    compression: &'a str,
+fn prepare_exact_compressed_chunk_input(
+    compression: &str,
     expected_compressed_bytes: u64,
     declared_uncompressed_size: u64,
     declared_uncompressed_crc: u32,
     budget: &ChunkDecompressionBudget,
-) -> Result<PreparedExactCompressedChunkInput<'a>, ChunkDecompressionError> {
+) -> Result<PreparedExactCompressedChunkInput<'static>, ChunkDecompressionError> {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_PHYSICAL_READ_IDENTITY: AtomicU64 = AtomicU64::new(1);
-    let identity = PhysicalChunkReadIdentity {
+    let identity = PhysicalChunkReadIdentity::CodecUnit {
         opaque: u128::from(NEXT_TEST_PHYSICAL_READ_IDENTITY.fetch_add(1, Ordering::Relaxed)),
     };
     Ok(PreparedExactCompressedChunkInput {
         identity,
-        compression,
+        codec: ChunkCompressionCodec::classify_mcap_name(compression),
         expected_compressed_bytes,
         declared_uncompressed_size,
         declared_uncompressed_crc,
@@ -386,8 +445,8 @@ pub(crate) struct ExactCompressedChunkInput<'a> {
     // `Drop` releases this backing before its permit on every failure path.
     compressed_payload: Option<Box<[u8]>>,
     reservation: Option<CompressedChunkInputReservation>,
-    identity: Option<PhysicalChunkReadIdentity>,
-    compression: &'a str,
+    identity: Option<PhysicalChunkReadIdentity<'a>>,
+    codec: ChunkCompressionCodec,
     declared_uncompressed_size: u64,
     declared_uncompressed_crc: u32,
 }
@@ -397,7 +456,7 @@ impl std::fmt::Debug for ExactCompressedChunkInput<'_> {
         formatter
             .debug_struct("ExactCompressedChunkInput")
             .field("identity", &"<opaque>")
-            .field("compression", &self.compression)
+            .field("codec", &self.codec)
             .field("compressed_payload", &"<owned exact bytes and permit>")
             .field(
                 "declared_uncompressed_size",
@@ -408,7 +467,14 @@ impl std::fmt::Debug for ExactCompressedChunkInput<'_> {
     }
 }
 
-impl ExactCompressedChunkInput<'_> {
+impl<'a> ExactCompressedChunkInput<'a> {
+    fn ensure_current(&self) -> Result<(), ChunkDecompressionError> {
+        self.identity
+            .as_ref()
+            .expect("live exact compressed input retains its evidence identity")
+            .ensure_current()
+    }
+
     fn compressed_payload(&self) -> &[u8] {
         self.compressed_payload
             .as_deref()
@@ -425,7 +491,7 @@ impl ExactCompressedChunkInput<'_> {
         )
     }
 
-    fn take_identity_after_releasing_compressed(mut self) -> PhysicalChunkReadIdentity {
+    fn take_identity_after_releasing_compressed(mut self) -> PhysicalChunkReadIdentity<'a> {
         drop(self.compressed_payload.take());
         drop(self.reservation.take());
         self.identity
@@ -433,7 +499,7 @@ impl ExactCompressedChunkInput<'_> {
             .expect("live exact compressed input retains its evidence identity")
     }
 
-    fn transition_none_to_output(mut self) -> (PhysicalChunkReadIdentity, Box<[u8]>) {
+    fn transition_none_to_output(mut self) -> (PhysicalChunkReadIdentity<'a>, Box<[u8]>) {
         let output = self
             .compressed_payload
             .take()
@@ -461,15 +527,23 @@ pub(crate) enum ChunkCompressionCodec {
     None,
     Zstd,
     Lz4,
+    Unsupported,
 }
 
 impl ChunkCompressionCodec {
-    fn from_mcap_name(name: &str) -> Result<Self, ChunkDecompressionError> {
+    pub(super) fn from_mcap_name(name: &str) -> Result<Self, ChunkDecompressionError> {
+        match Self::classify_mcap_name(name) {
+            Self::Unsupported => Err(ChunkDecompressionError::UnsupportedCompression),
+            codec => Ok(codec),
+        }
+    }
+
+    fn classify_mcap_name(name: &str) -> Self {
         match name {
-            "" => Ok(Self::None),
-            "zstd" => Ok(Self::Zstd),
-            "lz4" => Ok(Self::Lz4),
-            _ => Err(ChunkDecompressionError::UnsupportedCompression),
+            "" => Self::None,
+            "zstd" => Self::Zstd,
+            "lz4" => Self::Lz4,
+            _ => Self::Unsupported,
         }
     }
 }
@@ -484,15 +558,17 @@ pub(crate) struct ChunkCrcEvidence {
 /// Sealed, move-only bytes that the physical Chunk scanner must consume.
 ///
 /// The owner retains the exact upstream identity, codec, CRC evidence, and output reservation.
-pub(crate) struct ExactOutputChunk {
-    identity: PhysicalChunkReadIdentity,
+pub(crate) struct ExactOutputChunk<'a> {
+    // These owners are optional solely to make the security-relevant release order explicit in
+    // `Drop`: backing bytes, then accounting, then the physical read lease.
+    bytes: Option<Box<[u8]>>,
+    reservation: Option<ChunkDecompressionOutputReservation>,
+    identity: Option<PhysicalChunkReadIdentity<'a>>,
     codec: ChunkCompressionCodec,
     crc: ChunkCrcEvidence,
-    bytes: Box<[u8]>,
-    _reservation: ChunkDecompressionOutputReservation,
 }
 
-impl std::fmt::Debug for ExactOutputChunk {
+impl std::fmt::Debug for ExactOutputChunk<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ExactOutputChunk")
@@ -504,9 +580,11 @@ impl std::fmt::Debug for ExactOutputChunk {
     }
 }
 
-impl ExactOutputChunk {
-    pub(crate) const fn identity(&self) -> &PhysicalChunkReadIdentity {
-        &self.identity
+impl<'a> ExactOutputChunk<'a> {
+    pub(crate) fn identity(&self) -> &PhysicalChunkReadIdentity<'a> {
+        self.identity
+            .as_ref()
+            .expect("live exact output retains its physical read identity")
     }
 
     pub(crate) fn codec(&self) -> ChunkCompressionCodec {
@@ -518,13 +596,42 @@ impl ExactOutputChunk {
     }
 
     pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes
+        self.bytes
+            .as_deref()
+            .expect("live exact output retains its backing")
+    }
+
+    pub(crate) fn has_matching_lease_profile(&self) -> bool {
+        let PhysicalChunkReadIdentity::Lease(lease) = self.identity() else {
+            return false;
+        };
+        Arc::ptr_eq(
+            &lease.decompression_budget().state,
+            &self
+                .reservation
+                .as_ref()
+                .expect("live exact output retains its output reservation")
+                .state,
+        )
+    }
+
+    pub(crate) fn crc_validation(&self) -> OptionalCrcValidation {
+        self.crc.validation
+    }
+}
+
+impl Drop for ExactOutputChunk<'_> {
+    fn drop(&mut self) {
+        drop(self.bytes.take());
+        drop(self.reservation.take());
+        drop(self.identity.take());
     }
 }
 
 /// A decompression failure that is safe to surface without source bytes or sizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ChunkDecompressionError {
+    PhysicalReadNotCurrent,
     UnsupportedCompression,
     DeclaredOutputSizeUnsupported,
     CompressedBytesLimitExceeded,
@@ -551,6 +658,7 @@ pub(crate) enum ChunkDecompressionError {
 impl std::fmt::Display for ChunkDecompressionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            Self::PhysicalReadNotCurrent => "remote MCAP physical Chunk read is no longer current",
             Self::UnsupportedCompression => "remote MCAP Chunk compression is unsupported",
             Self::DeclaredOutputSizeUnsupported => {
                 "remote MCAP Chunk output size is unsupported on this target"
@@ -603,10 +711,16 @@ impl std::error::Error for ChunkDecompressionError {}
 /// Decompresses one exact physical payload without publishing or scanning any record.
 pub(crate) fn decompress_exact_chunk(
     input: ExactCompressedChunkInput<'_>,
-) -> Result<ExactOutputChunk, ChunkDecompressionError> {
+) -> Result<ExactOutputChunk<'_>, ChunkDecompressionError> {
+    input.ensure_current()?;
     let budget_state = input.budget_state();
     // Unsupported codecs fail before any size reservation or output allocation.
-    let codec = ChunkCompressionCodec::from_mcap_name(input.compression)?;
+    let codec = match input.codec {
+        ChunkCompressionCodec::Unsupported => {
+            return Err(ChunkDecompressionError::UnsupportedCompression);
+        }
+        codec => codec,
+    };
     let compressed_bytes = u64::try_from(input.compressed_payload().len())
         .map_err(|_overflow| ChunkDecompressionError::CompressedBytesLimitExceeded)?;
     let output_len = usize::try_from(input.declared_uncompressed_size)
@@ -616,6 +730,7 @@ pub(crate) fn decompress_exact_chunk(
             estimate_zstd_working_bytes(budget_state.limits.max_zstd_window_log)?
         }
         ChunkCompressionCodec::None | ChunkCompressionCodec::Lz4 => 0,
+        ChunkCompressionCodec::Unsupported => unreachable!("unsupported codecs fail above"),
     };
     let reservation = budget_state.try_reserve(
         compressed_bytes,
@@ -648,6 +763,7 @@ pub(crate) fn decompress_exact_chunk(
             decompress_lz4_single_frame(input.compressed_payload(), &mut output)?;
             (input.take_identity_after_releasing_compressed(), output)
         }
+        ChunkCompressionCodec::Unsupported => unreachable!("unsupported codecs fail above"),
     };
 
     let validation = if declared_uncompressed_crc == 0 {
@@ -655,18 +771,28 @@ pub(crate) fn decompress_exact_chunk(
     } else if crc32fast::hash(&output) == declared_uncompressed_crc {
         OptionalCrcValidation::Verified
     } else {
+        drop(output);
+        drop(reservation);
+        drop(identity);
         return Err(ChunkDecompressionError::ChunkChecksumMismatch);
     };
 
+    if let Err(error) = identity.ensure_current() {
+        drop(output);
+        drop(reservation);
+        drop(identity);
+        return Err(error);
+    }
+
     Ok(ExactOutputChunk {
-        identity,
+        bytes: Some(output),
+        reservation: Some(reservation.complete()),
+        identity: Some(identity),
         codec,
         crc: ChunkCrcEvidence {
             declared: declared_uncompressed_crc,
             validation,
         },
-        bytes: output,
-        _reservation: reservation.complete(),
     })
 }
 
@@ -1045,6 +1171,32 @@ fn read_lz4_u64(input: &[u8], cursor: &mut usize) -> Result<u64, ChunkDecompress
 }
 
 #[cfg(test)]
+pub(crate) fn chunk_decompression_budget_for_test() -> ChunkDecompressionBudget {
+    let max_zstd_working_bytes =
+        estimate_zstd_working_bytes(22).expect("the test zstd profile is valid");
+    ChunkDecompressionBudget {
+        state: Arc::new(ChunkDecompressionBudgetState {
+            limits: ChunkDecompressionLimits {
+                max_compressed_bytes: 16 * 1024 * 1024,
+                max_uncompressed_bytes: 16 * 1024 * 1024,
+                max_decompression_ratio: 1_024,
+                max_zstd_window_log: 22,
+            },
+            capacity: ChunkDecompressionBudgetCapacity {
+                max_active_inputs: 16,
+                max_retained_input_bytes: 32 * 1024 * 1024,
+                max_active_work_units: 4,
+                max_overflow_scratch_bytes: 4,
+                max_zstd_working_bytes: max_zstd_working_bytes.saturating_mul(4),
+                max_active_outputs: 16,
+                max_retained_output_bytes: 32 * 1024 * 1024,
+            },
+            usage: Mutex::new(ChunkDecompressionBudgetUsage::default()),
+        }),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::io::Write as _;
 
@@ -1238,7 +1390,7 @@ mod tests {
         assert!(production.contains("OVERFLOW_DETECTION_SCRATCH_BYTES: u64 = 1"));
 
         let codec_allowlist = production
-            .find("let codec = ChunkCompressionCodec::from_mcap_name")
+            .find("let codec = match input.codec")
             .expect("codec allowlist is checked");
         let estimate = production
             .find("estimate_zstd_working_bytes")
@@ -1257,14 +1409,11 @@ mod tests {
         assert!(!production.contains("pub(crate) fn install("));
         assert!(!production.contains("CompressedChunkEvidenceIdentity"));
         let identity_declaration = production
-            .split("pub(crate) struct PhysicalChunkReadIdentity")
+            .split("pub(crate) enum PhysicalChunkReadIdentity")
             .next()
             .expect("physical-read identity declaration exists");
         assert!(!identity_declaration.ends_with("#[derive(Clone, Copy, Debug)]\n"));
-        assert!(
-            production
-                .contains("pub(crate) const fn identity(&self) -> &PhysicalChunkReadIdentity")
-        );
+        assert!(production.contains("pub(crate) fn identity(&self) -> &PhysicalChunkReadIdentity"));
         let decompressor_signature = production
             .split("pub(crate) fn decompress_exact_chunk(")
             .nth(1)
@@ -1289,6 +1438,22 @@ mod tests {
             .find("drop(self.reservation.take())")
             .expect("compressed permit is released explicitly");
         assert!(backing_drop < permit_drop);
+
+        let output_drop = production
+            .find("impl Drop for ExactOutputChunk")
+            .expect("exact output has an explicit release order");
+        let output_drop = &production[output_drop..];
+        let backing_drop = output_drop
+            .find("drop(self.bytes.take())")
+            .expect("exact output drops its backing explicitly");
+        let permit_drop = output_drop
+            .find("drop(self.reservation.take())")
+            .expect("exact output drops its permit explicitly");
+        let identity_drop = output_drop
+            .find("drop(self.identity.take())")
+            .expect("exact output drops its lease-owning identity explicitly");
+        assert!(backing_drop < permit_drop);
+        assert!(permit_drop < identity_drop);
 
         let crate_root = include_str!("lib.rs");
         assert!(crate_root.contains("mod remote_decompression;"));
@@ -1443,12 +1608,12 @@ mod tests {
             &source_profile,
         )
         .expect("first physical handoff is prepared");
-        let first_identity = first_prepared.identity.opaque;
+        let first_identity = first_prepared.identity.codec_test_opaque();
         let first_input = first_prepared
             .install(first_payload.clone().into_boxed_slice())
             .expect("the exact first backing installs once");
         let first_output = decompress_exact_chunk(first_input).expect("first handoff succeeds");
-        assert_eq!(first_output.identity().opaque, first_identity);
+        assert_eq!(first_output.identity().codec_test_opaque(), first_identity);
         assert_eq!(first_output.bytes(), first_payload);
         assert_input_released(&source_profile);
         assert_budget_empty(&other_profile);
@@ -1472,7 +1637,8 @@ mod tests {
         )
         .expect("a later physical handoff is prepared independently");
         assert_ne!(
-            second_prepared.identity.opaque, first_identity,
+            second_prepared.identity.codec_test_opaque(),
+            first_identity,
             "no API accepts a prior identity for a different payload"
         );
         drop(second_prepared);
@@ -1494,6 +1660,17 @@ mod tests {
     }
 
     #[test]
+    fn codec_unit_identity_cannot_enter_the_physical_semantic_scanner() {
+        let budget = budget();
+        let output = decompress_exact_chunk(input(&budget, 1, "", vec![1], 1, 0)).unwrap();
+        assert_eq!(
+            crate::remote_chunk_scan::scan_decompressed_physical_chunk(output).unwrap_err(),
+            crate::remote_chunk_scan::PhysicalChunkValidationError::MissingPhysicalReadLease
+        );
+        assert_budget_empty(&budget);
+    }
+
+    #[test]
     fn source_profile_state_closes_only_after_the_last_input_or_output_owner() {
         let budget = budget();
         let state = Arc::clone(&budget.state);
@@ -1512,7 +1689,14 @@ mod tests {
         drop(budget);
         let output = decompress_exact_chunk(input)
             .expect("the sealed input keeps its source profile alive during close");
-        assert!(Arc::ptr_eq(&output._reservation.state, &state));
+        assert!(Arc::ptr_eq(
+            &output
+                .reservation
+                .as_ref()
+                .expect("the exact output retains its reservation")
+                .state,
+            &state
+        ));
         assert_eq!(output.bytes(), payload);
         drop(state);
         assert!(weak_state.upgrade().is_some());
@@ -1655,7 +1839,7 @@ mod tests {
             decompress_exact_chunk(input(&budget, 7, "", payload.clone(), payload.len(), crc))
                 .expect("exact raw payload succeeds");
 
-        assert_ne!(chunk.identity().opaque, 0);
+        assert_ne!(chunk.identity().codec_test_opaque(), 0);
         assert_eq!(chunk.codec(), ChunkCompressionCodec::None);
         assert_eq!(chunk.bytes(), payload);
         assert_eq!(

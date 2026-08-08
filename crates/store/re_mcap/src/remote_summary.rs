@@ -12,10 +12,10 @@
 use crate::remote_fixed_layout::{RemoteMcapSlice, ValidatedFixedLayout};
 
 mod ambiguous_zero;
-mod definitions;
+pub(crate) mod definitions;
 mod materialization;
 mod message_index;
-mod physical_regions;
+pub(crate) mod physical_regions;
 
 const RECORD_ENVELOPE_LEN: usize = super::RECORD_HEADER_LEN;
 const SUMMARY_OFFSET_BODY_LEN: u64 = 1 + 8 + 8;
@@ -464,7 +464,101 @@ fn checked_increment(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) fn validated_physical_regions_for_test(
+    fixture: &crate::testing::AdversarialMcapFixture,
+) -> physical_regions::ValidatedPhysicalRegions<'_> {
+    use crate::remote_fixed_layout::{RemoteMcapSlice, prepare_fixed_layout};
+
+    const FOOTER_TAIL_LEN: usize = RECORD_ENVELOPE_LEN + 20 + mcap::MAGIC.len();
+    let object_len = u64::try_from(fixture.bytes.len()).expect("fixture length fits u64");
+    let tail_start = fixture.bytes.len() - FOOTER_TAIL_LEN;
+    let prepared_fixed = prepare_fixed_layout(
+        object_len,
+        RemoteMcapSlice::new(0, &fixture.bytes[..mcap::MAGIC.len() + RECORD_ENVELOPE_LEN]),
+        RemoteMcapSlice::new(
+            u64::try_from(tail_start).expect("fixture tail offset fits u64"),
+            &fixture.bytes[tail_start..],
+        ),
+    )
+    .expect("the adversarial fixture has valid fixed edges");
+    let summary_range = prepared_fixed.data_end_and_summary_range();
+    let summary_start = usize::try_from(summary_range.start).expect("summary start fits usize");
+    let summary_end = usize::try_from(summary_range.end).expect("summary end fits usize");
+    let fixed = prepared_fixed
+        .validate_data_end_and_summary(RemoteMcapSlice::new(
+            summary_range.start,
+            &fixture.bytes[summary_start..summary_end],
+        ))
+        .expect("the adversarial fixture has a valid DataEnd and Summary");
+    let header = fixture
+        .layout
+        .records
+        .iter()
+        .find(|record| record.opcode == mcap::records::op::HEADER)
+        .expect("the adversarial fixture contains a Header");
+    let prepared = prepare_summary_records(
+        fixed,
+        RemoteMcapSlice::new(
+            u64::try_from(header.body_start).expect("header offset fits u64"),
+            &fixture.bytes[header.body_start..header.end],
+        ),
+        &SummaryCensusLimits {
+            max_header_body_bytes: object_len,
+            max_summary_bytes: object_len,
+            max_summary_records: 10_000,
+            max_schema_records: 10_000,
+            max_channel_records: 10_000,
+            max_chunk_index_records: 10_000,
+        },
+    )
+    .expect("the adversarial fixture Summary prepares");
+    let materialization_budget = materialization::SummaryMaterializationBudget::for_test(
+        materialization::SummaryMaterializationLimits::for_test(
+            10_000,
+            object_len,
+            object_len,
+            object_len.saturating_mul(8),
+            10_000,
+            10_000,
+        ),
+        1,
+        materialization::NestedPreflightCensus {
+            main_summary_records: 10_000,
+            owned_string_count: 100_000,
+            owned_string_bytes: object_len.saturating_mul(8),
+            schema_data_bytes: object_len.saturating_mul(8),
+            channel_metadata_entries: 100_000,
+            fixed_map_entries: 100_000,
+            nested_encoded_bytes: object_len.saturating_mul(8),
+            nested_retained_bytes: object_len.saturating_mul(8),
+        },
+    );
+    let token = materialization::preflight_summary_records(prepared, &materialization_budget)
+        .expect("the adversarial fixture Summary preflights");
+    let materialized = materialization::materialize_summary_records(token)
+        .expect("the adversarial fixture Summary materializes");
+    let definitions = definitions::validate_summary_definitions(materialized)
+        .expect("the adversarial fixture definitions validate");
+    let physical_budget = physical_regions::PhysicalRegionBudget::for_test(
+        physical_regions::PhysicalRegionLimits::for_test(
+            10_000,
+            object_len,
+            object_len,
+            object_len,
+            object_len,
+            object_len.saturating_mul(8),
+            object_len.saturating_mul(8),
+        ),
+        1,
+        10_000,
+        object_len.saturating_mul(8),
+    );
+    physical_regions::validate_physical_regions(definitions, &physical_budget)
+        .expect("the adversarial fixture physical regions validate")
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::borrow::Cow;
     use std::cell::Cell;
@@ -551,16 +645,16 @@ mod tests {
         });
     }
 
-    struct AllocationGuard;
+    pub(crate) struct AllocationGuard;
 
     impl AllocationGuard {
-        fn start() -> Self {
+        pub(crate) fn start() -> Self {
             ALLOCATIONS.with(|count| count.set(0));
             TRACK_THIS_THREAD.with(|tracking| tracking.set(true));
             Self
         }
 
-        fn count() -> u64 {
+        pub(crate) fn count() -> u64 {
             ALLOCATIONS.with(Cell::get)
         }
     }

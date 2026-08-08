@@ -61,6 +61,11 @@ mod remote_summary;
 #[cfg(any(target_arch = "wasm32", test))]
 mod remote_decompression;
 
+// Physical Chunk authority, header validation, and semantic scanning remain crate-private and
+// production-disarmed until the Chrome body-owner adapter and remote resource profile are sealed.
+#[cfg(any(target_arch = "wasm32", test))]
+mod remote_chunk_scan;
+
 pub(crate) mod parsers;
 pub(crate) mod util;
 
