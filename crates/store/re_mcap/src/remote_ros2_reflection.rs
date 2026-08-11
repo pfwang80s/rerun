@@ -89,6 +89,19 @@ pub(crate) struct RemoteDecoderPolicyWireV1<'wire> {
     fallback_identity: &'wire str,
 }
 
+#[cfg(test)]
+impl RemoteDecoderPolicyWireV1<'static> {
+    pub(crate) fn canonical_for_protobuf_test_v1() -> Self {
+        Self {
+            allowlist_version: REMOTE_ALLOWLIST_VERSION_V1,
+            assignment_version: REMOTE_POLICY_VERSION_V1,
+            grammar_version: REMOTE_GRAMMAR_VERSION_V1,
+            decoder_identities: &CANONICAL_DECODER_IDENTITIES_V1,
+            fallback_identity: CANONICAL_FALLBACK_IDENTITY_V1,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RemoteDecoderPolicyError {
     UnknownVersion,
@@ -142,11 +155,30 @@ pub(crate) fn freeze_remote_decoder_policy_v1<'wire>(
 pub(crate) struct RemoteDefinitionsSourceState {
     generation: Cell<u64>,
     viewer_scope: *const RemoteViewerScopeState,
+    protobuf_profile_scope:
+        *const crate::remote_protobuf_projection_boundary::RemoteProtobufProfileScopeV1,
 }
 
 impl RemoteDefinitionsSourceState {
     fn is_current(&self, generation: u64) -> bool {
         self.generation.get() == generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_protobuf_test_v1(
+        viewer_scope: &RemoteViewerScopeState,
+        protobuf_profile_scope: &crate::remote_protobuf_projection_boundary::RemoteProtobufProfileScopeV1,
+    ) -> Self {
+        Self {
+            generation: Cell::new(1),
+            viewer_scope,
+            protobuf_profile_scope,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invalidate_for_protobuf_test_v1(&self) {
+        self.generation.set(self.generation.get().wrapping_add(1));
     }
 }
 
@@ -156,6 +188,24 @@ pub(crate) struct RemoteViewerScopeState {
 
 pub(crate) struct RemoteRos2ProfileScopeV1 {
     _sealed_identity: u8,
+}
+
+#[cfg(test)]
+impl RemoteViewerScopeState {
+    pub(crate) const fn new_for_protobuf_test_v1(identity: u8) -> Self {
+        Self {
+            _sealed_identity: identity,
+        }
+    }
+}
+
+#[cfg(test)]
+impl RemoteRos2ProfileScopeV1 {
+    pub(crate) const fn new_for_protobuf_test_v1(identity: u8) -> Self {
+        Self {
+            _sealed_identity: identity,
+        }
+    }
 }
 
 /// A sealed view of MCAP-020 definitions tied to one live source generation.
@@ -171,6 +221,20 @@ impl RemoteDefinitionsCapability<'_, '_, '_> {
             Ok(())
         } else {
             Err(RemoteRos2InitializationError::StaleSource)
+        }
+    }
+}
+
+#[cfg(test)]
+impl<'definitions, 'input, 'source> RemoteDefinitionsCapability<'definitions, 'input, 'source> {
+    pub(crate) fn new_for_protobuf_test_v1(
+        definitions: &'definitions ValidatedSummaryDefinitions<'input>,
+        source: &'source RemoteDefinitionsSourceState,
+    ) -> Self {
+        Self {
+            definitions,
+            source,
+            generation: source.generation.get(),
         }
     }
 }
@@ -476,6 +540,70 @@ pub(crate) struct RemoteRos2InitializationBudget<'source, 'wire> {
     viewer_scope: *const RemoteViewerScopeState,
     profile_scope: *const RemoteRos2ProfileScopeV1,
     policy_wire: &'wire RemoteDecoderPolicyWireV1<'wire>,
+}
+
+#[cfg(test)]
+impl UnfrozenRemoteRos2LimitsV1 {
+    pub(crate) fn generous_for_protobuf_test_v1() -> Self {
+        Self {
+            max_schemas: 32,
+            max_definition_bytes: 1_000_000,
+            max_specifications: 256,
+            max_fields: 4_096,
+            max_constants: 4_096,
+            max_members: 8_192,
+            max_line_bytes: 16_384,
+            max_token_bytes: 1_024,
+            max_identifier_bytes: 1_024,
+            max_default_bytes: 16_384,
+            max_string_literal_bytes: 16_384,
+            max_string_bound: 1_000_000,
+            max_array_bound: 1_000_000,
+            max_dependency_edges: 4_096,
+            max_dependency_depth: 32,
+            max_signature_steps: 1_000_000,
+            max_projection_steps: 1_000_000,
+            max_recognition_steps: 1_000_000,
+            max_census_steps: 1_000_000,
+            max_materialization_steps: 1_000_000,
+            max_retained_bytes: 16_000_000,
+            max_working_bytes: 16_000_000,
+        }
+    }
+}
+
+#[cfg(test)]
+impl<'source, 'wire> RemoteRos2InitializationBudget<'source, 'wire> {
+    pub(crate) fn new_for_protobuf_test_v1(
+        source: &'source RemoteDefinitionsSourceState,
+        viewer_scope: &RemoteViewerScopeState,
+        profile_scope: &RemoteRos2ProfileScopeV1,
+        policy_wire: &'wire RemoteDecoderPolicyWireV1<'wire>,
+    ) -> Self {
+        let limits = UnfrozenRemoteRos2LimitsV1::generous_for_protobuf_test_v1();
+        Self {
+            state: Arc::new(RemoteRos2BudgetState {
+                limits,
+                capacity: RemoteRos2BudgetCapacity {
+                    max_active_initializers: 8,
+                    max_working_bytes: 64_000_000,
+                    max_retained_results: 8,
+                    max_retained_bytes: 64_000_000,
+                },
+                usage: Mutex::new(RemoteRos2BudgetUsage::default()),
+                poisoned: AtomicBool::new(false),
+                generation: source.generation.get(),
+                viewer_scope_identity: std::ptr::from_ref(viewer_scope).addr(),
+                profile_scope_identity: std::ptr::from_ref(profile_scope).addr(),
+                policy_wire_identity: std::ptr::from_ref(policy_wire).addr(),
+            }),
+            source,
+            generation: source.generation.get(),
+            viewer_scope,
+            profile_scope,
+            policy_wire,
+        }
+    }
 }
 
 impl std::fmt::Debug for RemoteRos2InitializationBudget<'_, '_> {
@@ -1013,6 +1141,7 @@ pub(crate) struct RemoteRos2ChannelRecognitionV1<
     owner: &'item RemoteRos2RecognitionIterV1<'borrow, 'definitions, 'input, 'source, 'wire>,
     channel_record_index: usize,
     recognized_by_reflection: bool,
+    protobuf_schema_id: Option<u16>,
 }
 
 impl RemoteRos2ChannelRecognitionV1<'_, '_, '_, '_, '_, '_> {
@@ -1028,6 +1157,15 @@ impl RemoteRos2ChannelRecognitionV1<'_, '_, '_, '_, '_, '_> {
     pub(crate) fn recognized_by_reflection(&self) -> Result<bool, RemoteRos2InitializationError> {
         self.owner.transition.ensure_current()?;
         Ok(self.recognized_by_reflection)
+    }
+
+    /// Returns the canonical protobuf Schema ID observed by the local protobuf recognizer shape.
+    ///
+    /// The descriptor graph still decides whether that schema completed bounded initialization;
+    /// this method only projects the already-bound Channel/Schema relationship.
+    pub(crate) fn protobuf_schema_id(&self) -> Result<Option<u16>, RemoteRos2InitializationError> {
+        self.owner.transition.ensure_current()?;
+        Ok(self.protobuf_schema_id)
     }
 }
 
@@ -1075,11 +1213,16 @@ impl<'borrow, 'definitions, 'input, 'source, 'wire>
                 });
             let schema = canonical_channel_schema_metered(definitions, channel, &mut self.steps)?;
             self.steps.consume_bytes(channel.message_encoding.len())?;
+            if let Some(schema) = schema {
+                self.steps.consume_bytes(schema.header.encoding.len())?;
+            }
+            let protobuf_schema_id = schema
+                .filter(|schema| schema.header.encoding == "protobuf")
+                .map(|schema| schema.header.id);
             let recognized_by_reflection = if !channel.message_encoding.eq_ignore_ascii_case("cdr")
             {
                 false
             } else if let Some(schema) = schema {
-                self.steps.consume_bytes(schema.header.encoding.len())?;
                 self.steps
                     .consume_bytes(self.transition.payload.initialized.schemas.len())?;
                 schema.header.encoding == ROS2_SCHEMA_ENCODING
@@ -1098,6 +1241,7 @@ impl<'borrow, 'definitions, 'input, 'source, 'wire>
                 owner: self,
                 channel_record_index: record_index,
                 recognized_by_reflection,
+                protobuf_schema_id,
             }));
         }
         self.steps.ensure_exhausted()?;
@@ -1121,9 +1265,21 @@ pub(crate) struct RemoteRos2ProjectionEofAuthorityV1<'definitions, 'input, 'sour
 impl<'definitions, 'input, 'source, 'wire>
     RemoteRos2ProjectionEofAuthorityV1<'definitions, 'input, 'source, 'wire>
 {
+    pub(crate) fn ensure_protobuf_profile_current_v1(
+        &self,
+        viewer_scope: *const RemoteViewerScopeState,
+        profile_scope: *const crate::remote_protobuf_projection_boundary::RemoteProtobufProfileScopeV1,
+    ) -> Result<(), RemoteRos2InitializationError> {
+        self.transition.ensure_current()?;
+        let source = self.transition.payload.initialized.source.source;
+        if source.viewer_scope != viewer_scope || source.protobuf_profile_scope != profile_scope {
+            remote_ros2_fatal_control_plane("protobuf viewer or profile scope was rebound");
+        }
+        Ok(())
+    }
+
     /// Borrows recognition from the still-bound EOF owner without exposing its transition.
-    #[cfg(test)]
-    pub(crate) fn take_bound_recognition_for_test_v1(
+    pub(crate) fn take_bound_recognition_v1(
         &mut self,
     ) -> Result<
         RemoteRos2RecognitionIterV1<'_, 'definitions, 'input, 'source, 'wire>,
@@ -1143,6 +1299,16 @@ impl<'definitions, 'input, 'source, 'wire>
     }
 
     #[cfg(test)]
+    pub(crate) fn take_bound_recognition_for_test_v1(
+        &mut self,
+    ) -> Result<
+        RemoteRos2RecognitionIterV1<'_, 'definitions, 'input, 'source, 'wire>,
+        RemoteRos2InitializationError,
+    > {
+        self.take_bound_recognition_v1()
+    }
+
+    #[cfg(test)]
     pub(crate) fn ensure_current_for_test_v1(&self) -> Result<(), RemoteRos2InitializationError> {
         self.transition.ensure_current()
     }
@@ -1151,6 +1317,19 @@ impl<'definitions, 'input, 'source, 'wire>
 impl<'definitions, 'input, 'source, 'wire>
     RemoteProtobufProjectionOwnerV1<'definitions, 'input, 'source, 'wire>
 {
+    pub(crate) fn ensure_protobuf_profile_current_v1(
+        &self,
+        viewer_scope: *const RemoteViewerScopeState,
+        profile_scope: *const crate::remote_protobuf_projection_boundary::RemoteProtobufProfileScopeV1,
+    ) -> Result<(), RemoteRos2InitializationError> {
+        self.transition.ensure_current()?;
+        let source = self.transition.payload.initialized.source.source;
+        if source.viewer_scope != viewer_scope || source.protobuf_profile_scope != profile_scope {
+            remote_ros2_fatal_control_plane("protobuf viewer or profile scope was rebound");
+        }
+        Ok(())
+    }
+
     fn consume_step(&mut self) -> Result<(), RemoteRos2InitializationError> {
         self.remaining_steps = self.remaining_steps.checked_sub(1).ok_or(
             RemoteRos2InitializationError::ResourceLimitExceeded(
@@ -1282,8 +1461,10 @@ pub(crate) struct RemoteProtobufSchemaProjectionV1<'borrow, 'definitions, 'input
     schema_record_index: usize,
 }
 
-impl RemoteProtobufSchemaProjectionV1<'_, '_, '_, '_, '_> {
-    fn schema(&self) -> Result<CanonicalSchemaDefinition<'_>, RemoteRos2InitializationError> {
+impl<'definitions> RemoteProtobufSchemaProjectionV1<'_, 'definitions, '_, '_, '_> {
+    fn schema(
+        &self,
+    ) -> Result<CanonicalSchemaDefinition<'definitions>, RemoteRos2InitializationError> {
         self.owner.transition.ensure_current()?;
         self.owner
             .transition
@@ -1299,15 +1480,15 @@ impl RemoteProtobufSchemaProjectionV1<'_, '_, '_, '_, '_> {
         Ok(self.schema()?.header.id)
     }
 
-    pub(crate) fn name(&self) -> Result<&str, RemoteRos2InitializationError> {
+    pub(crate) fn name(&self) -> Result<&'definitions str, RemoteRos2InitializationError> {
         Ok(self.schema()?.header.name.as_str())
     }
 
-    pub(crate) fn encoding(&self) -> Result<&str, RemoteRos2InitializationError> {
+    pub(crate) fn encoding(&self) -> Result<&'definitions str, RemoteRos2InitializationError> {
         Ok(self.schema()?.header.encoding.as_str())
     }
 
-    pub(crate) fn data(&self) -> Result<&[u8], RemoteRos2InitializationError> {
+    pub(crate) fn data(&self) -> Result<&'definitions [u8], RemoteRos2InitializationError> {
         Ok(self.schema()?.data)
     }
 }
@@ -3254,10 +3435,10 @@ fn measure_remote_ros2_recognition_steps_v1(
             });
         let schema = canonical_channel_schema_metered(definitions, channel, &mut steps)?;
         steps.consume_bytes(channel.message_encoding.len())?;
-        if channel.message_encoding.eq_ignore_ascii_case("cdr")
-            && let Some(schema) = schema
-        {
+        if let Some(schema) = schema {
             steps.consume_bytes(schema.header.encoding.len())?;
+        }
+        if channel.message_encoding.eq_ignore_ascii_case("cdr") && schema.is_some() {
             steps.consume_bytes(ros2_schema_count)?;
         }
     }
@@ -3804,9 +3985,12 @@ pub(crate) extern "C" fn rerun_remote_ros2_initializer_artifact_probe_v1_impl() 
     let profile_scope = RemoteRos2ProfileScopeV1 {
         _sealed_identity: 1,
     };
+    let protobuf_profile_scope =
+        crate::remote_protobuf_projection_boundary::RemoteProtobufProfileScopeV1::new_disarmed_v1();
     let source_state = RemoteDefinitionsSourceState {
         generation: Cell::new(1),
         viewer_scope: &viewer_scope,
+        protobuf_profile_scope: &protobuf_profile_scope,
     };
     let wire = RemoteDecoderPolicyWireV1 {
         allowlist_version: REMOTE_ALLOWLIST_VERSION_V1,
@@ -3922,6 +4106,117 @@ pub(crate) extern "C" fn rerun_remote_ros2_initializer_artifact_probe_v1_impl() 
         return 3;
     }
     0
+}
+
+/// Release-Wasm executable probe for the chained ROS 2 → protobuf initializer ownership path.
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub(crate) extern "C" fn rerun_remote_protobuf_initializer_artifact_probe_v1_impl() -> u32 {
+    let definitions = ValidatedSummaryDefinitions::for_remote_ros2_artifact_probe();
+    let viewer_scope = RemoteViewerScopeState {
+        _sealed_identity: 1,
+    };
+    let ros_profile_scope = RemoteRos2ProfileScopeV1 {
+        _sealed_identity: 1,
+    };
+    let protobuf_profile_scope =
+        crate::remote_protobuf_projection_boundary::RemoteProtobufProfileScopeV1::new_disarmed_v1();
+    let source_state = RemoteDefinitionsSourceState {
+        generation: Cell::new(1),
+        viewer_scope: &viewer_scope,
+        protobuf_profile_scope: &protobuf_profile_scope,
+    };
+    let wire = RemoteDecoderPolicyWireV1 {
+        allowlist_version: REMOTE_ALLOWLIST_VERSION_V1,
+        assignment_version: REMOTE_POLICY_VERSION_V1,
+        grammar_version: REMOTE_GRAMMAR_VERSION_V1,
+        decoder_identities: &CANONICAL_DECODER_IDENTITIES_V1,
+        fallback_identity: CANONICAL_FALLBACK_IDENTITY_V1,
+    };
+    let limits = UnfrozenRemoteRos2LimitsV1 {
+        max_schemas: 1,
+        max_definition_bytes: 128,
+        max_specifications: 2,
+        max_fields: 2,
+        max_constants: 0,
+        max_members: 2,
+        max_line_bytes: 128,
+        max_token_bytes: 32,
+        max_identifier_bytes: 32,
+        max_default_bytes: 32,
+        max_string_literal_bytes: 32,
+        max_string_bound: 32,
+        max_array_bound: 32,
+        max_dependency_edges: 1,
+        max_dependency_depth: 1,
+        max_signature_steps: 4_096,
+        max_projection_steps: 4_096,
+        max_recognition_steps: 4_096,
+        max_census_steps: 32_768,
+        max_materialization_steps: 32_768,
+        max_retained_bytes: u64::MAX,
+        max_working_bytes: u64::MAX,
+    };
+    let budget_state = Arc::new(RemoteRos2BudgetState {
+        limits,
+        capacity: RemoteRos2BudgetCapacity {
+            max_active_initializers: 1,
+            max_working_bytes: u64::MAX,
+            max_retained_results: 1,
+            max_retained_bytes: u64::MAX,
+        },
+        usage: Mutex::new(RemoteRos2BudgetUsage::default()),
+        poisoned: AtomicBool::new(false),
+        generation: 1,
+        viewer_scope_identity: std::ptr::from_ref(&viewer_scope).addr(),
+        profile_scope_identity: std::ptr::from_ref(&ros_profile_scope).addr(),
+        policy_wire_identity: std::ptr::from_ref(&wire).addr(),
+    });
+    let budget = RemoteRos2InitializationBudget {
+        state: budget_state,
+        source: &source_state,
+        generation: 1,
+        viewer_scope: &viewer_scope,
+        profile_scope: &ros_profile_scope,
+        policy_wire: &wire,
+    };
+    let policy = match freeze_remote_decoder_policy_v1(&wire) {
+        Ok(policy) => policy,
+        Err(_error) => return 11,
+    };
+    let owner = match begin_remote_ros2_admission_v1(
+        RemoteDefinitionsCapability {
+            definitions: &definitions,
+            source: &source_state,
+            generation: 1,
+        },
+        policy,
+        &budget,
+    ) {
+        Ok(owner) => owner,
+        Err(_error) => return 12,
+    };
+    let evidence = match preflight_remote_decoder_topic_signatures_v1(owner) {
+        Ok(evidence) => evidence,
+        Err(_error) => return 13,
+    };
+    let prepared = match prepare_remote_ros2_census_v1(evidence) {
+        Ok(prepared) => prepared,
+        Err(_error) => return 14,
+    };
+    let result = match materialize_remote_ros2_definitions_v1(prepared) {
+        Ok(result) => result,
+        Err(_error) => return 15,
+    };
+    let transition = match result.into_protobuf_transition_v1() {
+        Ok(transition) => transition,
+        Err(_error) => return 16,
+    };
+    crate::remote_protobuf_descriptor::run_remote_protobuf_artifact_probe_v1(
+        transition,
+        &viewer_scope,
+        &protobuf_profile_scope,
+    )
 }
 
 #[cfg(test)]
@@ -4095,6 +4390,7 @@ mod tests {
         RemoteDefinitionsSourceState {
             generation: Cell::new(1),
             viewer_scope: &VIEWER_SCOPE,
+            protobuf_profile_scope: std::ptr::null(),
         }
     }
 

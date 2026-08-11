@@ -91,6 +91,26 @@ pub extern "C" fn rerun_remote_ros2_initializer_artifact_probe_v1() -> u32 {
     unsafe { rerun_remote_ros2_initializer_artifact_probe_v1_impl() }
 }
 
+/// Executable final-artifact proof for the chained remote protobuf initializer.
+#[cfg(rerun_remote_ros2_artifact_probe_v1)]
+#[unsafe(no_mangle)]
+pub extern "C" fn rerun_remote_protobuf_initializer_artifact_probe_v1() -> u32 {
+    let _capability = RE_VIEWER_REMOTE_ROS2_GENERATED_CAPABILITY_V1;
+    if re_memory::is_tracking_callstacks() {
+        return 3;
+    }
+    let allocator_status = rerun_remote_ros2_accounting_allocator_artifact_probe_v1();
+    if allocator_status != 0 {
+        return allocator_status;
+    }
+    unsafe extern "C" {
+        fn rerun_remote_protobuf_initializer_artifact_probe_v1_impl() -> u32;
+    }
+    // SAFETY: the symbol is defined by the exact locked `re_mcap` dependency in this final Wasm
+    // artifact, takes no arguments, and has the same C ABI and return type.
+    unsafe { rerun_remote_protobuf_initializer_artifact_probe_v1_impl() }
+}
+
 #[wasm_bindgen]
 pub struct WebHandle {
     runner: eframe::WebRunner,

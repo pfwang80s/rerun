@@ -39,6 +39,13 @@
 //! use re_mcap::remote_protobuf_projection_boundary;
 //! ```
 //!
+//! The combined bounded protobuf graph and its source-bound recognition rows cannot be named,
+//! copied, or rebound by downstream crates:
+//!
+//! ```compile_fail
+//! use re_mcap::remote_protobuf_descriptor;
+//! ```
+//!
 //! Raw Summary/schema bytes, scalar policy claims, source generations, and reservations therefore
 //! cannot be used by a downstream crate to construct or rebind the sealed capability:
 //!
@@ -99,6 +106,12 @@ mod remote_chunk_scan;
 // It can own only the opaque post-EOF authority and is not a descendant of either implementation.
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
 mod remote_protobuf_projection_boundary;
+
+// Bounded protobuf descriptor initialization is a sibling of the neutral post-EOF boundary.
+// The boundary exposes only opaque operations, so the initializer can retain, but never detach,
+// the exact ROS/source/policy authority established by MCAP-026.
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+mod remote_protobuf_descriptor;
 
 // Bounded ROS 2 reflection initialization remains crate-private and production-disarmed until the
 // remote decoder policy and resource profile are sealed.

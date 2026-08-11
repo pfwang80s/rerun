@@ -16,6 +16,22 @@ pub(crate) struct RemoteProtobufProjectionEofContinuationV1<'definitions, 'input
     authority: RemoteRos2ProjectionEofAuthorityV1<'definitions, 'input, 'source, 'wire>,
 }
 
+/// Sealed identity for the remote protobuf resource profile expected by one source.
+///
+/// No ordinary product constructor exists while the remote route is disarmed.
+pub(crate) struct RemoteProtobufProfileScopeV1 {
+    _sealed_identity: u8,
+}
+
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+impl RemoteProtobufProfileScopeV1 {
+    pub(crate) const fn new_disarmed_v1() -> Self {
+        Self {
+            _sealed_identity: 1,
+        }
+    }
+}
+
 /// Seals the unforgeable authority produced by the ROS 2 projection owner.
 ///
 /// The input has no public constructor or fields, so another crate-root sibling cannot use this
@@ -24,6 +40,34 @@ pub(crate) fn seal_remote_ros2_projection_eof_v1<'definitions, 'input, 'source, 
     authority: RemoteRos2ProjectionEofAuthorityV1<'definitions, 'input, 'source, 'wire>,
 ) -> RemoteProtobufProjectionEofContinuationV1<'definitions, 'input, 'source, 'wire> {
     RemoteProtobufProjectionEofContinuationV1 { authority }
+}
+
+impl<'definitions, 'input, 'source, 'wire>
+    RemoteProtobufProjectionEofContinuationV1<'definitions, 'input, 'source, 'wire>
+{
+    pub(super) fn ensure_profile_current_v1(
+        &self,
+        viewer_scope: *const crate::remote_ros2_reflection::RemoteViewerScopeState,
+        profile_scope: *const RemoteProtobufProfileScopeV1,
+    ) -> Result<(), crate::remote_ros2_reflection::RemoteRos2InitializationError> {
+        self.authority
+            .ensure_protobuf_profile_current_v1(viewer_scope, profile_scope)
+    }
+
+    pub(super) fn take_bound_recognition_v1(
+        &mut self,
+    ) -> Result<
+        crate::remote_ros2_reflection::RemoteRos2RecognitionIterV1<
+            '_,
+            'definitions,
+            'input,
+            'source,
+            'wire,
+        >,
+        crate::remote_ros2_reflection::RemoteRos2InitializationError,
+    > {
+        self.authority.take_bound_recognition_v1()
+    }
 }
 
 #[cfg(test)]

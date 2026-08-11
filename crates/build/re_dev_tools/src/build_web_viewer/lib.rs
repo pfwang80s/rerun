@@ -16,6 +16,8 @@ const REMOTE_ROS2_ALLOCATOR_CONTRACT_V1: &[u8] =
     b"AccountingAllocator<System>;tracking=admission-v1";
 const REMOTE_ROS2_ALLOCATOR_SECTION_V1: &str = "rerun_remote_ros2_allocator_contract_v1";
 const REMOTE_ROS2_INITIALIZER_PROBE_V1: &str = "rerun_remote_ros2_initializer_artifact_probe_v1";
+const REMOTE_PROTOBUF_INITIALIZER_PROBE_V1: &str =
+    "rerun_remote_protobuf_initializer_artifact_probe_v1";
 const REMOTE_ROS2_ACCOUNTING_ALLOCATOR_PROBE_V1: &str =
     "rerun_remote_ros2_accounting_allocator_artifact_probe_v1";
 const REMOTE_ROS2_STACK_POINTER_V1: &str = "__stack_pointer";
@@ -27,16 +29,32 @@ const REMOTE_ROS2_REQUIRED_STAGES_V1: [&str; 5] = [
     "rerun_remote_ros2_peak_stage_v1",
 ];
 const REMOTE_ROS2_REQUIRED_STAGE_IDENTITIES_V1: [i32; 5] = [0x2601, 0x2602, 0x2603, 0x2604, 0x2605];
-const REMOTE_ROS2_INTERNAL_EXPORTS_V1: [&str; 9] = [
+const REMOTE_PROTOBUF_REQUIRED_STAGES_V1: [&str; 5] = [
+    "rerun_remote_protobuf_wire_stage_v1",
+    "rerun_remote_protobuf_graph_stage_v1",
+    "rerun_remote_protobuf_peak_stage_v1",
+    "rerun_remote_protobuf_arena_stage_v1",
+    "rerun_remote_protobuf_recognition_stage_v1",
+];
+const REMOTE_PROTOBUF_REQUIRED_STAGE_IDENTITIES_V1: [i32; 5] =
+    [0x2701, 0x2702, 0x2703, 0x2704, 0x2705];
+const REMOTE_ROS2_INTERNAL_EXPORTS_V1: [&str; 16] = [
     REMOTE_ROS2_INITIALIZER_PROBE_V1,
+    REMOTE_PROTOBUF_INITIALIZER_PROBE_V1,
     REMOTE_ROS2_ACCOUNTING_ALLOCATOR_PROBE_V1,
     "rerun_remote_ros2_initializer_artifact_probe_v1_impl",
+    "rerun_remote_protobuf_initializer_artifact_probe_v1_impl",
     REMOTE_ROS2_STACK_POINTER_V1,
     REMOTE_ROS2_REQUIRED_STAGES_V1[0],
     REMOTE_ROS2_REQUIRED_STAGES_V1[1],
     REMOTE_ROS2_REQUIRED_STAGES_V1[2],
     REMOTE_ROS2_REQUIRED_STAGES_V1[3],
     REMOTE_ROS2_REQUIRED_STAGES_V1[4],
+    REMOTE_PROTOBUF_REQUIRED_STAGES_V1[0],
+    REMOTE_PROTOBUF_REQUIRED_STAGES_V1[1],
+    REMOTE_PROTOBUF_REQUIRED_STAGES_V1[2],
+    REMOTE_PROTOBUF_REQUIRED_STAGES_V1[3],
+    REMOTE_PROTOBUF_REQUIRED_STAGES_V1[4],
 ];
 const REMOTE_ROS2_MIN_PROBE_STACK_V1: u64 = 512;
 const REMOTE_ROS2_MAX_PROBE_STACK_V1: u64 = 16 * 1024;
@@ -458,9 +476,11 @@ fn verify_remote_ros2_allocator_contract_bytes(wasm: &[u8]) -> anyhow::Result<()
     let mut marker_count = 0_usize;
     let mut imported_functions = 0_u32;
     let mut probe_function = None;
+    let mut protobuf_probe_function = None;
     let mut accounting_allocator_probe_function = None;
     let mut stack_pointer_global = None;
     let mut required_stage_functions = BTreeMap::<&'static str, u32>::new();
+    let mut protobuf_stage_functions = BTreeMap::<&'static str, u32>::new();
     let mut next_defined_function = 0_u32;
     let mut functions = BTreeMap::<u32, RemoteRos2WasmFunctionFacts>::new();
 
@@ -484,6 +504,14 @@ fn verify_remote_ros2_allocator_contract_bytes(wasm: &[u8]) -> anyhow::Result<()
                         anyhow::ensure!(
                             probe_function.replace(export.index).is_none(),
                             "Web artifact exports the remote ROS 2 initializer probe more than once"
+                        );
+                    }
+                    if export.name == REMOTE_PROTOBUF_INITIALIZER_PROBE_V1
+                        && export.kind == ExternalKind::Func
+                    {
+                        anyhow::ensure!(
+                            protobuf_probe_function.replace(export.index).is_none(),
+                            "Web artifact exports the remote protobuf initializer probe more than once"
                         );
                     }
                     if export.name == REMOTE_ROS2_ACCOUNTING_ALLOCATOR_PROBE_V1
@@ -515,6 +543,19 @@ fn verify_remote_ros2_allocator_contract_bytes(wasm: &[u8]) -> anyhow::Result<()
                                     .insert(stage, export.index)
                                     .is_none(),
                             "Web artifact has a malformed or duplicate remote ROS 2 stage anchor"
+                        );
+                    }
+                    if let Some(stage) = REMOTE_PROTOBUF_REQUIRED_STAGES_V1
+                        .iter()
+                        .copied()
+                        .find(|stage| *stage == export.name)
+                    {
+                        anyhow::ensure!(
+                            export.kind == ExternalKind::Func
+                                && protobuf_stage_functions
+                                    .insert(stage, export.index)
+                                    .is_none(),
+                            "Web artifact has a malformed or duplicate remote protobuf stage anchor"
                         );
                     }
                 }
@@ -600,6 +641,12 @@ fn verify_remote_ros2_allocator_contract_bytes(wasm: &[u8]) -> anyhow::Result<()
         probe_function >= imported_functions,
         "Web artifact resolves the remote ROS 2 initializer probe to an imported function"
     );
+    let protobuf_probe_function = protobuf_probe_function
+        .context("Web artifact does not export the remote protobuf initializer probe")?;
+    anyhow::ensure!(
+        protobuf_probe_function >= imported_functions,
+        "Web artifact resolves the remote protobuf initializer probe to an imported function"
+    );
     let accounting_allocator_probe_function = accounting_allocator_probe_function
         .context("Web artifact does not export the remote ROS 2 accounting allocator probe")?;
     anyhow::ensure!(
@@ -611,6 +658,10 @@ fn verify_remote_ros2_allocator_contract_bytes(wasm: &[u8]) -> anyhow::Result<()
     anyhow::ensure!(
         required_stage_functions.len() == REMOTE_ROS2_REQUIRED_STAGES_V1.len(),
         "Web artifact omits a required remote ROS 2 production-stage anchor"
+    );
+    anyhow::ensure!(
+        protobuf_stage_functions.len() == REMOTE_PROTOBUF_REQUIRED_STAGES_V1.len(),
+        "Web artifact omits a required remote protobuf production-stage anchor"
     );
     let distinct_stage_functions = required_stage_functions
         .values()
@@ -630,6 +681,24 @@ fn verify_remote_ros2_allocator_contract_bytes(wasm: &[u8]) -> anyhow::Result<()
             "Remote ROS 2 production stage {stage} does not return its stable identity"
         );
     }
+    let distinct_protobuf_stage_functions = protobuf_stage_functions
+        .values()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        distinct_protobuf_stage_functions.len() == REMOTE_PROTOBUF_REQUIRED_STAGES_V1.len(),
+        "Web artifact aliases distinct remote protobuf production-stage anchors"
+    );
+    for (index, stage) in REMOTE_PROTOBUF_REQUIRED_STAGES_V1.iter().enumerate() {
+        let function = protobuf_stage_functions[stage];
+        let expected = REMOTE_PROTOBUF_REQUIRED_STAGE_IDENTITIES_V1[index];
+        anyhow::ensure!(
+            functions
+                .get(&function)
+                .is_some_and(|facts| facts.i32_constants.contains(&expected)),
+            "Remote protobuf production stage {stage} does not return its stable identity"
+        );
+    }
     let probe_facts = functions
         .get(&probe_function)
         .context("Missing Web code body for the remote ROS 2 initializer probe")?;
@@ -638,6 +707,15 @@ fn verify_remote_ros2_allocator_contract_bytes(wasm: &[u8]) -> anyhow::Result<()
             .calls
             .contains(&accounting_allocator_probe_function),
         "Remote ROS 2 initializer probe does not directly call the exact accounting allocator probe"
+    );
+    let protobuf_probe_facts = functions
+        .get(&protobuf_probe_function)
+        .context("Missing Web code body for the remote protobuf initializer probe")?;
+    anyhow::ensure!(
+        protobuf_probe_facts
+            .calls
+            .contains(&accounting_allocator_probe_function),
+        "Remote protobuf initializer probe does not directly call the exact accounting allocator probe"
     );
     let mut visiting = BTreeSet::new();
     let mut completed = BTreeMap::new();
@@ -664,9 +742,9 @@ fn verify_remote_ros2_allocator_contract_bytes(wasm: &[u8]) -> anyhow::Result<()
         &mut visiting,
         &mut completed,
     )?;
-    for (stage, function) in required_stage_functions {
+    for (stage, function) in &required_stage_functions {
         anyhow::ensure!(
-            completed.contains_key(&function),
+            completed.contains_key(function),
             "Remote ROS 2 initializer probe does not cover production stage {stage}"
         );
     }
@@ -692,6 +770,54 @@ fn verify_remote_ros2_allocator_contract_bytes(wasm: &[u8]) -> anyhow::Result<()
     anyhow::ensure!(
         !proof.has_unresolved_indirect_call,
         "Remote ROS 2 initializer probe contains an unresolved indirect call path"
+    );
+
+    visiting.clear();
+    completed.clear();
+    let _protobuf_reachability = remote_ros2_stack_and_call_proof(
+        protobuf_probe_function,
+        imported_functions,
+        &functions,
+        &mut visiting,
+        &mut completed,
+    )?;
+    let protobuf_reachable: BTreeSet<_> = completed.keys().copied().collect();
+    for (function_index, facts) in &mut functions {
+        if protobuf_reachable.contains(function_index) {
+            facts.own_stack_bytes =
+                verified_stack_frame_peak(&facts.stack_writes, stack_pointer_global)?;
+        }
+    }
+    visiting.clear();
+    completed.clear();
+    let protobuf_proof = remote_ros2_stack_and_call_proof(
+        protobuf_probe_function,
+        imported_functions,
+        &functions,
+        &mut visiting,
+        &mut completed,
+    )?;
+    for (stage, function) in protobuf_stage_functions {
+        anyhow::ensure!(
+            completed.contains_key(&function),
+            "Remote protobuf initializer probe does not cover production stage {stage}"
+        );
+    }
+    for (stage, function) in required_stage_functions {
+        anyhow::ensure!(
+            completed.contains_key(&function),
+            "Remote protobuf initializer probe does not preserve the ROS 2 stage {stage} in its sealed transition chain"
+        );
+    }
+    anyhow::ensure!(
+        protobuf_proof.max_stack_bytes <= REMOTE_ROS2_MAX_PROBE_STACK_V1,
+        "Remote protobuf initializer probe stack/spill peak {} exceeds the locked {}-byte ceiling",
+        protobuf_proof.max_stack_bytes,
+        REMOTE_ROS2_MAX_PROBE_STACK_V1
+    );
+    anyhow::ensure!(
+        !protobuf_proof.has_unresolved_indirect_call,
+        "Remote protobuf initializer probe contains an unresolved indirect call path"
     );
     Ok(())
 }
@@ -869,6 +995,9 @@ mod remote_ros2_allocator_contract_tests {
         let mut nested_stack = ArtifactFixtureOptions::valid();
         nested_stack.nested_frame_bytes = Some(10 * 1024);
         cases.push((10 * 1024, nested_stack));
+        let mut detached_protobuf_chain = ArtifactFixtureOptions::valid();
+        detached_protobuf_chain.protobuf_omits_ros_stages = true;
+        cases.push((1_024, detached_protobuf_chain));
         for omitted_stage in 0..REMOTE_ROS2_REQUIRED_STAGES_V1.len() {
             let mut omitted = ArtifactFixtureOptions::valid();
             omitted.omitted_stage = Some(omitted_stage);
@@ -893,6 +1022,7 @@ mod remote_ros2_allocator_contract_tests {
         alias_second_stage: bool,
         wrong_stage_identity: bool,
         nested_frame_bytes: Option<i32>,
+        protobuf_omits_ros_stages: bool,
     }
 
     impl ArtifactFixtureOptions {
@@ -907,6 +1037,7 @@ mod remote_ros2_allocator_contract_tests {
                 alias_second_stage: false,
                 wrong_stage_identity: false,
                 nested_frame_bytes: None,
+                protobuf_omits_ros_stages: false,
             }
         }
     }
@@ -926,10 +1057,13 @@ mod remote_ros2_allocator_contract_tests {
         types.ty().function([], []);
         module.section(&types);
         let mut functions = FunctionSection::new();
-        for _index in 0..3 {
+        for _index in 0..4 {
             functions.function(0);
         }
         for _stage in &REMOTE_ROS2_REQUIRED_STAGES_V1 {
+            functions.function(0);
+        }
+        for _stage in &REMOTE_PROTOBUF_REQUIRED_STAGES_V1 {
             functions.function(0);
         }
         module.section(&functions);
@@ -962,6 +1096,7 @@ mod remote_ros2_allocator_contract_tests {
         module.section(&globals);
         let mut exports = ExportSection::new();
         exports.export(REMOTE_ROS2_INITIALIZER_PROBE_V1, ExportKind::Func, 0);
+        exports.export(REMOTE_PROTOBUF_INITIALIZER_PROBE_V1, ExportKind::Func, 3);
         exports.export(
             REMOTE_ROS2_ACCOUNTING_ALLOCATOR_PROBE_V1,
             ExportKind::Func,
@@ -975,12 +1110,19 @@ mod remote_ros2_allocator_contract_tests {
         for (stage_index, stage) in REMOTE_ROS2_REQUIRED_STAGES_V1.iter().enumerate() {
             if options.omitted_stage != Some(stage_index) {
                 let function = if options.alias_second_stage && stage_index == 1 {
-                    3
+                    4
                 } else {
-                    3 + stage_index as u32
+                    4 + stage_index as u32
                 };
                 exports.export(stage, ExportKind::Func, function);
             }
+        }
+        for (stage_index, stage) in REMOTE_PROTOBUF_REQUIRED_STAGES_V1.iter().enumerate() {
+            exports.export(
+                stage,
+                ExportKind::Func,
+                4 + REMOTE_ROS2_REQUIRED_STAGES_V1.len() as u32 + stage_index as u32,
+            );
         }
         module.section(&exports);
         let mut code = CodeSection::new();
@@ -1006,7 +1148,7 @@ mod remote_ros2_allocator_contract_tests {
         probe.instruction(&Instruction::Call(2));
         for stage_index in 0..REMOTE_ROS2_REQUIRED_STAGES_V1.len() {
             if options.omitted_stage != Some(stage_index) {
-                probe.instruction(&Instruction::Call(3 + stage_index as u32));
+                probe.instruction(&Instruction::Call(4 + stage_index as u32));
                 probe.instruction(&Instruction::Drop);
             }
         }
@@ -1040,6 +1182,24 @@ mod remote_ros2_allocator_contract_tests {
         decoy.instruction(&Instruction::I32Const(0));
         decoy.instruction(&Instruction::End);
         code.function(&decoy);
+        let mut protobuf_probe = Function::new([]);
+        protobuf_probe.instruction(&Instruction::Call(1));
+        protobuf_probe.instruction(&Instruction::Drop);
+        for stage_index in 0..REMOTE_ROS2_REQUIRED_STAGES_V1.len() {
+            if !options.protobuf_omits_ros_stages && options.omitted_stage != Some(stage_index) {
+                protobuf_probe.instruction(&Instruction::Call(4 + stage_index as u32));
+                protobuf_probe.instruction(&Instruction::Drop);
+            }
+        }
+        for stage_index in 0..REMOTE_PROTOBUF_REQUIRED_STAGES_V1.len() {
+            protobuf_probe.instruction(&Instruction::Call(
+                4 + REMOTE_ROS2_REQUIRED_STAGES_V1.len() as u32 + stage_index as u32,
+            ));
+            protobuf_probe.instruction(&Instruction::Drop);
+        }
+        protobuf_probe.instruction(&Instruction::I32Const(0));
+        protobuf_probe.instruction(&Instruction::End);
+        code.function(&protobuf_probe);
         for (stage_index, _stage) in REMOTE_ROS2_REQUIRED_STAGES_V1.iter().enumerate() {
             let mut stage = Function::new([]);
             let identity = if options.wrong_stage_identity && stage_index == 0 {
@@ -1048,6 +1208,14 @@ mod remote_ros2_allocator_contract_tests {
                 REMOTE_ROS2_REQUIRED_STAGE_IDENTITIES_V1[stage_index]
             };
             stage.instruction(&Instruction::I32Const(identity));
+            stage.instruction(&Instruction::End);
+            code.function(&stage);
+        }
+        for (stage_index, _stage) in REMOTE_PROTOBUF_REQUIRED_STAGES_V1.iter().enumerate() {
+            let mut stage = Function::new([]);
+            stage.instruction(&Instruction::I32Const(
+                REMOTE_PROTOBUF_REQUIRED_STAGE_IDENTITIES_V1[stage_index],
+            ));
             stage.instruction(&Instruction::End);
             code.function(&stage);
         }

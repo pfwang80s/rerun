@@ -2,6 +2,14 @@
 
 use super::materialization::{BoundedSummaryRecord, MaterializedSummaryRecords};
 
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+pub(crate) const REMOTE_PROTOBUF_ARTIFACT_DESCRIPTOR_V1: &[u8] = &[
+    0x0a, 0x36, 0x0a, 0x0b, b'p', b'r', b'o', b'b', b'e', b'.', b'p', b'r', b'o', b't', b'o', 0x12,
+    0x05, b'r', b'e', b'r', b'u', b'n', 0x22, 0x18, 0x0a, 0x07, b'M', b'e', b's', b's', b'a', b'g',
+    b'e', 0x12, 0x0d, 0x0a, 0x05, b'v', b'a', b'l', b'u', b'e', 0x18, 0x01, 0x20, 0x01, 0x28, 0x05,
+    0x62, 0x06, b'p', b'r', b'o', b't', b'o', b'3',
+];
+
 /// One canonical Schema borrowed from the source-ordered materialized Summary.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CanonicalSchemaDefinition<'a> {
@@ -175,11 +183,26 @@ impl<'a> ValidatedSummaryDefinitions<'a> {
                 message_encoding: "cdr".to_owned(),
                 metadata: BTreeMap::new(),
             })),
+            BoundedSummaryRecord::Known(mcap::records::Record::Schema {
+                header: mcap::records::SchemaHeader {
+                    id: 2,
+                    name: "rerun.Message".to_owned(),
+                    encoding: "protobuf".to_owned(),
+                },
+                data: Cow::Borrowed(REMOTE_PROTOBUF_ARTIFACT_DESCRIPTOR_V1),
+            }),
+            BoundedSummaryRecord::Known(mcap::records::Record::Channel(mcap::records::Channel {
+                id: 2,
+                schema_id: 2,
+                topic: "/rerun/remote_protobuf_artifact_probe".to_owned(),
+                message_encoding: "protobuf".to_owned(),
+                metadata: BTreeMap::new(),
+            })),
         ];
         Self {
             storage: ValidatedDefinitionStorage::ArtifactProbe(records),
-            canonical_schema_count: 1,
-            canonical_channel_count: 1,
+            canonical_schema_count: 2,
+            canonical_channel_count: 2,
         }
     }
 }
