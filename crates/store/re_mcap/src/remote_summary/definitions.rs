@@ -16,14 +16,75 @@ pub(crate) struct CanonicalSchemaDefinition<'a> {
 /// accounting.
 #[derive(Debug)]
 pub(crate) struct ValidatedSummaryDefinitions<'a> {
+    #[cfg(not(re_mcap_locked_remote_wasm_allocator_v1))]
     materialized: MaterializedSummaryRecords<'a>,
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
+    storage: ValidatedDefinitionStorage<'a>,
     canonical_schema_count: u64,
     canonical_channel_count: u64,
 }
 
+#[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
+#[derive(Debug)]
+enum ValidatedDefinitionStorage<'a> {
+    Materialized(MaterializedSummaryRecords<'a>),
+    ArtifactProbe(Vec<BoundedSummaryRecord<'a>>),
+}
+
 impl<'a> ValidatedSummaryDefinitions<'a> {
-    pub(crate) const fn materialized(&self) -> &MaterializedSummaryRecords<'a> {
-        &self.materialized
+    pub(crate) fn materialized(&self) -> &MaterializedSummaryRecords<'a> {
+        #[cfg(not(re_mcap_locked_remote_wasm_allocator_v1))]
+        {
+            &self.materialized
+        }
+        #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
+        {
+            match &self.storage {
+                ValidatedDefinitionStorage::Materialized(materialized) => materialized,
+                ValidatedDefinitionStorage::ArtifactProbe(_) => {
+                    panic!("artifact-probe definitions cannot enter physical Summary stages")
+                }
+            }
+        }
+    }
+
+    fn records(&self) -> &[BoundedSummaryRecord<'a>] {
+        #[cfg(not(re_mcap_locked_remote_wasm_allocator_v1))]
+        {
+            self.materialized.records()
+        }
+        #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
+        {
+            match &self.storage {
+                ValidatedDefinitionStorage::Materialized(materialized) => materialized.records(),
+                ValidatedDefinitionStorage::ArtifactProbe(records) => records,
+            }
+        }
+    }
+
+    pub(crate) fn source_record_count(&self) -> usize {
+        self.records().len()
+    }
+
+    pub(crate) fn projection_record_at(
+        &self,
+        record_index: usize,
+    ) -> Option<SummaryDefinitionProjectionRecord> {
+        match self.records().get(record_index)? {
+            BoundedSummaryRecord::Known(mcap::records::Record::Schema { header, .. }) => {
+                Some(SummaryDefinitionProjectionRecord::Schema {
+                    id: header.id,
+                    record_index,
+                })
+            }
+            BoundedSummaryRecord::Known(mcap::records::Record::Channel(channel)) => {
+                Some(SummaryDefinitionProjectionRecord::Channel {
+                    id: channel.id,
+                    record_index,
+                })
+            }
+            _ => None,
+        }
     }
 
     pub(crate) const fn canonical_schema_count(&self) -> u64 {
@@ -35,26 +96,17 @@ impl<'a> ValidatedSummaryDefinitions<'a> {
     }
 
     pub(crate) fn schema(&self, id: u16) -> Option<CanonicalSchemaDefinition<'_>> {
-        find_schema(
-            self.materialized.records(),
-            id,
-            self.materialized.records().len(),
-        )
+        find_schema(self.records(), id, self.records().len())
     }
 
     pub(crate) fn channel(&self, id: u16) -> Option<&mcap::records::Channel> {
-        find_channel(
-            self.materialized.records(),
-            id,
-            self.materialized.records().len(),
-        )
+        find_channel(self.records(), id, self.records().len())
     }
 
     pub(crate) fn projection_records(
         &self,
     ) -> impl Iterator<Item = SummaryDefinitionProjectionRecord> + '_ {
-        self.materialized
-            .records()
+        self.records()
             .iter()
             .enumerate()
             .filter_map(|(record_index, record)| match record {
@@ -79,7 +131,7 @@ impl<'a> ValidatedSummaryDefinitions<'a> {
         record_index: usize,
     ) -> Option<CanonicalSchemaDefinition<'_>> {
         let BoundedSummaryRecord::Known(mcap::records::Record::Schema { header, data }) =
-            self.materialized.records().get(record_index)?
+            self.records().get(record_index)?
         else {
             return None;
         };
@@ -91,11 +143,44 @@ impl<'a> ValidatedSummaryDefinitions<'a> {
 
     pub(crate) fn channel_at_record(&self, record_index: usize) -> Option<&mcap::records::Channel> {
         let BoundedSummaryRecord::Known(mcap::records::Record::Channel(channel)) =
-            self.materialized.records().get(record_index)?
+            self.records().get(record_index)?
         else {
             return None;
         };
         Some(channel)
+    }
+
+    /// Builds the fixed, side-effect-free source used only by the canonical verifier artifact.
+    ///
+    /// This takes no input and cannot mint capability for caller-controlled records. The special
+    /// storage variant does not exist in ordinary Wasm consumers or the product artifact.
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
+    pub(crate) fn for_remote_ros2_artifact_probe() -> ValidatedSummaryDefinitions<'static> {
+        use std::borrow::Cow;
+        use std::collections::BTreeMap;
+
+        let records = vec![
+            BoundedSummaryRecord::Known(mcap::records::Record::Schema {
+                header: mcap::records::SchemaHeader {
+                    id: 1,
+                    name: "rerun/RemoteArtifactProbe".to_owned(),
+                    encoding: "ros2msg".to_owned(),
+                },
+                data: Cow::Borrowed(b"Child child\n===\nMSG: rerun/Child\nint32 value\n"),
+            }),
+            BoundedSummaryRecord::Known(mcap::records::Record::Channel(mcap::records::Channel {
+                id: 1,
+                schema_id: 1,
+                topic: "/rerun/remote_artifact_probe".to_owned(),
+                message_encoding: "cdr".to_owned(),
+                metadata: BTreeMap::new(),
+            })),
+        ];
+        Self {
+            storage: ValidatedDefinitionStorage::ArtifactProbe(records),
+            canonical_schema_count: 1,
+            canonical_channel_count: 1,
+        }
     }
 }
 
@@ -229,7 +314,10 @@ pub(crate) fn validate_summary_definitions(
     }
 
     Ok(ValidatedSummaryDefinitions {
+        #[cfg(not(re_mcap_locked_remote_wasm_allocator_v1))]
         materialized,
+        #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
+        storage: ValidatedDefinitionStorage::Materialized(materialized),
         canonical_schema_count,
         canonical_channel_count,
     })

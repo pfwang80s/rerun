@@ -61,5 +61,9 @@ lz4_flex.workspace = true
 prost-reflect = { workspace = true, features = ["text-format"] }
 re_arrow_util.workspace = true
 re_log = { workspace = true, features = ["setup"] }
+static_assertions.workspace = true
 xxhash-rust.workspace = true
 zstd = { version = "0.13.3", features = ["experimental"] }
+
+[build-dependencies]
+re_build_tools.workspace = true

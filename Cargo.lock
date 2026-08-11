@@ -8690,6 +8690,7 @@ dependencies = [
  "jiff",
  "regex-lite",
  "sha2 0.10.9",
+ "tempfile",
  "unindent",
  "walkdir",
 ]
@@ -9113,6 +9114,8 @@ dependencies = [
  "ureq",
  "url",
  "wasm-bindgen-cli-support",
+ "wasm-encoder 0.245.1",
+ "wasmparser 0.245.1",
 ]
 
 [[package]]
@@ -9525,6 +9528,7 @@ dependencies = [
  "prost-reflect",
  "rayon",
  "re_arrow_util",
+ "re_build_tools",
  "re_cdr",
  "re_chunk",
  "re_int",
@@ -9537,6 +9541,7 @@ dependencies = [
  "regex-lite",
  "serde",
  "serde_bytes",
+ "static_assertions",
  "strum",
  "thiserror 2.0.18",
  "xxhash-rust",

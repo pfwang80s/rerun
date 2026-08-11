@@ -464,9 +464,9 @@ fn checked_increment(
 }
 
 #[cfg(test)]
-pub(crate) fn validated_physical_regions_for_test(
+pub(crate) fn validated_summary_definitions_for_test(
     fixture: &crate::testing::AdversarialMcapFixture,
-) -> physical_regions::ValidatedPhysicalRegions<'_> {
+) -> definitions::ValidatedSummaryDefinitions<'_> {
     use crate::remote_fixed_layout::{RemoteMcapSlice, prepare_fixed_layout};
 
     const FOOTER_TAIL_LEN: usize = RECORD_ENVELOPE_LEN + 20 + mcap::MAGIC.len();
@@ -537,8 +537,16 @@ pub(crate) fn validated_physical_regions_for_test(
         .expect("the adversarial fixture Summary preflights");
     let materialized = materialization::materialize_summary_records(token)
         .expect("the adversarial fixture Summary materializes");
-    let definitions = definitions::validate_summary_definitions(materialized)
-        .expect("the adversarial fixture definitions validate");
+    definitions::validate_summary_definitions(materialized)
+        .expect("the adversarial fixture definitions validate")
+}
+
+#[cfg(test)]
+pub(crate) fn validated_physical_regions_for_test(
+    fixture: &crate::testing::AdversarialMcapFixture,
+) -> physical_regions::ValidatedPhysicalRegions<'_> {
+    let object_len = u64::try_from(fixture.bytes.len()).expect("fixture length fits u64");
+    let definitions = validated_summary_definitions_for_test(fixture);
     let physical_budget = physical_regions::PhysicalRegionBudget::for_test(
         physical_regions::PhysicalRegionLimits::for_test(
             10_000,

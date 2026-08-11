@@ -16,6 +16,7 @@ use anyhow::Context as _;
 mod git;
 mod hashing;
 mod rebuild_detector;
+pub mod remote_wasm_contract;
 mod rustfmt;
 
 pub use self::git::{git_branch, git_commit_hash, git_commit_short_hash};

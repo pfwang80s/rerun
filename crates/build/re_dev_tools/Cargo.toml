@@ -40,3 +40,7 @@ toml = { workspace = true, features = ["parse", "preserve_order", "serde"] }
 ureq = { workspace = true, features = ["json"] }
 url.workspace = true
 wasm-bindgen-cli-support.workspace = true
+wasmparser = "0.245.1"
+
+[dev-dependencies]
+wasm-encoder = "0.245.1"

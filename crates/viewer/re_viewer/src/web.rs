@@ -25,6 +25,72 @@ use crate::web_tools::{Callback, JsResultExt as _, StringOrStringArray};
 static GLOBAL: AccountingAllocator<std::alloc::System> =
     AccountingAllocator::new(std::alloc::System);
 
+#[cfg(all(rerun_remote_ros2_artifact_probe_v1, not(test)))]
+include!(concat!(
+    env!("OUT_DIR"),
+    "/re_viewer_remote_ros2_generated_capability_v1.rs"
+));
+
+#[cfg(all(rerun_remote_ros2_artifact_probe_v1, not(test)))]
+const _: ReViewerRemoteRos2GeneratedCapabilityV1 = RE_VIEWER_REMOTE_ROS2_GENERATED_CAPABILITY_V1;
+
+/// Verified by the Web release builder after linking and Wasm post-processing.
+///
+/// Keeping the marker adjacent to the sole Web global allocator makes the final artifact contract
+/// explicit: remote ROS 2 initialization is enabled only for this `AccountingAllocator<System>`
+/// entry point, with callstack tracking checked again at admission time.
+#[cfg(rerun_remote_ros2_artifact_probe_v1)]
+#[used]
+#[unsafe(link_section = ".custom_section.rerun_remote_ros2_allocator_contract_v1")]
+static REMOTE_ROS2_ALLOCATOR_CONTRACT_V1: [u8; 49] =
+    *b"AccountingAllocator<System>;tracking=admission-v1";
+
+/// Executable final-artifact proof for the exact Web global allocator.
+///
+/// The release verifier requires the initializer probe to call this exported function directly,
+/// and requires this function's own direct-call graph to reach the locked Wasm allocator.
+#[cfg(rerun_remote_ros2_artifact_probe_v1)]
+#[inline(never)]
+#[unsafe(no_mangle)]
+pub extern "C" fn rerun_remote_ros2_accounting_allocator_artifact_probe_v1() -> u32 {
+    let _capability = RE_VIEWER_REMOTE_ROS2_GENERATED_CAPABILITY_V1;
+    use std::alloc::GlobalAlloc as _;
+
+    let Ok(layout) = std::alloc::Layout::from_size_align(4_096, 16) else {
+        return 1;
+    };
+    // SAFETY: `layout` is valid, a null result is checked, and the allocation is returned to the
+    // same allocator with the same layout before this function returns.
+    let allocation = unsafe { GLOBAL.alloc(layout) };
+    if allocation.is_null() {
+        return 2;
+    }
+    std::hint::black_box(allocation);
+    // SAFETY: `allocation` was allocated by `GLOBAL` with this exact `layout` above.
+    unsafe { GLOBAL.dealloc(allocation, layout) };
+    0
+}
+
+/// Executable final-artifact proof for the remote ROS 2 parser and allocator call path.
+#[cfg(rerun_remote_ros2_artifact_probe_v1)]
+#[unsafe(no_mangle)]
+pub extern "C" fn rerun_remote_ros2_initializer_artifact_probe_v1() -> u32 {
+    let _capability = RE_VIEWER_REMOTE_ROS2_GENERATED_CAPABILITY_V1;
+    if re_memory::is_tracking_callstacks() {
+        return 3;
+    }
+    let allocator_status = rerun_remote_ros2_accounting_allocator_artifact_probe_v1();
+    if allocator_status != 0 {
+        return allocator_status;
+    }
+    unsafe extern "C" {
+        fn rerun_remote_ros2_initializer_artifact_probe_v1_impl() -> u32;
+    }
+    // SAFETY: the symbol is defined by the exact locked `re_mcap` dependency in this final Wasm
+    // artifact, takes no arguments, and has the same C ABI and return type.
+    unsafe { rerun_remote_ros2_initializer_artifact_probe_v1_impl() }
+}
+
 #[wasm_bindgen]
 pub struct WebHandle {
     runner: eframe::WebRunner,

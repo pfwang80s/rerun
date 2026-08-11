@@ -25,6 +25,35 @@
 //! ```compile_fail
 //! use re_mcap::remote_decompression;
 //! ```
+//!
+//! Bounded remote ROS 2 initialization, its raw-schema entry points, and its source/policy
+//! evidence remain sealed as well:
+//!
+//! ```compile_fail
+//! use re_mcap::remote_ros2_reflection;
+//! ```
+//!
+//! The neutral protobuf projection EOF boundary is crate-private too:
+//!
+//! ```compile_fail
+//! use re_mcap::remote_protobuf_projection_boundary;
+//! ```
+//!
+//! Raw Summary/schema bytes, scalar policy claims, source generations, and reservations therefore
+//! cannot be used by a downstream crate to construct or rebind the sealed capability:
+//!
+//! ```compile_fail
+//! let raw_summary: mcap::Summary = todo!();
+//! let raw_schema: &[u8] = b"int32 value";
+//! let policy_claim = true;
+//! let generation = 1_u64;
+//! re_mcap::remote_ros2_reflection::initialize(
+//!     raw_summary,
+//!     raw_schema,
+//!     policy_claim,
+//!     generation,
+//! );
+//! ```
 
 /// Every MCAP record is framed by a fixed header containing a one-byte opcode followed by an
 /// eight-byte little-endian `u64` body length.
@@ -65,6 +94,16 @@ mod remote_decompression;
 // production-disarmed until the Chrome body-owner adapter and remote resource profile are sealed.
 #[cfg(any(target_arch = "wasm32", test))]
 mod remote_chunk_scan;
+
+// Neutral compile-time boundary between the ROS 2 initializer and the future protobuf initializer.
+// It can own only the opaque post-EOF authority and is not a descendant of either implementation.
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+mod remote_protobuf_projection_boundary;
+
+// Bounded ROS 2 reflection initialization remains crate-private and production-disarmed until the
+// remote decoder policy and resource profile are sealed.
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+mod remote_ros2_reflection;
 
 pub(crate) mod parsers;
 pub(crate) mod util;
