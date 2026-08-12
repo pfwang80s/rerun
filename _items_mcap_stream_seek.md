@@ -376,12 +376,21 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 验收：MessageIndex count零、一或严重低估都不影响exact plan，resource admission前parser/builder allocation为零，plan/decompressed/initializer ownership跨帧受retained budget和stale cancellation约束，compile/API测试阻止调用local unbounded initializer。
 - 负责人：kola；提交：本提交；备注：2026-08-12 完成production-disarmed的`PhysicalChunkValidationCount`首遍工作单元，只消费MCAP-025 sealed physical message evidence与MCAP-029 immutable group owner，从实际Chunk Message headers生成exact per-Channel count、payload bytes、selected group和versioned decoder resource-bound plan，不读取Statistics、MessageIndex或`msg_offsets`，不创建parser/builder也不调用local initializer。plan在分配前后校验physical evidence与manifest的same-source binding/current generation，并move持有decompressed/scan evidence、026/027 initializer及029 manifest ownership；retained budget以locked-Wasm footprint计入plan、physical backing和manifest/initializer reservation，stale/cross-source失败与Drop均恢复预算且physical claim保持至plan释放。真实integration覆盖025→026/027→028→029→validation/count、实际header exact count/payload/group、claim lifetime、combined exact/minus-one与预算归零；production call graph和adversarial assignment fixture证明错误/缺失Statistics与MessageIndex不影响结果。Dafee最终review为0个中级及以上问题且无设计缺陷；`re_mcap` all-features check、Clippy `-D warnings`、focused validation tests 3/3与diff-check通过，production route仍disarmed，native/local decoder API、Viewer运行行为和Rerun服务端不变。
 
+### [x] MCAP-030A — 提供 sealed bounded executable decoder adapter
+
+- 建议提交：`Add sealed remote executable decoder adapters`。
+- 依赖：MCAP-026、MCAP-027、MCAP-030。
+- 变更：在 bounded ROS 2/protobuf initializer 所属模块内生成 source/policy/config-bound、one-shot executable adapter；adapter 直接消费已 materialized 的 parsed arenas/graph，封装 exact `num_rows`、payload、step、scratch、builder 与 output reservation，不暴露 raw schema、graph 或可重绑 parser identity，不调用 `MessageSchema::parse` 或 `DescriptorPool::decode`。
+- 变更：ROS 2 仅允许已认证 reflection subset；semantic decoder 继续结构化返回 `SemanticParserNotAllowlisted`。protobuf adapter 直接使用 bounded descriptor graph 完成 admitted wire decode/Arrow construction，并绑定 source generation、policy versions、schema handle、canonical config digest。
+- 验收：adapter 只能从 matching MCAP-026/027 sealed owner 借用，cross-source/cross-policy/stale/drop 后使用均失败；所有 parser/builder/temporary allocations 在 reservation 内并可回收；合法 admitted ROS 2/protobuf payload 与 local normalized output 差分一致；raw schema、裸 descriptor、local unbounded initializer 不能构造 adapter；native/local API、Viewer 行为和 Rerun 服务端不变。
+- 负责人：kola；提交：本提交；备注：2026-08-13 完成用户批准的方案1：在026/027 bounded initializer内部增加production-disarmed、source/policy/config/generation-bound、one-shot executable adapter；MCAP-030提供不可Clone的validated per-message envelope lease，adapter直接消费私有materialized ROS2/protobuf arenas/graph生成opaque bounded normalized IR，禁止raw schema、裸graph、`MessageSchema::parse`和`DescriptorPool::decode`。ROS2仅认证reflection subset，semantic与未证明protobuf features在admission前结构化拒绝；protobuf wire reader按sealed field/type/resolution执行。adapter每条/每批在每个safe point重验binding，失败即poison且不可重放；reservation覆盖payload、metadata、IR fields/bytes/rows、scratch、builder/output及同时峰值，BudgetRoot冻结实例级global cap并共享实际reserve/drop。normalized span验证checked bounds、tree interval ownership和overflow；真实ROS/protobuf chain、差分、optional/unknown/truncated、cross-source/stale、double-execute/poison、预算exact-minus-one和Drop测试通过。Dafee多轮增量review最终0个中级及以上问题且无设计缺陷；`re_mcap` all-target check、Clippy `-D warnings`、focused executable tests及diff-check通过，production route仍disarmed，native/local API、Viewer行为和Rerun服务端不变。
+
 ### [ ] MCAP-031 — 实现 PhysicalChunkDispatchDecode 与 terminal partition contract
 
 - 建议提交：`Add admitted remote chunk dispatch and decode`。
-- 依赖：MCAP-026、MCAP-027、MCAP-030。
+- 依赖：MCAP-026、MCAP-027、MCAP-030、MCAP-030A。
 - 变更：admission成功后只从matching manifest descriptor和同一sealed bounded initializer result以exact `num_rows`构造parser，生成deterministic derived chunks，并把结果限制为完整`Complete/CompleteEmpty`或零partial publication的`Failed`；禁止从schema bytes重新调用`MessageSchema::parse`或`DescriptorPool::decode`。
-- 验收：actual append/dispatch与plan不一致失败；`OpeningStatic`只含static，temporal partition必须含canonical log timeline且不能产生static，消息派生static decoder不在allowlist；stale/cross-source/cross-policy initializer result不能decode，合法ROS 2/protobuf payload与local admitted-subset输出差分一致。
+- 验收：actual append/dispatch与plan不一致失败；`OpeningStatic`只含static，temporal partition必须含canonical log timeline且不能产生static，消息派生static decoder不在allowlist；stale/cross-source/cross-policy initializer result不能decode，合法admitted ROS 2 reflection/protobuf subset与local normalized output差分一致，semantic fixtures继续结构化拒绝。
 - 负责人：TBD；提交：TBD；备注：TBD。
 
 ### [ ] MCAP-032 — 构建 immutable manifest 与全 session metadata preflight
@@ -1152,7 +1161,7 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 
 ## 16. 最终项目完成检查表
 
-- [ ] 88 个有效工作项均填写负责人、commit SHA和验收结果，26 个 `[~]` 项保留范围决策记录且没有实现提交。
+- [ ] 89 个有效工作项均填写负责人、commit SHA和验收结果，26 个 `[~]` 项保留范围决策记录且没有实现提交。
 - [ ] 每个提交都可在其依赖点独立构建和回退，没有只靠后续提交修复的已知不通过测试。
 - [ ] compatibility API只有文档明确列出的accepted regression，其余characterization tests保持通过。
 - [ ] strict remote-MCAP API、compatibility MCAP 分支、page execution和remote session都覆盖success/failure/close/stop/stale callback，排除路由由差分测试证明不变。

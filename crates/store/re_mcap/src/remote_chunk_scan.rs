@@ -1175,7 +1175,105 @@ pub(crate) struct PhysicalChunkMessageEvidenceV1<'a> {
     inner: Arc<ValidatedPhysicalChunkScan<'a>>,
 }
 
+/// A lease-bound iterator over exact MCAP message payloads.  The iterator is intentionally
+/// move-only and borrows the validated physical scan, so callers cannot manufacture a payload
+/// view or detach it from its source generation.
+pub(crate) struct RemoteMessageEnvelopeIterV1<'a> {
+    binding: PhysicalChunkSourceBindingV1,
+    records: RecordSequence<'a>,
+    row_bound: u64,
+}
+
+pub(crate) struct RemoteMessageEnvelopeV1<'a> {
+    binding: PhysicalChunkSourceBindingV1,
+    pub(crate) channel_id: u16,
+    pub(crate) sequence: u64,
+    payload: &'a [u8],
+    pub(crate) row_bound: u64,
+}
+
+impl<'a> RemoteMessageEnvelopeIterV1<'a> {
+    pub(crate) fn next_v1(
+        &mut self,
+    ) -> Result<Option<RemoteMessageEnvelopeV1<'a>>, PhysicalChunkValidationError> {
+        self.binding.ensure_current_v1()?;
+        while let Some(record) = self.records.next()? {
+            if record.opcode != mcap::records::op::MESSAGE {
+                continue;
+            }
+            let mut cursor = BorrowedCursor::new(record.body);
+            let channel_id = cursor.u16()?;
+            let sequence = u64::from(cursor.u32()?);
+            let _log_time = cursor.u64()?;
+            let _publish_time = cursor.u64()?;
+            let payload = cursor.take_exact(cursor.remaining())?;
+            cursor.finish()?;
+            let row = self.row_bound;
+            self.row_bound = self
+                .row_bound
+                .checked_add(1)
+                .ok_or(PhysicalChunkValidationError::ArithmeticOverflow)?;
+            return Ok(Some(RemoteMessageEnvelopeV1 {
+                binding: self.binding.clone(),
+                channel_id,
+                sequence,
+                payload,
+                row_bound: row,
+            }));
+        }
+        Ok(None)
+    }
+}
+
+impl RemoteMessageEnvelopeV1<'_> {
+    pub(crate) fn ensure_current_v1(&self) -> Result<(), PhysicalChunkValidationError> {
+        self.binding.ensure_current_v1()
+    }
+
+    pub(crate) fn binding_v1(&self) -> &PhysicalChunkSourceBindingV1 {
+        &self.binding
+    }
+
+    pub(crate) fn payload_len_v1(&self) -> usize {
+        self.payload.len()
+    }
+
+    #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+    pub(crate) fn payload_for_bounded_decoder_v1(&self) -> &[u8] {
+        self.payload
+    }
+}
+
+#[cfg(test)]
+impl<'a> RemoteMessageEnvelopeV1<'a> {
+    pub(crate) fn new_for_adapter_test_v1(
+        binding: PhysicalChunkSourceBindingV1,
+        channel_id: u16,
+        sequence: u64,
+        payload: &'a [u8],
+        row_bound: u64,
+    ) -> Self {
+        Self {
+            binding,
+            channel_id,
+            sequence,
+            payload,
+            row_bound,
+        }
+    }
+}
+
 impl PhysicalChunkMessageEvidenceV1<'_> {
+    pub(crate) fn message_envelopes_v1(
+        &self,
+    ) -> Result<RemoteMessageEnvelopeIterV1<'_>, PhysicalChunkValidationError> {
+        self.ensure_current_v1()?;
+        Ok(RemoteMessageEnvelopeIterV1 {
+            binding: self.binding.clone(),
+            records: RecordSequence::new(self.inner.output.bytes()),
+            row_bound: 0,
+        })
+    }
     pub(crate) fn ensure_current_v1(&self) -> Result<(), PhysicalChunkValidationError> {
         self.binding.ensure_current_v1()?;
         self.inner.output.identity().lease()?.ensure_current()

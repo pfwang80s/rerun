@@ -450,14 +450,16 @@ fn exact_retained_bytes(
     groups: usize,
 ) -> Result<u64, RemoteValidationCountErrorV1> {
     let bytes = locked_footprint(
-        Layout::array::<ExactChannelDispatchCountV1>(channels).map_err(|_error| arithmetic_error())?,
+        Layout::array::<ExactChannelDispatchCountV1>(channels)
+            .map_err(|_error| arithmetic_error())?,
     )?
     .checked_add(locked_footprint(
         Layout::array::<StableDecoderGroupIdV1>(groups).map_err(|_error| arithmetic_error())?,
     )?)
     .ok_or_else(arithmetic_error)?
     .checked_add(locked_footprint(
-        Layout::array::<DecoderDispatchResourceBoundV1>(groups).map_err(|_error| arithmetic_error())?,
+        Layout::array::<DecoderDispatchResourceBoundV1>(groups)
+            .map_err(|_error| arithmetic_error())?,
     )?)
     .ok_or_else(arithmetic_error)?;
     Ok(bytes)

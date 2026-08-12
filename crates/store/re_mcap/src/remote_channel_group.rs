@@ -578,7 +578,7 @@ fn canonicalize_groups_v1(
             let source = source_assignments
                 .binary_search_by_key(&channel_id, RemoteChannelDecoderAssignmentV1::channel_id)
                 .ok()
-                .map(|index| source_assignments[index])
+                .map(|index| source_assignments[index].clone())
                 .ok_or(RemoteChannelGroupErrorV1::UnsupportedForRemote(
                     UnsupportedRemoteChannelGroupV1::MissingMembership,
                 ))?;

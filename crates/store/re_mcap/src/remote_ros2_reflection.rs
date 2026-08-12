@@ -6,6 +6,10 @@
 //! a fixed set of contiguous arenas containing only borrowed source spans.
 
 #![allow(dead_code)]
+#![expect(
+    clippy::map_err_ignore,
+    reason = "remote request errors intentionally erase parser/allocation internals"
+)]
 
 #[cfg(all(target_arch = "wasm32", not(re_mcap_locked_remote_wasm_allocator_v1)))]
 compile_error!("remote ROS 2 allocator accounting requires the locked release-Wasm artifact");
@@ -2451,6 +2455,21 @@ impl RemoteRos2ChannelRecognitionV1<'_, '_, '_, '_, '_, '_> {
             .canonical_versions_for_manifest_v1())
     }
 
+    pub(crate) fn physical_source_binding_for_adapter_v1(
+        &self,
+    ) -> Result<&PhysicalChunkSourceBindingV1, RemoteRos2InitializationError> {
+        self.owner.transition.ensure_current()?;
+        Ok(&self
+            .owner
+            .transition
+            .payload
+            .initialized
+            .source
+            .semantic_config
+            .state
+            .physical_source)
+    }
+
     pub(crate) fn resolve_bound_owner_v1(
         &self,
         recognized: [bool; 3],
@@ -2462,6 +2481,428 @@ impl RemoteRos2ChannelRecognitionV1<'_, '_, '_, '_, '_, '_> {
             .policy_descriptor_v1()
             .resolve_owner_v1(recognized))
     }
+
+    /// Decodes one admitted ROS 2 CDR payload by walking the already-materialized private arenas.
+    ///
+    /// This never reparses the source schema and never constructs a local `MessageSchema`.
+    pub(crate) fn decode_ros2_payload_v1(
+        &self,
+        payload: &[u8],
+        max_steps: u64,
+        max_output_bytes: u64,
+        max_field_values: usize,
+    ) -> Result<
+        (
+            Vec<crate::remote_protobuf_descriptor::RemoteNormalizedFieldV1>,
+            Vec<u8>,
+            u64,
+        ),
+        crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1,
+    > {
+        self.owner.transition.ensure_current().map_err(|_| {
+            crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1::StaleSource
+        })?;
+        let schema_id = self
+            .ros2_schema_id_v1()
+            .map_err(|_| {
+                crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1::StaleSource
+            })?
+            .ok_or(
+                crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1::ConfigMismatch,
+            )?;
+        decode_materialized_ros2_payload_v1(
+            &self.owner.transition.payload.initialized,
+            schema_id,
+            payload,
+            max_steps,
+            max_output_bytes,
+            max_field_values,
+        )
+    }
+}
+
+fn decode_materialized_ros2_payload_v1(
+    initialized: &Ros2InitializedRemoteDefinitionsV1<'_, '_, '_, '_>,
+    schema_id: u16,
+    payload: &[u8],
+    max_steps: u64,
+    max_output_bytes: u64,
+    max_field_values: usize,
+) -> Result<
+    (
+        Vec<crate::remote_protobuf_descriptor::RemoteNormalizedFieldV1>,
+        Vec<u8>,
+        u64,
+    ),
+    crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1,
+> {
+    use crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1 as Error;
+
+    if payload.len() < 4 || payload[0] != 0 {
+        return Err(Error::InvalidPayload);
+    }
+    let little_endian = match payload[1] {
+        0x00 | 0x10 => false,
+        0x01 | 0x11 => true,
+        _ => return Err(Error::UnsupportedPayloadFeature),
+    };
+    let schema = initialized
+        .schemas
+        .as_slice()
+        .iter()
+        .find(|schema| schema.schema_id == schema_id)
+        .ok_or(Error::ConfigMismatch)?;
+    let root = schema.specifications.start;
+    if root >= schema.specifications.end {
+        return Err(Error::ConfigMismatch);
+    }
+    let mut fields = Vec::new();
+    fields
+        .try_reserve_exact(max_field_values)
+        .map_err(|_| Error::ResourceLimitExceeded)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(
+            usize::try_from(max_output_bytes).map_err(|_| Error::ResourceLimitExceeded)?,
+        )
+        .map_err(|_| Error::ResourceLimitExceeded)?;
+    let payload_steps = u64::try_from(payload.len()).map_err(|_| Error::ResourceLimitExceeded)?;
+    let mut steps = max_steps
+        .checked_sub(payload_steps)
+        .ok_or(Error::ResourceLimitExceeded)?;
+    if little_endian {
+        let mut reader = re_cdr::CdrReader::<byteorder::LittleEndian>::new(&payload[4..]);
+        decode_ros2_specification_v1(
+            initialized,
+            root,
+            &mut reader,
+            &mut steps,
+            max_output_bytes,
+            max_field_values,
+            &mut fields,
+            &mut bytes,
+            0,
+        )?;
+        if reader.remaining() != 0 {
+            return Err(Error::InvalidPayload);
+        }
+    } else {
+        let mut reader = re_cdr::CdrReader::<byteorder::BigEndian>::new(&payload[4..]);
+        decode_ros2_specification_v1(
+            initialized,
+            root,
+            &mut reader,
+            &mut steps,
+            max_output_bytes,
+            max_field_values,
+            &mut fields,
+            &mut bytes,
+            0,
+        )?;
+        if reader.remaining() != 0 {
+            return Err(Error::InvalidPayload);
+        }
+    }
+    Ok((fields, bytes, max_steps - steps))
+}
+
+fn decode_ros2_specification_v1<BO: byteorder::ByteOrder>(
+    initialized: &Ros2InitializedRemoteDefinitionsV1<'_, '_, '_, '_>,
+    specification_index: usize,
+    reader: &mut re_cdr::CdrReader<'_, BO>,
+    steps: &mut u64,
+    max_output_bytes: u64,
+    max_field_values: usize,
+    fields: &mut Vec<crate::remote_protobuf_descriptor::RemoteNormalizedFieldV1>,
+    bytes: &mut Vec<u8>,
+    depth: usize,
+) -> Result<(), crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1> {
+    use crate::remote_protobuf_descriptor::{
+        RemoteExecutableAdapterErrorV1 as Error, RemoteNormalizedFieldV1 as Field,
+        RemoteNormalizedValueV1 as Value,
+    };
+    if depth > MAX_STACK_DEPENDENCY_DEPTH_V1 {
+        return Err(Error::ResourceLimitExceeded);
+    }
+    let specification = initialized
+        .specifications
+        .as_slice()
+        .get(specification_index)
+        .ok_or(Error::ConfigMismatch)?;
+    for (ordinal, member_index) in
+        (specification.members.start..specification.members.end).enumerate()
+    {
+        consume_ros2_decode_step_v1(steps)?;
+        let member = initialized
+            .members
+            .as_slice()
+            .get(member_index)
+            .ok_or(Error::ConfigMismatch)?;
+        if member.kind != ParsedMemberKindV1::Field {
+            continue;
+        }
+        let tag = u32::try_from(ordinal + 1).map_err(|_| Error::ResourceLimitExceeded)?;
+        let value = match member.ty.array {
+            ArraySizeV1::Scalar => decode_ros2_element_v1(
+                initialized,
+                member_index,
+                member.ty.element,
+                reader,
+                steps,
+                max_output_bytes,
+                fields,
+                bytes,
+                depth,
+                max_field_values,
+            )?,
+            ArraySizeV1::Fixed(count) | ArraySizeV1::Bounded(count) => {
+                let fixed = matches!(member.ty.array, ArraySizeV1::Fixed(_));
+                let actual = if fixed {
+                    usize::try_from(count).map_err(|_| Error::ResourceLimitExceeded)?
+                } else {
+                    let actual = reader
+                        .read_sequence_length()
+                        .map_err(|_| Error::InvalidPayload)?;
+                    if u64::try_from(actual)
+                        .ok()
+                        .is_none_or(|actual| actual > count)
+                    {
+                        return Err(Error::ResourceLimitExceeded);
+                    }
+                    actual
+                };
+                if u64::try_from(actual)
+                    .ok()
+                    .is_none_or(|actual| actual > *steps)
+                {
+                    return Err(Error::ResourceLimitExceeded);
+                }
+                let first_value =
+                    u32::try_from(fields.len()).map_err(|_| Error::ResourceLimitExceeded)?;
+                for index in 0..actual {
+                    consume_ros2_decode_step_v1(steps)?;
+                    if fields.len() >= max_field_values {
+                        return Err(Error::ResourceLimitExceeded);
+                    }
+                    let value = decode_ros2_element_v1(
+                        initialized,
+                        member_index,
+                        member.ty.element,
+                        reader,
+                        steps,
+                        max_output_bytes,
+                        fields,
+                        bytes,
+                        depth,
+                        max_field_values,
+                    )?;
+                    fields.push(Field {
+                        tag: u32::try_from(index + 1).map_err(|_| Error::ResourceLimitExceeded)?,
+                        value,
+                    });
+                }
+                Value::Array {
+                    first_value,
+                    value_count: u32::try_from(actual).map_err(|_| Error::ResourceLimitExceeded)?,
+                    fixed,
+                }
+            }
+            ArraySizeV1::Unbounded => return Err(Error::UnsupportedPayloadFeature),
+        };
+        if fields.len() >= max_field_values {
+            return Err(Error::ResourceLimitExceeded);
+        }
+        fields.push(Field { tag, value });
+    }
+    Ok(())
+}
+
+fn consume_ros2_decode_step_v1(
+    steps: &mut u64,
+) -> Result<(), crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1> {
+    *steps = steps.checked_sub(1).ok_or(
+        crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1::ResourceLimitExceeded,
+    )?;
+    Ok(())
+}
+
+fn decode_ros2_element_v1<BO: byteorder::ByteOrder>(
+    initialized: &Ros2InitializedRemoteDefinitionsV1<'_, '_, '_, '_>,
+    member_index: usize,
+    element: ElementTypeV1,
+    reader: &mut re_cdr::CdrReader<'_, BO>,
+    steps: &mut u64,
+    max_output_bytes: u64,
+    fields: &mut Vec<crate::remote_protobuf_descriptor::RemoteNormalizedFieldV1>,
+    bytes: &mut Vec<u8>,
+    depth: usize,
+    max_field_values: usize,
+) -> Result<
+    crate::remote_protobuf_descriptor::RemoteNormalizedValueV1,
+    crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1,
+> {
+    use crate::remote_protobuf_descriptor::{
+        RemoteExecutableAdapterErrorV1 as Error, RemoteNormalizedValueV1 as Value,
+    };
+    consume_ros2_decode_step_v1(steps)?;
+    Ok(match element {
+        ElementTypeV1::Primitive(primitive) => match primitive {
+            PrimitiveTypeV1::Bool => {
+                Value::Bool(reader.read_bool().map_err(|_| Error::InvalidPayload)?)
+            }
+            PrimitiveTypeV1::Byte | PrimitiveTypeV1::Char | PrimitiveTypeV1::UInt8 => {
+                Value::Unsigned(u64::from(
+                    reader.read_u8().map_err(|_| Error::InvalidPayload)?,
+                ))
+            }
+            PrimitiveTypeV1::Int8 => Value::Signed(i64::from(
+                reader.read_i8().map_err(|_| Error::InvalidPayload)?,
+            )),
+            PrimitiveTypeV1::Int16 => Value::Signed(i64::from(
+                reader.read_i16().map_err(|_| Error::InvalidPayload)?,
+            )),
+            PrimitiveTypeV1::Int32 => Value::Signed(i64::from(
+                reader.read_i32().map_err(|_| Error::InvalidPayload)?,
+            )),
+            PrimitiveTypeV1::Int64 => {
+                Value::Signed(reader.read_i64().map_err(|_| Error::InvalidPayload)?)
+            }
+            PrimitiveTypeV1::UInt16 => Value::Unsigned(u64::from(
+                reader.read_u16().map_err(|_| Error::InvalidPayload)?,
+            )),
+            PrimitiveTypeV1::UInt32 => Value::Unsigned(u64::from(
+                reader.read_u32().map_err(|_| Error::InvalidPayload)?,
+            )),
+            PrimitiveTypeV1::UInt64 => {
+                Value::Unsigned(reader.read_u64().map_err(|_| Error::InvalidPayload)?)
+            }
+            PrimitiveTypeV1::Float32 => Value::Float32(
+                reader
+                    .read_f32()
+                    .map_err(|_| Error::InvalidPayload)?
+                    .to_bits(),
+            ),
+            PrimitiveTypeV1::Float64 => Value::Float64(
+                reader
+                    .read_f64()
+                    .map_err(|_| Error::InvalidPayload)?
+                    .to_bits(),
+            ),
+            PrimitiveTypeV1::String { bound } => {
+                let text = reader.read_str().map_err(|_| Error::InvalidPayload)?;
+                if bound.is_some_and(|bound| {
+                    u64::try_from(text.len()).ok().is_none_or(|len| len > bound)
+                }) {
+                    return Err(Error::ResourceLimitExceeded);
+                }
+                let new_len = bytes
+                    .len()
+                    .checked_add(text.len())
+                    .ok_or(Error::ResourceLimitExceeded)?;
+                if u64::try_from(new_len)
+                    .ok()
+                    .is_none_or(|len| len > max_output_bytes)
+                {
+                    return Err(Error::ResourceLimitExceeded);
+                }
+                let start = u32::try_from(bytes.len()).map_err(|_| Error::ResourceLimitExceeded)?;
+                bytes.extend_from_slice(text.as_bytes());
+                Value::Bytes {
+                    start,
+                    len: u32::try_from(text.len()).map_err(|_| Error::ResourceLimitExceeded)?,
+                }
+            }
+        },
+        ElementTypeV1::Complex(_) => {
+            let target = initialized
+                .resolutions
+                .as_slice()
+                .iter()
+                .find(|resolution| resolution.member_index == member_index)
+                .ok_or(Error::ConfigMismatch)?
+                .target_specification_index;
+            if let Some(primitive) = remote_ros2_enum_underlying_v1(initialized, target)? {
+                return decode_ros2_element_v1(
+                    initialized,
+                    member_index,
+                    ElementTypeV1::Primitive(primitive),
+                    reader,
+                    steps,
+                    max_output_bytes,
+                    fields,
+                    bytes,
+                    depth,
+                    max_field_values,
+                );
+            }
+            let first_value =
+                u32::try_from(fields.len()).map_err(|_| Error::ResourceLimitExceeded)?;
+            decode_ros2_specification_v1(
+                initialized,
+                target,
+                reader,
+                steps,
+                max_output_bytes,
+                max_field_values,
+                fields,
+                bytes,
+                depth + 1,
+            )?;
+            Value::Message {
+                first_value,
+                value_count: u32::try_from(fields.len())
+                    .map_err(|_| Error::ResourceLimitExceeded)?
+                    - first_value,
+            }
+        }
+    })
+}
+
+fn remote_ros2_enum_underlying_v1(
+    initialized: &Ros2InitializedRemoteDefinitionsV1<'_, '_, '_, '_>,
+    specification_index: usize,
+) -> Result<
+    Option<PrimitiveTypeV1>,
+    crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1,
+> {
+    use crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1 as Error;
+    let specification = initialized
+        .specifications
+        .as_slice()
+        .get(specification_index)
+        .ok_or(Error::ConfigMismatch)?;
+    let mut primitive = None;
+    let mut constants = 0_usize;
+    for member in &initialized.members.as_slice()[specification.members.clone()] {
+        match member.kind {
+            ParsedMemberKindV1::Field | ParsedMemberKindV1::SyntheticPadding => return Ok(None),
+            ParsedMemberKindV1::Constant => {
+                let ElementTypeV1::Primitive(current) = member.ty.element else {
+                    return Err(Error::ConfigMismatch);
+                };
+                if primitive.is_some_and(|primitive| primitive != current) {
+                    return Ok(None);
+                }
+                primitive = Some(current);
+                constants = constants
+                    .checked_add(1)
+                    .ok_or(Error::ResourceLimitExceeded)?;
+            }
+        }
+    }
+    Ok((constants > 0
+        && primitive.is_some_and(|primitive| {
+            matches!(
+                primitive,
+                PrimitiveTypeV1::Bool
+                    | PrimitiveTypeV1::Byte
+                    | PrimitiveTypeV1::Char
+                    | PrimitiveTypeV1::Int8
+                    | PrimitiveTypeV1::UInt8
+            )
+        }))
+    .then_some(primitive)
+    .flatten())
 }
 
 /// One-shot, source/policy-bound recognition capability for MCAP-028.
@@ -5339,6 +5780,13 @@ fn materialize_one_schema(
             let Some(member) = members.next_member(steps)? else {
                 break;
             };
+            if matches!(member.ty.element, ElementTypeV1::Complex(_))
+                && !matches!(member.ty.array, ArraySizeV1::Scalar)
+            {
+                return Err(RemoteRos2InitializationError::UnsupportedForRemote(
+                    UnsupportedForRemote::GrammarFeature,
+                ));
+            }
             let member_index = sink.member_len();
             steps.consume()?;
             sink.push_member(ParsedMemberV1 {
@@ -8486,6 +8934,120 @@ mod tests {
             re_ros_msg::deserialize::decode_message(&mut local_reader, &local.spec, &resolver)
                 .unwrap();
         assert_eq!(remote_value, local_value);
+    }
+
+    fn initialized_ros2_for_payload_test<'definitions, 'input, 'source, 'wire>(
+        definitions: &'definitions ValidatedSummaryDefinitions<'input>,
+        state: &'source RemoteDefinitionsSourceState,
+        wire: &'wire RemoteDecoderPolicyWireV1<'wire>,
+        budget: &RemoteRos2InitializationBudget<'source, 'wire>,
+    ) -> Ros2InitializedRemoteDefinitionsV1<'definitions, 'input, 'source, 'wire> {
+        materialize_remote_ros2_definitions_v1(prepare(definitions, state, wire, budget).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn executable_ros2_walker_decodes_scalars_strings_arrays_and_nested() {
+        use crate::remote_protobuf_descriptor::RemoteNormalizedValueV1 as Value;
+
+        let definition = concat!(
+            "int32 count\n",
+            "string<=8 label\n",
+            "uint16[2] fixed\n",
+            "Child child\n",
+            "===\nMSG: pkg/Child\n",
+            "uint64 value\n",
+        );
+        let fixture = fixture(
+            [schema(7, "pkg/Root", "ros2msg", definition.as_bytes())],
+            [channel(1, 7, "/root", "cdr")],
+        );
+        let definitions = validated_summary_definitions_for_test(&fixture);
+        let state = source_state();
+        let wire = canonical_policy_wire();
+        let budget = budget(&state, &wire, generous_limits());
+        let initialized = initialized_ros2_for_payload_test(&definitions, &state, &wire, &budget);
+
+        let mut payload = vec![0, 1, 0, 0];
+        let mut writer = re_cdr::CdrWriter::<byteorder::LittleEndian>::new(&mut payload);
+        writer.write_i32(-4);
+        writer.write_string("hello");
+        writer.write_u16(10);
+        writer.write_u16(20);
+        writer.write_u64(42);
+        let (fields, bytes, _) =
+            decode_materialized_ros2_payload_v1(&initialized, 7, &payload, 256, 64, 256).unwrap();
+        assert!(fields.iter().any(|field| field.value == Value::Signed(-4)));
+        assert!(fields.iter().any(|field| matches!(
+            field.value,
+            Value::Array {
+                value_count: 2,
+                fixed: true,
+                ..
+            }
+        )));
+        assert!(
+            fields
+                .iter()
+                .any(|field| matches!(field.value, Value::Message { value_count: 1, .. }))
+        );
+        assert_eq!(bytes, b"hello");
+
+        let local = re_ros_msg::MessageSchema::parse("pkg/Root", definition).unwrap();
+        let resolver = re_ros_msg::deserialize::MapResolver::new(
+            local
+                .dependencies
+                .iter()
+                .map(|dependency| (dependency.name.clone(), dependency)),
+        );
+        let mut reader = re_cdr::CdrReader::<byteorder::LittleEndian>::new(&payload[4..]);
+        assert!(
+            re_ros_msg::deserialize::decode_message(&mut reader, &local.spec, &resolver).is_ok()
+        );
+    }
+
+    #[test]
+    fn executable_ros2_walker_rejects_truncation_and_runtime_bounds() {
+        use crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1 as Error;
+
+        let fixture = fixture(
+            [schema(
+                7,
+                "pkg/Root",
+                "ros2msg",
+                b"string<=3 label\nuint16[<=2] values\n",
+            )],
+            [channel(1, 7, "/root", "cdr")],
+        );
+        let definitions = validated_summary_definitions_for_test(&fixture);
+        let state = source_state();
+        let wire = canonical_policy_wire();
+        let budget = budget(&state, &wire, generous_limits());
+        let initialized = initialized_ros2_for_payload_test(&definitions, &state, &wire, &budget);
+
+        assert_eq!(
+            decode_materialized_ros2_payload_v1(&initialized, 7, &[0, 1, 0, 0, 4], 64, 32, 256),
+            Err(Error::InvalidPayload),
+        );
+        let mut overlong_string = vec![0, 1, 0, 0];
+        let mut writer = re_cdr::CdrWriter::<byteorder::LittleEndian>::new(&mut overlong_string);
+        writer.write_string("four");
+        writer.write_sequence_length(0);
+        assert_eq!(
+            decode_materialized_ros2_payload_v1(&initialized, 7, &overlong_string, 64, 32, 256),
+            Err(Error::ResourceLimitExceeded),
+        );
+        let mut too_many = vec![0, 1, 0, 0];
+        let mut writer = re_cdr::CdrWriter::<byteorder::LittleEndian>::new(&mut too_many);
+        writer.write_string("ok");
+        writer.write_sequence_length(3);
+        writer.write_u16(1);
+        writer.write_u16(2);
+        writer.write_u16(3);
+        assert_eq!(
+            decode_materialized_ros2_payload_v1(&initialized, 7, &too_many, 64, 32, 256),
+            Err(Error::ResourceLimitExceeded),
+        );
     }
 
     #[test]

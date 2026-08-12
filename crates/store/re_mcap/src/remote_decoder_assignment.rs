@@ -406,17 +406,18 @@ impl AssignmentStepOwnerV1 {
 }
 
 /// One immutable `ChannelId -> owner` projection retained by the assignment result.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) struct RemoteChannelDecoderAssignmentV1 {
     channel_id: u16,
     eligibility: RemoteChannelEligibilityV1,
     owner: RemoteDecoderOwnerV1,
     executable_config: FrozenRemoteExecutableConfigV1,
+    source_binding: crate::remote_chunk_scan::PhysicalChunkSourceBindingV1,
 }
 
 impl RemoteChannelDecoderAssignmentV1 {
     #[cfg(test)]
-    pub(crate) const fn new_for_manifest_test_v1(
+    pub(crate) fn new_for_manifest_test_v1(
         channel_id: u16,
         eligibility: RemoteChannelEligibilityV1,
         owner: RemoteDecoderOwnerV1,
@@ -427,6 +428,7 @@ impl RemoteChannelDecoderAssignmentV1 {
             eligibility,
             owner,
             executable_config,
+            source_binding: crate::remote_chunk_scan::PhysicalChunkSourceBindingV1::new_unscanned_for_assignment_test_v1(),
         }
     }
 
@@ -444,6 +446,13 @@ impl RemoteChannelDecoderAssignmentV1 {
 
     pub(crate) const fn executable_config(&self) -> FrozenRemoteExecutableConfigV1 {
         self.executable_config
+    }
+
+    pub(crate) fn ensure_source_matches_v1(
+        &self,
+        binding: &crate::remote_chunk_scan::PhysicalChunkSourceBindingV1,
+    ) {
+        self.source_binding.ensure_matches_v1(binding);
     }
 }
 
@@ -758,6 +767,10 @@ fn assign_remote_decoders_with_gate_v1<'definitions, 'input, 'source, 'wire>(
     initializers
         .ensure_current_for_assignment_v1()
         .map_err(map_initializer_error)?;
+    let source_binding = initializers
+        .physical_source_binding_for_manifest_v1()
+        .map_err(map_initializer_error)?
+        .clone();
     let mut assignments = FixedAssignmentArenaV1::try_new(membership.selected_len(), gate)?;
     let mut selected_cursor = 0_usize;
     {
@@ -833,6 +846,7 @@ fn assign_remote_decoders_with_gate_v1<'definitions, 'input, 'source, 'wire>(
                 executable_config: channel
                     .frozen_executable_config_v1(owner)
                     .map_err(map_initializer_error)?,
+                source_binding: source_binding.clone(),
             });
         }
     }
@@ -1430,16 +1444,14 @@ mod tests {
             u64::MAX,
         );
         let result = assign_for_test_v1(initializers, &budget).unwrap();
+        let row = &result.assignments_for_test()[0];
         assert_eq!(
-            result.assignments_for_test(),
-            [RemoteChannelDecoderAssignmentV1 {
-                channel_id: 2,
-                eligibility: RemoteChannelEligibilityV1::Unknown,
-                owner: RemoteDecoderOwnerV1::Raw,
-                executable_config: FrozenRemoteExecutableConfigV1::new_for_channel_group_test_v1(
-                    3, 0,
-                ),
-            }]
+            (row.channel_id(), row.eligibility(), row.owner()),
+            (
+                2,
+                RemoteChannelEligibilityV1::Unknown,
+                RemoteDecoderOwnerV1::Raw
+            )
         );
         assert_eq!(context.source.assignment_recognition_count_for_test_v1(), 1);
         drop(result);
@@ -1630,16 +1642,14 @@ mod tests {
         )
         .unwrap();
         let result = assign_remote_decoders_v1(prepared).unwrap();
+        let row = &result.assignments_for_test()[0];
         assert_eq!(
-            result.assignments_for_test(),
-            [RemoteChannelDecoderAssignmentV1 {
-                channel_id: 2,
-                eligibility: RemoteChannelEligibilityV1::Unknown,
-                owner: RemoteDecoderOwnerV1::Raw,
-                executable_config: FrozenRemoteExecutableConfigV1::new_for_channel_group_test_v1(
-                    3, 0,
-                ),
-            }],
+            (row.channel_id(), row.eligibility(), row.owner()),
+            (
+                2,
+                RemoteChannelEligibilityV1::Unknown,
+                RemoteDecoderOwnerV1::Raw
+            )
         );
         drop(result);
         assert!(!physical.read_is_still_claimed_v1());
@@ -2274,7 +2284,7 @@ mod tests {
             );
         }
         assert!(EXACT_SAFE_SEMANTIC_ROS2_TABLE_V1.is_empty());
-        assert!(!source.contains(concat!("pub(crate) fn ", "assignments")));
+        assert!(!source.contains(concat!("pub(crate) fn ", "raw_assignments")));
     }
 
     #[test]

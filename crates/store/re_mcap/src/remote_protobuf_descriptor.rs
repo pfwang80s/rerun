@@ -6,6 +6,10 @@
 //! the opaque post-EOF source/policy authority in the combined result.
 
 #![allow(dead_code)]
+#![expect(
+    clippy::map_err_ignore,
+    reason = "remote request errors intentionally erase parser/allocation internals"
+)]
 
 use std::alloc::Layout;
 use std::sync::Arc;
@@ -15,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 
+use crate::remote_chunk_scan::{PhysicalChunkSourceBindingV1, RemoteMessageEnvelopeV1};
 use crate::remote_protobuf_projection_boundary::{
     RemoteProtobufProfileScopeV1, RemoteProtobufProjectionEofContinuationV1,
 };
@@ -630,9 +635,9 @@ struct WireReaderV1<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WireValueV1 {
     Varint(u64),
-    Fixed64,
+    Fixed64(u64),
     Bytes(ByteSpanV1),
-    Fixed32,
+    Fixed32(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -699,8 +704,13 @@ impl<'a> WireReaderV1<'a> {
         let value = match wire_type {
             0 => WireValueV1::Varint(self.read_varint(steps)?),
             1 => {
+                let start = self.position;
                 self.take_exact(8, steps)?;
-                WireValueV1::Fixed64
+                WireValueV1::Fixed64(u64::from_le_bytes(
+                    self.bytes[start..start + 8]
+                        .try_into()
+                        .map_err(|_| RemoteProtobufInitializationErrorV1::InvalidRemoteSchema)?,
+                ))
             }
             2 => {
                 let len = self.read_varint(steps)?;
@@ -721,8 +731,13 @@ impl<'a> WireReaderV1<'a> {
                 })
             }
             5 => {
+                let start = self.position;
                 self.take_exact(4, steps)?;
-                WireValueV1::Fixed32
+                WireValueV1::Fixed32(u32::from_le_bytes(
+                    self.bytes[start..start + 4]
+                        .try_into()
+                        .map_err(|_| RemoteProtobufInitializationErrorV1::InvalidRemoteSchema)?,
+                ))
             }
             3 | 4 | 6 | 7 => {
                 return Err(RemoteProtobufInitializationErrorV1::InvalidRemoteSchema);
@@ -780,7 +795,7 @@ impl<'a> WireReaderV1<'a> {
 fn expected_bytes(value: WireValueV1) -> Result<ByteSpanV1, RemoteProtobufInitializationErrorV1> {
     match value {
         WireValueV1::Bytes(span) => Ok(span),
-        WireValueV1::Varint(_) | WireValueV1::Fixed64 | WireValueV1::Fixed32 => {
+        WireValueV1::Varint(_) | WireValueV1::Fixed64(_) | WireValueV1::Fixed32(_) => {
             Err(RemoteProtobufInitializationErrorV1::InvalidRemoteSchema)
         }
     }
@@ -789,7 +804,7 @@ fn expected_bytes(value: WireValueV1) -> Result<ByteSpanV1, RemoteProtobufInitia
 fn expected_varint(value: WireValueV1) -> Result<u64, RemoteProtobufInitializationErrorV1> {
     match value {
         WireValueV1::Varint(value) => Ok(value),
-        WireValueV1::Fixed64 | WireValueV1::Bytes(_) | WireValueV1::Fixed32 => {
+        WireValueV1::Fixed64(_) | WireValueV1::Bytes(_) | WireValueV1::Fixed32(_) => {
             Err(RemoteProtobufInitializationErrorV1::InvalidRemoteSchema)
         }
     }
@@ -2464,6 +2479,17 @@ fn validate_fields_and_resolve_types_v1(
             let body = direct_field_span_v1(projection, message_index, field_ordinal, steps)?;
             let field =
                 parse_field_header_v1(body, projection, &mut no_accounting, limits, steps, false)?;
+            // Executable V1 deliberately admits only singular, non-oneof fields with implicit
+            // defaults. Broader descriptor shapes remain valid protobuf, but cannot enter the
+            // remote executable table until their payload semantics and exact output bounds are
+            // implemented end-to-end.
+            if field.label != FieldLabelV1::Optional
+                || field.default.is_some()
+                || field.oneof_index.is_some()
+                || field.proto3_optional
+            {
+                return Err(unsupported_feature());
+            }
             if file.syntax == ProtobufSyntaxV1::Proto3
                 && (field.label == FieldLabelV1::Required || field.default.is_some())
             {
@@ -2523,6 +2549,9 @@ fn validate_fields_and_resolve_types_v1(
                 None
             };
             let kind = effective_field_kind_v1(projection, field, resolved_symbol)?;
+            if kind == FieldKindV1::Message {
+                return Err(unsupported_feature());
+            }
             validate_default_value_v1(projection, field, kind, resolved_symbol, steps)?;
         }
     }
@@ -3843,6 +3872,274 @@ impl BoundedProtobufDescriptorGraphV1<'_> {
             .map_or(0, |index| index.saturating_add(1))
     }
 
+    fn decode_schema_payload_v1(
+        &self,
+        schema_id: u16,
+        payload: &[u8],
+        max_steps: u64,
+        max_output_bytes: u64,
+        max_field_values: usize,
+    ) -> Result<(Vec<RemoteNormalizedFieldV1>, Vec<u8>, u64), RemoteExecutableAdapterErrorV1> {
+        let schema_position = self
+            .schemas
+            .as_slice()
+            .iter()
+            .position(|schema| schema.schema_id == schema_id)
+            .ok_or(RemoteExecutableAdapterErrorV1::ConfigMismatch)?;
+        let root = *self
+            .named_messages
+            .as_slice()
+            .get(schema_position)
+            .ok_or(RemoteExecutableAdapterErrorV1::ConfigMismatch)?;
+        let mut fields_out = Vec::new();
+        fields_out
+            .try_reserve_exact(max_field_values)
+            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        let mut bytes_out = Vec::new();
+        bytes_out
+            .try_reserve_exact(
+                usize::try_from(max_output_bytes)
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?,
+            )
+            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        let mut steps = RemoteProtobufStepOwnerV1::new(
+            max_steps,
+            RemoteProtobufResourceLimitV1::MaterializationSteps,
+        );
+        self.decode_message_payload_v1(
+            root,
+            payload,
+            &mut steps,
+            max_output_bytes,
+            max_field_values,
+            &mut fields_out,
+            &mut bytes_out,
+            0,
+        )?;
+        Ok((fields_out, bytes_out, steps.consumed))
+    }
+
+    fn decode_message_payload_v1(
+        &self,
+        message_index: u32,
+        payload: &[u8],
+        steps: &mut RemoteProtobufStepOwnerV1,
+        max_output_bytes: u64,
+        max_field_values: usize,
+        fields_out: &mut Vec<RemoteNormalizedFieldV1>,
+        bytes_out: &mut Vec<u8>,
+        depth: u32,
+    ) -> Result<(), RemoteExecutableAdapterErrorV1> {
+        if depth > 32 {
+            return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+        }
+        let input = SchemaInputV1 {
+            schema_id: 0,
+            name: "",
+            data: payload,
+        };
+        let mut inputs = InlineListV1::<SchemaInputV1<'_>, MAX_INLINE_PROTOBUF_SCHEMAS_V1>::new();
+        inputs
+            .push(input, RemoteProtobufResourceLimitV1::SchemaCount)
+            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        let mut reader = WireReaderV1::root(0, payload)
+            .map_err(|_| RemoteExecutableAdapterErrorV1::InvalidPayload)?;
+        let first_output = fields_out.len();
+        while let Some(wire) = reader
+            .next(steps)
+            .map_err(|_| RemoteExecutableAdapterErrorV1::InvalidPayload)?
+        {
+            let Some(field) = self.fields.as_slice().iter().find(|field| {
+                field.message_index == message_index
+                    && u32::try_from(field.number).ok() == Some(wire.number)
+            }) else {
+                return Err(RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature);
+            };
+            if fields_out[first_output..]
+                .iter()
+                .any(|observed| observed.tag == wire.number)
+            {
+                return Err(RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature);
+            }
+            let value = self.decode_field_value_v1(
+                field,
+                wire.value,
+                &inputs,
+                steps,
+                max_output_bytes,
+                max_field_values,
+                fields_out,
+                bytes_out,
+                depth,
+            )?;
+            if fields_out.len() >= max_field_values {
+                return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+            }
+            fields_out.push(RemoteNormalizedFieldV1 {
+                tag: wire.number,
+                value,
+            });
+        }
+        // Missing singular fields keep implicit protobuf default/presence semantics. The
+        // downstream fixed builder plan owns default materialization; this IR records wire
+        // observations only.
+        Ok(())
+    }
+
+    fn decode_field_value_v1(
+        &self,
+        field: &BoundedProtobufFieldV1,
+        wire: WireValueV1,
+        inputs: &InlineListV1<SchemaInputV1<'_>, MAX_INLINE_PROTOBUF_SCHEMAS_V1>,
+        steps: &mut RemoteProtobufStepOwnerV1,
+        max_output_bytes: u64,
+        max_field_values: usize,
+        fields_out: &mut Vec<RemoteNormalizedFieldV1>,
+        bytes_out: &mut Vec<u8>,
+        depth: u32,
+    ) -> Result<RemoteNormalizedValueV1, RemoteExecutableAdapterErrorV1> {
+        let varint = |wire| match wire {
+            WireValueV1::Varint(value) => Ok(value),
+            _ => Err(RemoteExecutableAdapterErrorV1::InvalidPayload),
+        };
+        Ok(match field.kind {
+            FieldKindV1::Bool => RemoteNormalizedValueV1::Bool(varint(wire)? != 0),
+            FieldKindV1::Int32 => {
+                RemoteNormalizedValueV1::Signed(i64::from((varint(wire)? as u32).cast_signed()))
+            }
+            FieldKindV1::Int64 => RemoteNormalizedValueV1::Signed(varint(wire)?.cast_signed()),
+            FieldKindV1::Enum => {
+                let number = varint(wire)?.cast_signed();
+                let symbol = field
+                    .resolved_symbol
+                    .ok_or(RemoteExecutableAdapterErrorV1::ConfigMismatch)?;
+                let enumeration = self
+                    .symbols
+                    .as_slice()
+                    .get(
+                        usize::try_from(symbol)
+                            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?,
+                    )
+                    .ok_or(RemoteExecutableAdapterErrorV1::ConfigMismatch)?;
+                if enumeration.kind != SymbolKindV1::Enum
+                    || !self.enum_values.as_slice().iter().any(|value| {
+                        value.enum_index == enumeration.node_index
+                            && i64::from(value.number) == number
+                    })
+                {
+                    return Err(RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature);
+                }
+                RemoteNormalizedValueV1::Signed(number)
+            }
+            FieldKindV1::UInt32 => {
+                RemoteNormalizedValueV1::Unsigned(u64::from(varint(wire)? as u32))
+            }
+            FieldKindV1::UInt64 => RemoteNormalizedValueV1::Unsigned(varint(wire)?),
+            FieldKindV1::SInt32 => {
+                let raw = varint(wire)?;
+                let raw = raw as u32;
+                RemoteNormalizedValueV1::Signed(i64::from(
+                    (raw >> 1).cast_signed() ^ -(raw & 1).cast_signed(),
+                ))
+            }
+            FieldKindV1::SInt64 => {
+                let raw = varint(wire)?;
+                RemoteNormalizedValueV1::Signed((raw >> 1).cast_signed() ^ -(raw & 1).cast_signed())
+            }
+            FieldKindV1::Fixed32 => match wire {
+                WireValueV1::Fixed32(value) => RemoteNormalizedValueV1::Fixed32(value),
+                _ => return Err(RemoteExecutableAdapterErrorV1::InvalidPayload),
+            },
+            FieldKindV1::SFixed32 => match wire {
+                WireValueV1::Fixed32(value) => {
+                    RemoteNormalizedValueV1::Signed(i64::from(value.cast_signed()))
+                }
+                _ => return Err(RemoteExecutableAdapterErrorV1::InvalidPayload),
+            },
+            FieldKindV1::Float => match wire {
+                WireValueV1::Fixed32(value) => RemoteNormalizedValueV1::Float32(value),
+                _ => return Err(RemoteExecutableAdapterErrorV1::InvalidPayload),
+            },
+            FieldKindV1::Fixed64 => match wire {
+                WireValueV1::Fixed64(value) => RemoteNormalizedValueV1::Fixed64(value),
+                _ => return Err(RemoteExecutableAdapterErrorV1::InvalidPayload),
+            },
+            FieldKindV1::SFixed64 => match wire {
+                WireValueV1::Fixed64(value) => RemoteNormalizedValueV1::Signed(value.cast_signed()),
+                _ => return Err(RemoteExecutableAdapterErrorV1::InvalidPayload),
+            },
+            FieldKindV1::Double => match wire {
+                WireValueV1::Fixed64(value) => RemoteNormalizedValueV1::Float64(value),
+                _ => return Err(RemoteExecutableAdapterErrorV1::InvalidPayload),
+            },
+            FieldKindV1::String | FieldKindV1::Bytes => {
+                let span = expected_bytes(wire)
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::InvalidPayload)?;
+                let data = span_bytes(inputs, span)
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::InvalidPayload)?;
+                if field.kind == FieldKindV1::String && std::str::from_utf8(data).is_err() {
+                    return Err(RemoteExecutableAdapterErrorV1::InvalidPayload);
+                }
+                let start = u32::try_from(bytes_out.len())
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+                let total = bytes_out
+                    .len()
+                    .checked_add(data.len())
+                    .ok_or(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+                if u64::try_from(total)
+                    .ok()
+                    .is_none_or(|n| n > max_output_bytes)
+                {
+                    return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+                }
+                bytes_out.extend_from_slice(data);
+                RemoteNormalizedValueV1::Bytes {
+                    start,
+                    len: u32::try_from(data.len())
+                        .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?,
+                }
+            }
+            FieldKindV1::Message => {
+                let span = expected_bytes(wire)
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::InvalidPayload)?;
+                let data = span_bytes(inputs, span)
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::InvalidPayload)?;
+                let symbol = field
+                    .resolved_symbol
+                    .ok_or(RemoteExecutableAdapterErrorV1::ConfigMismatch)?;
+                let resolved = self
+                    .symbols
+                    .as_slice()
+                    .get(
+                        usize::try_from(symbol)
+                            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?,
+                    )
+                    .ok_or(RemoteExecutableAdapterErrorV1::ConfigMismatch)?;
+                if resolved.kind != SymbolKindV1::Message {
+                    return Err(RemoteExecutableAdapterErrorV1::ConfigMismatch);
+                }
+                let first = u32::try_from(fields_out.len())
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+                self.decode_message_payload_v1(
+                    resolved.node_index,
+                    data,
+                    steps,
+                    max_output_bytes,
+                    max_field_values,
+                    fields_out,
+                    bytes_out,
+                    depth + 1,
+                )?;
+                RemoteNormalizedValueV1::Message {
+                    first_value: first,
+                    value_count: u32::try_from(fields_out.len())
+                        .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?
+                        - first,
+                }
+            }
+        })
+    }
+
     fn verify_lengths(
         &self,
         census: RemoteProtobufCensusV1,
@@ -4596,6 +4893,269 @@ pub(crate) struct BoundedRemoteChannelRecognitionV1<
     executable_configs: &'item [(u16, FrozenRemoteExecutableConfigV1)],
 }
 
+/// Errors raised by the sealed, bounded executable adapter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteExecutableAdapterErrorV1 {
+    StaleSource,
+    ConfigMismatch,
+    ResourceLimitExceeded,
+    AlreadyConsumed,
+    PayloadLengthMismatch,
+    UnsupportedSemantic,
+    InvalidPayload,
+    UnsupportedPayloadFeature,
+}
+
+/// A small source-owned budget for one executable adapter.  The production route has no
+/// constructor until its resource profile is frozen; tests use the disarmed constructor.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RemoteExecutableAdapterLimitsV1 {
+    pub(crate) max_rows: u64,
+    pub(crate) max_payload_bytes: u64,
+    pub(crate) max_steps: u64,
+    pub(crate) max_scratch_bytes: u64,
+    pub(crate) max_builder_bytes: u64,
+    pub(crate) max_output_bytes: u64,
+    pub(crate) max_global_bytes: u64,
+}
+
+#[derive(Default)]
+struct RemoteExecutableAdapterUsageV1 {
+    active: bool,
+    retained_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteNormalizedValueV1 {
+    Bool(bool),
+    Signed(i64),
+    Unsigned(u64),
+    Fixed32(u32),
+    Fixed64(u64),
+    Float32(u32),
+    Float64(u64),
+    Bytes {
+        start: u32,
+        len: u32,
+    },
+    Message {
+        first_value: u32,
+        value_count: u32,
+    },
+    Array {
+        first_value: u32,
+        value_count: u32,
+        fixed: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteNormalizedFieldV1 {
+    pub(crate) tag: u32,
+    pub(crate) value: RemoteNormalizedValueV1,
+}
+
+/// Opaque bounded normalized representation. Payload bytes and private graph handles never leave
+/// the adapter; consumers can only enumerate typed field values and copy admitted byte spans.
+pub(crate) struct RemoteNormalizedEnvelopeV1 {
+    fields: Vec<RemoteNormalizedFieldV1>,
+    bytes: Vec<u8>,
+    rows: u64,
+    config_digest: [u8; 16],
+    _reservation: Option<RemoteExecutableAdapterReservationV1>,
+}
+
+pub(crate) struct RemoteNormalizedBatchV1 {
+    envelopes: Vec<RemoteNormalizedEnvelopeV1>,
+    rows: u64,
+    _reservation: Option<RemoteExecutableAdapterReservationV1>,
+}
+
+impl RemoteNormalizedBatchV1 {
+    pub(crate) fn rows_v1(&self) -> u64 {
+        self.rows
+    }
+    pub(crate) fn envelopes_v1(&self) -> &[RemoteNormalizedEnvelopeV1] {
+        &self.envelopes
+    }
+}
+
+impl std::fmt::Debug for RemoteNormalizedEnvelopeV1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteNormalizedEnvelopeV1")
+            .field("fields", &self.fields)
+            .field("bytes", &self.bytes)
+            .field("rows", &self.rows)
+            .field("config_digest", &self.config_digest)
+            .finish_non_exhaustive()
+    }
+}
+impl PartialEq for RemoteNormalizedEnvelopeV1 {
+    fn eq(&self, other: &Self) -> bool {
+        self.fields == other.fields
+            && self.bytes == other.bytes
+            && self.rows == other.rows
+            && self.config_digest == other.config_digest
+    }
+}
+impl Eq for RemoteNormalizedEnvelopeV1 {}
+
+impl RemoteNormalizedEnvelopeV1 {
+    pub(crate) fn rows_v1(&self) -> u64 {
+        self.rows
+    }
+    pub(crate) fn fields_v1(&self) -> &[RemoteNormalizedFieldV1] {
+        &self.fields
+    }
+    pub(crate) fn bytes_v1(&self, start: u32, len: u32) -> Option<&[u8]> {
+        let start = usize::try_from(start).ok()?;
+        let end = start.checked_add(usize::try_from(len).ok()?)?;
+        self.bytes.get(start..end)
+    }
+    pub(crate) fn config_digest_v1(&self) -> [u8; 16] {
+        self.config_digest
+    }
+}
+
+/// Reservation held by an adapter for its complete simultaneous working set.
+pub(crate) struct RemoteExecutableAdapterReservationV1 {
+    state: std::sync::Arc<parking_lot::Mutex<RemoteExecutableAdapterUsageV1>>,
+    global_bytes: std::sync::Arc<parking_lot::Mutex<u64>>,
+    retained_bytes: u64,
+}
+
+/// Source-local admission budget for executable adapters.  It is intentionally separate from
+/// the protobuf census budget so MCAP-030 can account parser/output peak independently.
+pub(crate) struct RemoteExecutableAdapterBudgetV1 {
+    limits: RemoteExecutableAdapterLimitsV1,
+    state: std::sync::Arc<parking_lot::Mutex<RemoteExecutableAdapterUsageV1>>,
+    global_bytes: std::sync::Arc<parking_lot::Mutex<u64>>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct RemoteExecutableAdapterBudgetRootV1 {
+    global_bytes: std::sync::Arc<parking_lot::Mutex<u64>>,
+    max_global_bytes: u64,
+}
+
+impl RemoteExecutableAdapterBudgetRootV1 {
+    #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+    pub(crate) fn new_disarmed_v1(max_global_bytes: u64) -> Self {
+        Self {
+            global_bytes: std::sync::Arc::new(parking_lot::Mutex::new(0)),
+            max_global_bytes,
+        }
+    }
+}
+
+impl RemoteExecutableAdapterBudgetV1 {
+    #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+    pub(crate) fn new_disarmed_v1(limits: RemoteExecutableAdapterLimitsV1) -> Self {
+        let root = RemoteExecutableAdapterBudgetRootV1::new_disarmed_v1(limits.max_global_bytes);
+        Self::new_disarmed_with_root_v1(limits, &root).expect("root cap matches child cap")
+    }
+
+    #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+    pub(crate) fn new_disarmed_with_root_v1(
+        limits: RemoteExecutableAdapterLimitsV1,
+        root: &RemoteExecutableAdapterBudgetRootV1,
+    ) -> Result<Self, RemoteExecutableAdapterErrorV1> {
+        if limits.max_global_bytes != root.max_global_bytes {
+            return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+        }
+        Ok(Self {
+            limits,
+            state: std::sync::Arc::new(parking_lot::Mutex::new(
+                RemoteExecutableAdapterUsageV1::default(),
+            )),
+            global_bytes: std::sync::Arc::clone(&root.global_bytes),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_idle_for_test_v1(&self) -> bool {
+        let global = self.global_bytes.lock();
+        let usage = self.state.lock();
+        !usage.active && usage.retained_bytes == 0 && *global == 0
+    }
+
+    fn reserve_v1(
+        &self,
+        retained_bytes: u64,
+    ) -> Result<RemoteExecutableAdapterReservationV1, RemoteExecutableAdapterErrorV1> {
+        let mut global = self.global_bytes.lock();
+        let next = global
+            .checked_add(retained_bytes)
+            .ok_or(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        if next > self.limits.max_global_bytes {
+            return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+        }
+        let mut usage = self.state.lock();
+        if usage.active {
+            return Err(RemoteExecutableAdapterErrorV1::AlreadyConsumed);
+        }
+        usage.active = true;
+        usage.retained_bytes = retained_bytes;
+        *global = next;
+        Ok(RemoteExecutableAdapterReservationV1 {
+            state: std::sync::Arc::clone(&self.state),
+            global_bytes: std::sync::Arc::clone(&self.global_bytes),
+            retained_bytes,
+        })
+    }
+}
+
+impl Drop for RemoteExecutableAdapterReservationV1 {
+    fn drop(&mut self) {
+        let mut global = self.global_bytes.lock();
+        let mut state = self.state.lock();
+        state.active = false;
+        state.retained_bytes = state.retained_bytes.saturating_sub(self.retained_bytes);
+        drop(state);
+        *global = global
+            .checked_sub(self.retained_bytes)
+            .unwrap_or_else(|| protobuf_fatal_invariant("executable global reservation underflow"));
+    }
+}
+
+trait RemoteExecutableRecognitionAuthorityV1 {
+    fn ensure_current_for_adapter_v1(&self) -> Result<(), RemoteExecutableAdapterErrorV1>;
+    fn config_for_adapter_v1(
+        &self,
+        owner: crate::remote_decoder_assignment::RemoteDecoderOwnerV1,
+    ) -> Result<FrozenRemoteExecutableConfigV1, RemoteExecutableAdapterErrorV1>;
+    fn channel_id_for_adapter_v1(&self) -> Result<u16, RemoteExecutableAdapterErrorV1>;
+    fn physical_binding_for_adapter_v1(
+        &self,
+    ) -> Result<&PhysicalChunkSourceBindingV1, RemoteExecutableAdapterErrorV1>;
+    fn decode_payload_for_adapter_v1(
+        &self,
+        owner: crate::remote_decoder_assignment::RemoteDecoderOwnerV1,
+        payload: &[u8],
+        max_steps: u64,
+        max_output_bytes: u64,
+        max_field_values: usize,
+    ) -> Result<(Vec<RemoteNormalizedFieldV1>, Vec<u8>, u64), RemoteExecutableAdapterErrorV1>;
+}
+
+/// One-shot executable capability.  It retains only the bounded initializer owner and frozen
+/// config; no raw schema, descriptor bytes, or re-bindable parser identity is exposed.
+pub(crate) struct RemoteExecutableDecoderAdapterV1<'a> {
+    recognition: &'a dyn RemoteExecutableRecognitionAuthorityV1,
+    owner: crate::remote_decoder_assignment::RemoteDecoderOwnerV1,
+    config: FrozenRemoteExecutableConfigV1,
+    rows: u64,
+    payload_bytes: u64,
+    max_steps: u64,
+    max_output_bytes: u64,
+    max_builder_bytes: u64,
+    channel_id: u16,
+    physical_binding: PhysicalChunkSourceBindingV1,
+    consumed: bool,
+    reservation: Option<RemoteExecutableAdapterReservationV1>,
+    poisoned: bool,
+}
+
 impl BoundedRemoteChannelRecognitionV1<'_, '_, '_, '_, '_, '_> {
     pub(crate) fn channel_id(&self) -> Result<u16, RemoteProtobufInitializationErrorV1> {
         self.ros2.channel_id().map_err(map_ros_recognition_error)
@@ -4695,6 +5255,793 @@ impl BoundedRemoteChannelRecognitionV1<'_, '_, '_, '_, '_, '_> {
             max_roots_per_partition: 1,
             max_external_origin_bytes_per_partition: 128,
         })
+    }
+
+    /// Borrows this exact source/policy/config-bound initializer to construct one executable
+    /// decoder adapter.  Admission reserves the complete declared simultaneous peak before the
+    /// adapter exists; later stages cannot widen it.
+    pub(crate) fn prepare_executable_adapter_v1<'a>(
+        &'a self,
+        assignment: &crate::remote_decoder_assignment::RemoteChannelDecoderAssignmentV1,
+        num_rows: u64,
+        payload_bytes: u64,
+        budget: &RemoteExecutableAdapterBudgetV1,
+    ) -> Result<RemoteExecutableDecoderAdapterV1<'a>, RemoteExecutableAdapterErrorV1>
+    where
+        Self: 'a,
+    {
+        // Revalidation is deliberately performed through the sealed recognition owner.
+        self.ensure_current_for_adapter_v1()?;
+        let owner = assignment.owner();
+        if owner == crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Raw {
+            return Err(RemoteExecutableAdapterErrorV1::ConfigMismatch);
+        }
+        let actual = self.config_for_adapter_v1(owner)?;
+        let channel_id = self.channel_id_for_adapter_v1()?;
+        if assignment.channel_id() != channel_id || assignment.executable_config() != actual {
+            return Err(RemoteExecutableAdapterErrorV1::ConfigMismatch);
+        }
+        let physical_binding = self.physical_binding_for_adapter_v1()?.clone();
+        assignment.ensure_source_matches_v1(&physical_binding);
+        let limits = budget.limits;
+        if num_rows > limits.max_rows || payload_bytes > limits.max_payload_bytes {
+            return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+        }
+        let retained_bytes = payload_bytes
+            .checked_add(limits.max_scratch_bytes)
+            .and_then(|value| value.checked_add(limits.max_builder_bytes.checked_mul(num_rows)?))
+            .and_then(|value| value.checked_add(limits.max_output_bytes.checked_mul(num_rows)?))
+            .ok_or(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        let row_capacity = usize::try_from(num_rows)
+            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        let envelope_layout = Layout::array::<RemoteNormalizedEnvelopeV1>(row_capacity)
+            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        let field_capacity = usize::try_from(
+            limits.max_builder_bytes
+                / u64::try_from(std::mem::size_of::<RemoteNormalizedFieldV1>())
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?,
+        )
+        .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        let field_layout = Layout::array::<RemoteNormalizedFieldV1>(field_capacity)
+            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        let structural_peak = locked_wasm_allocation_footprint_v1(envelope_layout)
+            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?
+            .checked_add(
+                locked_wasm_allocation_footprint_v1(field_layout)
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?,
+            )
+            .ok_or(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        if structural_peak > limits.max_builder_bytes {
+            return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+        }
+        let output_capacity = usize::try_from(limits.max_output_bytes)
+            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        let output_layout = Layout::array::<u8>(output_capacity)
+            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        let per_row_peak = structural_peak
+            .checked_add(
+                locked_wasm_allocation_footprint_v1(output_layout)
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?,
+            )
+            .ok_or(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        let aggregate_peak = per_row_peak
+            .checked_mul(num_rows)
+            .ok_or(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        if aggregate_peak > retained_bytes {
+            return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+        }
+        if retained_bytes > limits.max_global_bytes {
+            return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+        }
+        // At least one step per row plus one byte-validation step is required.  MCAP-031 will
+        // consume the exact owner rather than infer work from input while executing.
+        let minimum_steps = num_rows
+            .checked_add(payload_bytes)
+            .ok_or(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        if limits.max_steps < minimum_steps {
+            return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+        }
+        let reservation = budget.reserve_v1(retained_bytes)?;
+        Ok(RemoteExecutableDecoderAdapterV1 {
+            recognition: self,
+            owner,
+            config: actual,
+            rows: num_rows,
+            payload_bytes,
+            max_steps: limits.max_steps,
+            max_output_bytes: limits.max_output_bytes,
+            max_builder_bytes: limits.max_builder_bytes,
+            channel_id,
+            physical_binding,
+            consumed: false,
+            reservation: Some(reservation),
+            poisoned: false,
+        })
+    }
+}
+
+impl RemoteExecutableRecognitionAuthorityV1
+    for BoundedRemoteChannelRecognitionV1<'_, '_, '_, '_, '_, '_>
+{
+    fn ensure_current_for_adapter_v1(&self) -> Result<(), RemoteExecutableAdapterErrorV1> {
+        self.channel_id()
+            .map(|_| ())
+            .map_err(|_error| RemoteExecutableAdapterErrorV1::StaleSource)
+    }
+
+    fn config_for_adapter_v1(
+        &self,
+        owner: crate::remote_decoder_assignment::RemoteDecoderOwnerV1,
+    ) -> Result<FrozenRemoteExecutableConfigV1, RemoteExecutableAdapterErrorV1> {
+        self.frozen_executable_config_v1(owner)
+            .map_err(|_error| RemoteExecutableAdapterErrorV1::StaleSource)
+    }
+
+    fn channel_id_for_adapter_v1(&self) -> Result<u16, RemoteExecutableAdapterErrorV1> {
+        self.channel_id()
+            .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)
+    }
+
+    fn physical_binding_for_adapter_v1(
+        &self,
+    ) -> Result<&PhysicalChunkSourceBindingV1, RemoteExecutableAdapterErrorV1> {
+        self.ros2
+            .physical_source_binding_for_adapter_v1()
+            .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)
+    }
+
+    fn decode_payload_for_adapter_v1(
+        &self,
+        owner: crate::remote_decoder_assignment::RemoteDecoderOwnerV1,
+        payload: &[u8],
+        max_steps: u64,
+        max_output_bytes: u64,
+        max_field_values: usize,
+    ) -> Result<(Vec<RemoteNormalizedFieldV1>, Vec<u8>, u64), RemoteExecutableAdapterErrorV1> {
+        match owner {
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Protobuf => {
+                self.protobuf.decode_schema_payload_v1(
+                    self.ros2
+                        .protobuf_schema_id()
+                        .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?
+                        .ok_or(RemoteExecutableAdapterErrorV1::ConfigMismatch)?,
+                    payload,
+                    max_steps,
+                    max_output_bytes,
+                    max_field_values,
+                )
+            }
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Ros2Reflection => self
+                .ros2
+                .decode_ros2_payload_v1(payload, max_steps, max_output_bytes, max_field_values),
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Raw => {
+                Err(RemoteExecutableAdapterErrorV1::UnsupportedSemantic)
+            }
+        }
+    }
+}
+
+fn normalized_span_v1(
+    value: RemoteNormalizedValueV1,
+) -> Result<Option<(usize, usize, bool)>, RemoteExecutableAdapterErrorV1> {
+    let span = match value {
+        RemoteNormalizedValueV1::Bytes { start, len } => (start, len, true),
+        RemoteNormalizedValueV1::Message {
+            first_value,
+            value_count,
+        }
+        | RemoteNormalizedValueV1::Array {
+            first_value,
+            value_count,
+            ..
+        } => (first_value, value_count, false),
+        _ => return Ok(None),
+    };
+    let start = usize::try_from(span.0)
+        .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+    let end = start
+        .checked_add(
+            usize::try_from(span.1)
+                .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?,
+        )
+        .ok_or(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+    Ok(Some((start, end, span.2)))
+}
+
+impl RemoteExecutableDecoderAdapterV1<'_> {
+    fn max_field_values_v1(&self) -> Result<usize, RemoteExecutableAdapterErrorV1> {
+        usize::try_from(
+            self.max_builder_bytes
+                / u64::try_from(std::mem::size_of::<RemoteNormalizedFieldV1>())
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?,
+        )
+        .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)
+    }
+
+    fn validate_normalized_v1(
+        &self,
+        normalized: &(Vec<RemoteNormalizedFieldV1>, Vec<u8>, u64),
+        offered_steps: u64,
+        offered_output_bytes: u64,
+    ) -> Result<(), RemoteExecutableAdapterErrorV1> {
+        if normalized.2 > offered_steps
+            || u64::try_from(normalized.1.len())
+                .ok()
+                .is_none_or(|len| len > offered_output_bytes)
+            || normalized.0.len() > self.max_field_values_v1()?
+        {
+            return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+        }
+        let field_layout = Layout::array::<RemoteNormalizedFieldV1>(normalized.0.capacity())
+            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        let byte_layout = Layout::array::<u8>(normalized.1.capacity())
+            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        let max_byte_layout = Layout::array::<u8>(
+            usize::try_from(self.max_output_bytes)
+                .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?,
+        )
+        .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        if locked_wasm_allocation_footprint_v1(field_layout)
+            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?
+            > self.max_builder_bytes
+            || locked_wasm_allocation_footprint_v1(byte_layout)
+                .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?
+                > locked_wasm_allocation_footprint_v1(max_byte_layout)
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?
+        {
+            return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+        }
+        for (index, field) in normalized.0.iter().enumerate() {
+            match field.value {
+                RemoteNormalizedValueV1::Bytes { start, len } => {
+                    let start = usize::try_from(start)
+                        .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+                    let end =
+                        start
+                            .checked_add(usize::try_from(len).map_err(|_| {
+                                RemoteExecutableAdapterErrorV1::ResourceLimitExceeded
+                            })?)
+                            .ok_or(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+                    if end > normalized.1.len() {
+                        return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+                    }
+                }
+                RemoteNormalizedValueV1::Message {
+                    first_value,
+                    value_count,
+                }
+                | RemoteNormalizedValueV1::Array {
+                    first_value,
+                    value_count,
+                    ..
+                } => {
+                    let first = usize::try_from(first_value)
+                        .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+                    let end =
+                        first
+                            .checked_add(usize::try_from(value_count).map_err(|_| {
+                                RemoteExecutableAdapterErrorV1::ResourceLimitExceeded
+                            })?)
+                            .ok_or(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+                    // Children are emitted before their enclosing field. This excludes
+                    // self-reference, forward-reference, and overlapping parent spans.
+                    if first > index || end > index {
+                        return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+                    }
+                }
+                RemoteNormalizedValueV1::Bool(_)
+                | RemoteNormalizedValueV1::Signed(_)
+                | RemoteNormalizedValueV1::Unsigned(_)
+                | RemoteNormalizedValueV1::Fixed32(_)
+                | RemoteNormalizedValueV1::Fixed64(_)
+                | RemoteNormalizedValueV1::Float32(_)
+                | RemoteNormalizedValueV1::Float64(_) => {}
+            }
+        }
+        // Spans may be nested (a parent message/array contains its already-emitted children),
+        // but partially-overlapping or duplicate intervals are never valid in this IR.
+        for (index, field) in normalized.0.iter().enumerate() {
+            let Some((start, end, is_bytes)) = normalized_span_v1(field.value)? else {
+                continue;
+            };
+            for other in normalized.0.iter().skip(index + 1) {
+                let Some((other_start, other_end, other_is_bytes)) =
+                    normalized_span_v1(other.value)?
+                else {
+                    continue;
+                };
+                if is_bytes != other_is_bytes {
+                    continue;
+                }
+                if start < other_end && other_start < end {
+                    let duplicate = start == other_start && end == other_end;
+                    let nested = (start <= other_start && other_end <= end)
+                        || (other_start <= start && end <= other_end);
+                    if duplicate || !nested {
+                        return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn execute_batch_v1(
+        mut self,
+        evidence: &crate::remote_chunk_scan::PhysicalChunkMessageEvidenceV1<'_>,
+    ) -> Result<RemoteNormalizedBatchV1, RemoteExecutableAdapterErrorV1> {
+        self.recognition.ensure_current_for_adapter_v1()?;
+        if self.recognition.config_for_adapter_v1(self.owner)? != self.config {
+            return Err(RemoteExecutableAdapterErrorV1::ConfigMismatch);
+        }
+        evidence.ensure_matches_source_v1(&self.physical_binding);
+        let mut envelopes = Vec::new();
+        envelopes
+            .try_reserve_exact(
+                usize::try_from(self.rows)
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?,
+            )
+            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        let mut iter = evidence
+            .message_envelopes_v1()
+            .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?;
+        let mut payload_bytes = 0_u64;
+        let mut remaining_steps = self.max_steps;
+        let mut remaining_output = self.max_output_bytes;
+        while let Some(envelope) = iter
+            .next_v1()
+            .map_err(|_| RemoteExecutableAdapterErrorV1::InvalidPayload)?
+        {
+            if envelope.channel_id != self.channel_id {
+                continue;
+            }
+            if envelopes.len()
+                >= usize::try_from(self.rows)
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?
+            {
+                return Err(RemoteExecutableAdapterErrorV1::PayloadLengthMismatch);
+            }
+            payload_bytes = payload_bytes
+                .checked_add(
+                    u64::try_from(envelope.payload_len_v1())
+                        .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?,
+                )
+                .ok_or(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+            if payload_bytes > self.payload_bytes {
+                return Err(RemoteExecutableAdapterErrorV1::PayloadLengthMismatch);
+            }
+            envelope
+                .ensure_current_v1()
+                .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?;
+            self.recognition.ensure_current_for_adapter_v1()?;
+            if self.recognition.config_for_adapter_v1(self.owner)? != self.config {
+                return Err(RemoteExecutableAdapterErrorV1::ConfigMismatch);
+            }
+            self.physical_binding
+                .ensure_matches_v1(envelope.binding_v1());
+            let normalized = self.recognition.decode_payload_for_adapter_v1(
+                self.owner,
+                envelope.payload_for_bounded_decoder_v1(),
+                remaining_steps,
+                remaining_output,
+                self.max_field_values_v1()?,
+            )?;
+            self.validate_normalized_v1(&normalized, remaining_steps, remaining_output)?;
+            let retained = u64::try_from(normalized.1.len())
+                .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+            remaining_steps = remaining_steps
+                .checked_sub(normalized.2)
+                .ok_or(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+            remaining_output = remaining_output
+                .checked_sub(retained)
+                .ok_or(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+            envelopes.push(RemoteNormalizedEnvelopeV1 {
+                fields: normalized.0,
+                bytes: normalized.1,
+                rows: 1,
+                config_digest: self.config.canonical_digest_v1(),
+                _reservation: None,
+            });
+        }
+        if u64::try_from(envelopes.len()).ok() != Some(self.rows)
+            || payload_bytes != self.payload_bytes
+        {
+            return Err(RemoteExecutableAdapterErrorV1::PayloadLengthMismatch);
+        }
+        self.recognition.ensure_current_for_adapter_v1()?;
+        if self.recognition.config_for_adapter_v1(self.owner)? != self.config {
+            return Err(RemoteExecutableAdapterErrorV1::ConfigMismatch);
+        }
+        self.consumed = true;
+        Ok(RemoteNormalizedBatchV1 {
+            envelopes,
+            rows: self.rows,
+            _reservation: self.reservation.take(),
+        })
+    }
+
+    /// Executes the admitted adapter once and materializes a bounded, owned normalized envelope.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the move-only envelope lease is consumed exactly once"
+    )]
+    pub(crate) fn execute_envelope_v1(
+        &mut self,
+        envelope: RemoteMessageEnvelopeV1<'_>,
+    ) -> Result<RemoteNormalizedEnvelopeV1, RemoteExecutableAdapterErrorV1> {
+        if self.consumed {
+            return Err(RemoteExecutableAdapterErrorV1::AlreadyConsumed);
+        }
+        if self.poisoned {
+            return Err(RemoteExecutableAdapterErrorV1::AlreadyConsumed);
+        }
+        if envelope.ensure_current_v1().is_err() {
+            self.poisoned = true;
+            return Err(RemoteExecutableAdapterErrorV1::StaleSource);
+        }
+        if envelope.channel_id != self.channel_id {
+            self.poisoned = true;
+            return Err(RemoteExecutableAdapterErrorV1::ConfigMismatch);
+        }
+        if self.recognition.ensure_current_for_adapter_v1().is_err() {
+            self.poisoned = true;
+            return Err(RemoteExecutableAdapterErrorV1::StaleSource);
+        }
+        self.physical_binding
+            .ensure_matches_v1(envelope.binding_v1());
+        let actual = match self.recognition.config_for_adapter_v1(self.owner) {
+            Ok(value) => value,
+            Err(error) => {
+                self.poisoned = true;
+                return Err(error);
+            }
+        };
+        if actual != self.config {
+            self.poisoned = true;
+            return Err(RemoteExecutableAdapterErrorV1::ConfigMismatch);
+        }
+        if self.rows != 1
+            || envelope.row_bound != 0
+            || u64::try_from(envelope.payload_len_v1()).ok() != Some(self.payload_bytes)
+        {
+            self.poisoned = true;
+            return Err(RemoteExecutableAdapterErrorV1::PayloadLengthMismatch);
+        }
+        let payload_len = u64::try_from(envelope.payload_len_v1()).map_err(|_| {
+            self.poisoned = true;
+            RemoteExecutableAdapterErrorV1::ResourceLimitExceeded
+        })?;
+        if payload_len > self.max_steps {
+            self.poisoned = true;
+            return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+        }
+        // Every attempt consumes the capability before any payload read/allocation. A malformed
+        // or over-budget payload can therefore never be retried through the same authority.
+        self.consumed = true;
+        let payload = envelope.payload_for_bounded_decoder_v1();
+        let normalized = self.recognition.decode_payload_for_adapter_v1(
+            self.owner,
+            payload,
+            self.max_steps,
+            self.max_output_bytes,
+            self.max_field_values_v1()?,
+        );
+        let normalized = match normalized {
+            Ok(normalized) => normalized,
+            Err(error) => {
+                self.poisoned = true;
+                return Err(error);
+            }
+        };
+        if self
+            .validate_normalized_v1(&normalized, self.max_steps, self.max_output_bytes)
+            .is_err()
+        {
+            self.poisoned = true;
+            return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+        }
+        Ok(RemoteNormalizedEnvelopeV1 {
+            fields: normalized.0,
+            bytes: normalized.1,
+            rows: 1,
+            config_digest: self.config.canonical_digest_v1(),
+            _reservation: self.reservation.take(),
+        })
+    }
+}
+
+fn decode_bounded_wire_v1(
+    payload: &[u8],
+    max_steps: u64,
+    max_output_bytes: u64,
+) -> Result<(Vec<RemoteNormalizedFieldV1>, Vec<u8>, u64), RemoteExecutableAdapterErrorV1> {
+    let mut steps = RemoteProtobufStepOwnerV1::new(
+        max_steps,
+        RemoteProtobufResourceLimitV1::MaterializationSteps,
+    );
+    let input = SchemaInputV1 {
+        schema_id: 0,
+        name: "",
+        data: payload,
+    };
+    let mut inputs = InlineListV1::<SchemaInputV1<'_>, MAX_INLINE_PROTOBUF_SCHEMAS_V1>::new();
+    inputs
+        .push(input, RemoteProtobufResourceLimitV1::SchemaCount)
+        .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+    let mut reader = WireReaderV1::root(0, payload)
+        .map_err(|_| RemoteExecutableAdapterErrorV1::InvalidPayload)?;
+    let mut fields = Vec::new();
+    let mut bytes = Vec::new();
+    while let Some(field) = reader
+        .next(&mut steps)
+        .map_err(|_| RemoteExecutableAdapterErrorV1::InvalidPayload)?
+    {
+        let value = match field.value {
+            WireValueV1::Varint(value) => RemoteNormalizedValueV1::Unsigned(value),
+            WireValueV1::Fixed64(value) => RemoteNormalizedValueV1::Fixed64(value),
+            WireValueV1::Fixed32(value) => RemoteNormalizedValueV1::Fixed32(value),
+            WireValueV1::Bytes(span) => {
+                let data = span_bytes(&inputs, span)
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::InvalidPayload)?;
+                let start = u32::try_from(bytes.len())
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+                let len = u32::try_from(data.len())
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+                let total = bytes
+                    .len()
+                    .checked_add(data.len())
+                    .ok_or(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+                if u64::try_from(total)
+                    .ok()
+                    .is_none_or(|n| n > max_output_bytes)
+                {
+                    return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+                }
+                bytes.extend_from_slice(data);
+                RemoteNormalizedValueV1::Bytes { start, len }
+            }
+        };
+        fields.push(RemoteNormalizedFieldV1 {
+            tag: field.number,
+            value,
+        });
+    }
+    Ok((fields, bytes, steps.consumed))
+}
+
+#[cfg(test)]
+mod executable_adapter_tests {
+    use super::*;
+
+    struct TestAuthority {
+        config: FrozenRemoteExecutableConfigV1,
+        stale: bool,
+        binding: PhysicalChunkSourceBindingV1,
+    }
+
+    impl RemoteExecutableRecognitionAuthorityV1 for TestAuthority {
+        fn ensure_current_for_adapter_v1(&self) -> Result<(), RemoteExecutableAdapterErrorV1> {
+            if self.stale {
+                Err(RemoteExecutableAdapterErrorV1::StaleSource)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn config_for_adapter_v1(
+            &self,
+            _owner: crate::remote_decoder_assignment::RemoteDecoderOwnerV1,
+        ) -> Result<FrozenRemoteExecutableConfigV1, RemoteExecutableAdapterErrorV1> {
+            self.ensure_current_for_adapter_v1()?;
+            Ok(self.config)
+        }
+        fn channel_id_for_adapter_v1(&self) -> Result<u16, RemoteExecutableAdapterErrorV1> {
+            Ok(1)
+        }
+        fn physical_binding_for_adapter_v1(
+            &self,
+        ) -> Result<&PhysicalChunkSourceBindingV1, RemoteExecutableAdapterErrorV1> {
+            Ok(&self.binding)
+        }
+        fn decode_payload_for_adapter_v1(
+            &self,
+            _owner: crate::remote_decoder_assignment::RemoteDecoderOwnerV1,
+            payload: &[u8],
+            max_steps: u64,
+            max_output_bytes: u64,
+            _max_field_values: usize,
+        ) -> Result<(Vec<RemoteNormalizedFieldV1>, Vec<u8>, u64), RemoteExecutableAdapterErrorV1>
+        {
+            decode_bounded_wire_v1(payload, max_steps, max_output_bytes)
+        }
+    }
+
+    fn limits() -> RemoteExecutableAdapterLimitsV1 {
+        RemoteExecutableAdapterLimitsV1 {
+            max_rows: 1,
+            max_payload_bytes: 4,
+            max_steps: 16,
+            max_scratch_bytes: 8,
+            max_builder_bytes: 131_072,
+            max_output_bytes: 32,
+            max_global_bytes: 256,
+        }
+    }
+
+    #[test]
+    fn one_shot_exact_payload_and_drop_restore_budget() {
+        let config = FrozenRemoteExecutableConfigV1::new_for_channel_group_test_v1(2, 7);
+        let authority = TestAuthority {
+            config,
+            stale: false,
+            binding: PhysicalChunkSourceBindingV1::new_unscanned_for_assignment_test_v1(),
+        };
+        let budget = RemoteExecutableAdapterBudgetV1::new_disarmed_v1(limits());
+        let output = {
+            let mut adapter = RemoteExecutableDecoderAdapterV1 {
+                recognition: &authority,
+                owner: crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Protobuf,
+                config,
+                rows: 1,
+                payload_bytes: 4,
+                max_steps: 16,
+                max_output_bytes: 32,
+                max_builder_bytes: 131_072,
+                channel_id: 1,
+                physical_binding: authority.binding.clone(),
+                consumed: false,
+                reservation: Some(RemoteExecutableAdapterReservationV1 {
+                    state: std::sync::Arc::clone(&budget.state),
+                    global_bytes: std::sync::Arc::clone(&budget.global_bytes),
+                    retained_bytes: 56,
+                }),
+                poisoned: false,
+            };
+            {
+                *budget.global_bytes.lock() = 56;
+                let mut usage = budget.state.lock();
+                usage.active = true;
+                usage.retained_bytes = 56;
+            }
+            // Unit tests use the envelope constructor supplied by the physical validation stage.
+            let binding = authority.binding.clone();
+            let envelope =
+                RemoteMessageEnvelopeV1::new_for_adapter_test_v1(binding, 1, 0, &[8, 1, 16, 2], 0);
+            let output = adapter.execute_envelope_v1(envelope).unwrap();
+            assert_eq!(output.rows_v1(), 1);
+            assert_eq!(output.fields_v1().len(), 2);
+            assert_eq!(output.config_digest_v1(), config.canonical_digest_v1());
+            assert_eq!(
+                adapter.execute_envelope_v1(RemoteMessageEnvelopeV1::new_for_adapter_test_v1(
+                    authority.binding.clone(),
+                    1,
+                    0,
+                    &[8, 1, 16, 2],
+                    0
+                )),
+                Err(RemoteExecutableAdapterErrorV1::AlreadyConsumed)
+            );
+            output
+        };
+        assert!(!budget.is_idle_for_test_v1());
+        drop(output);
+        assert!(budget.is_idle_for_test_v1());
+    }
+
+    #[test]
+    fn mismatched_payload_and_stale_authority_fail_closed() {
+        let config = FrozenRemoteExecutableConfigV1::new_for_channel_group_test_v1(1, 7);
+        let stale = TestAuthority {
+            config,
+            stale: true,
+            binding: PhysicalChunkSourceBindingV1::new_unscanned_for_assignment_test_v1(),
+        };
+        let budget = RemoteExecutableAdapterBudgetV1::new_disarmed_v1(limits());
+        let mut adapter = RemoteExecutableDecoderAdapterV1 {
+            recognition: &stale,
+            owner: crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Ros2Reflection,
+            config,
+            rows: 1,
+            payload_bytes: 4,
+            max_steps: 16,
+            max_output_bytes: 32,
+            max_builder_bytes: 131_072,
+            channel_id: 1,
+            physical_binding: stale.binding.clone(),
+            consumed: false,
+            reservation: Some(RemoteExecutableAdapterReservationV1 {
+                state: std::sync::Arc::clone(&budget.state),
+                global_bytes: std::sync::Arc::clone(&budget.global_bytes),
+                retained_bytes: 0,
+            }),
+            poisoned: false,
+        };
+        assert_eq!(
+            adapter.execute_envelope_v1(RemoteMessageEnvelopeV1::new_for_adapter_test_v1(crate::remote_chunk_scan::PhysicalChunkSourceBindingV1::new_unscanned_for_assignment_test_v1(), 1, 0, &[1, 2, 3], 0)),
+            Err(RemoteExecutableAdapterErrorV1::StaleSource)
+        );
+    }
+
+    #[test]
+    fn malformed_payload_consumes_adapter_once() {
+        let config = FrozenRemoteExecutableConfigV1::new_for_channel_group_test_v1(2, 7);
+        let authority = TestAuthority {
+            config,
+            stale: false,
+            binding: PhysicalChunkSourceBindingV1::new_unscanned_for_assignment_test_v1(),
+        };
+        let budget = RemoteExecutableAdapterBudgetV1::new_disarmed_v1(limits());
+        let mut adapter = RemoteExecutableDecoderAdapterV1 {
+            recognition: &authority,
+            owner: crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Protobuf,
+            config,
+            rows: 1,
+            payload_bytes: 4,
+            max_steps: 16,
+            max_output_bytes: 32,
+            max_builder_bytes: 131_072,
+            channel_id: 1,
+            physical_binding: authority.binding.clone(),
+            consumed: false,
+            reservation: Some(RemoteExecutableAdapterReservationV1 {
+                state: std::sync::Arc::clone(&budget.state),
+                global_bytes: std::sync::Arc::clone(&budget.global_bytes),
+                retained_bytes: 0,
+            }),
+            poisoned: false,
+        };
+        let malformed = RemoteMessageEnvelopeV1::new_for_adapter_test_v1(
+            authority.binding.clone(),
+            1,
+            0,
+            &[10, 4, 1, 2],
+            0,
+        );
+        assert_eq!(
+            adapter.execute_envelope_v1(malformed),
+            Err(RemoteExecutableAdapterErrorV1::InvalidPayload)
+        );
+        let legal = RemoteMessageEnvelopeV1::new_for_adapter_test_v1(
+            authority.binding.clone(),
+            1,
+            0,
+            &[8, 1, 16, 2],
+            0,
+        );
+        assert_eq!(
+            adapter.execute_envelope_v1(legal),
+            Err(RemoteExecutableAdapterErrorV1::AlreadyConsumed)
+        );
+    }
+
+    #[test]
+    fn shared_root_budget_caps_multiple_source_budgets() {
+        let root = RemoteExecutableAdapterBudgetRootV1::new_disarmed_v1(256);
+        let first =
+            RemoteExecutableAdapterBudgetV1::new_disarmed_with_root_v1(limits(), &root).unwrap();
+        let second =
+            RemoteExecutableAdapterBudgetV1::new_disarmed_with_root_v1(limits(), &root).unwrap();
+        let first_reservation = first.reserve_v1(250).unwrap();
+        assert_eq!(
+            second.reserve_v1(8).err(),
+            Some(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)
+        );
+        drop(first_reservation);
+        let second_reservation = second.reserve_v1(8).unwrap();
+        drop(second_reservation);
+        assert!(first.is_idle_for_test_v1());
+        assert!(second.is_idle_for_test_v1());
+        let mismatched = RemoteExecutableAdapterBudgetV1::new_disarmed_with_root_v1(
+            RemoteExecutableAdapterLimitsV1 {
+                max_global_bytes: 512,
+                ..limits()
+            },
+            &root,
+        );
+        assert!(matches!(
+            mismatched,
+            Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)
+        ));
     }
 }
 
