@@ -57,6 +57,15 @@ impl<'definitions, 'input, 'source, 'wire>
         self.authority.retained_bytes_for_assignment_v1()
     }
 
+    pub(super) fn physical_source_binding_for_manifest_v1(
+        &self,
+    ) -> Result<
+        &crate::remote_chunk_scan::PhysicalChunkSourceBindingV1,
+        crate::remote_ros2_reflection::RemoteRos2InitializationError,
+    > {
+        self.authority.physical_source_binding_for_manifest_v1()
+    }
+
     pub(super) fn policy_descriptor_for_assignment_v1(
         &self,
     ) -> Result<

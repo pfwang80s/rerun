@@ -4554,6 +4554,17 @@ impl<'definitions, 'input, 'source, 'wire>
         )
     }
 
+    pub(crate) fn physical_source_binding_for_manifest_v1(
+        &self,
+    ) -> Result<
+        &crate::remote_chunk_scan::PhysicalChunkSourceBindingV1,
+        RemoteProtobufInitializationErrorV1,
+    > {
+        self.continuation
+            .physical_source_binding_for_manifest_v1()
+            .map_err(map_ros_recognition_error)
+    }
+
     pub(crate) fn policy_descriptor_for_assignment_v1(
         &self,
     ) -> Result<

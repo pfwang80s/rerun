@@ -135,6 +135,11 @@ mod remote_decoder_assignment;
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
 mod remote_channel_group;
 
+// Exact validation/count plans consume a physical scan and immutable Channel-group owner while
+// remaining production-disarmed until decoder resource admission is implemented.
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+mod remote_chunk_validation_count;
+
 // Bounded ROS 2 reflection initialization remains crate-private and production-disarmed until the
 // remote decoder policy and resource profile are sealed.
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]

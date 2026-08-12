@@ -517,6 +517,17 @@ impl BoundedRemoteDecoderAssignmentsV1<'_, '_, '_, '_> {
         &self.assignments.storage
     }
 
+    pub(crate) fn physical_source_binding_for_manifest_v1(
+        &self,
+    ) -> Result<
+        &crate::remote_chunk_scan::PhysicalChunkSourceBindingV1,
+        RemoteDecoderAssignmentErrorV1,
+    > {
+        self.initializers
+            .physical_source_binding_for_manifest_v1()
+            .map_err(map_initializer_error)
+    }
+
     pub(crate) fn policy_versions_for_manifest_v1(
         &self,
     ) -> Result<(u16, u16, u16), RemoteDecoderAssignmentErrorV1> {
@@ -1523,6 +1534,72 @@ mod tests {
         assert!(!physical.read_is_still_claimed_v1());
         assert!(ros_budget.is_idle_for_assignment_test_v1());
         assert!(protobuf_budget.is_idle_for_assignment_test_v1());
+    }
+
+    #[test]
+    fn validation_count_uses_actual_message_headers_and_retains_all_owners() {
+        let fixture = fixture(
+            [],
+            [
+                FixtureChannel::schema_less(1, "/one"),
+                FixtureChannel::schema_less(2, "/two"),
+            ],
+            [1, 2, 1],
+        );
+        let physical = PhysicalChunkAssignmentEvidenceHarnessV1::new(&fixture, 0).unwrap();
+        let definitions = physical.definitions_capability_v1();
+        let context = StableContext::new_with_filter_and_physical(
+            TopicFilter::default(),
+            physical.source_binding_v1(),
+        );
+        let protobuf_budget = context.protobuf_budget();
+        let (initializers, ros_budget) =
+            combined_initializers_with_physical(&definitions, &context, &protobuf_budget);
+        let assignment_budget = assignment_budget();
+        let group_budget = crate::remote_channel_group::RemoteChannelGroupBudgetV1::new_for_assignment_test_v1(
+            crate::remote_channel_group::UnfrozenRemoteChannelGroupLimitsV1::generous_for_assignment_test_v1(),
+            1,
+            u64::MAX,
+        );
+        let manifest =
+            build_groups_for_test_v1(initializers, &assignment_budget, &group_budget).unwrap();
+        let evidence = physical.take_evidence_v1();
+        let combined =
+            crate::remote_chunk_validation_count::exact_combined_retained_bytes_for_test_v1(
+                &evidence, &manifest,
+            )
+            .unwrap();
+        let validation_budget = crate::remote_chunk_validation_count::RemoteValidationCountBudgetV1::new_for_test_v1(
+            crate::remote_chunk_validation_count::UnfrozenRemoteValidationCountLimitsV1::generous_for_test_v1(),
+            1,
+            u64::MAX,
+            combined,
+        );
+        let plan = crate::remote_chunk_validation_count::validate_and_count_physical_chunk_v1(
+            evidence,
+            manifest,
+            &validation_budget,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.channels_v1()
+                .iter()
+                .map(|row| row.values_for_test_v1())
+                .collect::<Vec<_>>(),
+            [(1, 2, 2, 0), (2, 1, 1, 1)],
+        );
+        assert_eq!(
+            plan.resource_bounds_for_test_v1()
+                .iter()
+                .map(|bound| bound.values_for_test_v1())
+                .collect::<Vec<_>>(),
+            [(1, 0, 2, 2), (1, 1, 1, 1)],
+        );
+        assert!(physical.read_is_still_claimed_v1());
+        drop(plan);
+        assert!(!physical.read_is_still_claimed_v1());
+        assert!(validation_budget.is_idle_for_test_v1());
+        assert!(ros_budget.is_idle_for_assignment_test_v1());
     }
 
     #[test]

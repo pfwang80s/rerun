@@ -378,6 +378,10 @@ impl TemporalChannelAssignmentV1 {
     pub(crate) const fn channel_id(self) -> u16 {
         self.channel_id
     }
+
+    pub(crate) const fn group_id(self) -> StableDecoderGroupIdV1 {
+        self.group_id
+    }
 }
 
 /// Non-`Copy`, lifetime-bound resolution of one dense group ID.
@@ -405,6 +409,24 @@ pub(crate) struct ImmutableRemoteChannelGroupsV1<'definitions, 'input, 'source, 
 }
 
 impl ImmutableRemoteChannelGroupsV1<'_, '_, '_, '_> {
+    pub(crate) fn ensure_current_for_validation_v1(&self) -> Result<(), RemoteChannelGroupErrorV1> {
+        self._assignment_owner
+            .ensure_current_for_manifest_v1()
+            .map_err(map_assignment_error)
+    }
+
+    pub(crate) fn ensure_matches_physical_evidence_v1(
+        &self,
+        evidence: &crate::remote_chunk_scan::PhysicalChunkMessageEvidenceV1<'_>,
+    ) -> Result<(), RemoteChannelGroupErrorV1> {
+        let binding = self
+            ._assignment_owner
+            .physical_source_binding_for_manifest_v1()
+            .map_err(map_assignment_error)?;
+        evidence.ensure_matches_source_v1(binding);
+        Ok(())
+    }
+
     pub(crate) fn resolve_group(
         &self,
         group_id: StableDecoderGroupIdV1,
@@ -414,6 +436,14 @@ impl ImmutableRemoteChannelGroupsV1<'_, '_, '_, '_> {
             group,
             channels: &self.memberships[group.membership.clone()],
         })
+    }
+
+    pub(crate) fn assignments_v1(&self) -> &[TemporalChannelAssignmentV1] {
+        &self.assignments
+    }
+
+    pub(crate) fn retained_bytes_for_validation_v1(&self) -> u64 {
+        self._reservation.retained_bytes
     }
 }
 

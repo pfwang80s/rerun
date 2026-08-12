@@ -368,13 +368,13 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 验收：identical group 去重，跨owner/source/policy initializer重绑和membership overlap拒绝，相同输入在seek、GC reload和allowlist serialization reorder后产生相同identity，group descriptor不能退化为裸schema bytes后重新初始化。
 - 负责人：kola；提交：本提交；备注：2026-08-12 完成production-disarmed的immutable remote Channel-group与稳定source identity：move消费MCAP-028 assignment并持续持有MCAP-026/027 sealed initializer ownership及reservation，以bounded materialization阶段冻结的ROS 2/protobuf canonical executable-config digest、decoder固有registration contract、canonical membership和dense group identity生成唯一`ChannelId → group_id`投影；protobuf identity显式覆盖materialized graph、依赖/resolution及完整named-message identity，ROS 2使用显式versioned parsed-type编码，028/029不回读裸schema。group resolution为non-Copy lifetime-bound handle，禁止跨source/policy重绑；canonical source order与derived ordinal生成stable RowId。029以每个真实allocation的locked-Wasm footprint核算working、retained及同时峰值，真实assignment-owner combined-minus-one在首次group allocation前拒绝并恢复026/027/028/029全部预算。Dafee多轮增量review后0个中级及以上问题且无设计缺陷；门限为`re_mcap` all-features/all-targets check与Clippy `-D warnings`、Channel-group定向4/4、真实owner/Drop与combined-minus-one测试、protobuf local-pool差分、doctest及diff-check通过；production route仍disarmed，native/local decoder API、Viewer运行行为和Rerun服务端不变。
 
-### [ ] MCAP-030 — 实现 PhysicalChunkValidationCount
+### [x] MCAP-030 — 实现 PhysicalChunkValidationCount
 
 - 建议提交：`Add remote chunk validation and count pass`。
 - 依赖：MCAP-025、MCAP-029。
 - 变更：第一遍从实际Message headers和manifest持有的MCAP-026/027 bounded initializer results构造exact per-Channel count、payload bytes、selected dispatch和versioned decoder resource-bound plan，不创建parser或重新解析schema。
 - 验收：MessageIndex count零、一或严重低估都不影响exact plan，resource admission前parser/builder allocation为零，plan/decompressed/initializer ownership跨帧受retained budget和stale cancellation约束，compile/API测试阻止调用local unbounded initializer。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：kola；提交：本提交；备注：2026-08-12 完成production-disarmed的`PhysicalChunkValidationCount`首遍工作单元，只消费MCAP-025 sealed physical message evidence与MCAP-029 immutable group owner，从实际Chunk Message headers生成exact per-Channel count、payload bytes、selected group和versioned decoder resource-bound plan，不读取Statistics、MessageIndex或`msg_offsets`，不创建parser/builder也不调用local initializer。plan在分配前后校验physical evidence与manifest的same-source binding/current generation，并move持有decompressed/scan evidence、026/027 initializer及029 manifest ownership；retained budget以locked-Wasm footprint计入plan、physical backing和manifest/initializer reservation，stale/cross-source失败与Drop均恢复预算且physical claim保持至plan释放。真实integration覆盖025→026/027→028→029→validation/count、实际header exact count/payload/group、claim lifetime、combined exact/minus-one与预算归零；production call graph和adversarial assignment fixture证明错误/缺失Statistics与MessageIndex不影响结果。Dafee最终review为0个中级及以上问题且无设计缺陷；`re_mcap` all-features check、Clippy `-D warnings`、focused validation tests 3/3与diff-check通过，production route仍disarmed，native/local decoder API、Viewer运行行为和Rerun服务端不变。
 
 ### [ ] MCAP-031 — 实现 PhysicalChunkDispatchDecode 与 terminal partition contract
 

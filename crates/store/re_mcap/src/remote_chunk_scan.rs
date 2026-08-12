@@ -1101,6 +1101,10 @@ impl ChannelSemanticCensus {
     pub(crate) const fn message_count(self) -> u64 {
         self.message_count
     }
+
+    pub(crate) const fn payload_bytes(self) -> u64 {
+        self.payload_bytes
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1181,6 +1185,10 @@ impl PhysicalChunkMessageEvidenceV1<'_> {
         self.binding.ensure_matches_v1(binding);
     }
 
+    pub(crate) fn source_binding_v1(&self) -> &PhysicalChunkSourceBindingV1 {
+        &self.binding
+    }
+
     pub(crate) fn channel_census_v1(
         &self,
     ) -> Result<
@@ -1189,6 +1197,33 @@ impl PhysicalChunkMessageEvidenceV1<'_> {
     > {
         self.ensure_current_v1()?;
         Ok(self.inner.census.channels.iter().copied())
+    }
+
+    pub(crate) fn message_payload_bytes_v1(&self) -> Result<u64, PhysicalChunkValidationError> {
+        self.ensure_current_v1()?;
+        Ok(self.inner.message_payload_bytes)
+    }
+
+    pub(crate) fn extent_v1(
+        &self,
+    ) -> Result<ValidatedPhysicalChunkExtent, PhysicalChunkValidationError> {
+        self.ensure_current_v1()?;
+        Ok(self.inner.extent)
+    }
+
+    pub(crate) fn retained_census_bytes_v1(&self) -> Result<u64, PhysicalChunkValidationError> {
+        self.ensure_current_v1()?;
+        u64::try_from(self.inner.census.channels.len())
+            .ok()
+            .and_then(|channels| channels.checked_mul(size_of::<ChannelSemanticCensus>() as u64))
+            .ok_or(PhysicalChunkValidationError::ArithmeticOverflow)
+    }
+
+    pub(crate) fn retained_physical_bytes_v1(&self) -> Result<u64, PhysicalChunkValidationError> {
+        self.ensure_current_v1()?;
+        let decompressed = u64::try_from(self.inner.output.bytes().len())
+            .map_err(|_overflow| PhysicalChunkValidationError::ArithmeticOverflow)?;
+        checked_add(self.retained_census_bytes_v1()?, decompressed)
     }
 }
 

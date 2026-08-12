@@ -2617,6 +2617,20 @@ impl<'definitions, 'input, 'source, 'wire>
             .retained_bytes)
     }
 
+    pub(crate) fn physical_source_binding_for_manifest_v1(
+        &self,
+    ) -> Result<&PhysicalChunkSourceBindingV1, RemoteRos2InitializationError> {
+        self.transition.ensure_current()?;
+        Ok(&self
+            .transition
+            .payload
+            .initialized
+            .source
+            .semantic_config
+            .state
+            .physical_source)
+    }
+
     pub(crate) fn policy_descriptor_for_assignment_v1(
         &self,
     ) -> Result<FrozenRemoteDecoderPolicyDescriptorViewV1<'_, 'wire>, RemoteRos2InitializationError>
