@@ -6,6 +6,8 @@
 
 #![allow(dead_code)]
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::ops::Range;
@@ -35,6 +37,12 @@ const DEFINITION_ID_DOMAIN_LEN: usize = u16::MAX as usize + 1;
 const MISSING_DEFINITION_RECORD: usize = usize::MAX;
 
 static NEXT_PHYSICAL_CHUNK_SOURCE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[cold]
+#[track_caller]
+fn physical_chunk_fatal_control_plane(reason: &'static str) -> ! {
+    panic!("Fatal physical-Chunk control-plane mismatch: {reason}")
+}
 
 /// The only checksum policy accepted by the remote physical-Chunk path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -450,13 +458,118 @@ struct PhysicalChunkSourceEvidence<'a> {
     source_generation: PhysicalChunkSourceGeneration,
     decompression_budget: ChunkDecompressionBudget,
     scan_budget: PhysicalChunkScanBudget,
-    state: Mutex<PhysicalChunkAuthorityState>,
+    state: Arc<Mutex<PhysicalChunkAuthorityState>>,
     _authority_reservation: PhysicalChunkAuthorityReservation,
 }
 
 /// The unique source-scoped owner of MCAP-021 → 020 → 019 physical evidence.
 pub(crate) struct PhysicalChunkSourceAuthority<'a> {
     shared: Arc<PhysicalChunkSourceEvidence<'a>>,
+}
+
+/// Lifetime-free, sealed source-generation binding for downstream remote capabilities.
+///
+/// The `Arc` identity and globally monotonic generation replace naked address identities, so a
+/// dropped source allocation can never be rebound through allocator address reuse.
+#[derive(Clone)]
+pub(crate) struct PhysicalChunkSourceBindingV1 {
+    state: Arc<Mutex<PhysicalChunkAuthorityState>>,
+    source_generation: NonZeroU64,
+}
+
+/// Sealed pairing of one physical source generation with the definitions it owns.
+///
+/// Only the physical authority can issue this capability in the remote production path.
+/// Downstream decoder initialization therefore cannot combine definitions from one MCAP object
+/// with scans or source state from another object, even if their Channel IDs happen to match.
+#[derive(Clone)]
+pub(crate) struct PhysicalChunkDefinitionsCapabilityV1<'definitions, 'input> {
+    definitions: &'definitions ValidatedSummaryDefinitions<'input>,
+    binding: PhysicalChunkSourceBindingV1,
+}
+
+impl<'definitions, 'input> PhysicalChunkDefinitionsCapabilityV1<'definitions, 'input> {
+    pub(crate) const fn definitions_v1(&self) -> &'definitions ValidatedSummaryDefinitions<'input> {
+        self.definitions
+    }
+
+    pub(crate) fn source_binding_v1(&self) -> &PhysicalChunkSourceBindingV1 {
+        &self.binding
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_unscanned_for_test_v1(
+        definitions: &'definitions ValidatedSummaryDefinitions<'input>,
+    ) -> Self {
+        Self::new_unscanned_for_test_with_binding_v1(
+            definitions,
+            PhysicalChunkSourceBindingV1::new_unscanned_for_assignment_test_v1(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_unscanned_for_test_with_binding_v1(
+        definitions: &'definitions ValidatedSummaryDefinitions<'input>,
+        binding: PhysicalChunkSourceBindingV1,
+    ) -> Self {
+        Self {
+            definitions,
+            binding,
+        }
+    }
+
+    #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+    pub(crate) fn new_unscanned_for_artifact_probe_with_binding_v1(
+        definitions: &'definitions ValidatedSummaryDefinitions<'input>,
+        binding: PhysicalChunkSourceBindingV1,
+    ) -> Self {
+        Self {
+            definitions,
+            binding,
+        }
+    }
+}
+
+impl PhysicalChunkSourceBindingV1 {
+    pub(crate) fn ensure_current_v1(&self) -> Result<(), PhysicalChunkValidationError> {
+        if self.state.lock().open {
+            Ok(())
+        } else {
+            Err(PhysicalChunkValidationError::SourceClosed)
+        }
+    }
+
+    pub(crate) fn ensure_matches_v1(&self, other: &Self) {
+        if self.source_generation != other.source_generation
+            || !Arc::ptr_eq(&self.state, &other.state)
+        {
+            physical_chunk_fatal_control_plane("source binding changed");
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_unscanned_for_assignment_test_v1() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(PhysicalChunkAuthorityState {
+                open: true,
+                slots: Vec::new(),
+            })),
+            source_generation: allocate_source_generation()
+                .expect("test physical source generation is available"),
+        }
+    }
+
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
+    pub(crate) fn new_unscanned_for_artifact_probe_v1() -> Result<Self, PhysicalChunkValidationError>
+    {
+        Ok(Self {
+            state: Arc::new(Mutex::new(PhysicalChunkAuthorityState {
+                open: true,
+                slots: Vec::new(),
+            })),
+            source_generation: allocate_source_generation()?,
+        })
+    }
 }
 
 impl std::fmt::Debug for PhysicalChunkSourceAuthority<'_> {
@@ -484,7 +597,46 @@ struct PhysicalChunkReadLeaseCore<'a> {
     canonical_ordinal: usize,
     source_generation: NonZeroU64,
     read_generation: NonZeroU64,
+    claim: Arc<PhysicalChunkReadClaimV1>,
     checksum_policy: ChunkChecksumPolicy,
+}
+
+struct PhysicalChunkReadClaimV1 {
+    state: Arc<Mutex<PhysicalChunkAuthorityState>>,
+    canonical_ordinal: usize,
+    read_generation: NonZeroU64,
+}
+
+impl PhysicalChunkReadClaimV1 {
+    fn ensure_current(&self) -> Result<(), PhysicalChunkValidationError> {
+        let state = self.state.lock();
+        if !state.open {
+            return Err(PhysicalChunkValidationError::SourceClosed);
+        }
+        match state.slots.get(self.canonical_ordinal) {
+            Some(PhysicalChunkSlot::Live { generation }) if *generation == self.read_generation => {
+                Ok(())
+            }
+            _ => Err(PhysicalChunkValidationError::StaleReadGeneration),
+        }
+    }
+}
+
+impl Drop for PhysicalChunkReadClaimV1 {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        let Some(slot) = state.slots.get_mut(self.canonical_ordinal) else {
+            return;
+        };
+        if matches!(
+            *slot,
+            PhysicalChunkSlot::Live { generation } if generation == self.read_generation
+        ) {
+            *slot = PhysicalChunkSlot::Vacant {
+                last_generation: self.read_generation.get(),
+            };
+        }
+    }
 }
 
 /// Move-only ownership of one canonical ordinal's live read claim.
@@ -561,7 +713,10 @@ impl<'a> PhysicalChunkSourceAuthority<'a> {
                 source_generation: PhysicalChunkSourceGeneration(source_generation),
                 decompression_budget,
                 scan_budget,
-                state: Mutex::new(PhysicalChunkAuthorityState { open: true, slots }),
+                state: Arc::new(Mutex::new(PhysicalChunkAuthorityState {
+                    open: true,
+                    slots,
+                })),
                 _authority_reservation: reservation,
             }),
         })
@@ -621,6 +776,11 @@ impl<'a> PhysicalChunkSourceAuthority<'a> {
                 canonical_ordinal: selector.canonical_ordinal,
                 source_generation: self.shared.source_generation.0,
                 read_generation: generation,
+                claim: Arc::new(PhysicalChunkReadClaimV1 {
+                    state: Arc::clone(&self.shared.state),
+                    canonical_ordinal: selector.canonical_ordinal,
+                    read_generation: generation,
+                }),
                 checksum_policy: ChunkChecksumPolicy::ValidateIfProvided,
             }),
             _state: PhantomData,
@@ -629,6 +789,22 @@ impl<'a> PhysicalChunkSourceAuthority<'a> {
 
     pub(crate) fn close(&self) {
         self.shared.state.lock().open = false;
+    }
+
+    pub(crate) fn binding_for_remote_assignment_v1(&self) -> PhysicalChunkSourceBindingV1 {
+        PhysicalChunkSourceBindingV1 {
+            state: Arc::clone(&self.shared.state),
+            source_generation: self.shared.source_generation.0,
+        }
+    }
+
+    pub(crate) fn definitions_capability_for_remote_assignment_v1(
+        &self,
+    ) -> PhysicalChunkDefinitionsCapabilityV1<'_, 'a> {
+        PhysicalChunkDefinitionsCapabilityV1 {
+            definitions: self.shared.physical.definitions(),
+            binding: self.binding_for_remote_assignment_v1(),
+        }
     }
 }
 
@@ -650,16 +826,7 @@ impl<'a, State> PhysicalChunkReadLease<'a, State> {
         if core.source_generation != core.shared.source_generation.0 {
             return Err(PhysicalChunkValidationError::StaleSourceGeneration);
         }
-        let state = core.shared.state.lock();
-        if !state.open {
-            return Err(PhysicalChunkValidationError::SourceClosed);
-        }
-        match state.slots.get(core.canonical_ordinal) {
-            Some(PhysicalChunkSlot::Live { generation }) if *generation == core.read_generation => {
-                Ok(())
-            }
-            _ => Err(PhysicalChunkValidationError::StaleReadGeneration),
-        }
+        core.claim.ensure_current()
     }
 
     fn region(&self) -> CanonicalPhysicalRegion<'_> {
@@ -691,21 +858,7 @@ impl<'a, State> PhysicalChunkReadLease<'a, State> {
 
 impl<State> Drop for PhysicalChunkReadLease<'_, State> {
     fn drop(&mut self) {
-        let Some(core) = self.core.take() else {
-            return;
-        };
-        let mut state = core.shared.state.lock();
-        let Some(slot) = state.slots.get_mut(core.canonical_ordinal) else {
-            return;
-        };
-        if matches!(
-            *slot,
-            PhysicalChunkSlot::Live { generation } if generation == core.read_generation
-        ) {
-            *slot = PhysicalChunkSlot::Vacant {
-                last_generation: core.read_generation.get(),
-            };
-        }
+        drop(self.core.take());
     }
 }
 
@@ -940,6 +1093,16 @@ pub(crate) struct ChannelSemanticCensus {
     payload_bytes: u64,
 }
 
+impl ChannelSemanticCensus {
+    pub(crate) const fn channel_id(self) -> u16 {
+        self.channel_id
+    }
+
+    pub(crate) const fn message_count(self) -> u64 {
+        self.message_count
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ValidatedPhysicalChunkExtent {
     KnownEmpty,
@@ -951,13 +1114,17 @@ pub(crate) enum ValidatedPhysicalChunkExtent {
     },
 }
 
+struct RetainedPhysicalChunkCensusV1 {
+    channels: Box<[ChannelSemanticCensus]>,
+    _reservation: PhysicalChunkScanResultReservation,
+}
+
 /// A sealed semantic result with no parser, dispatch, registration, or terminal authority.
 pub(crate) struct ValidatedPhysicalChunkScan<'a> {
     // Keep retained census backing and its accounting before the lease-owning output.
     // Rust drops fields in declaration order, while `ExactOutputChunk::drop` then releases its
     // decompressed backing and accounting before releasing the physical read lease.
-    channels: Vec<ChannelSemanticCensus>,
-    _reservation: PhysicalChunkScanResultReservation,
+    census: Arc<RetainedPhysicalChunkCensusV1>,
     output: ExactOutputChunk<'a>,
     records_seen: u64,
     messages_seen: u64,
@@ -973,7 +1140,7 @@ impl std::fmt::Debug for ValidatedPhysicalChunkScan<'_> {
             .field("records_seen", &self.records_seen)
             .field("messages_seen", &self.messages_seen)
             .field("message_payload_bytes", &self.message_payload_bytes)
-            .field("channels", &self.channels.len())
+            .field("channels", &self.census.channels.len())
             .field("extent", &self.extent)
             .finish_non_exhaustive()
     }
@@ -996,6 +1163,33 @@ pub(crate) struct PhysicalChunkScanCacheEntry<'a> {
 #[derive(Clone)]
 pub(crate) struct PhysicalChunkScanConsumer<'a> {
     inner: Arc<ValidatedPhysicalChunkScan<'a>>,
+}
+
+/// Sealed, lease-retaining proof of the exact Channel message census from one physical read.
+pub(crate) struct PhysicalChunkMessageEvidenceV1<'a> {
+    binding: PhysicalChunkSourceBindingV1,
+    inner: Arc<ValidatedPhysicalChunkScan<'a>>,
+}
+
+impl PhysicalChunkMessageEvidenceV1<'_> {
+    pub(crate) fn ensure_current_v1(&self) -> Result<(), PhysicalChunkValidationError> {
+        self.binding.ensure_current_v1()?;
+        self.inner.output.identity().lease()?.ensure_current()
+    }
+
+    pub(crate) fn ensure_matches_source_v1(&self, binding: &PhysicalChunkSourceBindingV1) {
+        self.binding.ensure_matches_v1(binding);
+    }
+
+    pub(crate) fn channel_census_v1(
+        &self,
+    ) -> Result<
+        impl ExactSizeIterator<Item = ChannelSemanticCensus> + '_,
+        PhysicalChunkValidationError,
+    > {
+        self.ensure_current_v1()?;
+        Ok(self.inner.census.channels.iter().copied())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1053,9 +1247,24 @@ impl<'a> PhysicalChunkScanCacheEntry<'a> {
     }
 }
 
-impl PhysicalChunkScanConsumer<'_> {
+impl<'a> PhysicalChunkScanConsumer<'a> {
     pub(crate) fn is_current(&self) -> bool {
         self.inner.is_current()
+    }
+
+    pub(crate) fn into_message_evidence_v1(
+        self,
+    ) -> Result<PhysicalChunkMessageEvidenceV1<'a>, PhysicalChunkValidationError> {
+        let lease = self.inner.output.identity().lease()?;
+        lease.ensure_current()?;
+        let core = lease.core();
+        Ok(PhysicalChunkMessageEvidenceV1 {
+            binding: PhysicalChunkSourceBindingV1 {
+                state: Arc::clone(&core.shared.state),
+                source_generation: core.source_generation,
+            },
+            inner: self.inner,
+        })
     }
 }
 
@@ -1175,8 +1384,10 @@ pub(crate) fn scan_decompressed_physical_chunk(
     lease.ensure_current()?;
     let extent = validate_actual_extent(&lease.region(), preflight)?;
     Ok(ValidatedPhysicalChunkScan {
-        channels,
-        _reservation: work_reservation.complete(),
+        census: Arc::new(RetainedPhysicalChunkCensusV1 {
+            channels: channels.into_boxed_slice(),
+            _reservation: work_reservation.complete(),
+        }),
         output,
         records_seen: preflight.records_seen,
         messages_seen: preflight.messages_seen,
@@ -1728,6 +1939,81 @@ impl PhysicalChunkScanBudget {
 }
 
 #[cfg(test)]
+pub(crate) struct PhysicalChunkAssignmentEvidenceHarnessV1<'a> {
+    authority: PhysicalChunkSourceAuthority<'a>,
+    evidence: RefCell<Option<PhysicalChunkMessageEvidenceV1<'a>>>,
+    canonical_ordinal: usize,
+}
+
+#[cfg(test)]
+impl<'a> PhysicalChunkAssignmentEvidenceHarnessV1<'a> {
+    pub(crate) fn new(
+        fixture: &'a crate::testing::AdversarialMcapFixture,
+        canonical_ordinal: usize,
+    ) -> Result<Self, PhysicalChunkValidationError> {
+        let authority = PhysicalChunkSourceAuthority::new(
+            crate::remote_summary::validated_physical_regions_for_test(fixture),
+            crate::remote_decompression::chunk_decompression_budget_for_test(),
+            PhysicalChunkScanBudget::for_test(PhysicalChunkScanLimits::generous()),
+        )?;
+        let record = fixture
+            .layout
+            .chunks
+            .get(canonical_ordinal)
+            .ok_or(PhysicalChunkValidationError::UnknownCanonicalOrdinal)?
+            .record;
+        let bytes = fixture.bytes[record.start..record.end]
+            .to_vec()
+            .into_boxed_slice();
+        let selector = authority.select(canonical_ordinal)?;
+        let lease = authority.issue(selector)?;
+        let validated = install_exact_physical_chunk_record_for_test(lease, bytes)?;
+        let input = install_header_validated_payload_for_test(validated)?;
+        let output = crate::remote_decompression::decompress_exact_chunk(input)?;
+        let scan = scan_decompressed_physical_chunk(output)?;
+        let cache = PhysicalChunkScanCacheEntry::new(scan)?;
+        let evidence = cache.consumer().into_message_evidence_v1()?;
+        drop(cache);
+        Ok(Self {
+            authority,
+            evidence: RefCell::new(Some(evidence)),
+            canonical_ordinal,
+        })
+    }
+
+    pub(crate) fn source_binding_v1(&self) -> PhysicalChunkSourceBindingV1 {
+        self.authority.binding_for_remote_assignment_v1()
+    }
+
+    pub(crate) fn definitions_capability_v1(&self) -> PhysicalChunkDefinitionsCapabilityV1<'_, 'a> {
+        self.authority
+            .definitions_capability_for_remote_assignment_v1()
+    }
+
+    pub(crate) fn take_evidence_v1(&self) -> PhysicalChunkMessageEvidenceV1<'a> {
+        self.evidence
+            .borrow_mut()
+            .take()
+            .expect("test harness owns one message evidence capability")
+    }
+
+    pub(crate) fn close_source_v1(&self) {
+        self.authority.close();
+    }
+
+    pub(crate) fn read_is_still_claimed_v1(&self) -> bool {
+        let selector = self
+            .authority
+            .select(self.canonical_ordinal)
+            .expect("test ordinal remains canonical");
+        matches!(
+            self.authority.issue(selector),
+            Err(PhysicalChunkValidationError::DuplicateLiveRead)
+        )
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::remote_decompression::{
@@ -1969,6 +2255,34 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "host-only test verifies that a cross-source binding reaches the fatal control-plane path"
+    )]
+    fn dropped_source_allocations_cannot_aba_rebind_a_fresh_authority() {
+        let fixture = AdversarialMcapFixtureBuilder::new().build().unwrap();
+        let first_authority = build_authority(&fixture);
+        let first = first_authority.binding_for_remote_assignment_v1();
+        let first_generation = first.source_generation;
+        drop(first_authority);
+        assert_eq!(
+            first.ensure_current_v1(),
+            Err(PhysicalChunkValidationError::SourceClosed),
+        );
+
+        let second_authority = build_authority(&fixture);
+        let second = second_authority.binding_for_remote_assignment_v1();
+        assert_ne!(first_generation, second.source_generation);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                first.ensure_matches_v1(&second);
+            }))
+            .is_err(),
+            "a fresh allocation cannot reuse a dropped source identity",
+        );
+    }
+
+    #[test]
     fn selectors_and_stale_drops_cannot_cross_authority_or_release_a_new_claim() {
         let fixture = fixture_with_chunks([FixtureChunk::empty()]);
         let first_authority = build_authority(&fixture);
@@ -2117,7 +2431,7 @@ mod tests {
         let before_scan = projection.lookup_calls();
         let scan = scan_fixture_chunk(&fixture, &authority, 0).unwrap();
         assert_eq!(scan.messages_seen, 2);
-        assert_eq!(scan.channels.len(), 2);
+        assert_eq!(scan.census.channels.len(), 2);
         assert!(
             projection.lookup_calls() - before_scan
                 <= scan.records_seen
@@ -2366,8 +2680,8 @@ mod tests {
             let scan = scan_fixture_chunk(&fixture, &authority, 0).unwrap();
             assert_eq!(scan.messages_seen, 2);
             assert_eq!(scan.message_payload_bytes, 5);
-            assert_eq!(scan.channels[0].message_count, 2);
-            assert_eq!(scan.channels[0].payload_bytes, 5);
+            assert_eq!(scan.census.channels[0].message_count, 2);
+            assert_eq!(scan.census.channels[0].payload_bytes, 5);
             assert_eq!(
                 scan.extent,
                 ValidatedPhysicalChunkExtent::NonEmpty {
@@ -3111,6 +3425,33 @@ mod tests {
     }
 
     #[test]
+    fn assignment_evidence_retains_exact_scan_budget_and_read_claim_until_drop() {
+        let fixture = fixture_with_chunks([FixtureChunk::single(FixtureMessage::new(1, 0, 1))]);
+        let authority = build_authority(&fixture);
+        let budget = &authority.shared.scan_budget;
+        let scan = scan_fixture_chunk(&fixture, &authority, 0).unwrap();
+        let cache = PhysicalChunkScanCacheEntry::new(scan).unwrap();
+        let evidence = cache.consumer().into_message_evidence_v1().unwrap();
+        assert_eq!(cache.evict(), PhysicalChunkCacheEviction::PendingReclaim);
+        assert_eq!(budget.usage_for_test().retained_results, 1);
+        assert_eq!(
+            authority.issue(authority.select(0).unwrap()).unwrap_err(),
+            PhysicalChunkValidationError::DuplicateLiveRead,
+        );
+        assert_eq!(
+            evidence
+                .channel_census_v1()
+                .unwrap()
+                .map(|channel| (channel.channel_id(), channel.message_count()))
+                .collect::<Vec<_>>(),
+            [(1, 1)],
+        );
+        drop(evidence);
+        assert_eq!(budget.usage_for_test().retained_results, 0);
+        assert_eq!(issue(&authority, 0).core().read_generation.get(), 2);
+    }
+
+    #[test]
     fn retained_cache_consumers_become_stale_when_the_source_closes() {
         let fixture = AdversarialMcapFixtureBuilder::new().build().unwrap();
         let authority = build_authority(&fixture);
@@ -3186,6 +3527,18 @@ mod tests {
         assert!(production.contains("DEFINITION_ID_DOMAIN_LEN"));
         assert!(production.contains("MAX_SLOT_LOOKUPS_PER_QUERY: u64 = 1"));
 
+        let source_binding = production
+            .split("pub(crate) struct PhysicalChunkSourceBindingV1")
+            .nth(1)
+            .unwrap()
+            .split("impl PhysicalChunkSourceBindingV1")
+            .next()
+            .unwrap();
+        assert!(source_binding.contains("Arc<Mutex<PhysicalChunkAuthorityState>>"));
+        assert!(source_binding.contains("NonZeroU64"));
+        assert!(!source_binding.contains("usize"));
+        assert!(!source_binding.contains("*const"));
+
         for (owner, backing, lease) in [
             (
                 "impl Drop for ExactPhysicalChunkRecord",
@@ -3207,6 +3560,17 @@ mod tests {
             assert!(backing < lease);
         }
 
+        let census_owner = production
+            .split("struct RetainedPhysicalChunkCensusV1")
+            .nth(1)
+            .expect("the sealed retained census owner exists")
+            .split("pub(crate) struct ValidatedPhysicalChunkScan")
+            .next()
+            .unwrap();
+        let census = census_owner.find("channels:").unwrap();
+        let permit = census_owner.find("_reservation:").unwrap();
+        assert!(census < permit);
+
         let scan_owner = production
             .split("pub(crate) struct ValidatedPhysicalChunkScan")
             .nth(1)
@@ -3214,11 +3578,9 @@ mod tests {
             .split("impl std::fmt::Debug for ValidatedPhysicalChunkScan")
             .next()
             .unwrap();
-        let census = scan_owner.find("channels:").unwrap();
-        let permit = scan_owner.find("_reservation:").unwrap();
+        let census = scan_owner.find("census:").unwrap();
         let lease_owner = scan_owner.find("output:").unwrap();
-        assert!(census < permit);
-        assert!(permit < lease_owner);
+        assert!(census < lease_owner);
 
         let decompression = include_str!("remote_decompression.rs");
         let prepared = decompression

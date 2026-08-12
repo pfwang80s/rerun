@@ -20,16 +20,24 @@ include!(concat!(
 const _: ReMcapRemoteRos2GeneratedCapabilityV1 = RE_MCAP_REMOTE_ROS2_GENERATED_CAPABILITY_V1;
 
 use std::alloc::Layout;
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell, RefCell};
+use std::mem::size_of;
+use std::num::NonZeroU64;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
+use crate::TopicFilter;
+use crate::remote_chunk_scan::{
+    PhysicalChunkDefinitionsCapabilityV1, PhysicalChunkMessageEvidenceV1,
+    PhysicalChunkSourceBindingV1,
+};
 use crate::remote_summary::definitions::{
     CanonicalSchemaDefinition, SummaryDefinitionProjectionRecord, ValidatedSummaryDefinitions,
 };
+use crate::remote_time::RemoteMcapTimeType;
 
 const ROS2_SCHEMA_ENCODING: &str = "ros2msg";
 const REMOTE_POLICY_VERSION_V1: u16 = 1;
@@ -52,7 +60,20 @@ const CANONICAL_DECODER_IDENTITIES_V1: [&str; 4] = [
     "protobuf:v1",
     "raw:v1",
 ];
+#[cfg(test)]
+const REORDERED_DECODER_IDENTITIES_FOR_ASSIGNMENT_TEST_V1: [&str; 4] = [
+    "ros2_reflection:v1",
+    "semantic_ros2:v1-empty",
+    "protobuf:v1",
+    "raw:v1",
+];
 const CANONICAL_FALLBACK_IDENTITY_V1: &str = "raw:v1";
+const MAX_REMOTE_SEMANTIC_CONFIG_CHANNELS_V1: usize = 256;
+const MAX_REMOTE_TOPIC_FILTER_PATTERNS_V1: usize = 256;
+const MAX_REMOTE_TOPIC_FILTER_BYTES_V1: usize = 4 * 1024;
+const MAX_REMOTE_TOPIC_BYTES_V1: usize = 4 * 1024;
+
+static NEXT_REMOTE_SEMANTIC_CONFIG_IDENTITY_V1: AtomicU64 = AtomicU64::new(1);
 
 macro_rules! remote_ros2_artifact_stage_anchor {
     ($name:ident, $identity:literal) => {
@@ -100,6 +121,40 @@ impl RemoteDecoderPolicyWireV1<'static> {
             fallback_identity: CANONICAL_FALLBACK_IDENTITY_V1,
         }
     }
+
+    pub(crate) fn exact_identity_for_assignment_test_v1(
+        &self,
+    ) -> (u16, u16, u16, *const (), *const u8, usize) {
+        (
+            self.allowlist_version,
+            self.assignment_version,
+            self.grammar_version,
+            self.decoder_identities.as_ptr().cast(),
+            self.fallback_identity.as_ptr(),
+            self.fallback_identity.len(),
+        )
+    }
+
+    pub(crate) fn unknown_version_for_assignment_test_v1() -> Self {
+        Self {
+            assignment_version: REMOTE_POLICY_VERSION_V1 + 1,
+            ..Self::canonical_for_protobuf_test_v1()
+        }
+    }
+
+    pub(crate) fn reordered_for_assignment_test_v1() -> Self {
+        Self {
+            decoder_identities: &REORDERED_DECODER_IDENTITIES_FOR_ASSIGNMENT_TEST_V1,
+            ..Self::canonical_for_protobuf_test_v1()
+        }
+    }
+
+    pub(crate) fn noncanonical_fallback_for_assignment_test_v1() -> Self {
+        Self {
+            fallback_identity: "raw:v1-noncanonical",
+            ..Self::canonical_for_protobuf_test_v1()
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,6 +183,83 @@ impl std::error::Error for RemoteDecoderPolicyError {}
 /// Sealed, move-only proof of the exact V1 decoder policy.
 pub(crate) struct FrozenRemoteDecoderPolicyV1<'wire> {
     wire: &'wire RemoteDecoderPolicyWireV1<'wire>,
+    descriptor: FrozenRemoteDecoderPolicyDescriptorV1<'wire>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrozenRemoteDecoderSlotV1 {
+    SemanticRos2,
+    Ros2Reflection,
+    Protobuf,
+    Raw,
+}
+
+struct FrozenRemoteDecoderPolicyDescriptorV1<'wire> {
+    allowlist_version: u16,
+    assignment_version: u16,
+    grammar_version: u16,
+    slots: [FrozenRemoteDecoderSlotV1; 4],
+    decoder_identities: &'wire [&'wire str],
+    fallback: FrozenRemoteDecoderSlotV1,
+    fallback_identity: &'wire str,
+}
+
+/// Address-free value identity for the complete canonical decoder policy.
+///
+/// The string-bearing wire is validated before this can be produced, so the ordered slots and
+/// fallback encode those exact canonical identities without retaining caller addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrozenRemoteDecoderPolicyValueV1 {
+    allowlist_version: u16,
+    assignment_version: u16,
+    grammar_version: u16,
+    slots: [FrozenRemoteDecoderSlotV1; 4],
+    fallback: FrozenRemoteDecoderSlotV1,
+}
+
+pub(crate) struct FrozenRemoteDecoderPolicyDescriptorViewV1<'borrow, 'wire> {
+    descriptor: &'borrow FrozenRemoteDecoderPolicyDescriptorV1<'wire>,
+}
+
+impl FrozenRemoteDecoderPolicyDescriptorViewV1<'_, '_> {
+    pub(crate) fn resolve_owner_v1(
+        &self,
+        recognized: [bool; 3],
+    ) -> Option<FrozenRemoteDecoderSlotV1> {
+        crate::decoders::resolve_decoder_owner(
+            std::iter::zip(
+                self.descriptor.slots,
+                recognized.into_iter().chain(std::iter::once(false)),
+            ),
+            || Some(self.descriptor.fallback),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exact_identity_for_assignment_test_v1(
+        &self,
+    ) -> (u16, u16, u16, *const (), *const u8, usize) {
+        (
+            self.descriptor.allowlist_version,
+            self.descriptor.assignment_version,
+            self.descriptor.grammar_version,
+            self.descriptor.decoder_identities.as_ptr().cast(),
+            self.descriptor.fallback_identity.as_ptr(),
+            self.descriptor.fallback_identity.len(),
+        )
+    }
+}
+
+impl FrozenRemoteDecoderPolicyV1<'_> {
+    const fn value_v1(&self) -> FrozenRemoteDecoderPolicyValueV1 {
+        FrozenRemoteDecoderPolicyValueV1 {
+            allowlist_version: self.descriptor.allowlist_version,
+            assignment_version: self.descriptor.assignment_version,
+            grammar_version: self.descriptor.grammar_version,
+            slots: self.descriptor.slots,
+            fallback: self.descriptor.fallback,
+        }
+    }
 }
 
 pub(crate) fn freeze_remote_decoder_policy_v1<'wire>(
@@ -145,7 +277,23 @@ pub(crate) fn freeze_remote_decoder_policy_v1<'wire>(
     if wire.fallback_identity != CANONICAL_FALLBACK_IDENTITY_V1 {
         return Err(RemoteDecoderPolicyError::NonCanonicalFallbackIdentity);
     }
-    Ok(FrozenRemoteDecoderPolicyV1 { wire })
+    Ok(FrozenRemoteDecoderPolicyV1 {
+        wire,
+        descriptor: FrozenRemoteDecoderPolicyDescriptorV1 {
+            allowlist_version: wire.allowlist_version,
+            assignment_version: wire.assignment_version,
+            grammar_version: wire.grammar_version,
+            slots: [
+                FrozenRemoteDecoderSlotV1::SemanticRos2,
+                FrozenRemoteDecoderSlotV1::Ros2Reflection,
+                FrozenRemoteDecoderSlotV1::Protobuf,
+                FrozenRemoteDecoderSlotV1::Raw,
+            ],
+            decoder_identities: wire.decoder_identities,
+            fallback: FrozenRemoteDecoderSlotV1::Raw,
+            fallback_identity: wire.fallback_identity,
+        },
+    })
 }
 
 /// Source-generation state owned by the future remote session.
@@ -157,6 +305,226 @@ pub(crate) struct RemoteDefinitionsSourceState {
     viewer_scope: *const RemoteViewerScopeState,
     protobuf_profile_scope:
         *const crate::remote_protobuf_projection_boundary::RemoteProtobufProfileScopeV1,
+    // The physical authority binding is fixed when the source state is constructed.  It is
+    // deliberately not a OnceCell: the first semantic admission must not be able to attach an
+    // unrelated authority after the source has been created.
+    physical_source: PhysicalChunkSourceBindingV1,
+    semantic_topic_filter: RefCell<Option<TopicFilter>>,
+    semantic_time_type: RemoteMcapTimeType,
+    semantic_consistency: RemoteMcapConsistencyPolicyV1,
+    semantic_config: OnceCell<RemoteMcapSemanticConfigStateV1>,
+    #[cfg(test)]
+    assignment_recognition_count: Cell<u64>,
+    #[cfg(test)]
+    assignment_membership_projection_count: Cell<u64>,
+    #[cfg(test)]
+    semantic_match_count: Cell<u64>,
+    #[cfg(test)]
+    semantic_selection_count: Cell<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct RemoteMcapSelectedChannelV1 {
+    channel_id: u16,
+}
+
+struct RemoteMcapSemanticConfigStateV1 {
+    physical_source: PhysicalChunkSourceBindingV1,
+    policy: FrozenRemoteDecoderPolicyValueV1,
+    source_generation: u64,
+    config_generation: u64,
+    config_identity: NonZeroU64,
+    canonical_topic_filter_len: usize,
+    canonical_topic_filter: [u8; MAX_REMOTE_TOPIC_FILTER_BYTES_V1],
+    retained_bytes: u64,
+    census_steps: u64,
+    time_type: RemoteMcapTimeType,
+    consistency: RemoteMcapConsistencyPolicyV1,
+    canonical_channel_count: u64,
+    selected: [Option<RemoteMcapSelectedChannelV1>; MAX_REMOTE_SEMANTIC_CONFIG_CHANNELS_V1],
+    selected_len: usize,
+    _reservation: RemoteMcapSemanticConfigReservationV1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteMcapConsistencyPolicyV1 {
+    RequireStrongValidator,
+    AllowDeploymentAssumed,
+}
+
+/// Move-only source/config/policy-bound selected membership projected by MCAP-027.
+pub(crate) struct RemoteMcapSelectedMembershipV1 {
+    semantic_config_identity: NonZeroU64,
+    physical_source: PhysicalChunkSourceBindingV1,
+    source_generation: u64,
+    config_generation: u64,
+    policy: FrozenRemoteDecoderPolicyValueV1,
+    canonical_channel_count: u64,
+    selected: [Option<RemoteMcapSelectedChannelV1>; MAX_REMOTE_SEMANTIC_CONFIG_CHANNELS_V1],
+    selected_len: usize,
+}
+
+impl RemoteMcapSelectedMembershipV1 {
+    pub(crate) const fn selected_len(&self) -> usize {
+        self.selected_len
+    }
+
+    pub(crate) const fn canonical_channel_count(&self) -> u64 {
+        self.canonical_channel_count
+    }
+
+    pub(crate) fn channel_id_at(&self, index: usize) -> u16 {
+        self.selected
+            .get(index)
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| {
+                remote_ros2_fatal_invariant("selected semantic-config row disappeared")
+            })
+            .channel_id
+    }
+}
+
+/// Sealed source/config-aligned message-presence evidence from the future bounded scanner.
+pub(crate) struct RemoteKnownNonEmptyEvidenceV1<'input> {
+    semantic_config_identity: NonZeroU64,
+    physical: PhysicalChunkMessageEvidenceV1<'input>,
+    source_generation: u64,
+    config_generation: u64,
+    policy: FrozenRemoteDecoderPolicyValueV1,
+    selected_len: usize,
+    known_non_empty: [u64; MAX_REMOTE_SEMANTIC_CONFIG_CHANNELS_V1 / 64],
+}
+
+impl<'input> RemoteKnownNonEmptyEvidenceV1<'input> {
+    pub(crate) fn bind_physical_scan_v1(
+        membership: &RemoteMcapSelectedMembershipV1,
+        physical: PhysicalChunkMessageEvidenceV1<'input>,
+        mut consume_step: impl FnMut(),
+    ) -> Result<Self, RemoteRos2InitializationError> {
+        physical.ensure_matches_source_v1(&membership.physical_source);
+        let census = physical
+            .channel_census_v1()
+            .map_err(|_error| RemoteRos2InitializationError::StaleSource)?;
+        if census.len() as u64 != membership.canonical_channel_count {
+            remote_ros2_fatal_control_plane(
+                "physical census and semantic config canonical Channel counts differ",
+            );
+        }
+        let mut selected_cursor = 0_usize;
+        let mut known_non_empty = [0_u64; MAX_REMOTE_SEMANTIC_CONFIG_CHANNELS_V1 / 64];
+        for channel in census {
+            consume_step();
+            if selected_cursor < membership.selected_len
+                && membership.channel_id_at(selected_cursor) == channel.channel_id()
+            {
+                if channel.message_count() > 0 {
+                    known_non_empty[selected_cursor / 64] |= 1_u64 << (selected_cursor % 64);
+                }
+                selected_cursor += 1;
+            }
+        }
+        if selected_cursor != membership.selected_len {
+            remote_ros2_fatal_control_plane(
+                "physical census omitted a selected semantic-config Channel",
+            );
+        }
+        Ok(Self {
+            semantic_config_identity: membership.semantic_config_identity,
+            physical,
+            source_generation: membership.source_generation,
+            config_generation: membership.config_generation,
+            policy: membership.policy,
+            selected_len: membership.selected_len,
+            known_non_empty,
+        })
+    }
+
+    pub(crate) fn is_known_non_empty(&self, selected_index: usize) -> bool {
+        if selected_index >= self.selected_len {
+            remote_ros2_fatal_invariant("presence evidence index exceeded selected membership");
+        }
+        let word = selected_index / 64;
+        let bit = selected_index % 64;
+        self.known_non_empty[word] & (1_u64 << bit) != 0
+    }
+}
+
+struct FrozenRemoteMcapSemanticConfigV1<'source> {
+    state: &'source RemoteMcapSemanticConfigStateV1,
+    source: &'source RemoteDefinitionsSourceState,
+    source_generation: u64,
+    config_generation: u64,
+}
+
+impl FrozenRemoteMcapSemanticConfigV1<'_> {
+    fn ensure_bound_v1(
+        &self,
+        wire: &RemoteDecoderPolicyWireV1<'_>,
+    ) -> Result<(), RemoteRos2InitializationError> {
+        if !self.source.is_current(self.source_generation) {
+            return Err(RemoteRos2InitializationError::StaleSource);
+        }
+        let policy = freeze_remote_decoder_policy_v1(wire).unwrap_or_else(|_error| {
+            remote_ros2_fatal_control_plane("bound decoder policy became invalid")
+        });
+        if self.state.policy != policy.value_v1()
+            || self.state.source_generation != self.source_generation
+            || self.state.config_generation != self.config_generation
+        {
+            remote_ros2_fatal_control_plane(
+                "semantic config source, generation, or policy identity changed",
+            );
+        }
+        Ok(())
+    }
+
+    fn selected_count_v1(&self) -> usize {
+        self.state.selected_len
+    }
+
+    fn project_membership_v1(&self) -> RemoteMcapSelectedMembershipV1 {
+        RemoteMcapSelectedMembershipV1 {
+            semantic_config_identity: self.state.config_identity,
+            physical_source: self.state.physical_source.clone(),
+            source_generation: self.source_generation,
+            config_generation: self.config_generation,
+            policy: self.state.policy,
+            canonical_channel_count: self.state.canonical_channel_count,
+            selected: self.state.selected,
+            selected_len: self.state.selected_len,
+        }
+    }
+}
+
+impl RemoteMcapSelectedMembershipV1 {
+    fn ensure_matches_config_v1(&self, config: &FrozenRemoteMcapSemanticConfigV1<'_>) {
+        if self.semantic_config_identity != config.state.config_identity
+            || self.source_generation != config.source_generation
+            || self.config_generation != config.config_generation
+            || self.policy != config.state.policy
+        {
+            remote_ros2_fatal_control_plane(
+                "selected membership was rebound across source or semantic config",
+            );
+        }
+    }
+
+    pub(crate) fn ensure_matches_evidence_v1(&self, evidence: &RemoteKnownNonEmptyEvidenceV1<'_>) {
+        if evidence.semantic_config_identity != self.semantic_config_identity
+            || evidence.source_generation != self.source_generation
+            || evidence.config_generation != self.config_generation
+            || evidence.policy != self.policy
+            || evidence.selected_len != self.selected_len
+        {
+            remote_ros2_fatal_control_plane(
+                "presence evidence was rebound across source or semantic config",
+            );
+        }
+        evidence
+            .physical
+            .ensure_matches_source_v1(&self.physical_source);
+    }
 }
 
 impl RemoteDefinitionsSourceState {
@@ -166,6 +534,7 @@ impl RemoteDefinitionsSourceState {
 
     #[cfg(test)]
     pub(crate) fn new_for_protobuf_test_v1(
+        physical_source: PhysicalChunkSourceBindingV1,
         viewer_scope: &RemoteViewerScopeState,
         protobuf_profile_scope: &crate::remote_protobuf_projection_boundary::RemoteProtobufProfileScopeV1,
     ) -> Self {
@@ -173,6 +542,85 @@ impl RemoteDefinitionsSourceState {
             generation: Cell::new(1),
             viewer_scope,
             protobuf_profile_scope,
+            physical_source,
+            semantic_topic_filter: RefCell::new(Some(TopicFilter::default())),
+            semantic_time_type: RemoteMcapTimeType::TimestampNs,
+            semantic_consistency: RemoteMcapConsistencyPolicyV1::RequireStrongValidator,
+            semantic_config: OnceCell::new(),
+            assignment_recognition_count: Cell::new(0),
+            assignment_membership_projection_count: Cell::new(0),
+            semantic_match_count: Cell::new(0),
+            semantic_selection_count: Cell::new(0),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_assignment_test_with_selected_topics_v1(
+        physical_source: PhysicalChunkSourceBindingV1,
+        viewer_scope: &RemoteViewerScopeState,
+        protobuf_profile_scope: &crate::remote_protobuf_projection_boundary::RemoteProtobufProfileScopeV1,
+        selected_topics: &'static [&'static str],
+    ) -> Self {
+        let include = selected_topics
+            .iter()
+            // Remote assignment accepts only literal/exact patterns, so these test-only
+            // fixtures deliberately avoid regex escaping (which would itself be rejected).
+            .map(|topic| format!("^{topic}$"))
+            .collect::<Vec<_>>();
+        let filter = TopicFilter::default()
+            .with_include_patterns(&include)
+            .expect("test Topic filter is valid");
+        Self::new_for_assignment_test_with_filter_v1(
+            physical_source,
+            viewer_scope,
+            protobuf_profile_scope,
+            filter,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_assignment_test_with_filter_v1(
+        physical_source: PhysicalChunkSourceBindingV1,
+        viewer_scope: &RemoteViewerScopeState,
+        protobuf_profile_scope: &crate::remote_protobuf_projection_boundary::RemoteProtobufProfileScopeV1,
+        semantic_topic_filter: TopicFilter,
+    ) -> Self {
+        Self {
+            generation: Cell::new(1),
+            viewer_scope,
+            protobuf_profile_scope,
+            physical_source,
+            semantic_topic_filter: RefCell::new(Some(semantic_topic_filter)),
+            semantic_time_type: RemoteMcapTimeType::TimestampNs,
+            semantic_consistency: RemoteMcapConsistencyPolicyV1::RequireStrongValidator,
+            semantic_config: OnceCell::new(),
+            assignment_recognition_count: Cell::new(0),
+            assignment_membership_projection_count: Cell::new(0),
+            semantic_match_count: Cell::new(0),
+            semantic_selection_count: Cell::new(0),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_assignment_test_with_filter_and_physical_v1(
+        physical_source: PhysicalChunkSourceBindingV1,
+        viewer_scope: &RemoteViewerScopeState,
+        protobuf_profile_scope: &crate::remote_protobuf_projection_boundary::RemoteProtobufProfileScopeV1,
+        semantic_topic_filter: TopicFilter,
+    ) -> Self {
+        Self {
+            generation: Cell::new(1),
+            viewer_scope,
+            protobuf_profile_scope,
+            physical_source,
+            semantic_topic_filter: RefCell::new(Some(semantic_topic_filter)),
+            semantic_time_type: RemoteMcapTimeType::TimestampNs,
+            semantic_consistency: RemoteMcapConsistencyPolicyV1::RequireStrongValidator,
+            semantic_config: OnceCell::new(),
+            assignment_recognition_count: Cell::new(0),
+            assignment_membership_projection_count: Cell::new(0),
+            semantic_match_count: Cell::new(0),
+            semantic_selection_count: Cell::new(0),
         }
     }
 
@@ -180,6 +628,569 @@ impl RemoteDefinitionsSourceState {
     pub(crate) fn invalidate_for_protobuf_test_v1(&self) {
         self.generation.set(self.generation.get().wrapping_add(1));
     }
+
+    #[cfg(test)]
+    pub(crate) fn assignment_recognition_count_for_test_v1(&self) -> u64 {
+        self.assignment_recognition_count.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assignment_membership_projection_count_for_test_v1(&self) -> u64 {
+        self.assignment_membership_projection_count.get()
+    }
+
+    pub(crate) fn physical_source_binding_for_test_v1(&self) -> PhysicalChunkSourceBindingV1 {
+        self.physical_source.clone()
+    }
+
+    fn freeze_semantic_config_v1<'source>(
+        &'source self,
+        physical: &PhysicalChunkDefinitionsCapabilityV1<'_, '_>,
+        policy: &FrozenRemoteDecoderPolicyV1<'_>,
+        budget: &RemoteRos2InitializationBudget<'source, '_>,
+        topic_filter: &TopicFilter,
+    ) -> Result<FrozenRemoteMcapSemanticConfigV1<'source>, RemoteRos2InitializationError> {
+        physical
+            .source_binding_v1()
+            .ensure_current_v1()
+            .map_err(|_error| RemoteRos2InitializationError::StaleSource)?;
+        let definitions = physical.definitions_v1();
+        let policy_value = policy.value_v1();
+
+        if let Some(state) = self.semantic_config.get() {
+            state
+                .physical_source
+                .ensure_matches_v1(physical.source_binding_v1());
+            state._reservation.ensure_matches_v1(&budget.state);
+            if state.policy != policy_value || state.source_generation != self.generation.get() {
+                remote_ros2_fatal_control_plane(
+                    "semantic config source generation or policy value changed",
+                );
+            }
+            if state.time_type != self.semantic_time_type
+                || state.consistency != self.semantic_consistency
+            {
+                return Err(RemoteRos2InitializationError::SemanticConfigConflict);
+            }
+            ensure_remote_literal_topic_filter_v1(topic_filter)?;
+            let (canonical_topic_filter, canonical_topic_filter_len, filter_steps) =
+                canonical_remote_topic_filter_v1(topic_filter)?;
+            if filter_steps > budget.state.limits.max_semantic_config_steps {
+                return Err(RemoteRos2InitializationError::ResourceLimitExceeded(
+                    RemoteRos2ResourceLimit::SemanticConfigSteps,
+                ));
+            }
+            if state.canonical_topic_filter_len != canonical_topic_filter_len
+                || state.canonical_topic_filter[..state.canonical_topic_filter_len]
+                    != canonical_topic_filter[..canonical_topic_filter_len]
+            {
+                return Err(RemoteRos2InitializationError::SemanticConfigConflict);
+            }
+            return Ok(FrozenRemoteMcapSemanticConfigV1 {
+                state,
+                source: self,
+                source_generation: state.source_generation,
+                config_generation: state.config_generation,
+            });
+        }
+
+        let preflight = preflight_remote_semantic_config_v1(
+            definitions,
+            topic_filter,
+            budget.state.limits.max_semantic_config_steps,
+        )?;
+        if preflight.exact_steps > budget.state.limits.max_semantic_config_steps {
+            return Err(RemoteRos2InitializationError::ResourceLimitExceeded(
+                RemoteRos2ResourceLimit::SemanticConfigSteps,
+            ));
+        }
+        let retained_bytes = remote_semantic_config_retained_bytes_v1();
+        let reservation = budget.state.reserve_semantic_config_v1(retained_bytes)?;
+        let mut steps = RemoteSemanticConfigStepOwnerV1::new(preflight.exact_steps);
+        steps.consume_exact(preflight.canonical_topic_filter_len as u64);
+        let (canonical_topic_filter, canonical_topic_filter_len, filter_steps) =
+            canonical_remote_topic_filter_v1(topic_filter)?;
+        if canonical_topic_filter_len != preflight.canonical_topic_filter_len
+            || filter_steps != preflight.canonical_topic_filter_len as u64
+        {
+            remote_ros2_fatal_control_plane("semantic Topic filter preflight changed");
+        }
+        let mut selected = [None; MAX_REMOTE_SEMANTIC_CONFIG_CHANNELS_V1];
+        let mut selected_len = 0_usize;
+        let mut canonical_channel_count = 0_u64;
+        let mut seen_channel_ids = [0_u64; (u16::MAX as usize + 1) / 64];
+        let mut projection_count = 0_u64;
+        for projection in definitions.projection_records() {
+            projection_count = projection_count.checked_add(1).ok_or(
+                RemoteRos2InitializationError::ResourceLimitExceeded(
+                    RemoteRos2ResourceLimit::Arithmetic,
+                ),
+            )?;
+            steps.consume_exact(1);
+            let matcher_steps = remote_topic_matcher_steps_from_count_v1(
+                preflight.pattern_count,
+                MAX_REMOTE_TOPIC_BYTES_V1,
+            )?;
+            steps.consume_exact(matcher_steps.checked_add(1).ok_or(
+                RemoteRos2InitializationError::ResourceLimitExceeded(
+                    RemoteRos2ResourceLimit::Arithmetic,
+                ),
+            )?);
+            let SummaryDefinitionProjectionRecord::Channel { id, record_index } = projection else {
+                continue;
+            };
+            let word = usize::from(id) / 64;
+            let bit = usize::from(id) % 64;
+            if seen_channel_ids[word] & (1_u64 << bit) != 0 {
+                continue;
+            }
+            seen_channel_ids[word] |= 1_u64 << bit;
+            canonical_channel_count = canonical_channel_count.checked_add(1).ok_or(
+                RemoteRos2InitializationError::ResourceLimitExceeded(
+                    RemoteRos2ResourceLimit::Arithmetic,
+                ),
+            )?;
+            let channel = definitions
+                .channel_at_record(record_index)
+                .unwrap_or_else(|| {
+                    remote_ros2_fatal_invariant("semantic-config Channel projection changed kind")
+                });
+            #[cfg(test)]
+            self.semantic_match_count.set(
+                self.semantic_match_count
+                    .get()
+                    .checked_add(1)
+                    .unwrap_or_else(|| remote_ros2_fatal_invariant("matcher count overflowed")),
+            );
+            let matches = remote_literal_topic_filter_matches_v1(topic_filter, &channel.topic)?;
+            if !matches {
+                continue;
+            }
+            let Some(slot) = selected.get_mut(selected_len) else {
+                return Err(RemoteRos2InitializationError::ResourceLimitExceeded(
+                    RemoteRos2ResourceLimit::SemanticConfigChannels,
+                ));
+            };
+            *slot = Some(RemoteMcapSelectedChannelV1 { channel_id: id });
+            selected_len = selected_len.checked_add(1).ok_or(
+                RemoteRos2InitializationError::ResourceLimitExceeded(
+                    RemoteRos2ResourceLimit::Arithmetic,
+                ),
+            )?;
+            #[cfg(test)]
+            self.semantic_selection_count.set(
+                self.semantic_selection_count
+                    .get()
+                    .checked_add(1)
+                    .unwrap_or_else(|| remote_ros2_fatal_invariant("selection count overflowed")),
+            );
+        }
+        steps.ensure_exhausted();
+        let source_binding = physical.source_binding_v1().clone();
+        self.physical_source.ensure_matches_v1(&source_binding);
+        let config_identity = allocate_semantic_config_identity_v1()?;
+        self.semantic_config
+            .set(RemoteMcapSemanticConfigStateV1 {
+                physical_source: source_binding,
+                policy: policy_value,
+                source_generation: self.generation.get(),
+                config_generation: 1,
+                config_identity,
+                canonical_topic_filter_len,
+                canonical_topic_filter,
+                retained_bytes,
+                census_steps: preflight.exact_steps,
+                time_type: self.semantic_time_type,
+                consistency: self.semantic_consistency,
+                canonical_channel_count,
+                selected,
+                selected_len,
+                _reservation: reservation,
+            })
+            .unwrap_or_else(|_config| {
+                remote_ros2_fatal_control_plane("semantic config initialized twice")
+            });
+        let state = self
+            .semantic_config
+            .get()
+            .unwrap_or_else(|| remote_ros2_fatal_invariant("semantic config disappeared"));
+        Ok(FrozenRemoteMcapSemanticConfigV1 {
+            state,
+            source: self,
+            source_generation: state.source_generation,
+            config_generation: state.config_generation,
+        })
+    }
+
+    fn freeze_source_semantic_config_v1<'source>(
+        &'source self,
+        physical: &PhysicalChunkDefinitionsCapabilityV1<'_, '_>,
+        policy: &FrozenRemoteDecoderPolicyV1<'_>,
+        budget: &RemoteRos2InitializationBudget<'source, '_>,
+    ) -> Result<FrozenRemoteMcapSemanticConfigV1<'source>, RemoteRos2InitializationError> {
+        if let Some(state) = self.semantic_config.get() {
+            physical
+                .source_binding_v1()
+                .ensure_current_v1()
+                .map_err(|_error| RemoteRos2InitializationError::StaleSource)?;
+            state
+                .physical_source
+                .ensure_matches_v1(physical.source_binding_v1());
+            state._reservation.ensure_matches_v1(&budget.state);
+            if state.policy != policy.value_v1() || state.source_generation != self.generation.get()
+            {
+                remote_ros2_fatal_control_plane(
+                    "semantic config source generation or policy value changed",
+                );
+            }
+            if state.time_type != self.semantic_time_type
+                || state.consistency != self.semantic_consistency
+            {
+                return Err(RemoteRos2InitializationError::SemanticConfigConflict);
+            }
+            return Ok(FrozenRemoteMcapSemanticConfigV1 {
+                state,
+                source: self,
+                source_generation: state.source_generation,
+                config_generation: state.config_generation,
+            });
+        }
+        let filter_guard = self.semantic_topic_filter.borrow();
+        let filter = filter_guard.as_ref().unwrap_or_else(|| {
+            remote_ros2_fatal_invariant("unfrozen semantic config lost its Topic filter")
+        });
+        let frozen = self.freeze_semantic_config_v1(physical, policy, budget, filter)?;
+        drop(filter_guard);
+        self.semantic_topic_filter.borrow_mut().take();
+        Ok(frozen)
+    }
+}
+
+struct RemoteSemanticConfigPreflightV1 {
+    exact_steps: u64,
+    canonical_topic_filter_len: usize,
+    pattern_count: usize,
+}
+
+struct RemoteSemanticConfigStepOwnerV1 {
+    remaining: u64,
+}
+
+impl RemoteSemanticConfigStepOwnerV1 {
+    const fn new(exact_steps: u64) -> Self {
+        Self {
+            remaining: exact_steps,
+        }
+    }
+
+    fn consume_exact(&mut self, steps: u64) {
+        self.remaining = self.remaining.checked_sub(steps).unwrap_or_else(|| {
+            remote_ros2_fatal_invariant("semantic config exceeded its exact step permit")
+        });
+    }
+
+    fn ensure_exhausted(&self) {
+        if self.remaining != 0 {
+            remote_ros2_fatal_invariant("semantic config did not exhaust its exact step permit");
+        }
+    }
+}
+
+fn preflight_remote_semantic_config_v1(
+    definitions: &ValidatedSummaryDefinitions<'_>,
+    filter: &TopicFilter,
+    max_steps: u64,
+) -> Result<RemoteSemanticConfigPreflightV1, RemoteRos2InitializationError> {
+    ensure_remote_literal_topic_filter_v1(filter)?;
+    let (canonical_topic_filter_len, pattern_count) = remote_topic_filter_shape_v1(filter)?;
+    let projection_count =
+        u64::try_from(definitions.projection_records().count()).map_err(|_overflow| {
+            RemoteRos2InitializationError::ResourceLimitExceeded(
+                RemoteRos2ResourceLimit::Arithmetic,
+            )
+        })?;
+    let matcher_upper =
+        remote_topic_matcher_steps_from_count_v1(pattern_count, MAX_REMOTE_TOPIC_BYTES_V1)?;
+    let per_record = 1_u64
+        .checked_add(matcher_upper)
+        .and_then(|steps| steps.checked_add(1))
+        .ok_or(RemoteRos2InitializationError::ResourceLimitExceeded(
+            RemoteRos2ResourceLimit::Arithmetic,
+        ))?;
+    let exact_steps = u64::try_from(canonical_topic_filter_len)
+        .map_err(|_overflow| {
+            RemoteRos2InitializationError::ResourceLimitExceeded(
+                RemoteRos2ResourceLimit::Arithmetic,
+            )
+        })?
+        .checked_add(projection_count.checked_mul(per_record).ok_or(
+            RemoteRos2InitializationError::ResourceLimitExceeded(
+                RemoteRos2ResourceLimit::Arithmetic,
+            ),
+        )?)
+        .ok_or(RemoteRos2InitializationError::ResourceLimitExceeded(
+            RemoteRos2ResourceLimit::Arithmetic,
+        ))?;
+    if exact_steps > max_steps {
+        return Err(RemoteRos2InitializationError::ResourceLimitExceeded(
+            RemoteRos2ResourceLimit::SemanticConfigSteps,
+        ));
+    }
+    Ok(RemoteSemanticConfigPreflightV1 {
+        exact_steps,
+        canonical_topic_filter_len,
+        pattern_count,
+    })
+}
+
+fn remote_topic_matcher_steps_from_count_v1(
+    pattern_count: usize,
+    topic_len: usize,
+) -> Result<u64, RemoteRos2InitializationError> {
+    let pattern_units = u64::try_from(pattern_count)
+        .map_err(|_overflow| {
+            RemoteRos2InitializationError::ResourceLimitExceeded(
+                RemoteRos2ResourceLimit::Arithmetic,
+            )
+        })?
+        .checked_add(1)
+        .ok_or(RemoteRos2InitializationError::ResourceLimitExceeded(
+            RemoteRos2ResourceLimit::Arithmetic,
+        ))?;
+    let topic_units = u64::try_from(topic_len)
+        .map_err(|_overflow| {
+            RemoteRos2InitializationError::ResourceLimitExceeded(
+                RemoteRos2ResourceLimit::Arithmetic,
+            )
+        })?
+        .checked_add(1)
+        .ok_or(RemoteRos2InitializationError::ResourceLimitExceeded(
+            RemoteRos2ResourceLimit::Arithmetic,
+        ))?;
+    pattern_units.checked_mul(topic_units).ok_or(
+        RemoteRos2InitializationError::ResourceLimitExceeded(RemoteRos2ResourceLimit::Arithmetic),
+    )
+}
+
+fn remote_literal_topic_filter_matches_v1(
+    filter: &TopicFilter,
+    topic: &str,
+) -> Result<bool, RemoteRos2InitializationError> {
+    if topic.len() > MAX_REMOTE_TOPIC_BYTES_V1 {
+        return Err(RemoteRos2InitializationError::ResourceLimitExceeded(
+            RemoteRos2ResourceLimit::SemanticConfigFilterBytes,
+        ));
+    }
+    let include = filter.exact_include_patterns_for_remote_v1();
+    let exclude = filter.exact_exclude_patterns_for_remote_v1();
+    let mut included = include.len() == 0;
+    for pattern in include {
+        let literal = remote_exact_literal_pattern_v1(pattern).ok_or(
+            RemoteRos2InitializationError::UnsupportedForRemote(
+                UnsupportedForRemote::TopicFilterExpression,
+            ),
+        )?;
+        if literal == topic {
+            included = true;
+        }
+    }
+    for pattern in exclude {
+        let literal = remote_exact_literal_pattern_v1(pattern).ok_or(
+            RemoteRos2InitializationError::UnsupportedForRemote(
+                UnsupportedForRemote::TopicFilterExpression,
+            ),
+        )?;
+        if literal == topic {
+            return Ok(false);
+        }
+    }
+    Ok(included)
+}
+
+fn remote_exact_literal_pattern_v1(pattern: &str) -> Option<&str> {
+    let pattern = pattern
+        .strip_prefix('^')
+        .and_then(|pattern| pattern.strip_suffix('$'))
+        .unwrap_or(pattern);
+    (pattern.len() <= MAX_REMOTE_TOPIC_BYTES_V1
+        && !pattern.is_empty()
+        && pattern.bytes().all(|byte| {
+            !matches!(
+                byte,
+                b'.' | b'^'
+                    | b'$'
+                    | b'*'
+                    | b'+'
+                    | b'?'
+                    | b'['
+                    | b']'
+                    | b'('
+                    | b')'
+                    | b'{'
+                    | b'}'
+                    | b'|'
+                    | b'\\'
+            )
+        }))
+    .then_some(pattern)
+}
+
+fn ensure_remote_literal_topic_filter_v1(
+    filter: &TopicFilter,
+) -> Result<(), RemoteRos2InitializationError> {
+    for pattern in filter
+        .exact_include_patterns_for_remote_v1()
+        .chain(filter.exact_exclude_patterns_for_remote_v1())
+    {
+        if remote_exact_literal_pattern_v1(pattern).is_none() {
+            return Err(RemoteRos2InitializationError::UnsupportedForRemote(
+                UnsupportedForRemote::TopicFilterExpression,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remote_topic_filter_shape_v1(
+    filter: &TopicFilter,
+) -> Result<(usize, usize), RemoteRos2InitializationError> {
+    let include_count = filter.exact_include_patterns_for_remote_v1().len();
+    let exclude_count = filter.exact_exclude_patterns_for_remote_v1().len();
+    let pattern_count = include_count.checked_add(exclude_count).ok_or(
+        RemoteRos2InitializationError::ResourceLimitExceeded(
+            RemoteRos2ResourceLimit::SemanticConfigPatterns,
+        ),
+    )?;
+    if pattern_count > MAX_REMOTE_TOPIC_FILTER_PATTERNS_V1 {
+        return Err(RemoteRos2InitializationError::ResourceLimitExceeded(
+            RemoteRos2ResourceLimit::SemanticConfigPatterns,
+        ));
+    }
+    let mut canonical_len = 12_usize;
+    for pattern in filter
+        .exact_include_patterns_for_remote_v1()
+        .chain(filter.exact_exclude_patterns_for_remote_v1())
+    {
+        canonical_len = canonical_len
+            .checked_add(size_of::<u32>())
+            .and_then(|len| len.checked_add(pattern.len()))
+            .ok_or(RemoteRos2InitializationError::ResourceLimitExceeded(
+                RemoteRos2ResourceLimit::Arithmetic,
+            ))?;
+        if canonical_len > MAX_REMOTE_TOPIC_FILTER_BYTES_V1 {
+            return Err(RemoteRos2InitializationError::ResourceLimitExceeded(
+                RemoteRos2ResourceLimit::SemanticConfigFilterBytes,
+            ));
+        }
+    }
+    Ok((canonical_len, pattern_count))
+}
+
+fn canonical_remote_topic_filter_v1(
+    filter: &TopicFilter,
+) -> Result<([u8; MAX_REMOTE_TOPIC_FILTER_BYTES_V1], usize, u64), RemoteRos2InitializationError> {
+    let include_count = filter.exact_include_patterns_for_remote_v1().len();
+    let exclude_count = filter.exact_exclude_patterns_for_remote_v1().len();
+    let (canonical_len, _pattern_count) = remote_topic_filter_shape_v1(filter)?;
+    let mut bytes = [0_u8; MAX_REMOTE_TOPIC_FILTER_BYTES_V1];
+    let mut cursor = 0_usize;
+    let mut steps = 0_u64;
+    push_filter_bytes_v1(&mut bytes, &mut cursor, b"RTF1", &mut steps)?;
+    push_filter_bytes_v1(
+        &mut bytes,
+        &mut cursor,
+        &u32::try_from(include_count)
+            .map_err(|_overflow| {
+                RemoteRos2InitializationError::ResourceLimitExceeded(
+                    RemoteRos2ResourceLimit::SemanticConfigPatterns,
+                )
+            })?
+            .to_le_bytes(),
+        &mut steps,
+    )?;
+    for pattern in filter.exact_include_patterns_for_remote_v1() {
+        push_filter_pattern_v1(&mut bytes, &mut cursor, pattern, &mut steps)?;
+    }
+    push_filter_bytes_v1(
+        &mut bytes,
+        &mut cursor,
+        &u32::try_from(exclude_count)
+            .map_err(|_overflow| {
+                RemoteRos2InitializationError::ResourceLimitExceeded(
+                    RemoteRos2ResourceLimit::SemanticConfigPatterns,
+                )
+            })?
+            .to_le_bytes(),
+        &mut steps,
+    )?;
+    for pattern in filter.exact_exclude_patterns_for_remote_v1() {
+        push_filter_pattern_v1(&mut bytes, &mut cursor, pattern, &mut steps)?;
+    }
+    if cursor != canonical_len || steps != canonical_len as u64 {
+        remote_ros2_fatal_invariant("canonical Topic filter shape changed after preflight");
+    }
+    Ok((bytes, cursor, steps))
+}
+
+const fn remote_semantic_config_retained_bytes_v1() -> u64 {
+    size_of::<RemoteDefinitionsSourceState>() as u64
+}
+
+fn push_filter_pattern_v1(
+    output: &mut [u8; MAX_REMOTE_TOPIC_FILTER_BYTES_V1],
+    cursor: &mut usize,
+    pattern: &str,
+    steps: &mut u64,
+) -> Result<(), RemoteRos2InitializationError> {
+    let length = u32::try_from(pattern.len()).map_err(|_overflow| {
+        RemoteRos2InitializationError::ResourceLimitExceeded(
+            RemoteRos2ResourceLimit::SemanticConfigFilterBytes,
+        )
+    })?;
+    push_filter_bytes_v1(output, cursor, &length.to_le_bytes(), steps)?;
+    push_filter_bytes_v1(output, cursor, pattern.as_bytes(), steps)
+}
+
+fn push_filter_bytes_v1(
+    output: &mut [u8; MAX_REMOTE_TOPIC_FILTER_BYTES_V1],
+    cursor: &mut usize,
+    bytes: &[u8],
+    steps: &mut u64,
+) -> Result<(), RemoteRos2InitializationError> {
+    let end = cursor.checked_add(bytes.len()).ok_or(
+        RemoteRos2InitializationError::ResourceLimitExceeded(RemoteRos2ResourceLimit::Arithmetic),
+    )?;
+    let destination = output.get_mut(*cursor..end).ok_or(
+        RemoteRos2InitializationError::ResourceLimitExceeded(
+            RemoteRos2ResourceLimit::SemanticConfigFilterBytes,
+        ),
+    )?;
+    destination.copy_from_slice(bytes);
+    *cursor = end;
+    *steps = checked_add(
+        *steps,
+        u64::try_from(bytes.len()).map_err(|_overflow| {
+            RemoteRos2InitializationError::ResourceLimitExceeded(
+                RemoteRos2ResourceLimit::Arithmetic,
+            )
+        })?,
+    )?;
+    Ok(())
+}
+
+fn allocate_semantic_config_identity_v1() -> Result<NonZeroU64, RemoteRos2InitializationError> {
+    let identity = NEXT_REMOTE_SEMANTIC_CONFIG_IDENTITY_V1
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_current| {
+            RemoteRos2InitializationError::ResourceLimitExceeded(
+                RemoteRos2ResourceLimit::Arithmetic,
+            )
+        })?;
+    NonZeroU64::new(identity).ok_or(RemoteRos2InitializationError::ResourceLimitExceeded(
+        RemoteRos2ResourceLimit::Arithmetic,
+    ))
 }
 
 pub(crate) struct RemoteViewerScopeState {
@@ -213,11 +1224,22 @@ pub(crate) struct RemoteDefinitionsCapability<'definitions, 'input, 'source> {
     definitions: &'definitions ValidatedSummaryDefinitions<'input>,
     source: &'source RemoteDefinitionsSourceState,
     generation: u64,
+    semantic_config: FrozenRemoteMcapSemanticConfigV1<'source>,
 }
 
 impl RemoteDefinitionsCapability<'_, '_, '_> {
     fn ensure_current(&self) -> Result<(), RemoteRos2InitializationError> {
-        if self.source.is_current(self.generation) {
+        self.semantic_config
+            .state
+            .physical_source
+            .ensure_current_v1()
+            .map_err(|_error| RemoteRos2InitializationError::StaleSource)?;
+        if self.source.is_current(self.generation)
+            && std::ptr::eq(self.source, self.semantic_config.source)
+            && self.semantic_config.source_generation == self.generation
+            && self.semantic_config.config_generation
+                == self.semantic_config.state.config_generation
+        {
             Ok(())
         } else {
             Err(RemoteRos2InitializationError::StaleSource)
@@ -228,14 +1250,82 @@ impl RemoteDefinitionsCapability<'_, '_, '_> {
 #[cfg(test)]
 impl<'definitions, 'input, 'source> RemoteDefinitionsCapability<'definitions, 'input, 'source> {
     pub(crate) fn new_for_protobuf_test_v1(
-        definitions: &'definitions ValidatedSummaryDefinitions<'input>,
+        physical: &PhysicalChunkDefinitionsCapabilityV1<'definitions, 'input>,
         source: &'source RemoteDefinitionsSourceState,
-    ) -> Self {
-        Self {
-            definitions,
+        policy: &FrozenRemoteDecoderPolicyV1<'_>,
+        budget: &RemoteRos2InitializationBudget<'source, '_>,
+    ) -> Result<Self, RemoteRos2InitializationError> {
+        ensure_semantic_config_budget_binding_v1(source, policy, budget);
+        let semantic_config = source.freeze_source_semantic_config_v1(physical, policy, budget)?;
+        Ok(Self {
+            definitions: physical.definitions_v1(),
             source,
             generation: source.generation.get(),
-        }
+            semantic_config,
+        })
+    }
+
+    pub(crate) fn new_for_semantic_config_conflict_test_v1(
+        physical: &PhysicalChunkDefinitionsCapabilityV1<'definitions, 'input>,
+        source: &'source RemoteDefinitionsSourceState,
+        policy: &FrozenRemoteDecoderPolicyV1<'_>,
+        budget: &RemoteRos2InitializationBudget<'source, '_>,
+        topic_filter: &TopicFilter,
+    ) -> Result<Self, RemoteRos2InitializationError> {
+        ensure_semantic_config_budget_binding_v1(source, policy, budget);
+        let semantic_config =
+            source.freeze_semantic_config_v1(physical, policy, budget, topic_filter)?;
+        Ok(Self {
+            definitions: physical.definitions_v1(),
+            source,
+            generation: source.generation.get(),
+            semantic_config,
+        })
+    }
+}
+
+#[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
+impl<'definitions, 'input, 'source> RemoteDefinitionsCapability<'definitions, 'input, 'source> {
+    fn new_for_artifact_probe_v1(
+        physical: &PhysicalChunkDefinitionsCapabilityV1<'definitions, 'input>,
+        source: &'source RemoteDefinitionsSourceState,
+        policy: &FrozenRemoteDecoderPolicyV1<'_>,
+        budget: &RemoteRos2InitializationBudget<'source, '_>,
+    ) -> Result<Self, RemoteRos2InitializationError> {
+        ensure_semantic_config_budget_binding_v1(source, policy, budget);
+        let semantic_config = source.freeze_source_semantic_config_v1(physical, policy, budget)?;
+        Ok(Self {
+            definitions: physical.definitions_v1(),
+            source,
+            generation: source.generation.get(),
+            semantic_config,
+        })
+    }
+}
+
+fn ensure_semantic_config_budget_binding_v1(
+    source: &RemoteDefinitionsSourceState,
+    policy: &FrozenRemoteDecoderPolicyV1<'_>,
+    budget: &RemoteRos2InitializationBudget<'_, '_>,
+) {
+    if !std::ptr::eq(source, budget.source)
+        || source.generation.get() != budget.generation
+        || source.viewer_scope != budget.viewer_scope
+        || policy.value_v1()
+            != freeze_remote_decoder_policy_v1(budget.policy_wire)
+                .unwrap_or_else(|_error| {
+                    remote_ros2_fatal_control_plane("budget decoder policy became invalid")
+                })
+                .value_v1()
+        || budget.profile_scope.is_null()
+        || budget.state.generation != budget.generation
+        || budget.state.viewer_scope_identity != budget.viewer_scope.addr()
+        || budget.state.profile_scope_identity != budget.profile_scope.addr()
+        || budget.state.policy != policy.value_v1()
+    {
+        remote_ros2_fatal_control_plane(
+            "semantic config source, policy, profile, or budget was rebound",
+        );
     }
 }
 
@@ -250,10 +1340,15 @@ pub(crate) enum UnsupportedForRemote {
     Ros2Wstring,
     GrammarFeature,
     DependencyGraph,
+    TopicFilterExpression,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RemoteRos2ResourceLimit {
+    SemanticConfigChannels,
+    SemanticConfigPatterns,
+    SemanticConfigFilterBytes,
+    SemanticConfigSteps,
     SchemaCount,
     DefinitionBytes,
     SpecificationCount,
@@ -288,6 +1383,7 @@ pub(crate) enum RemoteRos2InitializationError {
     FallibleAllocationFailed,
     StaleSource,
     ConflictingTopicDecoderSignature,
+    SemanticConfigConflict,
 }
 
 impl std::fmt::Display for RemoteRos2InitializationError {
@@ -303,12 +1399,16 @@ impl std::fmt::Display for RemoteRos2InitializationError {
             Self::UnsupportedForRemote(UnsupportedForRemote::DependencyGraph) => {
                 "remote ROS 2 schema dependency graph is unsupported"
             }
+            Self::UnsupportedForRemote(UnsupportedForRemote::TopicFilterExpression) => {
+                "remote Topic filter expression is outside the bounded literal profile"
+            }
             Self::ResourceLimitExceeded(_) => "remote ROS 2 schema exceeds a resource limit",
             Self::FallibleAllocationFailed => "remote ROS 2 schema allocation failed",
             Self::StaleSource => "remote ROS 2 source is stale",
             Self::ConflictingTopicDecoderSignature => {
                 "remote MCAP topic has conflicting decoder signatures"
             }
+            Self::SemanticConfigConflict => "remote MCAP semantic config conflicts with source",
         })
     }
 }
@@ -496,6 +1596,7 @@ pub(crate) struct UnfrozenRemoteRos2LimitsV1 {
     max_array_bound: u64,
     max_dependency_edges: u64,
     max_dependency_depth: u64,
+    max_semantic_config_steps: u64,
     max_signature_steps: u64,
     max_projection_steps: u64,
     max_recognition_steps: u64,
@@ -529,7 +1630,40 @@ struct RemoteRos2BudgetState {
     generation: u64,
     viewer_scope_identity: usize,
     profile_scope_identity: usize,
-    policy_wire_identity: usize,
+    policy: FrozenRemoteDecoderPolicyValueV1,
+}
+
+/// Move-only aggregate reservation for the source-owned semantic config.
+///
+/// It remains inside the source `OnceCell` until source teardown, unlike initializer result
+/// reservations which are released when their individual typestate chain is dropped.
+struct RemoteMcapSemanticConfigReservationV1 {
+    state: Arc<RemoteRos2BudgetState>,
+    retained_bytes: u64,
+}
+
+impl RemoteMcapSemanticConfigReservationV1 {
+    fn ensure_matches_v1(&self, budget: &Arc<RemoteRos2BudgetState>) {
+        if !Arc::ptr_eq(&self.state, budget) {
+            remote_ros2_fatal_control_plane("semantic config budget owner changed");
+        }
+    }
+}
+
+impl Drop for RemoteMcapSemanticConfigReservationV1 {
+    fn drop(&mut self) {
+        let mut usage = self.state.usage.lock();
+        let Some(retained_results) = usage.retained_results.checked_sub(1) else {
+            drop(usage);
+            poison_invariant(&self.state, "semantic config result count underflowed");
+        };
+        let Some(retained_bytes) = usage.retained_bytes.checked_sub(self.retained_bytes) else {
+            drop(usage);
+            poison_invariant(&self.state, "semantic config retained bytes underflowed");
+        };
+        usage.retained_results = retained_results;
+        usage.retained_bytes = retained_bytes;
+    }
 }
 
 /// Source/profile budget for the complete initializer peak and retained parsed result.
@@ -561,6 +1695,7 @@ impl UnfrozenRemoteRos2LimitsV1 {
             max_array_bound: 1_000_000,
             max_dependency_edges: 4_096,
             max_dependency_depth: 32,
+            max_semantic_config_steps: 1_000_000,
             max_signature_steps: 1_000_000,
             max_projection_steps: 1_000_000,
             max_recognition_steps: 1_000_000,
@@ -595,7 +1730,9 @@ impl<'source, 'wire> RemoteRos2InitializationBudget<'source, 'wire> {
                 generation: source.generation.get(),
                 viewer_scope_identity: std::ptr::from_ref(viewer_scope).addr(),
                 profile_scope_identity: std::ptr::from_ref(profile_scope).addr(),
-                policy_wire_identity: std::ptr::from_ref(policy_wire).addr(),
+                policy: freeze_remote_decoder_policy_v1(policy_wire)
+                    .expect("test policy is canonical")
+                    .value_v1(),
             }),
             source,
             generation: source.generation.get(),
@@ -603,6 +1740,26 @@ impl<'source, 'wire> RemoteRos2InitializationBudget<'source, 'wire> {
             profile_scope,
             policy_wire,
         }
+    }
+
+    pub(crate) fn is_idle_for_assignment_test_v1(&self) -> bool {
+        *self.state.usage.lock() == self.source.semantic_config_budget_usage_for_test_v1()
+    }
+}
+
+#[cfg(test)]
+impl RemoteDefinitionsSourceState {
+    fn semantic_config_budget_usage_for_test_v1(&self) -> RemoteRos2BudgetUsage {
+        self.semantic_config
+            .get()
+            .map_or_else(RemoteRos2BudgetUsage::default, |state| {
+                RemoteRos2BudgetUsage {
+                    active_initializers: 0,
+                    working_bytes: 0,
+                    retained_results: 1,
+                    retained_bytes: state.retained_bytes,
+                }
+            })
     }
 }
 
@@ -627,6 +1784,37 @@ impl RemoteRos2InitializationBudget<'_, '_> {
 }
 
 impl RemoteRos2BudgetState {
+    fn reserve_semantic_config_v1(
+        self: &Arc<Self>,
+        retained_bytes: u64,
+    ) -> Result<RemoteMcapSemanticConfigReservationV1, RemoteRos2InitializationError> {
+        if self.poisoned.load(Ordering::Acquire) {
+            remote_ros2_fatal_control_plane("initializer budget is poisoned");
+        }
+        if retained_bytes > self.limits.max_retained_bytes {
+            return Err(RemoteRos2InitializationError::ResourceLimitExceeded(
+                RemoteRos2ResourceLimit::RetainedBytes,
+            ));
+        }
+        let mut usage = self.usage.lock();
+        let retained_results = checked_add(usage.retained_results, 1)?;
+        let aggregate_retained_bytes = checked_add(usage.retained_bytes, retained_bytes)?;
+        if retained_results > self.capacity.max_retained_results
+            || aggregate_retained_bytes > self.capacity.max_retained_bytes
+        {
+            return Err(RemoteRos2InitializationError::ResourceLimitExceeded(
+                RemoteRos2ResourceLimit::ReservationCapacity,
+            ));
+        }
+        usage.retained_results = retained_results;
+        usage.retained_bytes = aggregate_retained_bytes;
+        drop(usage);
+        Ok(RemoteMcapSemanticConfigReservationV1 {
+            state: Arc::clone(self),
+            retained_bytes,
+        })
+    }
+
     fn reserve(
         self: &Arc<Self>,
         working_bytes: u64,
@@ -691,6 +1879,9 @@ pub(crate) struct RemoteRos2AdmissionOwnerV1<'definitions, 'input, 'source, 'wir
 impl RemoteRos2AdmissionOwnerV1<'_, '_, '_, '_> {
     fn ensure_current(&self) -> Result<(), RemoteRos2InitializationError> {
         self.source.ensure_current()?;
+        self.source
+            .semantic_config
+            .ensure_bound_v1(self.policy.wire)?;
         if self.source.source.viewer_scope != self.viewer_scope
             || self.budget_state.generation != self.source.generation
             || self.budget_state.viewer_scope_identity != self.viewer_scope.addr()
@@ -758,15 +1949,31 @@ pub(crate) fn begin_remote_ros2_admission_v1<'definitions, 'input, 'source, 'wir
     RemoteRos2InitializationError,
 > {
     source.ensure_current()?;
+    source.semantic_config.ensure_bound_v1(policy.wire)?;
+    if source.semantic_config.state.census_steps > budget.state.limits.max_semantic_config_steps {
+        return Err(RemoteRos2InitializationError::ResourceLimitExceeded(
+            RemoteRos2ResourceLimit::SemanticConfigSteps,
+        ));
+    }
+    if source.semantic_config.state.retained_bytes > budget.state.limits.max_retained_bytes {
+        return Err(RemoteRos2InitializationError::ResourceLimitExceeded(
+            RemoteRos2ResourceLimit::RetainedBytes,
+        ));
+    }
     if !std::ptr::eq(source.source, budget.source)
         || source.generation != budget.generation
         || source.source.viewer_scope != budget.viewer_scope
-        || !std::ptr::eq(policy.wire, budget.policy_wire)
+        || policy.value_v1()
+            != freeze_remote_decoder_policy_v1(budget.policy_wire)
+                .unwrap_or_else(|_error| {
+                    remote_ros2_fatal_control_plane("budget decoder policy became invalid")
+                })
+                .value_v1()
         || budget.profile_scope.is_null()
         || budget.state.generation != budget.generation
         || budget.state.viewer_scope_identity != budget.viewer_scope.addr()
         || budget.state.profile_scope_identity != budget.profile_scope.addr()
-        || budget.state.policy_wire_identity != std::ptr::from_ref(budget.policy_wire).addr()
+        || budget.state.policy != policy.value_v1()
     {
         remote_ros2_fatal_control_plane("source, policy, profile, or generation was rebound");
     }
@@ -1081,7 +2288,7 @@ impl<'definitions, 'input, 'source, 'wire>
             || state.viewer_scope_identity != initialized.viewer_scope.addr()
             || initialized.profile_scope.is_null()
             || state.profile_scope_identity != initialized.profile_scope.addr()
-            || state.policy_wire_identity != std::ptr::from_ref(initialized.policy.wire).addr()
+            || state.policy != initialized.policy.value_v1()
             || state.poisoned.load(Ordering::Acquire)
         {
             remote_ros2_fatal_control_plane(
@@ -1093,6 +2300,12 @@ impl<'definitions, 'input, 'source, 'wire>
 
     fn ros2_schema_count(&self) -> usize {
         self.payload.initialized.schemas.len()
+    }
+
+    fn policy_descriptor_v1(&self) -> FrozenRemoteDecoderPolicyDescriptorViewV1<'_, 'wire> {
+        FrozenRemoteDecoderPolicyDescriptorViewV1 {
+            descriptor: &self.payload.initialized.policy.descriptor,
+        }
     }
 
     /// The only bounded borrow that MCAP-027 can use to inspect the admitted ROS projection.
@@ -1140,6 +2353,7 @@ pub(crate) struct RemoteRos2ChannelRecognitionV1<
 > {
     owner: &'item RemoteRos2RecognitionIterV1<'borrow, 'definitions, 'input, 'source, 'wire>,
     channel_record_index: usize,
+    recognized_by_semantic: bool,
     recognized_by_reflection: bool,
     protobuf_schema_id: Option<u16>,
 }
@@ -1159,6 +2373,13 @@ impl RemoteRos2ChannelRecognitionV1<'_, '_, '_, '_, '_, '_> {
         Ok(self.recognized_by_reflection)
     }
 
+    pub(crate) fn recognized_by_builtin_semantic(
+        &self,
+    ) -> Result<bool, RemoteRos2InitializationError> {
+        self.owner.transition.ensure_current()?;
+        Ok(self.recognized_by_semantic)
+    }
+
     /// Returns the canonical protobuf Schema ID observed by the local protobuf recognizer shape.
     ///
     /// The descriptor graph still decides whether that schema completed bounded initialization;
@@ -1166,6 +2387,18 @@ impl RemoteRos2ChannelRecognitionV1<'_, '_, '_, '_, '_, '_> {
     pub(crate) fn protobuf_schema_id(&self) -> Result<Option<u16>, RemoteRos2InitializationError> {
         self.owner.transition.ensure_current()?;
         Ok(self.protobuf_schema_id)
+    }
+
+    pub(crate) fn resolve_bound_owner_v1(
+        &self,
+        recognized: [bool; 3],
+    ) -> Result<Option<FrozenRemoteDecoderSlotV1>, RemoteRos2InitializationError> {
+        self.owner.transition.ensure_current()?;
+        Ok(self
+            .owner
+            .transition
+            .policy_descriptor_v1()
+            .resolve_owner_v1(recognized))
     }
 }
 
@@ -1181,6 +2414,18 @@ impl<'borrow, 'definitions, 'input, 'source, 'wire>
 {
     pub(crate) fn next_channel<'item>(
         &'item mut self,
+    ) -> Result<
+        Option<
+            RemoteRos2ChannelRecognitionV1<'item, 'borrow, 'definitions, 'input, 'source, 'wire>,
+        >,
+        RemoteRos2InitializationError,
+    > {
+        self.next_matching_channel(|_channel_id| true)
+    }
+
+    pub(crate) fn next_matching_channel<'item>(
+        &'item mut self,
+        mut matches: impl FnMut(u16) -> bool,
     ) -> Result<
         Option<
             RemoteRos2ChannelRecognitionV1<'item, 'borrow, 'definitions, 'input, 'source, 'wire>,
@@ -1215,6 +2460,27 @@ impl<'borrow, 'definitions, 'input, 'source, 'wire>
             self.steps.consume_bytes(channel.message_encoding.len())?;
             if let Some(schema) = schema {
                 self.steps.consume_bytes(schema.header.encoding.len())?;
+                self.steps.consume_bytes(schema.header.name.len())?;
+            }
+            if !matches(id) {
+                if channel.message_encoding.eq_ignore_ascii_case("cdr") && schema.is_some() {
+                    self.steps
+                        .consume_bytes(self.transition.payload.initialized.schemas.len())?;
+                }
+                continue;
+            }
+            #[cfg(test)]
+            {
+                let source = self.transition.payload.initialized.source.source;
+                source.assignment_recognition_count.set(
+                    source
+                        .assignment_recognition_count
+                        .get()
+                        .checked_add(1)
+                        .unwrap_or_else(|| {
+                            remote_ros2_fatal_invariant("assignment recognition count overflowed")
+                        }),
+                );
             }
             let protobuf_schema_id = schema
                 .filter(|schema| schema.header.encoding == "protobuf")
@@ -1237,9 +2503,15 @@ impl<'borrow, 'definitions, 'input, 'source, 'wire>
             } else {
                 false
             };
+            let recognized_by_semantic = channel.message_encoding.eq_ignore_ascii_case("cdr")
+                && schema.is_some_and(|schema| {
+                    schema.header.encoding == ROS2_SCHEMA_ENCODING
+                        && crate::decoders::supports_builtin_semantic_schema(&schema.header.name)
+                });
             return Ok(Some(RemoteRos2ChannelRecognitionV1 {
                 owner: self,
                 channel_record_index: record_index,
+                recognized_by_semantic,
                 recognized_by_reflection,
                 protobuf_schema_id,
             }));
@@ -1265,6 +2537,94 @@ pub(crate) struct RemoteRos2ProjectionEofAuthorityV1<'definitions, 'input, 'sour
 impl<'definitions, 'input, 'source, 'wire>
     RemoteRos2ProjectionEofAuthorityV1<'definitions, 'input, 'source, 'wire>
 {
+    pub(crate) fn ensure_current_for_assignment_v1(
+        &self,
+    ) -> Result<(), RemoteRos2InitializationError> {
+        self.transition.ensure_current()
+    }
+
+    pub(crate) fn retained_bytes_for_assignment_v1(
+        &self,
+    ) -> Result<u64, RemoteRos2InitializationError> {
+        self.transition.ensure_current()?;
+        Ok(self
+            .transition
+            .payload
+            .initialized
+            .reservation
+            .retained_bytes)
+    }
+
+    pub(crate) fn policy_descriptor_for_assignment_v1(
+        &self,
+    ) -> Result<FrozenRemoteDecoderPolicyDescriptorViewV1<'_, 'wire>, RemoteRos2InitializationError>
+    {
+        self.transition.ensure_current()?;
+        Ok(self.transition.policy_descriptor_v1())
+    }
+
+    pub(crate) fn selected_count_for_assignment_v1(
+        &self,
+    ) -> Result<usize, RemoteRos2InitializationError> {
+        self.transition.ensure_current()?;
+        let initialized = &self.transition.payload.initialized;
+        initialized
+            .source
+            .semantic_config
+            .ensure_bound_v1(initialized.policy.wire)?;
+        Ok(initialized.source.semantic_config.selected_count_v1())
+    }
+
+    pub(crate) fn canonical_channel_count_for_assignment_v1(
+        &self,
+    ) -> Result<u64, RemoteRos2InitializationError> {
+        self.transition.ensure_current()?;
+        let initialized = &self.transition.payload.initialized;
+        initialized
+            .source
+            .semantic_config
+            .ensure_bound_v1(initialized.policy.wire)?;
+        Ok(initialized
+            .source
+            .semantic_config
+            .state
+            .canonical_channel_count)
+    }
+
+    pub(crate) fn project_selected_membership_for_assignment_v1(
+        &self,
+    ) -> Result<RemoteMcapSelectedMembershipV1, RemoteRos2InitializationError> {
+        self.transition.ensure_current()?;
+        let initialized = &self.transition.payload.initialized;
+        initialized
+            .source
+            .semantic_config
+            .ensure_bound_v1(initialized.policy.wire)?;
+        #[cfg(test)]
+        initialized
+            .source
+            .semantic_config
+            .source
+            .assignment_membership_projection_count
+            .set(
+                initialized
+                    .source
+                    .semantic_config
+                    .source
+                    .assignment_membership_projection_count
+                    .get()
+                    .checked_add(1)
+                    .unwrap_or_else(|| {
+                        remote_ros2_fatal_invariant(
+                            "assignment membership projection count overflowed",
+                        )
+                    }),
+            );
+        let membership = initialized.source.semantic_config.project_membership_v1();
+        membership.ensure_matches_config_v1(&initialized.source.semantic_config);
+        Ok(membership)
+    }
+
     pub(crate) fn ensure_protobuf_profile_current_v1(
         &self,
         viewer_scope: *const RemoteViewerScopeState,
@@ -3437,6 +4797,7 @@ fn measure_remote_ros2_recognition_steps_v1(
         steps.consume_bytes(channel.message_encoding.len())?;
         if let Some(schema) = schema {
             steps.consume_bytes(schema.header.encoding.len())?;
+            steps.consume_bytes(schema.header.name.len())?;
         }
         if channel.message_encoding.eq_ignore_ascii_case("cdr") && schema.is_some() {
             steps.consume_bytes(ros2_schema_count)?;
@@ -3979,6 +5340,16 @@ fn materialize_remote_ros2_definitions_v1_with_gate<'definitions, 'input, 'sourc
 #[unsafe(no_mangle)]
 pub(crate) extern "C" fn rerun_remote_ros2_initializer_artifact_probe_v1_impl() -> u32 {
     let definitions = ValidatedSummaryDefinitions::for_remote_ros2_artifact_probe();
+    let artifact_binding = match PhysicalChunkSourceBindingV1::new_unscanned_for_artifact_probe_v1()
+    {
+        Ok(binding) => binding,
+        Err(_error) => return 20,
+    };
+    let physical =
+        PhysicalChunkDefinitionsCapabilityV1::new_unscanned_for_artifact_probe_with_binding_v1(
+            &definitions,
+            artifact_binding.clone(),
+        );
     let viewer_scope = RemoteViewerScopeState {
         _sealed_identity: 1,
     };
@@ -3987,11 +5358,20 @@ pub(crate) extern "C" fn rerun_remote_ros2_initializer_artifact_probe_v1_impl() 
     };
     let protobuf_profile_scope =
         crate::remote_protobuf_projection_boundary::RemoteProtobufProfileScopeV1::new_disarmed_v1();
-    let source_state = RemoteDefinitionsSourceState {
+    let source_state = Box::new(RemoteDefinitionsSourceState {
         generation: Cell::new(1),
         viewer_scope: &viewer_scope,
         protobuf_profile_scope: &protobuf_profile_scope,
-    };
+        physical_source: artifact_binding,
+        semantic_topic_filter: RefCell::new(Some(TopicFilter::default())),
+        semantic_time_type: RemoteMcapTimeType::TimestampNs,
+        semantic_consistency: RemoteMcapConsistencyPolicyV1::RequireStrongValidator,
+        semantic_config: OnceCell::new(),
+        #[cfg(test)]
+        assignment_recognition_count: Cell::new(0),
+        #[cfg(test)]
+        assignment_membership_projection_count: Cell::new(0),
+    });
     let wire = RemoteDecoderPolicyWireV1 {
         allowlist_version: REMOTE_ALLOWLIST_VERSION_V1,
         assignment_version: REMOTE_POLICY_VERSION_V1,
@@ -4015,6 +5395,7 @@ pub(crate) extern "C" fn rerun_remote_ros2_initializer_artifact_probe_v1_impl() 
         max_array_bound: 32,
         max_dependency_edges: 1,
         max_dependency_depth: 1,
+        max_semantic_config_steps: 4_096,
         max_signature_steps: 4_096,
         max_projection_steps: 4_096,
         max_recognition_steps: 4_096,
@@ -4028,7 +5409,7 @@ pub(crate) extern "C" fn rerun_remote_ros2_initializer_artifact_probe_v1_impl() 
         capacity: RemoteRos2BudgetCapacity {
             max_active_initializers: 1,
             max_working_bytes: u64::MAX,
-            max_retained_results: 1,
+            max_retained_results: 2,
             max_retained_bytes: u64::MAX,
         },
         usage: Mutex::new(RemoteRos2BudgetUsage::default()),
@@ -4036,7 +5417,9 @@ pub(crate) extern "C" fn rerun_remote_ros2_initializer_artifact_probe_v1_impl() 
         generation: 1,
         viewer_scope_identity: std::ptr::from_ref(&viewer_scope).addr(),
         profile_scope_identity: std::ptr::from_ref(&profile_scope).addr(),
-        policy_wire_identity: std::ptr::from_ref(&wire).addr(),
+        policy: freeze_remote_decoder_policy_v1(&wire)
+            .unwrap_or_else(|_error| remote_ros2_fatal_invariant("artifact policy is canonical"))
+            .value_v1(),
     });
     let budget = RemoteRos2InitializationBudget {
         state: budget_state,
@@ -4051,10 +5434,14 @@ pub(crate) extern "C" fn rerun_remote_ros2_initializer_artifact_probe_v1_impl() 
         Err(_error) => return 2,
     };
     let owner = match begin_remote_ros2_admission_v1(
-        RemoteDefinitionsCapability {
-            definitions: &definitions,
-            source: &source_state,
-            generation: 1,
+        match RemoteDefinitionsCapability::new_for_artifact_probe_v1(
+            &physical,
+            &source_state,
+            &policy,
+            &budget,
+        ) {
+            Ok(source) => source,
+            Err(_error) => return 2,
         },
         policy,
         &budget,
@@ -4102,7 +5489,10 @@ pub(crate) extern "C" fn rerun_remote_ros2_initializer_artifact_probe_v1_impl() 
     }
     drop(projection);
     drop(transition);
-    if *budget.state.usage.lock() != RemoteRos2BudgetUsage::default() {
+    let budget_state = Arc::clone(&budget.state);
+    drop(budget);
+    drop(source_state);
+    if *budget_state.usage.lock() != RemoteRos2BudgetUsage::default() {
         return 3;
     }
     0
@@ -4113,6 +5503,16 @@ pub(crate) extern "C" fn rerun_remote_ros2_initializer_artifact_probe_v1_impl() 
 #[unsafe(no_mangle)]
 pub(crate) extern "C" fn rerun_remote_protobuf_initializer_artifact_probe_v1_impl() -> u32 {
     let definitions = ValidatedSummaryDefinitions::for_remote_ros2_artifact_probe();
+    let artifact_binding = match PhysicalChunkSourceBindingV1::new_unscanned_for_artifact_probe_v1()
+    {
+        Ok(binding) => binding,
+        Err(_error) => return 20,
+    };
+    let physical =
+        PhysicalChunkDefinitionsCapabilityV1::new_unscanned_for_artifact_probe_with_binding_v1(
+            &definitions,
+            artifact_binding.clone(),
+        );
     let viewer_scope = RemoteViewerScopeState {
         _sealed_identity: 1,
     };
@@ -4121,11 +5521,20 @@ pub(crate) extern "C" fn rerun_remote_protobuf_initializer_artifact_probe_v1_imp
     };
     let protobuf_profile_scope =
         crate::remote_protobuf_projection_boundary::RemoteProtobufProfileScopeV1::new_disarmed_v1();
-    let source_state = RemoteDefinitionsSourceState {
+    let source_state = Box::new(RemoteDefinitionsSourceState {
         generation: Cell::new(1),
         viewer_scope: &viewer_scope,
         protobuf_profile_scope: &protobuf_profile_scope,
-    };
+        physical_source: artifact_binding,
+        semantic_topic_filter: RefCell::new(Some(TopicFilter::default())),
+        semantic_time_type: RemoteMcapTimeType::TimestampNs,
+        semantic_consistency: RemoteMcapConsistencyPolicyV1::RequireStrongValidator,
+        semantic_config: OnceCell::new(),
+        #[cfg(test)]
+        assignment_recognition_count: Cell::new(0),
+        #[cfg(test)]
+        assignment_membership_projection_count: Cell::new(0),
+    });
     let wire = RemoteDecoderPolicyWireV1 {
         allowlist_version: REMOTE_ALLOWLIST_VERSION_V1,
         assignment_version: REMOTE_POLICY_VERSION_V1,
@@ -4149,6 +5558,7 @@ pub(crate) extern "C" fn rerun_remote_protobuf_initializer_artifact_probe_v1_imp
         max_array_bound: 32,
         max_dependency_edges: 1,
         max_dependency_depth: 1,
+        max_semantic_config_steps: 4_096,
         max_signature_steps: 4_096,
         max_projection_steps: 4_096,
         max_recognition_steps: 4_096,
@@ -4162,7 +5572,7 @@ pub(crate) extern "C" fn rerun_remote_protobuf_initializer_artifact_probe_v1_imp
         capacity: RemoteRos2BudgetCapacity {
             max_active_initializers: 1,
             max_working_bytes: u64::MAX,
-            max_retained_results: 1,
+            max_retained_results: 2,
             max_retained_bytes: u64::MAX,
         },
         usage: Mutex::new(RemoteRos2BudgetUsage::default()),
@@ -4170,7 +5580,9 @@ pub(crate) extern "C" fn rerun_remote_protobuf_initializer_artifact_probe_v1_imp
         generation: 1,
         viewer_scope_identity: std::ptr::from_ref(&viewer_scope).addr(),
         profile_scope_identity: std::ptr::from_ref(&ros_profile_scope).addr(),
-        policy_wire_identity: std::ptr::from_ref(&wire).addr(),
+        policy: freeze_remote_decoder_policy_v1(&wire)
+            .unwrap_or_else(|_error| remote_ros2_fatal_invariant("artifact policy is canonical"))
+            .value_v1(),
     });
     let budget = RemoteRos2InitializationBudget {
         state: budget_state,
@@ -4185,10 +5597,14 @@ pub(crate) extern "C" fn rerun_remote_protobuf_initializer_artifact_probe_v1_imp
         Err(_error) => return 11,
     };
     let owner = match begin_remote_ros2_admission_v1(
-        RemoteDefinitionsCapability {
-            definitions: &definitions,
-            source: &source_state,
-            generation: 1,
+        match RemoteDefinitionsCapability::new_for_artifact_probe_v1(
+            &physical,
+            &source_state,
+            &policy,
+            &budget,
+        ) {
+            Ok(source) => source,
+            Err(_error) => return 11,
         },
         policy,
         &budget,
@@ -4212,15 +5628,26 @@ pub(crate) extern "C" fn rerun_remote_protobuf_initializer_artifact_probe_v1_imp
         Ok(transition) => transition,
         Err(_error) => return 16,
     };
-    crate::remote_protobuf_descriptor::run_remote_protobuf_artifact_probe_v1(
+    let status = crate::remote_protobuf_descriptor::run_remote_protobuf_artifact_probe_v1(
         transition,
         &viewer_scope,
         &protobuf_profile_scope,
-    )
+    );
+    if status != 0 {
+        return status;
+    }
+    let budget_state = Arc::clone(&budget.state);
+    drop(budget);
+    drop(source_state);
+    if *budget_state.usage.lock() != RemoteRos2BudgetUsage::default() {
+        return 17;
+    }
+    0
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::remote_chunk_scan::PhysicalChunkAssignmentEvidenceHarnessV1;
     use crate::remote_summary::tests::AllocationGuard;
     use crate::remote_summary::validated_summary_definitions_for_test;
     use crate::testing::{
@@ -4326,6 +5753,7 @@ mod tests {
             max_array_bound: 1_000_000,
             max_dependency_edges: 4_096,
             max_dependency_depth: 32,
+            max_semantic_config_steps: 1_000_000,
             max_signature_steps: 1_000_000,
             max_projection_steps: 1_000_000,
             max_recognition_steps: 1_000_000,
@@ -4355,7 +5783,9 @@ mod tests {
                 generation: source.generation.get(),
                 viewer_scope_identity: source.viewer_scope.addr(),
                 profile_scope_identity: std::ptr::from_ref(&PROFILE_SCOPE).addr(),
-                policy_wire_identity: std::ptr::from_ref(policy_wire).addr(),
+                policy: freeze_remote_decoder_policy_v1(policy_wire)
+                    .expect("test policy is canonical")
+                    .value_v1(),
             }),
             source,
             generation: source.generation.get(),
@@ -4387,11 +5817,118 @@ mod tests {
     }
 
     fn source_state() -> RemoteDefinitionsSourceState {
+        source_state_with_filter(TopicFilter::default())
+    }
+
+    fn source_state_with_filter(
+        semantic_topic_filter: TopicFilter,
+    ) -> RemoteDefinitionsSourceState {
         RemoteDefinitionsSourceState {
             generation: Cell::new(1),
             viewer_scope: &VIEWER_SCOPE,
             protobuf_profile_scope: std::ptr::null(),
+            physical_source: PhysicalChunkSourceBindingV1::new_unscanned_for_assignment_test_v1(),
+            semantic_topic_filter: RefCell::new(Some(semantic_topic_filter)),
+            semantic_time_type: RemoteMcapTimeType::TimestampNs,
+            semantic_consistency: RemoteMcapConsistencyPolicyV1::RequireStrongValidator,
+            semantic_config: OnceCell::new(),
+            assignment_recognition_count: Cell::new(0),
+            assignment_membership_projection_count: Cell::new(0),
+            semantic_match_count: Cell::new(0),
+            semantic_selection_count: Cell::new(0),
         }
+    }
+
+    fn physical_for_state<'definitions, 'input>(
+        definitions: &'definitions ValidatedSummaryDefinitions<'input>,
+        state: &RemoteDefinitionsSourceState,
+    ) -> PhysicalChunkDefinitionsCapabilityV1<'definitions, 'input> {
+        PhysicalChunkDefinitionsCapabilityV1::new_unscanned_for_test_with_binding_v1(
+            definitions,
+            state.physical_source.clone(),
+        )
+    }
+
+    #[test]
+    fn artifact_probe_shared_binding_accepts_one_authority() {
+        let fixture = fixture(
+            [],
+            [
+                FixtureChannel::schema_less(1, "/a"),
+                FixtureChannel::schema_less(2, "/b"),
+            ],
+        );
+        let definitions = validated_summary_definitions_for_test(&fixture);
+        let binding = PhysicalChunkSourceBindingV1::new_unscanned_for_assignment_test_v1();
+        let physical =
+            PhysicalChunkDefinitionsCapabilityV1::new_unscanned_for_artifact_probe_with_binding_v1(
+                &definitions,
+                binding.clone(),
+            );
+        let state = RemoteDefinitionsSourceState {
+            generation: Cell::new(1),
+            viewer_scope: &VIEWER_SCOPE,
+            protobuf_profile_scope: std::ptr::null(),
+            physical_source: binding,
+            semantic_topic_filter: RefCell::new(Some(TopicFilter::default())),
+            semantic_time_type: RemoteMcapTimeType::TimestampNs,
+            semantic_consistency: RemoteMcapConsistencyPolicyV1::RequireStrongValidator,
+            semantic_config: OnceCell::new(),
+            assignment_recognition_count: Cell::new(0),
+            assignment_membership_projection_count: Cell::new(0),
+            semantic_match_count: Cell::new(0),
+            semantic_selection_count: Cell::new(0),
+        };
+        let wire = canonical_policy_wire();
+        let policy = freeze_remote_decoder_policy_v1(&wire).unwrap();
+        let budget = budget(&state, &wire, generous_limits());
+        let source = RemoteDefinitionsCapability::new_for_protobuf_test_v1(
+            &physical, &state, &policy, &budget,
+        )
+        .unwrap();
+        let owner = begin_remote_ros2_admission_v1(source, policy, &budget).unwrap();
+        drop(owner);
+    }
+
+    #[test]
+    fn artifact_probe_mismatched_binding_trips_fatal_control_plane() {
+        let fixture = fixture(
+            [],
+            [
+                FixtureChannel::schema_less(1, "/a"),
+                FixtureChannel::schema_less(2, "/b"),
+            ],
+        );
+        let definitions = validated_summary_definitions_for_test(&fixture);
+        let physical_binding = PhysicalChunkSourceBindingV1::new_unscanned_for_assignment_test_v1();
+        let source_binding = PhysicalChunkSourceBindingV1::new_unscanned_for_assignment_test_v1();
+        let physical = PhysicalChunkDefinitionsCapabilityV1::new_unscanned_for_test_with_binding_v1(
+            &definitions,
+            physical_binding,
+        );
+        let source = RemoteDefinitionsSourceState {
+            generation: Cell::new(1),
+            viewer_scope: &VIEWER_SCOPE,
+            protobuf_profile_scope: std::ptr::null(),
+            physical_source: source_binding,
+            semantic_topic_filter: RefCell::new(Some(TopicFilter::default())),
+            semantic_time_type: RemoteMcapTimeType::TimestampNs,
+            semantic_consistency: RemoteMcapConsistencyPolicyV1::RequireStrongValidator,
+            semantic_config: OnceCell::new(),
+            assignment_recognition_count: Cell::new(0),
+            assignment_membership_projection_count: Cell::new(0),
+            semantic_match_count: Cell::new(0),
+            semantic_selection_count: Cell::new(0),
+        };
+        let wire = canonical_policy_wire();
+        let policy = freeze_remote_decoder_policy_v1(&wire).unwrap();
+        let budget = budget(&source, &wire, generous_limits());
+        assert_fatal_control_plane(|| {
+            let _ = RemoteDefinitionsCapability::new_for_protobuf_test_v1(
+                &physical, &source, &policy, &budget,
+            )
+            .unwrap();
+        });
     }
 
     #[expect(
@@ -4402,6 +5939,308 @@ mod tests {
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)).is_err(),
             "control-plane invariant must use the internal fatal path"
+        );
+    }
+
+    #[test]
+    fn semantic_config_reuse_requires_exact_canonical_topic_filter_bytes() {
+        let fixture = fixture(
+            [],
+            [
+                FixtureChannel::schema_less(1, "/a"),
+                FixtureChannel::schema_less(2, "/b"),
+            ],
+        );
+        let definitions = validated_summary_definitions_for_test(&fixture);
+        let exact_a = TopicFilter::default()
+            .with_include_patterns(&["^/a$".to_owned()])
+            .unwrap();
+        let same_selection_different_bytes = TopicFilter::default()
+            .with_include_patterns(&["^/a(?:)$".to_owned()])
+            .unwrap();
+        let different_selection = TopicFilter::default()
+            .with_include_patterns(&["^/b$".to_owned()])
+            .unwrap();
+        let exact_a_again = TopicFilter::default()
+            .with_include_patterns(&["^/a$".to_owned()])
+            .unwrap();
+        let mut state = source_state_with_filter(exact_a);
+        let wire = canonical_policy_wire();
+        let budget = budget(&state, &wire, generous_limits());
+        let policy = freeze_remote_decoder_policy_v1(&wire).unwrap();
+        let physical = physical_for_state(&definitions, &state);
+
+        {
+            let _capability = RemoteDefinitionsCapability::new_for_protobuf_test_v1(
+                &physical, &state, &policy, &budget,
+            )
+            .unwrap();
+        }
+        assert!(
+            RemoteDefinitionsCapability::new_for_semantic_config_conflict_test_v1(
+                &physical,
+                &state,
+                &policy,
+                &budget,
+                &exact_a_again,
+            )
+            .is_ok(),
+            "an exact canonical filter may reuse the same source config",
+        );
+        assert_eq!(
+            RemoteDefinitionsCapability::new_for_semantic_config_conflict_test_v1(
+                &physical,
+                &state,
+                &policy,
+                &budget,
+                &same_selection_different_bytes,
+            )
+            .err(),
+            Some(RemoteRos2InitializationError::UnsupportedForRemote(
+                UnsupportedForRemote::TopicFilterExpression,
+            )),
+            "complex regex is unsupported for remote",
+        );
+        assert_eq!(
+            RemoteDefinitionsCapability::new_for_semantic_config_conflict_test_v1(
+                &physical,
+                &state,
+                &policy,
+                &budget,
+                &different_selection,
+            )
+            .err(),
+            Some(RemoteRos2InitializationError::SemanticConfigConflict),
+        );
+
+        let budget_state = Arc::clone(&budget.state);
+        drop(budget);
+        state.semantic_time_type = RemoteMcapTimeType::DurationNs;
+        let changed_time_budget = RemoteRos2InitializationBudget {
+            state: Arc::clone(&budget_state),
+            source: &state,
+            generation: state.generation.get(),
+            viewer_scope: &VIEWER_SCOPE,
+            profile_scope: &PROFILE_SCOPE,
+            policy_wire: &wire,
+        };
+        assert_eq!(
+            RemoteDefinitionsCapability::new_for_semantic_config_conflict_test_v1(
+                &physical,
+                &state,
+                &policy,
+                &changed_time_budget,
+                &exact_a_again,
+            )
+            .err(),
+            Some(RemoteRos2InitializationError::SemanticConfigConflict),
+        );
+        drop(changed_time_budget);
+        state.semantic_time_type = RemoteMcapTimeType::TimestampNs;
+        state.semantic_consistency = RemoteMcapConsistencyPolicyV1::AllowDeploymentAssumed;
+        let changed_consistency_budget = RemoteRos2InitializationBudget {
+            state: budget_state,
+            source: &state,
+            generation: state.generation.get(),
+            viewer_scope: &VIEWER_SCOPE,
+            profile_scope: &PROFILE_SCOPE,
+            policy_wire: &wire,
+        };
+        assert_eq!(
+            RemoteDefinitionsCapability::new_for_semantic_config_conflict_test_v1(
+                &physical,
+                &state,
+                &policy,
+                &changed_consistency_budget,
+                &exact_a_again,
+            )
+            .err(),
+            Some(RemoteRos2InitializationError::SemanticConfigConflict),
+        );
+    }
+
+    #[test]
+    fn semantic_config_topic_filter_pattern_and_byte_caps_are_exact() {
+        let exact_pattern_count = vec![String::new(); MAX_REMOTE_TOPIC_FILTER_PATTERNS_V1];
+        let exact_pattern_filter = TopicFilter::default()
+            .with_include_patterns(&exact_pattern_count)
+            .unwrap();
+        assert!(canonical_remote_topic_filter_v1(&exact_pattern_filter).is_ok());
+
+        let one_too_many_patterns = vec![String::new(); MAX_REMOTE_TOPIC_FILTER_PATTERNS_V1 + 1];
+        let one_too_many_patterns_filter = TopicFilter::default()
+            .with_include_patterns(&one_too_many_patterns)
+            .unwrap();
+        assert_eq!(
+            canonical_remote_topic_filter_v1(&one_too_many_patterns_filter).err(),
+            Some(RemoteRos2InitializationError::ResourceLimitExceeded(
+                RemoteRos2ResourceLimit::SemanticConfigPatterns,
+            )),
+        );
+
+        // RTF1 + two counts + 255 length prefixes retain 1,032 bytes before pattern data.
+        let mut exact_bytes_patterns = vec!["a".repeat(12); 254];
+        exact_bytes_patterns.push("b".repeat(16));
+        let exact_bytes_filter = TopicFilter::default()
+            .with_include_patterns(&exact_bytes_patterns)
+            .unwrap();
+        let (_bytes, exact_len, _steps) =
+            canonical_remote_topic_filter_v1(&exact_bytes_filter).unwrap();
+        assert_eq!(exact_len, MAX_REMOTE_TOPIC_FILTER_BYTES_V1);
+
+        *exact_bytes_patterns.last_mut().unwrap() = "b".repeat(17);
+        let one_too_many_bytes_filter = TopicFilter::default()
+            .with_include_patterns(&exact_bytes_patterns)
+            .unwrap();
+        assert_eq!(
+            canonical_remote_topic_filter_v1(&one_too_many_bytes_filter).err(),
+            Some(RemoteRos2InitializationError::ResourceLimitExceeded(
+                RemoteRos2ResourceLimit::SemanticConfigFilterBytes,
+            )),
+        );
+    }
+
+    #[test]
+    fn semantic_config_reservation_precedes_work_and_lives_until_source_teardown() {
+        let fixture = fixture([], [FixtureChannel::schema_less(1, "/selected")]);
+        let definitions = validated_summary_definitions_for_test(&fixture);
+        let retained_bytes = remote_semantic_config_retained_bytes_v1();
+
+        let low_cap_source = source_state();
+        let low_cap_wire = canonical_policy_wire();
+        let mut low_cap_limits = generous_limits();
+        low_cap_limits.max_retained_bytes = retained_bytes - 1;
+        let low_cap_budget = budget(&low_cap_source, &low_cap_wire, low_cap_limits);
+        assert_eq!(
+            prepare(
+                &definitions,
+                &low_cap_source,
+                &low_cap_wire,
+                &low_cap_budget,
+            )
+            .err(),
+            Some(RemoteRos2InitializationError::ResourceLimitExceeded(
+                RemoteRos2ResourceLimit::RetainedBytes,
+            )),
+        );
+        assert_eq!(low_cap_source.semantic_match_count.get(), 0);
+        assert_eq!(low_cap_source.semantic_selection_count.get(), 0);
+        assert!(low_cap_source.semantic_config.get().is_none());
+        assert_eq!(
+            *low_cap_budget.state.usage.lock(),
+            RemoteRos2BudgetUsage::default(),
+        );
+
+        let contention_source = source_state();
+        let contention_wire = canonical_policy_wire();
+        let mut contention_budget = budget(&contention_source, &contention_wire, generous_limits());
+        Arc::get_mut(&mut contention_budget.state)
+            .unwrap()
+            .capacity
+            .max_retained_results = 0;
+        assert_eq!(
+            prepare(
+                &definitions,
+                &contention_source,
+                &contention_wire,
+                &contention_budget,
+            )
+            .err(),
+            Some(RemoteRos2InitializationError::ResourceLimitExceeded(
+                RemoteRos2ResourceLimit::ReservationCapacity,
+            )),
+        );
+        assert_eq!(contention_source.semantic_match_count.get(), 0);
+        assert_eq!(contention_source.semantic_selection_count.get(), 0);
+        assert!(contention_source.semantic_config.get().is_none());
+        assert_eq!(
+            *contention_budget.state.usage.lock(),
+            RemoteRos2BudgetUsage::default(),
+        );
+
+        let source = Box::new(source_state());
+        let wire = canonical_policy_wire();
+        let budget = budget(&source, &wire, generous_limits());
+        let prepared = prepare(&definitions, &source, &wire, &budget).unwrap();
+        drop(prepared);
+        assert!(source.semantic_topic_filter.borrow().is_none());
+        assert_eq!(budget.state.usage.lock().retained_results, 1);
+        assert_eq!(budget.state.usage.lock().retained_bytes, retained_bytes);
+        let budget_state = Arc::clone(&budget.state);
+        drop(budget);
+        drop(source);
+        assert_eq!(budget_state.usage.lock().retained_results, 0);
+        assert_eq!(budget_state.usage.lock().retained_bytes, 0);
+    }
+
+    #[test]
+    fn semantic_config_rejects_cross_file_definitions_and_uses_policy_values_not_addresses() {
+        let fixture_a = fixture([], [FixtureChannel::schema_less(1, "/a")]);
+        let fixture_b = fixture(
+            [schema(7, "pkg.Other", "protobuf", [0x0a, 0x00])],
+            [channel(1, 7, "/b", "protobuf")],
+        );
+        let physical_a = PhysicalChunkAssignmentEvidenceHarnessV1::new(&fixture_a, 0).unwrap();
+        let physical_b = PhysicalChunkAssignmentEvidenceHarnessV1::new(&fixture_b, 0).unwrap();
+        let definitions_a = physical_a.definitions_capability_v1();
+        let definitions_b = physical_b.definitions_capability_v1();
+        let source = source_state();
+        let wire_a = canonical_policy_wire();
+        let budget_a = budget(&source, &wire_a, generous_limits());
+        let policy_a = freeze_remote_decoder_policy_v1(&wire_a).unwrap();
+        let capability_a = RemoteDefinitionsCapability::new_for_protobuf_test_v1(
+            &definitions_a,
+            &source,
+            &policy_a,
+            &budget_a,
+        )
+        .unwrap();
+        drop(begin_remote_ros2_admission_v1(
+            capability_a,
+            policy_a,
+            &budget_a,
+        ));
+
+        let same_value_different_address = canonical_policy_wire();
+        let same_value_budget = RemoteRos2InitializationBudget {
+            state: Arc::clone(&budget_a.state),
+            source: &source,
+            generation: source.generation.get(),
+            viewer_scope: &VIEWER_SCOPE,
+            profile_scope: &PROFILE_SCOPE,
+            policy_wire: &same_value_different_address,
+        };
+        let same_value_policy =
+            freeze_remote_decoder_policy_v1(&same_value_different_address).unwrap();
+        let same_value_capability = RemoteDefinitionsCapability::new_for_protobuf_test_v1(
+            &definitions_a,
+            &source,
+            &same_value_policy,
+            &same_value_budget,
+        )
+        .unwrap();
+        drop(begin_remote_ros2_admission_v1(
+            same_value_capability,
+            same_value_policy,
+            &same_value_budget,
+        ));
+
+        assert_fatal_control_plane(|| {
+            let same_value_policy =
+                freeze_remote_decoder_policy_v1(&same_value_different_address).unwrap();
+            let _cross_file = RemoteDefinitionsCapability::new_for_protobuf_test_v1(
+                &definitions_b,
+                &source,
+                &same_value_policy,
+                &same_value_budget,
+            );
+        });
+        assert_eq!(
+            freeze_remote_decoder_policy_v1(
+                &RemoteDecoderPolicyWireV1::unknown_version_for_assignment_test_v1(),
+            )
+            .err(),
+            Some(RemoteDecoderPolicyError::UnknownVersion),
         );
     }
 
@@ -4602,16 +6441,27 @@ mod tests {
         RemoteDecoderTopicSignatureEvidenceV1<'definitions, 'input, 'source, 'wire>,
         RemoteRos2InitializationError,
     > {
+        let physical = PhysicalChunkDefinitionsCapabilityV1::new_unscanned_for_test_with_binding_v1(
+            definitions,
+            state.physical_source.clone(),
+        );
+        preflight_with_physical(&physical, state, wire, budget)
+    }
+
+    fn preflight_with_physical<'definitions, 'input, 'source, 'wire>(
+        physical: &PhysicalChunkDefinitionsCapabilityV1<'definitions, 'input>,
+        state: &'source RemoteDefinitionsSourceState,
+        wire: &'wire RemoteDecoderPolicyWireV1<'wire>,
+        budget: &RemoteRos2InitializationBudget<'source, 'wire>,
+    ) -> Result<
+        RemoteDecoderTopicSignatureEvidenceV1<'definitions, 'input, 'source, 'wire>,
+        RemoteRos2InitializationError,
+    > {
         let policy = freeze_remote_decoder_policy_v1(wire).expect("test policy is canonical");
-        let owner = begin_remote_ros2_admission_v1(
-            RemoteDefinitionsCapability {
-                definitions,
-                source: state,
-                generation: 1,
-            },
-            policy,
-            budget,
+        let source = RemoteDefinitionsCapability::new_for_protobuf_test_v1(
+            physical, state, &policy, budget,
         )?;
+        let owner = begin_remote_ros2_admission_v1(source, policy, budget)?;
         preflight_remote_decoder_topic_signatures_v1(owner)
     }
 
@@ -4625,6 +6475,18 @@ mod tests {
         RemoteRos2InitializationError,
     > {
         prepare_remote_ros2_census_v1(preflight(definitions, state, wire, budget)?)
+    }
+
+    fn prepare_with_physical<'definitions, 'input, 'source, 'wire>(
+        physical: &PhysicalChunkDefinitionsCapabilityV1<'definitions, 'input>,
+        state: &'source RemoteDefinitionsSourceState,
+        wire: &'wire RemoteDecoderPolicyWireV1<'wire>,
+        budget: &RemoteRos2InitializationBudget<'source, 'wire>,
+    ) -> Result<
+        PreparedRemoteRos2CensusV1<'definitions, 'input, 'source, 'wire>,
+        RemoteRos2InitializationError,
+    > {
+        prepare_remote_ros2_census_v1(preflight_with_physical(physical, state, wire, budget)?)
     }
 
     #[test]
@@ -4655,12 +6517,19 @@ mod tests {
             RemoteRos2BudgetUsage {
                 active_initializers: 1,
                 working_bytes: prepared.census.working_bytes,
-                retained_results: 1,
-                retained_bytes: prepared.census.retained_bytes,
+                retained_results: 2,
+                retained_bytes: checked_add(
+                    prepared.census.retained_bytes,
+                    remote_semantic_config_retained_bytes_v1(),
+                )
+                .unwrap(),
             }
         );
         drop(prepared);
-        assert_eq!(*budget.state.usage.lock(), RemoteRos2BudgetUsage::default());
+        assert_eq!(
+            *budget.state.usage.lock(),
+            state.semantic_config_budget_usage_for_test_v1()
+        );
     }
 
     #[test]
@@ -4675,34 +6544,56 @@ mod tests {
             [channel(1, 7, "/root", "cdr")],
         );
         let invalid_definitions = validated_summary_definitions_for_test(&invalid_fixture);
-        let state = source_state();
+        let measuring_state = source_state();
         let wire = canonical_policy_wire();
-        let measuring_budget = budget(&state, &wire, generous_limits());
-        let measured = prepare(&valid_definitions, &state, &wire, &measuring_budget).unwrap();
+        let measuring_budget = budget(&measuring_state, &wire, generous_limits());
+        let measured = prepare(
+            &valid_definitions,
+            &measuring_state,
+            &wire,
+            &measuring_budget,
+        )
+        .unwrap();
         let exact_working = measured.census.working_bytes;
         let exact_retained = measured.census.retained_bytes;
         assert!(exact_working < measuring_budget.state.limits.max_working_bytes);
         assert!(exact_retained < measuring_budget.state.limits.max_retained_bytes);
         drop(measured);
 
+        let state = source_state();
+        let physical = physical_for_state(&valid_definitions, &state);
         let mut constrained = budget(&state, &wire, generous_limits());
         let state_mut = Arc::get_mut(&mut constrained.state).unwrap();
         state_mut.capacity = RemoteRos2BudgetCapacity {
             max_active_initializers: 2,
             max_working_bytes: exact_working * 2,
-            max_retained_results: 2,
-            max_retained_bytes: exact_retained * 2,
+            max_retained_results: 3,
+            max_retained_bytes: checked_add(
+                exact_retained * 2,
+                remote_semantic_config_retained_bytes_v1(),
+            )
+            .unwrap(),
         };
-        let first = prepare(&valid_definitions, &state, &wire, &constrained).unwrap();
-        let before_invalid = *constrained.state.usage.lock();
+        let first = prepare_with_physical(&physical, &state, &wire, &constrained).unwrap();
+        let invalid_state = source_state();
+        let invalid_wire = canonical_policy_wire();
+        let invalid_budget = budget(&invalid_state, &invalid_wire, generous_limits());
         assert!(matches!(
-            prepare(&invalid_definitions, &state, &wire, &constrained),
+            prepare(
+                &invalid_definitions,
+                &invalid_state,
+                &invalid_wire,
+                &invalid_budget,
+            ),
             Err(RemoteRos2InitializationError::UnsupportedForRemote(
                 UnsupportedForRemote::Ros2Wstring
             ))
         ));
-        assert_eq!(*constrained.state.usage.lock(), before_invalid);
-        let second = prepare(&valid_definitions, &state, &wire, &constrained).unwrap();
+        assert_eq!(
+            *invalid_budget.state.usage.lock(),
+            invalid_state.semantic_config_budget_usage_for_test_v1()
+        );
+        let second = prepare_with_physical(&physical, &state, &wire, &constrained).unwrap();
         assert_eq!(
             constrained.state.usage.lock().active_initializers,
             2,
@@ -4711,7 +6602,7 @@ mod tests {
         drop((first, second));
         assert_eq!(
             *constrained.state.usage.lock(),
-            RemoteRos2BudgetUsage::default()
+            state.semantic_config_budget_usage_for_test_v1()
         );
     }
 
@@ -4748,7 +6639,10 @@ mod tests {
                 prepare(&definitions, &state, &wire, &budget).err(),
                 Some(expected)
             );
-            assert_eq!(*budget.state.usage.lock(), RemoteRos2BudgetUsage::default());
+            assert_eq!(
+                *budget.state.usage.lock(),
+                state.semantic_config_budget_usage_for_test_v1()
+            );
         }
 
         let fixture = fixture(
@@ -4767,7 +6661,10 @@ mod tests {
                 RemoteRos2ResourceLimit::FieldCount
             ))
         );
-        assert_eq!(*budget.state.usage.lock(), RemoteRos2BudgetUsage::default());
+        assert_eq!(
+            *budget.state.usage.lock(),
+            state.semantic_config_budget_usage_for_test_v1()
+        );
     }
 
     #[test]
@@ -4785,13 +6682,17 @@ mod tests {
             let state = source_state();
             let wire = canonical_policy_wire();
             let budget = budget(&state, &wire, generous_limits());
+            let physical = physical_for_state(&definitions, &state);
             let guard = AllocationGuard::start();
-            let result = prepare(&definitions, &state, &wire, &budget);
+            let result = prepare_with_physical(&physical, &state, &wire, &budget);
             let allocations = AllocationGuard::count();
             drop(guard);
             assert_eq!(allocations, 0, "census must not allocate");
             drop(result);
-            assert_eq!(*budget.state.usage.lock(), RemoteRos2BudgetUsage::default());
+            assert_eq!(
+                *budget.state.usage.lock(),
+                state.semantic_config_budget_usage_for_test_v1()
+            );
         }
     }
 
@@ -4871,7 +6772,10 @@ mod tests {
                 Some(*expected),
                 "the invalid/unsupported classification must match local validity"
             );
-            assert_eq!(*budget.state.usage.lock(), RemoteRos2BudgetUsage::default());
+            assert_eq!(
+                *budget.state.usage.lock(),
+                state.semantic_config_budget_usage_for_test_v1()
+            );
         }
     }
 
@@ -5024,7 +6928,10 @@ mod tests {
             let outcome = prepare(&definitions, &state, &wire, &budget);
             assert_eq!(outcome.as_ref().err().copied(), expected, "{definition}");
             drop(outcome);
-            assert_eq!(*budget.state.usage.lock(), RemoteRos2BudgetUsage::default());
+            assert_eq!(
+                *budget.state.usage.lock(),
+                state.semantic_config_budget_usage_for_test_v1()
+            );
         }
     }
 
@@ -5043,10 +6950,10 @@ mod tests {
             [channel(1, 7, "/root", "not-cdr")],
         );
         let definitions = validated_summary_definitions_for_test(&fixture);
-        let state = source_state();
+        let measuring_state = source_state();
         let wire = canonical_policy_wire();
-        let generous_budget = budget(&state, &wire, generous_limits());
-        let generous = prepare(&definitions, &state, &wire, &generous_budget).unwrap();
+        let generous_budget = budget(&measuring_state, &wire, generous_limits());
+        let generous = prepare(&definitions, &measuring_state, &wire, &generous_budget).unwrap();
         let census = generous.census;
         drop(generous);
 
@@ -5074,29 +6981,33 @@ mod tests {
         exact.max_retained_bytes = census.retained_bytes;
         exact.max_working_bytes = census.working_bytes;
 
-        let exact_budget = budget(&state, &wire, exact);
-        let exact_prepared = prepare(&definitions, &state, &wire, &exact_budget)
-            .expect("every exact V1 limit boundary is admitted");
+        let exact_state = source_state();
+        let exact_physical = physical_for_state(&definitions, &exact_state);
+        let exact_budget = budget(&exact_state, &wire, exact);
+        let exact_prepared =
+            prepare_with_physical(&exact_physical, &exact_state, &wire, &exact_budget)
+                .expect("every exact V1 limit boundary is admitted");
         drop(exact_prepared);
         assert_eq!(
             *exact_budget.state.usage.lock(),
-            RemoteRos2BudgetUsage::default()
+            exact_state.semantic_config_budget_usage_for_test_v1()
         );
 
         macro_rules! rejects_one_less {
             ($field:ident, $kind:expr) => {{
                 let mut limited = exact;
                 limited.$field = limited.$field.checked_sub(1).unwrap();
-                let limited_budget = budget(&state, &wire, limited);
+                let limited_state = source_state();
+                let limited_budget = budget(&limited_state, &wire, limited);
                 assert_eq!(
-                    prepare(&definitions, &state, &wire, &limited_budget).err(),
+                    prepare(&definitions, &limited_state, &wire, &limited_budget).err(),
                     Some(RemoteRos2InitializationError::ResourceLimitExceeded($kind)),
                     "one unit below the exact {} boundary must fail",
                     stringify!($field),
                 );
                 assert_eq!(
                     *limited_budget.state.usage.lock(),
-                    RemoteRos2BudgetUsage::default()
+                    limited_state.semantic_config_budget_usage_for_test_v1()
                 );
             }};
         }
@@ -5189,7 +7100,10 @@ mod tests {
                 prepare(&definitions, &state, &wire, &budget).err(),
                 Some(expected)
             );
-            assert_eq!(*budget.state.usage.lock(), RemoteRos2BudgetUsage::default());
+            assert_eq!(
+                *budget.state.usage.lock(),
+                state.semantic_config_budget_usage_for_test_v1()
+            );
         }
     }
 
@@ -5201,14 +7115,23 @@ mod tests {
         );
         let definitions = validated_summary_definitions_for_test(&fixture);
         let state = source_state();
-        state.generation.set(2);
         let wire = canonical_policy_wire();
         let budget = budget(&state, &wire, generous_limits());
+        let policy = freeze_remote_decoder_policy_v1(&wire).unwrap();
+        let physical = physical_for_state(&definitions, &state);
+        let source = RemoteDefinitionsCapability::new_for_protobuf_test_v1(
+            &physical, &state, &policy, &budget,
+        )
+        .unwrap();
+        state.generation.set(2);
         assert_eq!(
-            prepare(&definitions, &state, &wire, &budget).err(),
+            begin_remote_ros2_admission_v1(source, policy, &budget).err(),
             Some(RemoteRos2InitializationError::StaleSource)
         );
-        assert_eq!(*budget.state.usage.lock(), RemoteRos2BudgetUsage::default());
+        assert_eq!(
+            *budget.state.usage.lock(),
+            state.semantic_config_budget_usage_for_test_v1()
+        );
     }
 
     struct TestAllocationGate<'a> {
@@ -5286,12 +7209,16 @@ mod tests {
             RemoteRos2BudgetUsage {
                 active_initializers: 0,
                 working_bytes: 0,
-                retained_results: 1,
-                retained_bytes: retained,
+                retained_results: 2,
+                retained_bytes: checked_add(retained, remote_semantic_config_retained_bytes_v1(),)
+                    .unwrap(),
             }
         );
         drop(result);
-        assert_eq!(*budget.state.usage.lock(), RemoteRos2BudgetUsage::default());
+        assert_eq!(
+            *budget.state.usage.lock(),
+            state.semantic_config_budget_usage_for_test_v1()
+        );
     }
 
     #[test]
@@ -5315,7 +7242,10 @@ mod tests {
         assert!(std::ptr::eq(result.source.definitions, &definitions));
         assert!(std::ptr::eq(result.policy.wire, &wire));
         drop(result);
-        assert_eq!(*budget.state.usage.lock(), RemoteRos2BudgetUsage::default());
+        assert_eq!(
+            *budget.state.usage.lock(),
+            state.semantic_config_budget_usage_for_test_v1()
+        );
     }
 
     #[test]
@@ -5344,7 +7274,10 @@ mod tests {
                 materialize_remote_ros2_definitions_v1_with_gate(prepared, &gate).err(),
                 Some(RemoteRos2InitializationError::FallibleAllocationFailed)
             );
-            assert_eq!(*budget.state.usage.lock(), RemoteRos2BudgetUsage::default());
+            assert_eq!(
+                *budget.state.usage.lock(),
+                state.semantic_config_budget_usage_for_test_v1()
+            );
         }
 
         for stale_index in 0..4 {
@@ -5371,7 +7304,10 @@ mod tests {
                 materialize_remote_ros2_definitions_v1_with_gate(prepared, &gate).err(),
                 Some(RemoteRos2InitializationError::StaleSource)
             );
-            assert_eq!(*budget.state.usage.lock(), RemoteRos2BudgetUsage::default());
+            assert_eq!(
+                *budget.state.usage.lock(),
+                state.semantic_config_budget_usage_for_test_v1()
+            );
         }
     }
 
@@ -5386,6 +7322,7 @@ mod tests {
         let source_b = source_state();
         let wire_a = canonical_policy_wire();
         let wire_b = canonical_policy_wire();
+        let physical = physical_for_state(&definitions, &source_a);
         let mut budget_a = budget(&source_a, &wire_a, generous_limits());
         Arc::get_mut(&mut budget_a.state)
             .unwrap()
@@ -5393,31 +7330,35 @@ mod tests {
             .max_active_initializers = 1;
 
         assert_fatal_control_plane(|| {
+            let policy = freeze_remote_decoder_policy_v1(&wire_a).unwrap();
             let _owner = begin_remote_ros2_admission_v1(
-                RemoteDefinitionsCapability {
-                    definitions: &definitions,
-                    source: &source_b,
-                    generation: 1,
-                },
-                freeze_remote_decoder_policy_v1(&wire_a).unwrap(),
+                RemoteDefinitionsCapability::new_for_protobuf_test_v1(
+                    &physical, &source_b, &policy, &budget_a,
+                )
+                .unwrap(),
+                policy,
                 &budget_a,
             );
         });
-        assert_fatal_control_plane(|| {
-            let _owner = begin_remote_ros2_admission_v1(
-                RemoteDefinitionsCapability {
-                    definitions: &definitions,
-                    source: &source_a,
-                    generation: 1,
-                },
-                freeze_remote_decoder_policy_v1(&wire_b).unwrap(),
+        // Policy identity is value-based: the same canonical policy at another wire address is
+        // compatible with the budget and source that froze the first copy.
+        {
+            let policy = freeze_remote_decoder_policy_v1(&wire_b).unwrap();
+            let owner = begin_remote_ros2_admission_v1(
+                RemoteDefinitionsCapability::new_for_protobuf_test_v1(
+                    &physical, &source_a, &policy, &budget_a,
+                )
+                .unwrap(),
+                policy,
                 &budget_a,
-            );
-        });
+            )
+            .unwrap();
+            drop(owner);
+        }
 
-        let first = prepare(&definitions, &source_a, &wire_a, &budget_a).unwrap();
+        let first = prepare_with_physical(&physical, &source_a, &wire_a, &budget_a).unwrap();
         assert_eq!(
-            prepare(&definitions, &source_a, &wire_a, &budget_a).err(),
+            prepare_with_physical(&physical, &source_a, &wire_a, &budget_a).err(),
             Some(RemoteRos2InitializationError::ResourceLimitExceeded(
                 RemoteRos2ResourceLimit::ReservationCapacity,
             ))
@@ -5425,7 +7366,7 @@ mod tests {
         drop(first);
         assert_eq!(
             *budget_a.state.usage.lock(),
-            RemoteRos2BudgetUsage::default()
+            source_a.semantic_config_budget_usage_for_test_v1()
         );
     }
 
@@ -5453,7 +7394,7 @@ mod tests {
         );
         assert_eq!(
             *constrained.state.usage.lock(),
-            RemoteRos2BudgetUsage::default()
+            state.semantic_config_budget_usage_for_test_v1()
         );
     }
 
@@ -5483,13 +7424,14 @@ mod tests {
         state.generation.set(2);
         original.generation = 2;
         assert_fatal_control_plane(|| {
+            let policy = freeze_remote_decoder_policy_v1(&wire).unwrap();
+            let physical = physical_for_state(&definitions, &state);
             let _owner = begin_remote_ros2_admission_v1(
-                RemoteDefinitionsCapability {
-                    definitions: &definitions,
-                    source: &state,
-                    generation: 2,
-                },
-                freeze_remote_decoder_policy_v1(&wire).unwrap(),
+                RemoteDefinitionsCapability::new_for_protobuf_test_v1(
+                    &physical, &state, &policy, &original,
+                )
+                .unwrap(),
+                policy,
                 &original,
             );
         });
@@ -5509,22 +7451,29 @@ mod tests {
         let definitions = validated_summary_definitions_for_test(&fixture);
         let state = source_state();
         let wire = canonical_policy_wire();
+        let physical = physical_for_state(&definitions, &state);
         let generous_budget = budget(&state, &wire, generous_limits());
-        let signature = preflight(&definitions, &state, &wire, &generous_budget).unwrap();
+        let signature =
+            preflight_with_physical(&physical, &state, &wire, &generous_budget).unwrap();
         let exact_signature_steps = signature.owner.steps.consumed;
+        let exact_semantic_config_steps = state.semantic_config.get().unwrap().census_steps;
         drop(signature);
-        let prepared = prepare(&definitions, &state, &wire, &generous_budget).unwrap();
+        let prepared = prepare_with_physical(&physical, &state, &wire, &generous_budget).unwrap();
         let census = prepared.census;
         drop(prepared);
 
         let mut exact = generous_limits();
+        exact.max_semantic_config_steps = exact_semantic_config_steps;
         exact.max_signature_steps = exact_signature_steps;
         exact.max_census_steps = census.census_steps;
         exact.max_materialization_steps = census.materialization_steps;
         exact.max_projection_steps = census.projection_steps;
         exact.max_recognition_steps = census.recognition_steps;
-        let exact_budget = budget(&state, &wire, exact);
-        let exact_prepared = prepare(&definitions, &state, &wire, &exact_budget).unwrap();
+        let exact_state = source_state();
+        let exact_physical = physical_for_state(&definitions, &exact_state);
+        let exact_budget = budget(&exact_state, &wire, exact);
+        let exact_prepared =
+            prepare_with_physical(&exact_physical, &exact_state, &wire, &exact_budget).unwrap();
         let initialized = materialize_remote_ros2_definitions_v1(exact_prepared).unwrap();
         let transition = initialized.into_protobuf_transition_v1().unwrap();
         let mut projection = transition.into_protobuf_projection_v1().unwrap();
@@ -5537,10 +7486,18 @@ mod tests {
         drop(continuation);
         assert_eq!(
             *exact_budget.state.usage.lock(),
-            RemoteRos2BudgetUsage::default()
+            exact_state.semantic_config_budget_usage_for_test_v1()
         );
 
         for (phase, limits, expected) in [
+            (
+                "semantic config",
+                UnfrozenRemoteRos2LimitsV1 {
+                    max_semantic_config_steps: exact_semantic_config_steps - 1,
+                    ..exact
+                },
+                RemoteRos2ResourceLimit::SemanticConfigSteps,
+            ),
             (
                 "signature",
                 UnfrozenRemoteRos2LimitsV1 {
@@ -5582,9 +7539,13 @@ mod tests {
                 RemoteRos2ResourceLimit::RecognitionSteps,
             ),
         ] {
-            let limited_budget = budget(&state, &wire, limits);
+            let limited_state = source_state();
+            let limited_physical = physical_for_state(&definitions, &limited_state);
+            let limited_budget = budget(&limited_state, &wire, limits);
             let guard = AllocationGuard::start();
-            let error = prepare(&definitions, &state, &wire, &limited_budget).err();
+            let error =
+                prepare_with_physical(&limited_physical, &limited_state, &wire, &limited_budget)
+                    .err();
             let allocations = AllocationGuard::count();
             drop(guard);
             assert_eq!(
@@ -5595,9 +7556,14 @@ mod tests {
                 "{phase} exact-minus-one must fail in its allocation-free phase"
             );
             assert_eq!(allocations, 0, "{phase} failure must precede allocation");
+            if phase == "semantic config" {
+                assert_eq!(limited_state.semantic_match_count.get(), 0);
+                assert_eq!(limited_state.semantic_selection_count.get(), 0);
+                assert!(limited_state.semantic_config.get().is_none());
+            }
             assert_eq!(
                 *limited_budget.state.usage.lock(),
-                RemoteRos2BudgetUsage::default()
+                limited_state.semantic_config_budget_usage_for_test_v1()
             );
         }
 
@@ -5749,7 +7715,10 @@ mod tests {
             let _reservation = budget.reserve(1, 1);
         });
         drop(reservation);
-        assert_eq!(*budget.state.usage.lock(), RemoteRos2BudgetUsage::default());
+        assert_eq!(
+            *budget.state.usage.lock(),
+            state.semantic_config_budget_usage_for_test_v1()
+        );
     }
 
     #[test]
@@ -5857,7 +7826,10 @@ mod tests {
             Err(RemoteRos2InitializationError::StaleSource)
         ));
         drop(continuation);
-        assert_eq!(*budget.state.usage.lock(), RemoteRos2BudgetUsage::default());
+        assert_eq!(
+            *budget.state.usage.lock(),
+            state.semantic_config_budget_usage_for_test_v1()
+        );
     }
 
     #[test]
@@ -5882,7 +7854,10 @@ mod tests {
         assert_fatal_control_plane(move || {
             let _eof = projection.finish_eof_v1();
         });
-        assert_eq!(*budget.state.usage.lock(), RemoteRos2BudgetUsage::default());
+        assert_eq!(
+            *budget.state.usage.lock(),
+            state.semantic_config_budget_usage_for_test_v1()
+        );
     }
 
     #[test]
@@ -5943,11 +7918,11 @@ mod tests {
         drop(continuation_b);
         assert_eq!(
             *budget_a.state.usage.lock(),
-            RemoteRos2BudgetUsage::default()
+            state_a.semantic_config_budget_usage_for_test_v1()
         );
         assert_eq!(
             *budget_b.state.usage.lock(),
-            RemoteRos2BudgetUsage::default()
+            state_b.semantic_config_budget_usage_for_test_v1()
         );
     }
 
@@ -6391,7 +8366,10 @@ mod tests {
             );
         }
         drop(continuation);
-        assert_eq!(*budget.state.usage.lock(), RemoteRos2BudgetUsage::default());
+        assert_eq!(
+            *budget.state.usage.lock(),
+            state.semantic_config_budget_usage_for_test_v1()
+        );
     }
 
     #[test]
@@ -6500,7 +8478,10 @@ mod tests {
                 .all(|resolution| resolution.target_specification_index == 1)
         );
         drop(result);
-        assert_eq!(*budget.state.usage.lock(), RemoteRos2BudgetUsage::default());
+        assert_eq!(
+            *budget.state.usage.lock(),
+            state.semantic_config_budget_usage_for_test_v1()
+        );
     }
 
     #[test]
@@ -6542,7 +8523,10 @@ mod tests {
             .unwrap();
             assert_eq!(remote_value, local_value);
             drop(result);
-            assert_eq!(*budget.state.usage.lock(), RemoteRos2BudgetUsage::default());
+            assert_eq!(
+                *budget.state.usage.lock(),
+                state.semantic_config_budget_usage_for_test_v1()
+            );
         }
     }
 }

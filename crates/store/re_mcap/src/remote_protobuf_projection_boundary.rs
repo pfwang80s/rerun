@@ -45,6 +45,27 @@ pub(crate) fn seal_remote_ros2_projection_eof_v1<'definitions, 'input, 'source, 
 impl<'definitions, 'input, 'source, 'wire>
     RemoteProtobufProjectionEofContinuationV1<'definitions, 'input, 'source, 'wire>
 {
+    pub(super) fn ensure_current_for_assignment_v1(
+        &self,
+    ) -> Result<(), crate::remote_ros2_reflection::RemoteRos2InitializationError> {
+        self.authority.ensure_current_for_assignment_v1()
+    }
+
+    pub(super) fn retained_bytes_for_assignment_v1(
+        &self,
+    ) -> Result<u64, crate::remote_ros2_reflection::RemoteRos2InitializationError> {
+        self.authority.retained_bytes_for_assignment_v1()
+    }
+
+    pub(super) fn policy_descriptor_for_assignment_v1(
+        &self,
+    ) -> Result<
+        crate::remote_ros2_reflection::FrozenRemoteDecoderPolicyDescriptorViewV1<'_, 'wire>,
+        crate::remote_ros2_reflection::RemoteRos2InitializationError,
+    > {
+        self.authority.policy_descriptor_for_assignment_v1()
+    }
+
     pub(super) fn ensure_profile_current_v1(
         &self,
         viewer_scope: *const crate::remote_ros2_reflection::RemoteViewerScopeState,
@@ -67,6 +88,28 @@ impl<'definitions, 'input, 'source, 'wire>
         crate::remote_ros2_reflection::RemoteRos2InitializationError,
     > {
         self.authority.take_bound_recognition_v1()
+    }
+
+    pub(super) fn selected_count_for_assignment_v1(
+        &self,
+    ) -> Result<usize, crate::remote_ros2_reflection::RemoteRos2InitializationError> {
+        self.authority.selected_count_for_assignment_v1()
+    }
+
+    pub(super) fn canonical_channel_count_for_assignment_v1(
+        &self,
+    ) -> Result<u64, crate::remote_ros2_reflection::RemoteRos2InitializationError> {
+        self.authority.canonical_channel_count_for_assignment_v1()
+    }
+
+    pub(super) fn project_selected_membership_for_assignment_v1(
+        &self,
+    ) -> Result<
+        crate::remote_ros2_reflection::RemoteMcapSelectedMembershipV1,
+        crate::remote_ros2_reflection::RemoteRos2InitializationError,
+    > {
+        self.authority
+            .project_selected_membership_for_assignment_v1()
     }
 }
 

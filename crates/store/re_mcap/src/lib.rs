@@ -46,6 +46,12 @@
 //! use re_mcap::remote_protobuf_descriptor;
 //! ```
 //!
+//! The source-bound remote decoder assignment result and its reservation are sealed too:
+//!
+//! ```compile_fail
+//! use re_mcap::remote_decoder_assignment;
+//! ```
+//!
 //! Raw Summary/schema bytes, scalar policy claims, source generations, and reservations therefore
 //! cannot be used by a downstream crate to construct or rebind the sealed capability:
 //!
@@ -112,6 +118,11 @@ mod remote_protobuf_projection_boundary;
 // the exact ROS/source/policy authority established by MCAP-026.
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
 mod remote_protobuf_descriptor;
+
+// Deterministic assignment consumes only the sealed combined initializer owner and remains
+// production-disarmed until the immutable manifest and executable decoder contracts are sealed.
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+mod remote_decoder_assignment;
 
 // Bounded ROS 2 reflection initialization remains crate-private and production-disarmed until the
 // remote decoder policy and resource profile are sealed.

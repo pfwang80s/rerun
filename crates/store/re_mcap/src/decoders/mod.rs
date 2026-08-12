@@ -23,6 +23,8 @@ pub use self::protobuf::McapProtobufDecoder;
 pub use self::raw::McapRawDecoder;
 pub use self::recording_info::McapRecordingInfoDecoder;
 pub use self::ros2::McapRos2Decoder;
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+pub(crate) use self::ros2::supports_builtin_semantic_schema;
 pub use self::ros2_reflection::McapRos2ReflectionDecoder;
 pub use self::schema::McapSchemaDecoder;
 pub use self::stats::McapStatisticDecoder;
@@ -326,6 +328,20 @@ impl TopicFilter {
     pub fn is_empty(&self) -> bool {
         self.include.is_empty() && self.exclude.is_empty()
     }
+
+    #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+    pub(crate) fn exact_include_patterns_for_remote_v1(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &str> {
+        self.include.iter().map(regex_lite::Regex::as_str)
+    }
+
+    #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+    pub(crate) fn exact_exclude_patterns_for_remote_v1(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &str> {
+        self.exclude.iter().map(regex_lite::Regex::as_str)
+    }
 }
 
 /// Registry fallback strategy.
@@ -337,6 +353,22 @@ pub enum Fallback {
 
     /// Single global fallback message decoder (e.g. `raw`).
     Global(DecoderIdentifier),
+}
+
+/// Resolves one decoder owner from caller-provided recognition in caller-provided priority order.
+///
+/// This is deliberately pure: eligibility, decoder initialization, recognition, and fallback
+/// validation remain the caller's responsibility.
+/// The remote Web adapter uses the same core after its bounded initializers have produced sealed
+/// recognition rows, while [`DecoderRegistry::plan`] preserves its existing full-file setup.
+pub(crate) fn resolve_decoder_owner<T>(
+    candidates: impl IntoIterator<Item = (T, bool)>,
+    fallback: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    candidates
+        .into_iter()
+        .find_map(|(owner, recognized)| recognized.then_some(owner))
+        .or_else(fallback)
 }
 
 /// A runner that constrains a [`MessageDecoder`] to a specific set of channels.
@@ -809,22 +841,22 @@ impl DecoderRegistry {
             }
 
             // explicit priority order
-            let mut chosen: Option<DecoderIdentifier> = None;
-            for (id, decoder) in &msg_decoders {
-                if decoder.supports_channel(channel) {
-                    chosen = Some(id.clone());
-                    break;
-                }
-            }
-
-            if chosen.is_none() {
-                // fallbacks (if any)
-                if let Fallback::Global(id) = &self.fallback
-                    && self.msg_factories.contains_key(id)
-                {
-                    chosen = Some(id.clone());
-                }
-            }
+            let chosen = resolve_decoder_owner(
+                msg_decoders
+                    .iter()
+                    .map(|(id, decoder)| (id, decoder.supports_channel(channel))),
+                || {
+                    // fallbacks (if any)
+                    if let Fallback::Global(id) = &self.fallback
+                        && self.msg_factories.contains_key(id)
+                    {
+                        Some(id)
+                    } else {
+                        None
+                    }
+                },
+            )
+            .cloned();
 
             let schema_name = channel.schema.as_ref().map(|s| s.name.clone());
 

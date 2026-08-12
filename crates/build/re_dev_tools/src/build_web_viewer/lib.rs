@@ -29,16 +29,17 @@ const REMOTE_ROS2_REQUIRED_STAGES_V1: [&str; 5] = [
     "rerun_remote_ros2_peak_stage_v1",
 ];
 const REMOTE_ROS2_REQUIRED_STAGE_IDENTITIES_V1: [i32; 5] = [0x2601, 0x2602, 0x2603, 0x2604, 0x2605];
-const REMOTE_PROTOBUF_REQUIRED_STAGES_V1: [&str; 5] = [
+const REMOTE_PROTOBUF_REQUIRED_STAGES_V1: [&str; 6] = [
     "rerun_remote_protobuf_wire_stage_v1",
     "rerun_remote_protobuf_graph_stage_v1",
     "rerun_remote_protobuf_peak_stage_v1",
     "rerun_remote_protobuf_arena_stage_v1",
     "rerun_remote_protobuf_recognition_stage_v1",
+    "rerun_remote_decoder_assignment_stage_v1",
 ];
-const REMOTE_PROTOBUF_REQUIRED_STAGE_IDENTITIES_V1: [i32; 5] =
-    [0x2701, 0x2702, 0x2703, 0x2704, 0x2705];
-const REMOTE_ROS2_INTERNAL_EXPORTS_V1: [&str; 16] = [
+const REMOTE_PROTOBUF_REQUIRED_STAGE_IDENTITIES_V1: [i32; 6] =
+    [0x2701, 0x2702, 0x2703, 0x2704, 0x2705, 0x2801];
+const REMOTE_ROS2_INTERNAL_EXPORTS_V1: [&str; 17] = [
     REMOTE_ROS2_INITIALIZER_PROBE_V1,
     REMOTE_PROTOBUF_INITIALIZER_PROBE_V1,
     REMOTE_ROS2_ACCOUNTING_ALLOCATOR_PROBE_V1,
@@ -55,6 +56,7 @@ const REMOTE_ROS2_INTERNAL_EXPORTS_V1: [&str; 16] = [
     REMOTE_PROTOBUF_REQUIRED_STAGES_V1[2],
     REMOTE_PROTOBUF_REQUIRED_STAGES_V1[3],
     REMOTE_PROTOBUF_REQUIRED_STAGES_V1[4],
+    REMOTE_PROTOBUF_REQUIRED_STAGES_V1[5],
 ];
 const REMOTE_ROS2_MIN_PROBE_STACK_V1: u64 = 512;
 const REMOTE_ROS2_MAX_PROBE_STACK_V1: u64 = 16 * 1024;

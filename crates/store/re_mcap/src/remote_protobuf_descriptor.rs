@@ -17,8 +17,9 @@ use crate::remote_protobuf_projection_boundary::{
     RemoteProtobufProfileScopeV1, RemoteProtobufProjectionEofContinuationV1,
 };
 use crate::remote_ros2_reflection::{
-    RemoteRos2ChannelRecognitionV1, RemoteRos2InitializationError, RemoteRos2RecognitionIterV1,
-    RemoteViewerScopeState,
+    FrozenRemoteDecoderPolicyDescriptorViewV1, FrozenRemoteDecoderSlotV1,
+    RemoteMcapSelectedMembershipV1, RemoteRos2ChannelRecognitionV1, RemoteRos2InitializationError,
+    RemoteRos2RecognitionIterV1, RemoteViewerScopeState,
 };
 
 const REMOTE_PROTOBUF_PROFILE_VERSION_V1: u16 = 1;
@@ -162,7 +163,8 @@ fn map_ros_error(error: RemoteRos2InitializationError) -> RemoteProtobufInitiali
         RemoteRos2InitializationError::InvalidRemoteSchema
         | RemoteRos2InitializationError::UnsupportedForRemote(_)
         | RemoteRos2InitializationError::FallibleAllocationFailed
-        | RemoteRos2InitializationError::ConflictingTopicDecoderSignature => {
+        | RemoteRos2InitializationError::ConflictingTopicDecoderSignature
+        | RemoteRos2InitializationError::SemanticConfigConflict => {
             RemoteProtobufInitializationErrorV1::InvalidRemoteSchema
         }
     }
@@ -183,7 +185,8 @@ fn map_ros_recognition_error(
         RemoteRos2InitializationError::InvalidRemoteSchema
         | RemoteRos2InitializationError::UnsupportedForRemote(_)
         | RemoteRos2InitializationError::FallibleAllocationFailed
-        | RemoteRos2InitializationError::ConflictingTopicDecoderSignature => {
+        | RemoteRos2InitializationError::ConflictingTopicDecoderSignature
+        | RemoteRos2InitializationError::SemanticConfigConflict => {
             RemoteProtobufInitializationErrorV1::InvalidRemoteSchema
         }
     }
@@ -227,6 +230,35 @@ pub(crate) struct UnfrozenRemoteProtobufLimitsV1 {
     max_resolution_steps: u64,
     max_retained_bytes: u64,
     max_working_bytes: u64,
+}
+
+#[cfg(test)]
+impl UnfrozenRemoteProtobufLimitsV1 {
+    pub(crate) fn generous_for_assignment_test_v1() -> Self {
+        Self {
+            profile_version: REMOTE_PROTOBUF_PROFILE_VERSION_V1,
+            max_schemas: MAX_INLINE_PROTOBUF_SCHEMAS_V1 as u64,
+            max_descriptor_bytes: 1_000_000,
+            max_files: MAX_INLINE_PROTOBUF_FILES_V1 as u64,
+            max_messages: MAX_INLINE_PROTOBUF_MESSAGES_V1 as u64,
+            max_fields: MAX_INLINE_PROTOBUF_RESOLUTIONS_V1 as u64,
+            max_enums: MAX_INLINE_PROTOBUF_ENUMS_V1 as u64,
+            max_enum_values: 1_024,
+            max_oneofs: 512,
+            max_dependencies: MAX_INLINE_PROTOBUF_DEPENDENCIES_V1 as u64,
+            max_options: 512,
+            max_string_bytes: 1_000_000,
+            max_default_bytes: 1_000_000,
+            max_single_string_bytes: 64_000,
+            max_descriptor_depth: 32,
+            max_import_depth: 32,
+            max_census_steps: 10_000_000,
+            max_materialization_steps: 10_000_000,
+            max_resolution_steps: 10_000_000,
+            max_retained_bytes: 64_000_000,
+            max_working_bytes: 64_000_000,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4081,6 +4113,11 @@ impl<'viewer, 'profile> RemoteProtobufInitializationBudgetV1<'viewer, 'profile> 
             profile_scope,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_idle_for_assignment_test_v1(&self) -> bool {
+        *self.state.usage.lock() == RemoteProtobufBudgetUsageV1::default()
+    }
 }
 
 pub(crate) struct PreparedRemoteProtobufCensusV1<'definitions, 'input, 'source, 'wire> {
@@ -4237,6 +4274,7 @@ pub(crate) fn prepare_remote_protobuf_census_v1<'definitions, 'input, 'source, '
 pub(crate) struct BoundedRemoteDecoderInitializersV1<'definitions, 'input, 'source, 'wire> {
     continuation: RemoteProtobufProjectionEofContinuationV1<'definitions, 'input, 'source, 'wire>,
     protobuf: BoundedProtobufDescriptorGraphV1<'definitions>,
+    membership_projected: bool,
     _reservation: RemoteProtobufResultReservationV1,
 }
 
@@ -4245,6 +4283,36 @@ impl<'definitions, 'input, 'source, 'wire>
 {
     pub(crate) fn protobuf_schema_count(&self) -> usize {
         self.protobuf.schemas.as_slice().len()
+    }
+
+    pub(crate) fn selected_count_for_assignment_v1(
+        &self,
+    ) -> Result<usize, RemoteProtobufInitializationErrorV1> {
+        self.continuation
+            .selected_count_for_assignment_v1()
+            .map_err(map_ros_recognition_error)
+    }
+
+    pub(crate) fn canonical_channel_count_for_assignment_v1(
+        &self,
+    ) -> Result<u64, RemoteProtobufInitializationErrorV1> {
+        self.continuation
+            .canonical_channel_count_for_assignment_v1()
+            .map_err(map_ros_recognition_error)
+    }
+
+    pub(crate) fn project_selected_membership_for_assignment_v1(
+        &mut self,
+    ) -> Result<RemoteMcapSelectedMembershipV1, RemoteProtobufInitializationErrorV1> {
+        if self.membership_projected {
+            protobuf_fatal_control_plane("semantic-config membership was projected twice");
+        }
+        let membership = self
+            .continuation
+            .project_selected_membership_for_assignment_v1()
+            .map_err(map_ros_recognition_error)?;
+        self.membership_projected = true;
+        Ok(membership)
     }
 
     pub(crate) fn take_recognition_v1(
@@ -4261,6 +4329,39 @@ impl<'definitions, 'input, 'source, 'wire>
             .take_bound_recognition_v1()
             .map_err(map_ros_recognition_error)?;
         Ok(BoundedRemoteRecognitionIterV1 { ros2, protobuf })
+    }
+
+    pub(crate) fn ensure_current_for_assignment_v1(
+        &self,
+    ) -> Result<(), RemoteProtobufInitializationErrorV1> {
+        self.continuation
+            .ensure_current_for_assignment_v1()
+            .map_err(map_ros_recognition_error)
+    }
+
+    pub(crate) fn combined_retained_bytes_for_assignment_v1(
+        &self,
+    ) -> Result<u64, RemoteProtobufInitializationErrorV1> {
+        let ros2 = self
+            .continuation
+            .retained_bytes_for_assignment_v1()
+            .map_err(map_ros_recognition_error)?;
+        ros2.checked_add(self._reservation.retained_bytes).ok_or(
+            RemoteProtobufInitializationErrorV1::ResourceLimitExceeded(
+                RemoteProtobufResourceLimitV1::Arithmetic,
+            ),
+        )
+    }
+
+    pub(crate) fn policy_descriptor_for_assignment_v1(
+        &self,
+    ) -> Result<
+        FrozenRemoteDecoderPolicyDescriptorViewV1<'_, 'wire>,
+        RemoteProtobufInitializationErrorV1,
+    > {
+        self.continuation
+            .policy_descriptor_for_assignment_v1()
+            .map_err(map_ros_recognition_error)
     }
 }
 
@@ -4294,6 +4395,14 @@ impl BoundedRemoteChannelRecognitionV1<'_, '_, '_, '_, '_, '_> {
             .map_err(map_ros_recognition_error)
     }
 
+    pub(crate) fn recognized_by_builtin_semantic(
+        &self,
+    ) -> Result<bool, RemoteProtobufInitializationErrorV1> {
+        self.ros2
+            .recognized_by_builtin_semantic()
+            .map_err(map_ros_recognition_error)
+    }
+
     pub(crate) fn recognized_by_protobuf(
         &self,
     ) -> Result<bool, RemoteProtobufInitializationErrorV1> {
@@ -4302,6 +4411,15 @@ impl BoundedRemoteChannelRecognitionV1<'_, '_, '_, '_, '_, '_> {
             .protobuf_schema_id()
             .map_err(map_ros_recognition_error)?
             .is_some_and(|schema_id| self.protobuf.has_schema_id(schema_id)))
+    }
+
+    pub(crate) fn resolve_bound_owner_v1(
+        &self,
+        recognized: [bool; 3],
+    ) -> Result<Option<FrozenRemoteDecoderSlotV1>, RemoteProtobufInitializationErrorV1> {
+        self.ros2
+            .resolve_bound_owner_v1(recognized)
+            .map_err(map_ros_recognition_error)
     }
 }
 
@@ -4320,6 +4438,26 @@ impl<'borrow, 'definitions, 'input, 'source, 'wire>
         let Some(ros2) = self
             .ros2
             .next_channel()
+            .map_err(map_ros_recognition_error)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(BoundedRemoteChannelRecognitionV1 { ros2, protobuf }))
+    }
+
+    pub(crate) fn next_matching_channel<'item>(
+        &'item mut self,
+        matches: impl FnMut(u16) -> bool,
+    ) -> Result<
+        Option<
+            BoundedRemoteChannelRecognitionV1<'item, 'borrow, 'definitions, 'input, 'source, 'wire>,
+        >,
+        RemoteProtobufInitializationErrorV1,
+    > {
+        let protobuf = self.protobuf;
+        let Some(ros2) = self
+            .ros2
+            .next_matching_channel(matches)
             .map_err(map_ros_recognition_error)?
         else {
             return Ok(None);
@@ -4379,6 +4517,7 @@ fn initialize_remote_protobuf_with_gate_v1<'definitions, 'input, 'source, 'wire>
     Ok(BoundedRemoteDecoderInitializersV1 {
         continuation: prepared.continuation,
         protobuf: graph,
+        membership_projected: false,
         _reservation: reservation,
     })
 }
@@ -4438,37 +4577,20 @@ pub(crate) fn run_remote_protobuf_artifact_probe_v1<'definitions, 'input, 'sourc
     {
         return 22;
     }
-    let mut result = match initialize_remote_protobuf_v1(prepared) {
+    let result = match initialize_remote_protobuf_v1(prepared) {
         Ok(result) => result,
         Err(_error) => return 23,
     };
     if result.protobuf_schema_count() != 1 {
         return 24;
     }
-    let saw_protobuf = {
-        let mut recognition = match result.take_recognition_v1() {
-            Ok(recognition) => recognition,
-            Err(_error) => return 25,
-        };
-        let mut saw_protobuf = false;
-        loop {
-            match recognition.next_channel() {
-                Ok(Some(channel)) => match channel.recognized_by_protobuf() {
-                    Ok(recognized) => saw_protobuf |= recognized,
-                    Err(_error) => return 26,
-                },
-                Ok(None) => break,
-                Err(_error) => return 26,
-            }
-        }
-        saw_protobuf
-    };
-    if !saw_protobuf {
-        return 27;
+    let assignment_status =
+        crate::remote_decoder_assignment::run_remote_assignment_artifact_probe_v1(result);
+    if assignment_status != 0 {
+        return 25 + assignment_status;
     }
-    drop(result);
     if *budget.state.usage.lock() != RemoteProtobufBudgetUsageV1::default() {
-        return 28;
+        return 29;
     }
     0
 }
@@ -4715,19 +4837,47 @@ mod tests {
         viewer: &RemoteViewerScopeState,
         ros_profile: &RemoteRos2ProfileScopeV1,
     ) -> RemoteRos2ToProtobufTransitionV1<'definitions, 'input, 'source, 'wire> {
+        let physical = crate::remote_chunk_scan::PhysicalChunkDefinitionsCapabilityV1::new_unscanned_for_test_with_binding_v1(
+            definitions,
+            source.physical_source_binding_for_test_v1(),
+        );
+        transition_with_physical(&physical, source, wire, viewer, ros_profile)
+    }
+
+    fn transition_with_physical<'definitions, 'input, 'source, 'wire>(
+        physical: &crate::remote_chunk_scan::PhysicalChunkDefinitionsCapabilityV1<
+            'definitions,
+            'input,
+        >,
+        source: &'source RemoteDefinitionsSourceState,
+        wire: &'wire RemoteDecoderPolicyWireV1<'wire>,
+        viewer: &RemoteViewerScopeState,
+        ros_profile: &RemoteRos2ProfileScopeV1,
+    ) -> RemoteRos2ToProtobufTransitionV1<'definitions, 'input, 'source, 'wire> {
         let ros_budget = RemoteRos2InitializationBudget::new_for_protobuf_test_v1(
             source,
             viewer,
             ros_profile,
             wire,
         );
+        transition_with_physical_and_ros_budget(physical, source, wire, &ros_budget)
+    }
+
+    fn transition_with_physical_and_ros_budget<'definitions, 'input, 'source, 'wire>(
+        physical: &crate::remote_chunk_scan::PhysicalChunkDefinitionsCapabilityV1<
+            'definitions,
+            'input,
+        >,
+        source: &'source RemoteDefinitionsSourceState,
+        wire: &'wire RemoteDecoderPolicyWireV1<'wire>,
+        ros_budget: &RemoteRos2InitializationBudget<'source, 'wire>,
+    ) -> RemoteRos2ToProtobufTransitionV1<'definitions, 'input, 'source, 'wire> {
         let policy = freeze_remote_decoder_policy_v1(wire).unwrap();
-        let owner = begin_remote_ros2_admission_v1(
-            RemoteDefinitionsCapability::new_for_protobuf_test_v1(definitions, source),
-            policy,
-            &ros_budget,
+        let source = RemoteDefinitionsCapability::new_for_protobuf_test_v1(
+            physical, source, &policy, ros_budget,
         )
         .unwrap();
+        let owner = begin_remote_ros2_admission_v1(source, policy, ros_budget).unwrap();
         let evidence = preflight_remote_decoder_topic_signatures_v1(owner).unwrap();
         let prepared = prepare_remote_ros2_census_v1(evidence).unwrap();
         materialize_remote_ros2_definitions_v1(prepared)
@@ -4749,8 +4899,11 @@ mod tests {
             let viewer = Box::new(RemoteViewerScopeState::new_for_protobuf_test_v1(1));
             let ros_profile = Box::new(RemoteRos2ProfileScopeV1::new_for_protobuf_test_v1(1));
             let protobuf_profile = Box::new(RemoteProtobufProfileScopeV1::new_disarmed_v1());
-            let source =
-                RemoteDefinitionsSourceState::new_for_protobuf_test_v1(&viewer, &protobuf_profile);
+            let source = RemoteDefinitionsSourceState::new_for_protobuf_test_v1(
+                crate::remote_chunk_scan::PhysicalChunkSourceBindingV1::new_unscanned_for_assignment_test_v1(),
+                &viewer,
+                &protobuf_profile,
+            );
             Self {
                 viewer,
                 ros_profile,
@@ -4794,6 +4947,48 @@ mod tests {
             &context.wire,
             &context.viewer,
             &context.ros_profile,
+        );
+        prepare_remote_protobuf_census_v1(transition, budget)
+    }
+
+    fn prepared_with_physical<'definitions, 'input, 'source>(
+        physical: &crate::remote_chunk_scan::PhysicalChunkDefinitionsCapabilityV1<
+            'definitions,
+            'input,
+        >,
+        context: &'source StableContext,
+        budget: &RemoteProtobufInitializationBudgetV1<'_, '_>,
+    ) -> Result<
+        PreparedRemoteProtobufCensusV1<'definitions, 'input, 'source, 'source>,
+        RemoteProtobufInitializationErrorV1,
+    > {
+        let transition = transition_with_physical(
+            physical,
+            &context.source,
+            &context.wire,
+            &context.viewer,
+            &context.ros_profile,
+        );
+        prepare_remote_protobuf_census_v1(transition, budget)
+    }
+
+    fn prepared_with_physical_and_ros_budget<'definitions, 'input, 'source>(
+        physical: &crate::remote_chunk_scan::PhysicalChunkDefinitionsCapabilityV1<
+            'definitions,
+            'input,
+        >,
+        context: &'source StableContext,
+        ros_budget: &RemoteRos2InitializationBudget<'source, 'source>,
+        budget: &RemoteProtobufInitializationBudgetV1<'_, '_>,
+    ) -> Result<
+        PreparedRemoteProtobufCensusV1<'definitions, 'input, 'source, 'source>,
+        RemoteProtobufInitializationErrorV1,
+    > {
+        let transition = transition_with_physical_and_ros_budget(
+            physical,
+            &context.source,
+            &context.wire,
+            ros_budget,
         );
         prepare_remote_protobuf_census_v1(transition, budget)
     }
@@ -5897,6 +6092,17 @@ mod tests {
         let fixture = fixture(simple_descriptor(), "pkg.Message");
         let definitions = validated_summary_definitions_for_test(&fixture);
         let context = StableContext::new();
+        let physical =
+            crate::remote_chunk_scan::PhysicalChunkDefinitionsCapabilityV1::new_unscanned_for_test_with_binding_v1(
+                &definitions,
+                context.source.physical_source_binding_for_test_v1(),
+            );
+        let ros_budget = RemoteRos2InitializationBudget::new_for_protobuf_test_v1(
+            &context.source,
+            &context.viewer,
+            &context.ros_profile,
+            &context.wire,
+        );
         let budget = RemoteProtobufInitializationBudgetV1::new_disarmed_v1(
             &context.viewer,
             &context.protobuf_profile,
@@ -5906,10 +6112,17 @@ mod tests {
             1,
             256_000_000,
         );
-        let first =
-            initialize_remote_protobuf_v1(prepared(&definitions, &context, &budget).unwrap())
-                .unwrap();
-        let error = match prepared(&definitions, &context, &budget) {
+        let first = initialize_remote_protobuf_v1(
+            prepared_with_physical_and_ros_budget(&physical, &context, &ros_budget, &budget)
+                .unwrap(),
+        )
+        .unwrap();
+        let error = match prepared_with_physical_and_ros_budget(
+            &physical,
+            &context,
+            &ros_budget,
+            &budget,
+        ) {
             Ok(_prepared) => panic!("second retained result exceeded the aggregate cap"),
             Err(error) => error,
         };
@@ -5920,9 +6133,11 @@ mod tests {
             )
         );
         drop(first);
-        let second =
-            initialize_remote_protobuf_v1(prepared(&definitions, &context, &budget).unwrap())
-                .unwrap();
+        let second = initialize_remote_protobuf_v1(
+            prepared_with_physical_and_ros_budget(&physical, &context, &ros_budget, &budget)
+                .unwrap(),
+        )
+        .unwrap();
         drop(second);
         assert_eq!(
             *budget.state.usage.lock(),

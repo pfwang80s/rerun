@@ -16,6 +16,43 @@ use crate::parsers::ros2msg::tf2_msgs::tf_message::TfMessageParser;
 
 type ParserFactory = fn(usize) -> Box<dyn MessageParser>;
 
+macro_rules! builtin_ros2_parsers {
+    ($consumer:ident) => {
+        $consumer! {
+            BatteryStateMessageParser => "sensor_msgs/msg/BatteryState",
+            CompressedImageMessageParser => "sensor_msgs/msg/CompressedImage",
+            FluidPressureMessageParser => "sensor_msgs/msg/FluidPressure",
+            IlluminanceMessageParser => "sensor_msgs/msg/Illuminance",
+            ImageMessageParser => "sensor_msgs/msg/Image",
+            ImuMessageParser => "sensor_msgs/msg/Imu",
+            JoyMessageParser => "sensor_msgs/msg/Joy",
+            JointStateMessageParser => "sensor_msgs/msg/JointState",
+            NavSatFixMessageParser => "sensor_msgs/msg/NavSatFix",
+            PointCloud2MessageParser => "sensor_msgs/msg/PointCloud2",
+            RangeMessageParser => "sensor_msgs/msg/Range",
+            RelativeHumidityMessageParser => "sensor_msgs/msg/RelativeHumidity",
+            TemperatureMessageParser => "sensor_msgs/msg/Temperature",
+            Float64ArrayMessageParser => "std_msgs/msg/Float64Array",
+            Float64MultiArrayMessageParser => "std_msgs/msg/Float64MultiArray",
+            TfMessageParser => "tf2_msgs/msg/TFMessage",
+        }
+    };
+}
+
+/// Allocation-free recognition shape of the built-in semantic ROS 2 decoder.
+///
+/// Remote assignment uses this only to fail closed while its exact-safe table is empty.
+/// It does not construct a parser or make the native registry available to the remote route.
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+pub(crate) fn supports_builtin_semantic_schema(schema_name: &str) -> bool {
+    macro_rules! recognizes_schema {
+        ($($parser:ty => $registered:literal),+ $(,)?) => {
+            matches!(schema_name, $($registered)|+)
+        };
+    }
+    builtin_ros2_parsers!(recognizes_schema)
+}
+
 #[derive(Debug)]
 pub struct McapRos2Decoder {
     registry: BTreeMap<String, ParserFactory>,
@@ -32,26 +69,12 @@ impl McapRos2Decoder {
 
     /// Creates a new [`McapRos2Decoder`] with all supported message types pre-registered
     pub fn new() -> Self {
-        Self::empty()
-            // sensor_msgs
-            .register_parser::<BatteryStateMessageParser>("sensor_msgs/msg/BatteryState")
-            .register_parser::<CompressedImageMessageParser>("sensor_msgs/msg/CompressedImage")
-            .register_parser::<FluidPressureMessageParser>("sensor_msgs/msg/FluidPressure")
-            .register_parser::<IlluminanceMessageParser>("sensor_msgs/msg/Illuminance")
-            .register_parser::<ImageMessageParser>("sensor_msgs/msg/Image")
-            .register_parser::<ImuMessageParser>("sensor_msgs/msg/Imu")
-            .register_parser::<JoyMessageParser>("sensor_msgs/msg/Joy")
-            .register_parser::<JointStateMessageParser>("sensor_msgs/msg/JointState")
-            .register_parser::<NavSatFixMessageParser>("sensor_msgs/msg/NavSatFix")
-            .register_parser::<PointCloud2MessageParser>("sensor_msgs/msg/PointCloud2")
-            .register_parser::<RangeMessageParser>("sensor_msgs/msg/Range")
-            .register_parser::<RelativeHumidityMessageParser>("sensor_msgs/msg/RelativeHumidity")
-            .register_parser::<TemperatureMessageParser>("sensor_msgs/msg/Temperature")
-            // std_msgs
-            .register_parser::<Float64ArrayMessageParser>("std_msgs/msg/Float64Array")
-            .register_parser::<Float64MultiArrayMessageParser>("std_msgs/msg/Float64MultiArray")
-            // tf2_msgs
-            .register_parser::<TfMessageParser>("tf2_msgs/msg/TFMessage")
+        macro_rules! register_parsers {
+            ($($parser:ty => $schema:literal),+ $(,)?) => {
+                Self::empty()$(.register_parser::<$parser>($schema))+
+            };
+        }
+        builtin_ros2_parsers!(register_parsers)
     }
 
     /// Registers a new message parser for the given schema name
