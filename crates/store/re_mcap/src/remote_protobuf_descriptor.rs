@@ -9,6 +9,8 @@
 
 use std::alloc::Layout;
 use std::sync::Arc;
+
+use sha2::{Digest as _, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
@@ -3789,12 +3791,56 @@ struct BoundedProtobufDescriptorGraphV1<'definitions> {
     named_messages: FixedProtobufArenaV1<u32>,
 }
 
+/// Sealed executable decoder/config identity derived only inside the bounded initializer module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FrozenRemoteExecutableConfigV1 {
+    kind: u8,
+    schema_handle: u16,
+    canonical_digest: [u8; 16],
+    max_roots_per_partition: u32,
+    max_external_origin_bytes_per_partition: u64,
+}
+
+impl FrozenRemoteExecutableConfigV1 {
+    pub(crate) const fn canonical_digest_v1(self) -> [u8; 16] {
+        self.canonical_digest
+    }
+    pub(crate) const fn registration_contract_v1(self) -> (u32, u64) {
+        (
+            self.max_roots_per_partition,
+            self.max_external_origin_bytes_per_partition,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_channel_group_test_v1(kind: u8, schema_handle: u16) -> Self {
+        let mut digest = [0; 16];
+        digest[0] = kind;
+        digest[1..3].copy_from_slice(&schema_handle.to_le_bytes());
+        Self {
+            kind,
+            schema_handle,
+            canonical_digest: digest,
+            max_roots_per_partition: 1,
+            max_external_origin_bytes_per_partition: 128,
+        }
+    }
+}
+
 impl BoundedProtobufDescriptorGraphV1<'_> {
     fn has_schema_id(&self, schema_id: u16) -> bool {
         self.schemas
             .as_slice()
             .iter()
             .any(|schema| schema.schema_id == schema_id)
+    }
+
+    fn schema_shape_v1(&self, schema_id: u16) -> usize {
+        self.schemas
+            .as_slice()
+            .iter()
+            .position(|schema| schema.schema_id == schema_id)
+            .map_or(0, |index| index.saturating_add(1))
     }
 
     fn verify_lengths(
@@ -3822,9 +3868,158 @@ impl BoundedProtobufDescriptorGraphV1<'_> {
             protobuf_fatal_invariant("protobuf fixed arena lengths differ from census")
         }
     }
+
+    fn canonical_digest_for_schema_v1(
+        &self,
+        schema_id: u16,
+        policy_versions: (u16, u16, u16),
+    ) -> Result<[u8; 16], RemoteProtobufInitializationErrorV1> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"rerun.remote-mcap.protobuf-config.v2\0");
+        hasher.update(policy_versions.0.to_le_bytes());
+        hasher.update(policy_versions.1.to_le_bytes());
+        hasher.update(policy_versions.2.to_le_bytes());
+        hasher.update(schema_id.to_le_bytes());
+        for schema in self.schemas.as_slice() {
+            hasher.update(schema.schema_id.to_le_bytes());
+            hasher.update((schema.name.len() as u64).to_le_bytes());
+            hasher.update(schema.name.as_bytes());
+        }
+        for file in self.files.as_slice() {
+            hasher.update(file.schema_index.to_le_bytes());
+            self.hash_span_v1(&mut hasher, file.name)?;
+            self.hash_option_span_v1(&mut hasher, file.package)?;
+            hasher.update([match file.syntax {
+                ProtobufSyntaxV1::Proto2 => 2,
+                ProtobufSyntaxV1::Proto3 => 3,
+            }]);
+        }
+        for message in self.messages.as_slice() {
+            hasher.update(message.file_index.to_le_bytes());
+            hash_option_u32(&mut hasher, message.parent_message);
+            self.hash_span_v1(&mut hasher, message.name)?;
+            hasher.update([message.map_entry as u8]);
+            hasher.update(message.direct_fields.to_le_bytes());
+            hasher.update(message.direct_oneofs.to_le_bytes());
+        }
+        for value in self.enums.as_slice() {
+            hasher.update(value.file_index.to_le_bytes());
+            hash_option_u32(&mut hasher, value.parent_message);
+            self.hash_span_v1(&mut hasher, value.name)?;
+            hasher.update(value.direct_values.to_le_bytes());
+        }
+        for field in self.fields.as_slice() {
+            hasher.update(field.message_index.to_le_bytes());
+            hasher.update(field.ordinal.to_le_bytes());
+            self.hash_span_v1(&mut hasher, field.name)?;
+            hasher.update(field.number.to_le_bytes());
+            hasher.update([field.label as u8, field.kind as u8]);
+            self.hash_option_span_v1(&mut hasher, field.type_name)?;
+            self.hash_option_span_v1(&mut hasher, field.default)?;
+            hash_option_u32(&mut hasher, field.oneof_index);
+            hasher.update([field.proto3_optional as u8]);
+            hash_option_u32(&mut hasher, field.resolved_symbol);
+        }
+        for value in self.enum_values.as_slice() {
+            hasher.update(value.enum_index.to_le_bytes());
+            hasher.update(value.ordinal.to_le_bytes());
+            self.hash_span_v1(&mut hasher, value.name)?;
+            hasher.update(value.number.to_le_bytes());
+        }
+        for value in self.oneofs.as_slice() {
+            hasher.update(value.message_index.to_le_bytes());
+            hasher.update(value.ordinal.to_le_bytes());
+            self.hash_span_v1(&mut hasher, value.name)?;
+        }
+        for value in self.symbols.as_slice() {
+            hasher.update([value.kind as u8]);
+            hasher.update(value.node_index.to_le_bytes());
+        }
+        for value in self.sorted_symbols.as_slice() {
+            hasher.update(value.to_le_bytes());
+        }
+        for value in self.dependencies.as_slice() {
+            hasher.update(value.file_index.to_le_bytes());
+            self.hash_span_v1(&mut hasher, value.name)?;
+        }
+        for value in self.sorted_dependencies.as_slice() {
+            hasher.update(value.to_le_bytes());
+        }
+        for value in self.resolutions.as_slice() {
+            hasher.update(value.message_index.to_le_bytes());
+            hasher.update(value.field_ordinal.to_le_bytes());
+            hasher.update(value.symbol_index.to_le_bytes());
+        }
+        for value in self.named_messages.as_slice() {
+            hasher.update(value.to_le_bytes());
+        }
+        let full = hasher.finalize();
+        let mut digest = [0; 16];
+        digest.copy_from_slice(&full[..16]);
+        Ok(digest)
+    }
+
+    fn hash_span_v1(
+        &self,
+        hasher: &mut Sha256,
+        span: ByteSpanV1,
+    ) -> Result<(), RemoteProtobufInitializationErrorV1> {
+        let schema = self
+            .schemas
+            .as_slice()
+            .get(usize::from(span.schema_index))
+            .ok_or(RemoteProtobufInitializationErrorV1::InvalidRemoteSchema)?;
+        let bytes = schema
+            .data
+            .get(
+                usize::try_from(span.start)
+                    .map_err(|_overflow| RemoteProtobufInitializationErrorV1::InvalidRemoteSchema)?
+                    ..span.end()?,
+            )
+            .ok_or(RemoteProtobufInitializationErrorV1::InvalidRemoteSchema)?;
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+        Ok(())
+    }
+
+    fn hash_option_span_v1(
+        &self,
+        hasher: &mut Sha256,
+        span: Option<ByteSpanV1>,
+    ) -> Result<(), RemoteProtobufInitializationErrorV1> {
+        if let Some(value) = span {
+            hasher.update([1]);
+            self.hash_span_v1(hasher, value)
+        } else {
+            hasher.update([0]);
+            Ok(())
+        }
+    }
 }
 
-const REMOTE_PROTOBUF_ARENA_COUNT_V1: usize = 13;
+fn config_for_schema_id_v1(
+    schema_id: u16,
+    configs: &[(u16, FrozenRemoteExecutableConfigV1)],
+) -> Result<FrozenRemoteExecutableConfigV1, RemoteProtobufInitializationErrorV1> {
+    configs
+        .iter()
+        .find(|(id, _)| *id == schema_id)
+        .map(|(_, config)| *config)
+        .ok_or(RemoteProtobufInitializationErrorV1::InvalidRemoteSchema)
+}
+
+fn hash_option_u32(hasher: &mut Sha256, value: Option<u32>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_le_bytes());
+        }
+        None => hasher.update([0]),
+    }
+}
+
+const REMOTE_PROTOBUF_GRAPH_ARENA_COUNT_V1: usize = 13;
+const REMOTE_PROTOBUF_ARENA_COUNT_V1: usize = 14;
 
 fn allocate_graph_v1<'definitions>(
     census: RemoteProtobufCensusV1,
@@ -3870,7 +4065,7 @@ fn allocate_graph_v1<'definitions>(
         ),
         named_messages: arena!(u32, census.schemas),
     };
-    if index != REMOTE_PROTOBUF_ARENA_COUNT_V1 {
+    if index != REMOTE_PROTOBUF_GRAPH_ARENA_COUNT_V1 {
         protobuf_fatal_invariant("protobuf arena directory count changed");
     }
     Ok(graph)
@@ -4000,6 +4195,7 @@ fn checked_retained_bytes_v1(
         })?
     );
     charge!(u32, census.schemas);
+    charge!((u16, FrozenRemoteExecutableConfigV1), census.schemas);
     checked_add(
         retained,
         u64::try_from(std::mem::size_of::<
@@ -4238,7 +4434,7 @@ pub(crate) fn prepare_remote_protobuf_census_v1<'definitions, 'input, 'source, '
         limits.max_materialization_steps,
         RemoteProtobufResourceLimitV1::MaterializationSteps,
     );
-    for _arena in 0..REMOTE_PROTOBUF_ARENA_COUNT_V1 {
+    for _arena in 0..REMOTE_PROTOBUF_GRAPH_ARENA_COUNT_V1 {
         dry_run_steps.consume()?;
     }
     let mut counts = MaterializationCountsV1::default();
@@ -4274,6 +4470,7 @@ pub(crate) fn prepare_remote_protobuf_census_v1<'definitions, 'input, 'source, '
 pub(crate) struct BoundedRemoteDecoderInitializersV1<'definitions, 'input, 'source, 'wire> {
     continuation: RemoteProtobufProjectionEofContinuationV1<'definitions, 'input, 'source, 'wire>,
     protobuf: BoundedProtobufDescriptorGraphV1<'definitions>,
+    executable_configs: FixedProtobufArenaV1<(u16, FrozenRemoteExecutableConfigV1)>,
     membership_projected: bool,
     _reservation: RemoteProtobufResultReservationV1,
 }
@@ -4328,7 +4525,11 @@ impl<'definitions, 'input, 'source, 'wire>
             .continuation
             .take_bound_recognition_v1()
             .map_err(map_ros_recognition_error)?;
-        Ok(BoundedRemoteRecognitionIterV1 { ros2, protobuf })
+        Ok(BoundedRemoteRecognitionIterV1 {
+            ros2,
+            protobuf,
+            executable_configs: &self.executable_configs,
+        })
     }
 
     pub(crate) fn ensure_current_for_assignment_v1(
@@ -4368,6 +4569,7 @@ impl<'definitions, 'input, 'source, 'wire>
 pub(crate) struct BoundedRemoteRecognitionIterV1<'borrow, 'definitions, 'input, 'source, 'wire> {
     ros2: RemoteRos2RecognitionIterV1<'borrow, 'definitions, 'input, 'source, 'wire>,
     protobuf: &'borrow BoundedProtobufDescriptorGraphV1<'definitions>,
+    executable_configs: &'borrow FixedProtobufArenaV1<(u16, FrozenRemoteExecutableConfigV1)>,
 }
 
 pub(crate) struct BoundedRemoteChannelRecognitionV1<
@@ -4380,6 +4582,7 @@ pub(crate) struct BoundedRemoteChannelRecognitionV1<
 > {
     ros2: RemoteRos2ChannelRecognitionV1<'item, 'borrow, 'definitions, 'input, 'source, 'wire>,
     protobuf: &'item BoundedProtobufDescriptorGraphV1<'definitions>,
+    executable_configs: &'item [(u16, FrozenRemoteExecutableConfigV1)],
 }
 
 impl BoundedRemoteChannelRecognitionV1<'_, '_, '_, '_, '_, '_> {
@@ -4421,6 +4624,67 @@ impl BoundedRemoteChannelRecognitionV1<'_, '_, '_, '_, '_, '_> {
             .resolve_bound_owner_v1(recognized)
             .map_err(map_ros_recognition_error)
     }
+
+    pub(crate) fn frozen_executable_config_v1(
+        &self,
+        owner: crate::remote_decoder_assignment::RemoteDecoderOwnerV1,
+    ) -> Result<FrozenRemoteExecutableConfigV1, RemoteProtobufInitializationErrorV1> {
+        let schema_id = match owner {
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Ros2Reflection => self
+                .ros2
+                .ros2_schema_id_v1()
+                .map_err(map_ros_recognition_error)?
+                .ok_or(RemoteProtobufInitializationErrorV1::InvalidRemoteSchema)?,
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Protobuf => self
+                .ros2
+                .protobuf_schema_id()
+                .map_err(map_ros_recognition_error)?
+                .filter(|schema_id| self.protobuf.has_schema_id(*schema_id))
+                .ok_or(RemoteProtobufInitializationErrorV1::InvalidRemoteSchema)?,
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Raw => 0,
+        };
+        let kind = match owner {
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Ros2Reflection => 1,
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Protobuf => 2,
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Raw => 3,
+        };
+        let policy_versions = self
+            .ros2
+            .policy_versions_v1()
+            .map_err(map_ros_recognition_error)?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"rerun.remote-mcap.executable-config.v1\0");
+        hasher.update(policy_versions.0.to_le_bytes());
+        hasher.update(policy_versions.1.to_le_bytes());
+        hasher.update(policy_versions.2.to_le_bytes());
+        hasher.update([kind]);
+        match owner {
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Ros2Reflection => {
+                let digest = self
+                    .ros2
+                    .ros2_executable_config_digest_v1()
+                    .map_err(map_ros_recognition_error)?
+                    .ok_or(RemoteProtobufInitializationErrorV1::InvalidRemoteSchema)?;
+                hasher.update(digest);
+            }
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Protobuf => {
+                return config_for_schema_id_v1(schema_id, self.executable_configs);
+            }
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Raw => {}
+        }
+        let full_digest = hasher.finalize();
+        let mut digest = [0; 16];
+        digest.copy_from_slice(&full_digest[..16]);
+        Ok(FrozenRemoteExecutableConfigV1 {
+            kind,
+            schema_handle: schema_id,
+            canonical_digest: digest,
+            // All three currently admitted remote-specific parsers finalize exactly one temporal
+            // Chunk. The external-origin descriptor is a fixed-width V1 encoding.
+            max_roots_per_partition: 1,
+            max_external_origin_bytes_per_partition: 128,
+        })
+    }
 }
 
 impl<'borrow, 'definitions, 'input, 'source, 'wire>
@@ -4435,6 +4699,7 @@ impl<'borrow, 'definitions, 'input, 'source, 'wire>
         RemoteProtobufInitializationErrorV1,
     > {
         let protobuf = self.protobuf;
+        let executable_configs = self.executable_configs.as_slice();
         let Some(ros2) = self
             .ros2
             .next_channel()
@@ -4442,7 +4707,11 @@ impl<'borrow, 'definitions, 'input, 'source, 'wire>
         else {
             return Ok(None);
         };
-        Ok(Some(BoundedRemoteChannelRecognitionV1 { ros2, protobuf }))
+        Ok(Some(BoundedRemoteChannelRecognitionV1 {
+            ros2,
+            protobuf,
+            executable_configs,
+        }))
     }
 
     pub(crate) fn next_matching_channel<'item>(
@@ -4455,6 +4724,7 @@ impl<'borrow, 'definitions, 'input, 'source, 'wire>
         RemoteProtobufInitializationErrorV1,
     > {
         let protobuf = self.protobuf;
+        let executable_configs = self.executable_configs.as_slice();
         let Some(ros2) = self
             .ros2
             .next_matching_channel(matches)
@@ -4462,7 +4732,11 @@ impl<'borrow, 'definitions, 'input, 'source, 'wire>
         else {
             return Ok(None);
         };
-        Ok(Some(BoundedRemoteChannelRecognitionV1 { ros2, protobuf }))
+        Ok(Some(BoundedRemoteChannelRecognitionV1 {
+            ros2,
+            protobuf,
+            executable_configs,
+        }))
     }
 }
 
@@ -4512,11 +4786,35 @@ fn initialize_remote_protobuf_with_gate_v1<'definitions, 'input, 'source, 'wire>
         .continuation
         .ensure_profile_current_v1(prepared.viewer_scope, prepared.profile_scope)
         .map_err(map_ros_error)?;
-    gate.before_result()?;
     let reservation = prepared.reservation.complete();
+    let mut executable_configs = FixedProtobufArenaV1::try_new(
+        graph.schemas.as_slice().len(),
+        REMOTE_PROTOBUF_GRAPH_ARENA_COUNT_V1,
+        gate,
+    )?;
+    let policy_versions = prepared
+        .continuation
+        .policy_descriptor_for_assignment_v1()
+        .map_err(map_ros_error)?
+        .canonical_versions_for_manifest_v1();
+    for schema in graph.schemas.as_slice() {
+        let short = graph.canonical_digest_for_schema_v1(schema.schema_id, policy_versions)?;
+        executable_configs.push((
+            schema.schema_id,
+            FrozenRemoteExecutableConfigV1 {
+                kind: 2,
+                schema_handle: schema.schema_id,
+                canonical_digest: short,
+                max_roots_per_partition: 1,
+                max_external_origin_bytes_per_partition: 128,
+            },
+        ));
+    }
+    gate.before_result()?;
     Ok(BoundedRemoteDecoderInitializersV1 {
         continuation: prepared.continuation,
         protobuf: graph,
+        executable_configs,
         membership_projected: false,
         _reservation: reservation,
     })

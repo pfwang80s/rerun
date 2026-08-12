@@ -15,7 +15,8 @@ use parking_lot::Mutex;
 
 use crate::remote_chunk_scan::PhysicalChunkMessageEvidenceV1;
 use crate::remote_protobuf_descriptor::{
-    BoundedRemoteDecoderInitializersV1, RemoteProtobufInitializationErrorV1,
+    BoundedRemoteDecoderInitializersV1, FrozenRemoteExecutableConfigV1,
+    RemoteProtobufInitializationErrorV1,
 };
 use crate::remote_ros2_reflection::{
     FrozenRemoteDecoderSlotV1, RemoteKnownNonEmptyEvidenceV1, RemoteMcapSelectedMembershipV1,
@@ -46,13 +47,13 @@ struct RemoteSemanticParserIdentityV1 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RemoteChannelEligibilityV1 {
+pub(crate) enum RemoteChannelEligibilityV1 {
     KnownNonEmpty,
     Unknown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RemoteDecoderOwnerV1 {
+pub(crate) enum RemoteDecoderOwnerV1 {
     Ros2Reflection,
     Protobuf,
     Raw,
@@ -406,23 +407,43 @@ impl AssignmentStepOwnerV1 {
 
 /// One immutable `ChannelId -> owner` projection retained by the assignment result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RemoteChannelDecoderAssignmentV1 {
+pub(crate) struct RemoteChannelDecoderAssignmentV1 {
     channel_id: u16,
     eligibility: RemoteChannelEligibilityV1,
     owner: RemoteDecoderOwnerV1,
+    executable_config: FrozenRemoteExecutableConfigV1,
 }
 
 impl RemoteChannelDecoderAssignmentV1 {
-    const fn channel_id(&self) -> u16 {
+    #[cfg(test)]
+    pub(crate) const fn new_for_manifest_test_v1(
+        channel_id: u16,
+        eligibility: RemoteChannelEligibilityV1,
+        owner: RemoteDecoderOwnerV1,
+        executable_config: FrozenRemoteExecutableConfigV1,
+    ) -> Self {
+        Self {
+            channel_id,
+            eligibility,
+            owner,
+            executable_config,
+        }
+    }
+
+    pub(crate) const fn channel_id(&self) -> u16 {
         self.channel_id
     }
 
-    const fn eligibility(&self) -> RemoteChannelEligibilityV1 {
+    pub(crate) const fn eligibility(&self) -> RemoteChannelEligibilityV1 {
         self.eligibility
     }
 
-    const fn owner(&self) -> RemoteDecoderOwnerV1 {
+    pub(crate) const fn owner(&self) -> RemoteDecoderOwnerV1 {
         self.owner
+    }
+
+    pub(crate) const fn executable_config(&self) -> FrozenRemoteExecutableConfigV1 {
+        self.executable_config
     }
 }
 
@@ -484,6 +505,28 @@ pub(crate) struct BoundedRemoteDecoderAssignmentsV1<'definitions, 'input, 'sourc
 }
 
 impl BoundedRemoteDecoderAssignmentsV1<'_, '_, '_, '_> {
+    pub(crate) fn ensure_current_for_manifest_v1(
+        &self,
+    ) -> Result<(), RemoteDecoderAssignmentErrorV1> {
+        self.initializers
+            .ensure_current_for_assignment_v1()
+            .map_err(map_initializer_error)
+    }
+
+    pub(crate) fn assignments_for_manifest_v1(&self) -> &[RemoteChannelDecoderAssignmentV1] {
+        &self.assignments.storage
+    }
+
+    pub(crate) fn policy_versions_for_manifest_v1(
+        &self,
+    ) -> Result<(u16, u16, u16), RemoteDecoderAssignmentErrorV1> {
+        Ok(self
+            .initializers
+            .policy_descriptor_for_assignment_v1()
+            .map_err(map_initializer_error)?
+            .canonical_versions_for_manifest_v1())
+    }
+
     #[cfg(test)]
     fn assignments_for_test(&self) -> &[RemoteChannelDecoderAssignmentV1] {
         &self.assignments.storage
@@ -776,6 +819,9 @@ fn assign_remote_decoders_with_gate_v1<'definitions, 'input, 'source, 'wire>(
                 channel_id,
                 eligibility: channel_eligibility,
                 owner,
+                executable_config: channel
+                    .frozen_executable_config_v1(owner)
+                    .map_err(map_initializer_error)?,
             });
         }
     }
@@ -1096,6 +1142,28 @@ mod tests {
         assign_remote_decoders_with_gate_v1(eligibility, gate)
     }
 
+    fn build_groups_for_test_v1<'definitions, 'input, 'source>(
+        initializers: BoundedRemoteDecoderInitializersV1<'definitions, 'input, 'source, 'source>,
+        assignment_budget: &RemoteDecoderAssignmentBudgetV1,
+        group_budget: &crate::remote_channel_group::RemoteChannelGroupBudgetV1,
+    ) -> Result<
+        crate::remote_channel_group::ImmutableRemoteChannelGroupsV1<
+            'definitions,
+            'input,
+            'source,
+            'source,
+        >,
+        crate::remote_channel_group::RemoteChannelGroupErrorV1,
+    > {
+        let assignment = assign_for_test_v1(initializers, assignment_budget).map_err(|_error| {
+            crate::remote_channel_group::RemoteChannelGroupErrorV1::AssignmentFailed
+        })?;
+        crate::remote_channel_group::build_immutable_remote_channel_groups_v1(
+            assignment,
+            group_budget,
+        )
+    }
+
     fn fixture(
         schemas: impl IntoIterator<Item = FixtureSchema>,
         channels: impl IntoIterator<Item = FixtureChannel>,
@@ -1357,6 +1425,9 @@ mod tests {
                 channel_id: 2,
                 eligibility: RemoteChannelEligibilityV1::Unknown,
                 owner: RemoteDecoderOwnerV1::Raw,
+                executable_config: FrozenRemoteExecutableConfigV1::new_for_channel_group_test_v1(
+                    3, 0,
+                ),
             }]
         );
         assert_eq!(context.source.assignment_recognition_count_for_test_v1(), 1);
@@ -1488,6 +1559,9 @@ mod tests {
                 channel_id: 2,
                 eligibility: RemoteChannelEligibilityV1::Unknown,
                 owner: RemoteDecoderOwnerV1::Raw,
+                executable_config: FrozenRemoteExecutableConfigV1::new_for_channel_group_test_v1(
+                    3, 0,
+                ),
             }],
         );
         drop(result);
@@ -2124,5 +2198,81 @@ mod tests {
         }
         assert!(EXACT_SAFE_SEMANTIC_ROS2_TABLE_V1.is_empty());
         assert!(!source.contains(concat!("pub(crate) fn ", "assignments")));
+    }
+
+    #[test]
+    fn immutable_groups_consume_real_assignment_and_retain_all_owner_reservations() {
+        let fixture = fixture([], [FixtureChannel::schema_less(1, "/raw")], [1]);
+        let definitions = validated_summary_definitions_for_test(&fixture);
+        let context = StableContext::new();
+        let protobuf_budget = context.protobuf_budget();
+        let (initializers, ros_budget) =
+            combined_initializers(&definitions, &context, &protobuf_budget);
+        let assignment_budget = assignment_budget();
+        let group_limits =
+            crate::remote_channel_group::UnfrozenRemoteChannelGroupLimitsV1::generous_for_assignment_test_v1();
+        let group_budget =
+            crate::remote_channel_group::RemoteChannelGroupBudgetV1::new_for_assignment_test_v1(
+                group_limits,
+                1,
+                1_000_000,
+            );
+        let groups =
+            build_groups_for_test_v1(initializers, &assignment_budget, &group_budget).unwrap();
+        assert!(!ros_budget.is_idle_for_assignment_test_v1());
+        assert!(!protobuf_budget.is_idle_for_assignment_test_v1());
+        assert_ne!(
+            *assignment_budget.state.usage.lock(),
+            RemoteDecoderAssignmentBudgetUsageV1::default()
+        );
+        assert!(groups.resolve_group(crate::remote_channel_group::StableDecoderGroupIdV1::first_for_assignment_test_v1()).is_some());
+        drop(groups);
+        assert!(ros_budget.is_idle_for_assignment_test_v1());
+        assert!(protobuf_budget.is_idle_for_assignment_test_v1());
+        assert_eq!(
+            *assignment_budget.state.usage.lock(),
+            RemoteDecoderAssignmentBudgetUsageV1::default()
+        );
+        assert!(group_budget.is_idle_for_assignment_test_v1());
+    }
+
+    #[test]
+    fn immutable_group_combined_minus_one_rejects_real_build_before_group_allocation() {
+        let fixture = fixture([], [FixtureChannel::schema_less(1, "/raw")], [1]);
+        let definitions = validated_summary_definitions_for_test(&fixture);
+        let context = StableContext::new();
+        let protobuf_budget = context.protobuf_budget();
+        let (initializers, ros_budget) =
+            combined_initializers(&definitions, &context, &protobuf_budget);
+        let assignment_budget = assignment_budget();
+        let group_limits =
+            crate::remote_channel_group::UnfrozenRemoteChannelGroupLimitsV1::generous_for_assignment_test_v1();
+        let (working, retained) =
+            crate::remote_channel_group::peak_bytes_for_assignment_test_v1(1).unwrap();
+        let group_budget = crate::remote_channel_group::RemoteChannelGroupBudgetV1::new_for_test_v1(
+            group_limits,
+            1,
+            working,
+            retained,
+            working.checked_add(retained).unwrap() - 1,
+        );
+        let error = match build_groups_for_test_v1(initializers, &assignment_budget, &group_budget)
+        {
+            Ok(_groups) => panic!("minus-one Channel-group budget unexpectedly built"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            crate::remote_channel_group::RemoteChannelGroupErrorV1::ResourceLimitExceeded(
+                crate::remote_channel_group::RemoteChannelGroupResourceLimitV1::ReservationCapacity,
+            )
+        );
+        assert!(ros_budget.is_idle_for_assignment_test_v1());
+        assert!(protobuf_budget.is_idle_for_assignment_test_v1());
+        assert_eq!(
+            *assignment_budget.state.usage.lock(),
+            RemoteDecoderAssignmentBudgetUsageV1::default()
+        );
+        assert!(group_budget.is_idle_for_assignment_test_v1());
     }
 }

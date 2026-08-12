@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
+use sha2::{Digest as _, Sha256};
 
 use crate::TopicFilter;
 use crate::remote_chunk_scan::{
@@ -204,6 +205,16 @@ struct FrozenRemoteDecoderPolicyDescriptorV1<'wire> {
     fallback_identity: &'wire str,
 }
 
+impl FrozenRemoteDecoderPolicyDescriptorV1<'_> {
+    const fn canonical_versions_for_manifest_v1(&self) -> (u16, u16, u16) {
+        (
+            self.allowlist_version,
+            self.assignment_version,
+            self.grammar_version,
+        )
+    }
+}
+
 /// Address-free value identity for the complete canonical decoder policy.
 ///
 /// The string-bearing wire is validated before this can be produced, so the ordered slots and
@@ -222,6 +233,14 @@ pub(crate) struct FrozenRemoteDecoderPolicyDescriptorViewV1<'borrow, 'wire> {
 }
 
 impl FrozenRemoteDecoderPolicyDescriptorViewV1<'_, '_> {
+    pub(crate) const fn canonical_versions_for_manifest_v1(&self) -> (u16, u16, u16) {
+        (
+            self.descriptor.allowlist_version,
+            self.descriptor.assignment_version,
+            self.descriptor.grammar_version,
+        )
+    }
+
     pub(crate) fn resolve_owner_v1(
         &self,
         recognized: [bool; 3],
@@ -2233,6 +2252,7 @@ pub(crate) struct Ros2InitializedRemoteDefinitionsV1<'definitions, 'input, 'sour
     specifications: FixedArena<ParsedSpecificationV1>,
     members: FixedArena<ParsedMemberV1>,
     resolutions: FixedArena<ComplexTypeResolutionV1>,
+    executable_config_digests: FixedArena<(u16, [u8; 16])>,
     projection_steps: u64,
     recognition_steps: u64,
     reservation: RemoteRos2ResultReservation,
@@ -2387,6 +2407,48 @@ impl RemoteRos2ChannelRecognitionV1<'_, '_, '_, '_, '_, '_> {
     pub(crate) fn protobuf_schema_id(&self) -> Result<Option<u16>, RemoteRos2InitializationError> {
         self.owner.transition.ensure_current()?;
         Ok(self.protobuf_schema_id)
+    }
+
+    pub(crate) fn ros2_schema_id_v1(&self) -> Result<Option<u16>, RemoteRos2InitializationError> {
+        self.owner.transition.ensure_current()?;
+        let definitions = self.owner.transition.payload.initialized.source.definitions;
+        let channel = definitions
+            .channel_at_record(self.channel_record_index)
+            .ok_or_else(|| remote_ros2_fatal_invariant("recognized channel projection changed"))?;
+        Ok(self
+            .recognized_by_reflection
+            .then_some(channel.schema_id)
+            .filter(|schema_id| *schema_id != 0))
+    }
+
+    pub(crate) fn ros2_executable_config_digest_v1(
+        &self,
+    ) -> Result<Option<[u8; 16]>, RemoteRos2InitializationError> {
+        self.owner.transition.ensure_current()?;
+        let Some(schema_id) = self.ros2_schema_id_v1()? else {
+            return Ok(None);
+        };
+        Ok(self
+            .owner
+            .transition
+            .payload
+            .initialized
+            .executable_config_digests
+            .as_slice()
+            .iter()
+            .find(|(id, _digest)| *id == schema_id)
+            .map(|(_id, digest)| *digest))
+    }
+
+    pub(crate) fn policy_versions_v1(
+        &self,
+    ) -> Result<(u16, u16, u16), RemoteRos2InitializationError> {
+        self.owner.transition.ensure_current()?;
+        Ok(self
+            .owner
+            .transition
+            .policy_descriptor_v1()
+            .canonical_versions_for_manifest_v1())
     }
 
     pub(crate) fn resolve_bound_owner_v1(
@@ -3103,6 +3165,64 @@ fn arena_allocation_footprint<T>(count: u64) -> Result<u64, RemoteRos2Initializa
         RemoteRos2InitializationError::ResourceLimitExceeded(RemoteRos2ResourceLimit::Arithmetic)
     })?;
     locked_wasm_allocation_footprint_v1(layout)
+}
+
+fn encode_parsed_type_v1(hasher: &mut Sha256, ty: ParsedTypeV1) {
+    fn span(hasher: &mut Sha256, value: SourceTextSpan) {
+        hasher.update((value.schema_record_index as u64).to_le_bytes());
+        hasher.update([value.kind as u8]);
+        hasher.update(value.start.to_le_bytes());
+        hasher.update(value.len.to_le_bytes());
+    }
+    fn primitive(hasher: &mut Sha256, value: PrimitiveTypeV1) {
+        match value {
+            PrimitiveTypeV1::Bool => hasher.update([0]),
+            PrimitiveTypeV1::Byte => hasher.update([1]),
+            PrimitiveTypeV1::Char => hasher.update([2]),
+            PrimitiveTypeV1::Float32 => hasher.update([3]),
+            PrimitiveTypeV1::Float64 => hasher.update([4]),
+            PrimitiveTypeV1::Int8 => hasher.update([5]),
+            PrimitiveTypeV1::Int16 => hasher.update([6]),
+            PrimitiveTypeV1::Int32 => hasher.update([7]),
+            PrimitiveTypeV1::Int64 => hasher.update([8]),
+            PrimitiveTypeV1::UInt8 => hasher.update([9]),
+            PrimitiveTypeV1::UInt16 => hasher.update([10]),
+            PrimitiveTypeV1::UInt32 => hasher.update([11]),
+            PrimitiveTypeV1::UInt64 => hasher.update([12]),
+            PrimitiveTypeV1::String { bound } => {
+                hasher.update([13]);
+                match bound {
+                    Some(bound) => {
+                        hasher.update([1]);
+                        hasher.update(bound.to_le_bytes());
+                    }
+                    None => hasher.update([0]),
+                }
+            }
+        }
+    }
+    match ty.element {
+        ElementTypeV1::Primitive(value) => {
+            hasher.update([0]);
+            primitive(hasher, value);
+        }
+        ElementTypeV1::Complex(value) => {
+            hasher.update([1]);
+            span(hasher, value);
+        }
+    }
+    match ty.array {
+        ArraySizeV1::Scalar => hasher.update([0]),
+        ArraySizeV1::Fixed(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_le_bytes());
+        }
+        ArraySizeV1::Bounded(value) => {
+            hasher.update([2]);
+            hasher.update(value.to_le_bytes());
+        }
+        ArraySizeV1::Unbounded => hasher.update([3]),
+    }
 }
 
 fn for_each_canonical_ros2_schema<'definitions, 'input>(
@@ -4713,9 +4833,10 @@ fn compute_arena_peak(
     let member_bytes = arena_allocation_footprint::<ParsedMemberV1>(census.members)?;
     let resolution_bytes =
         arena_allocation_footprint::<ComplexTypeResolutionV1>(census.dependency_edges)?;
+    let digest_bytes = arena_allocation_footprint::<(u16, [u8; 16])>(census.schemas)?;
     let retained = checked_add(
         checked_add(schema_bytes, specification_bytes)?,
-        checked_add(member_bytes, resolution_bytes)?,
+        checked_add(checked_add(member_bytes, resolution_bytes)?, digest_bytes)?,
     )?;
     census.retained_bytes = checked_add(retained, remote_ros2_result_inline_bytes_v1()?)?;
     if census.retained_bytes > limits.max_retained_bytes {
@@ -4811,6 +4932,7 @@ struct Ros2ArenaDirectoryV1 {
     specifications: FixedArena<ParsedSpecificationV1>,
     members: FixedArena<ParsedMemberV1>,
     resolutions: FixedArena<ComplexTypeResolutionV1>,
+    executable_config_digests: FixedArena<(u16, [u8; 16])>,
 }
 
 fn sealed_fixed_working_bytes_v1() -> Result<u64, RemoteRos2InitializationError> {
@@ -4867,7 +4989,7 @@ pub(crate) fn prepare_remote_ros2_census_v1<'definitions, 'input, 'source, 'wire
     compute_arena_peak(&mut census, &limits)?;
 
     // This is the allocation-free dry run of the exact materialization control flow.
-    // It includes the four arena allocation actions, every parser scan, and every emitted record.
+    // It includes the five arena allocation actions, every parser scan, and every emitted record.
     // A limit one step below the exact count therefore fails here, before the first arena exists.
     let mut materialization_steps = RemoteRos2StepOwnershipV1::with_limit(
         limits.max_materialization_steps,
@@ -4996,7 +5118,7 @@ impl<T> FixedArena<T> {
 fn consume_arena_allocation_steps(
     steps: &mut RemoteRos2StepOwnershipV1,
 ) -> Result<(), RemoteRos2InitializationError> {
-    for _arena in 0..4 {
+    for _arena in 0..5 {
         steps.consume()?;
     }
     Ok(())
@@ -5015,11 +5137,14 @@ fn allocate_remote_ros2_arenas(
     let members = FixedArena::try_new(checked_usize(census.members)?, 2, gate)?;
     steps.consume()?;
     let resolutions = FixedArena::try_new(checked_usize(census.dependency_edges)?, 3, gate)?;
+    steps.consume()?;
+    let executable_config_digests = FixedArena::try_new(checked_usize(census.schemas)?, 4, gate)?;
     Ok(Ros2ArenaDirectoryV1 {
         schemas,
         specifications,
         members,
         resolutions,
+        executable_config_digests,
     })
 }
 
@@ -5316,6 +5441,36 @@ fn materialize_remote_ros2_definitions_v1_with_gate<'definitions, 'input, 'sourc
         scratch: _scratch,
     } = owner;
     let result_reservation = reservation.complete();
+    let policy_versions = policy.descriptor.canonical_versions_for_manifest_v1();
+    let executable_config_digests = &mut arenas.executable_config_digests;
+    for schema in arenas.schemas.as_slice() {
+        let mut hasher = Sha256::new();
+        hasher.update(b"rerun.remote-mcap.ros2-config.v1\0");
+        hasher.update(policy_versions.0.to_le_bytes());
+        hasher.update(policy_versions.1.to_le_bytes());
+        hasher.update(policy_versions.2.to_le_bytes());
+        for specification in &arenas.specifications.as_slice()[schema.specifications.clone()] {
+            hasher.update(text_for_span(source.definitions, specification.name)?.as_bytes());
+            for member in &arenas.members.as_slice()[specification.members.clone()] {
+                hasher.update([member.kind as u8]);
+                hasher.update(text_for_span(source.definitions, member.name)?.as_bytes());
+                encode_parsed_type_v1(&mut hasher, member.ty);
+            }
+        }
+        for resolution in arenas.resolutions.as_slice().iter().filter(|resolution| {
+            arenas.members.as_slice()[resolution.member_index].specification_index
+                >= schema.specifications.start
+                && arenas.members.as_slice()[resolution.member_index].specification_index
+                    < schema.specifications.end
+        }) {
+            hasher.update((resolution.member_index as u64).to_le_bytes());
+            hasher.update((resolution.target_specification_index as u64).to_le_bytes());
+        }
+        let full = hasher.finalize();
+        let mut digest = [0; 16];
+        digest.copy_from_slice(&full[..16]);
+        executable_config_digests.push((schema.schema_id, digest))?;
+    }
     Ok(Ros2InitializedRemoteDefinitionsV1 {
         source,
         policy,
@@ -5325,6 +5480,7 @@ fn materialize_remote_ros2_definitions_v1_with_gate<'definitions, 'input, 'sourc
         specifications: arenas.specifications,
         members: arenas.members,
         resolutions: arenas.resolutions,
+        executable_config_digests: arenas.executable_config_digests,
         projection_steps: census.projection_steps,
         recognition_steps: census.recognition_steps,
         reservation: result_reservation,
@@ -7250,7 +7406,7 @@ mod tests {
 
     #[test]
     fn every_arena_failure_and_stale_checkpoint_rolls_back_exactly() {
-        for fault_index in 0..4 {
+        for fault_index in 0..5 {
             let fixture = fixture(
                 [schema(
                     7,
@@ -7280,7 +7436,7 @@ mod tests {
             );
         }
 
-        for stale_index in 0..4 {
+        for stale_index in 0..5 {
             let fixture = fixture(
                 [schema(
                     7,
@@ -7758,6 +7914,12 @@ mod tests {
             )
             .unwrap(),
         )
+        .and_then(|bytes| {
+            checked_add(
+                bytes,
+                arena_allocation_footprint::<(u16, [u8; 16])>(1).unwrap(),
+            )
+        })
         .and_then(|bytes| checked_add(bytes, remote_ros2_result_inline_bytes_v1().unwrap()))
         .unwrap();
         assert_eq!(census.retained_bytes, exact_retained);

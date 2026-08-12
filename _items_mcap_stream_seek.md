@@ -360,13 +360,13 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 验收：compile/API tests证明raw `mcap::Summary`、裸owner map、cross-source/cross-policy重绑和evidence drop后使用不可表达；projection/result exact bytes、initializer proven working set、aggregate contention及所有失败/Drop路径恢复budget snapshot；production remote route保持disarmed且native/public API不扩大。
 - 负责人：kola；提交：本提交；备注：2026-08-12 完成production-disarmed的Web remote decoder assignment adapter，只消费MCAP-027的same-source/policy combined initializer ownership和物理Chunk message evidence，冻结canonical policy与source semantic config后以deterministic priority/fallback core生成move-only assignment；V1 semantic allowlist保守保持为空，所有semantic候选结构化返回`SemanticParserNotAllowlisted`且不降级Raw，native/local `ExecutionPlan`、公开decoder API和服务端运行行为不变。artifact verifier的definitions capability与source state复用同一`PhysicalChunkSourceBindingV1`，独立binding仍进入fatal control-plane，闭合locked release-Wasm probe的authority一致性。Dafee最终增量review无中级及以上问题且无设计缺陷；门限为artifact probe 2/2、decoder assignment定向21/21、`re_mcap` all-features library check及Clippy `-D warnings`通过，目标Rust文件已格式化且diff-check通过；本机无pixi/cargo-nextest，全workspace fmt受既有缺失`docs/snippets/src/snippets.rs`阻断，真实release Web构建仍受既有clang依赖缺失限制。
 
-### [ ] MCAP-029 — 构建 immutable Channel-group 与稳定 source identity
+### [x] MCAP-029 — 构建 immutable Channel-group 与稳定 source identity
 
 - 建议提交：`Add immutable remote MCAP channel groups`。
 - 依赖：MCAP-028。
 - 变更：消费MCAP-028 move-only assignment并继续拥有MCAP-026/027 sealed initializer results及matching reservation，生成decoder/config hash/canonical membership/registration bounds、唯一 `ChannelId → group_id`、dense partition key、canonical source order、deterministic ordinal、stable RowId。
 - 验收：identical group 去重，跨owner/source/policy initializer重绑和membership overlap拒绝，相同输入在seek、GC reload和allowlist serialization reorder后产生相同identity，group descriptor不能退化为裸schema bytes后重新初始化。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：kola；提交：本提交；备注：2026-08-12 完成production-disarmed的immutable remote Channel-group与稳定source identity：move消费MCAP-028 assignment并持续持有MCAP-026/027 sealed initializer ownership及reservation，以bounded materialization阶段冻结的ROS 2/protobuf canonical executable-config digest、decoder固有registration contract、canonical membership和dense group identity生成唯一`ChannelId → group_id`投影；protobuf identity显式覆盖materialized graph、依赖/resolution及完整named-message identity，ROS 2使用显式versioned parsed-type编码，028/029不回读裸schema。group resolution为non-Copy lifetime-bound handle，禁止跨source/policy重绑；canonical source order与derived ordinal生成stable RowId。029以每个真实allocation的locked-Wasm footprint核算working、retained及同时峰值，真实assignment-owner combined-minus-one在首次group allocation前拒绝并恢复026/027/028/029全部预算。Dafee多轮增量review后0个中级及以上问题且无设计缺陷；门限为`re_mcap` all-features/all-targets check与Clippy `-D warnings`、Channel-group定向4/4、真实owner/Drop与combined-minus-one测试、protobuf local-pool差分、doctest及diff-check通过；production route仍disarmed，native/local decoder API、Viewer运行行为和Rerun服务端不变。
 
 ### [ ] MCAP-030 — 实现 PhysicalChunkValidationCount
 
