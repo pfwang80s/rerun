@@ -692,6 +692,9 @@ impl<'definitions, 'input> PhysicalChunkDefinitionsCapabilityV1<'definitions, 'i
 }
 
 impl PhysicalChunkSourceBindingV1 {
+    pub(crate) const fn source_generation_v1(&self) -> u64 {
+        self.source_generation.get()
+    }
     pub(super) fn matches_v1(&self, other: &Self) -> bool {
         self.source_generation == other.source_generation
             && Arc::ptr_eq(&self.state, &other.state)

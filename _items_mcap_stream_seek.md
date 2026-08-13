@@ -421,7 +421,7 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 当前中间态：工作树中的A/B normalized output descriptor/executable factory属于031的未提交实现输入；它们不得签发partition/root identity、不得被计为032完成，也不得在032之前提交为独立产品能力。
 - 负责人：TBD；提交：TBD；备注：TBD。
 
-### [ ] MCAP-032 — 构建 immutable manifest 与全 session metadata preflight
+### [x] MCAP-032 — 构建 immutable manifest 与全 session metadata preflight
 
 - 建议提交：`Build bounded immutable remote MCAP manifest`。
 - 依赖：MCAP-009、MCAP-025A、MCAP-026、MCAP-027、MCAP-029、MCAP-030、MCAP-030A。
@@ -433,7 +433,7 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 变更：root issuer在decode前冻结stable identity fields、domain separation、deterministic output ordinal规则和allowed descriptor shape；decode后只允许补入已预留且不改变identity的bounded actual metadata。
 - 验收：所有乘法在集合构造前checked，合法最大manifest完整遍历不耗尽预留，不合法输入在Store创建前失败，`NoIndexedMessages`仍保留`OpeningStatic`且不声称source empty；manifest Drop后initializer reservation恰好释放一次。
 - 验收：compile/API测试证明validation plan、030A factory、031 output builder、caller scalar/hash和另一session/generation不能构造partition key、root descriptor或`ChunkId`；same partition+ordinal稳定，cross-domain不同，超过registration bound在decode/publication前失败。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：kola；提交：本提交；备注：2026-08-13 完成production-disarmed的immutable manifest authority：消费MCAP-025A resolved physical source ref与MCAP-029 immutable groups，在任何allocation前校验stale source并checked preflight partition、retained metadata、registration和external-origin headroom；session-level `OpeningStatic` 在零indexed units时仍保留。Root issuer使用固定domain/version与little-endian字段的BLAKE3-128，绑定fresh session、physical generation、source ordinal、partition kind/group和output ordinal；caller scalar/hash、cross-session/generation/kind及超界ordinal均fail-closed。Dafee多轮审查后无中级及以上问题且无设计偏离；focused manifest测试2/2、all-features library check、Clippy `-D warnings`与diff-check通过。完整NoIndexed/max-manifest fixture留待后续集成验收；生产Web route继续disarmed，native Viewer/API和Rerun服务端行为不变。
 
 ### [ ] MCAP-033 — 建立 Fetch completion queue、CPU driver 与 Phase A 性能基线
 

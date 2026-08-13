@@ -7,8 +7,8 @@
 
 use std::alloc::Layout;
 use std::num::NonZeroU64;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 use re_log_types::TimeInt;
@@ -26,7 +26,7 @@ use crate::remote_summary::{
     AmbiguousChunkClassification, PreparedAmbiguousZeroAggregateReservations,
     PreparedAmbiguousZeroResolutionSeed,
 };
-use crate::remote_time::{RawMcapTime, canonicalize_raw_mcap_time};
+use crate::remote_time::{canonicalize_raw_mcap_time, RawMcapTime};
 
 static NEXT_REMOTE_OBJECT_GENERATION_V1: AtomicU64 = AtomicU64::new(1);
 
@@ -718,6 +718,9 @@ pub(crate) struct ResolvedRemotePhysicalSourceRefV1<'owner, 'input> {
 }
 
 impl ResolvedRemotePhysicalSourceRefV1<'_, '_> {
+    pub(crate) fn source_generation_v1(&self) -> u64 {
+        self.inner.source_binding.source_generation_v1()
+    }
     pub(crate) fn layout_v1(&self) -> &ResolvedCanonicalPhysicalLayoutV1 {
         &self.inner.layout
     }
@@ -1877,8 +1880,8 @@ mod tests {
 
     use super::*;
     use crate::remote_chunk_scan::{
-        PhysicalChunkScanLimits, install_exact_physical_chunk_record_for_test,
-        install_header_validated_payload_for_test, scan_decompressed_physical_chunk,
+        install_exact_physical_chunk_record_for_test, install_header_validated_payload_for_test,
+        scan_decompressed_physical_chunk, PhysicalChunkScanLimits,
     };
     use crate::testing::{
         AdversarialMcapFixture, AdversarialMcapFixtureBuilder, FixtureChunk, FixtureCrc,
@@ -1922,7 +1925,7 @@ mod tests {
         fixture: &AdversarialMcapFixture,
         budget: AggregateResolutionBudgetRootV1,
     ) -> PreparedBoundRemotePhysicalSourceV1<&'static str, PreparedAmbiguousZeroBodyPlan<'_>> {
-        use crate::remote_fixed_layout::{RemoteMcapSlice, prepare_fixed_layout};
+        use crate::remote_fixed_layout::{prepare_fixed_layout, RemoteMcapSlice};
         use crate::remote_summary::ambiguous_zero::{AmbiguousZeroBudget, AmbiguousZeroLimits};
         use crate::remote_summary::materialization::{
             NestedPreflightCensus, SummaryMaterializationBudget, SummaryMaterializationLimits,
@@ -2505,12 +2508,10 @@ mod tests {
             crate::remote_decompression::decompress_exact_chunk(input).unwrap_err(),
             crate::remote_decompression::ChunkDecompressionError::ChunkChecksumMismatch
         );
-        assert!(
-            prepared
-                .inner_mut_v1()
-                .issue_next_resolution_lease_v1()
-                .is_ok()
-        );
+        assert!(prepared
+            .inner_mut_v1()
+            .issue_next_resolution_lease_v1()
+            .is_ok());
         drop(prepared);
         assert_eq!(
             root.usage_for_test_v1(),
@@ -2539,12 +2540,10 @@ mod tests {
                 .unwrap_err(),
             PhysicalChunkValidationError::FullRecordLengthMismatch
         );
-        assert!(
-            prepared
-                .inner_mut_v1()
-                .issue_next_resolution_lease_v1()
-                .is_ok()
-        );
+        assert!(prepared
+            .inner_mut_v1()
+            .issue_next_resolution_lease_v1()
+            .is_ok());
         drop(prepared);
         assert_eq!(
             root.usage_for_test_v1(),

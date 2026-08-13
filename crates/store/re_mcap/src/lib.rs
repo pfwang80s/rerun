@@ -148,6 +148,11 @@ mod remote_channel_group;
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
 mod remote_chunk_validation_count;
 
+// Immutable manifest and partition/root identity authority. Kept disarmed until the Web
+// production adapter is enabled; native and ordinary local MCAP paths never compile this module.
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+mod remote_manifest;
+
 // Bounded ROS 2 reflection initialization remains crate-private and production-disarmed until the
 // remote decoder policy and resource profile are sealed.
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]

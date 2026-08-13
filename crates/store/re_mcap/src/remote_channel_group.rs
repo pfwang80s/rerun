@@ -294,7 +294,7 @@ impl Drop for RemoteChannelGroupReservationV1 {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct StableDecoderGroupIdV1(u32);
 
 impl StableDecoderGroupIdV1 {
@@ -322,6 +322,16 @@ pub(crate) enum RemoteDecoderIdentifierV1 {
 pub(crate) struct RemotePartitionRegistrationBoundsV1 {
     max_roots_per_partition: u32,
     max_external_origin_bytes_per_partition: u64,
+}
+
+impl RemotePartitionRegistrationBoundsV1 {
+    pub(crate) const fn max_roots_per_partition_v1(self) -> u32 {
+        self.max_roots_per_partition
+    }
+
+    pub(crate) const fn max_external_origin_bytes_per_partition_v1(self) -> u64 {
+        self.max_external_origin_bytes_per_partition
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -364,6 +374,14 @@ impl ImmutableChannelGroupV1 {
 
     pub(crate) const fn decoder_config_hash(&self) -> DecoderConfigHashV1 {
         DecoderConfigHashV1(self.executable_config.canonical_digest_v1())
+    }
+
+    pub(crate) const fn registration_bounds_v1(&self) -> RemotePartitionRegistrationBoundsV1 {
+        self.registration_bounds
+    }
+
+    pub(crate) const fn decoder_identifier_v1(&self) -> RemoteDecoderIdentifierV1 {
+        self.decoder_identifier
     }
 }
 
@@ -409,6 +427,9 @@ pub(crate) struct ImmutableRemoteChannelGroupsV1<'definitions, 'input, 'source, 
 }
 
 impl ImmutableRemoteChannelGroupsV1<'_, '_, '_, '_> {
+    pub(crate) fn groups_v1(&self) -> &[ImmutableChannelGroupV1] {
+        &self.groups
+    }
     pub(crate) fn ensure_current_for_validation_v1(&self) -> Result<(), RemoteChannelGroupErrorV1> {
         self._assignment_owner
             .ensure_current_for_manifest_v1()

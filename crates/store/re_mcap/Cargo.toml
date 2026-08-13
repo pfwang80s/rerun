@@ -24,6 +24,7 @@ re_int.workspace = true
 re_log_types.workspace = true
 re_log.workspace = true
 re_quota_channel.workspace = true
+re_tuid.workspace = true
 re_ros_msg.workspace = true
 re_sdk_types = { workspace = true, features = ["ecolor", "glam", "image", "video"] }
 re_tracing.workspace = true
@@ -31,6 +32,7 @@ re_tracing.workspace = true
 ahash.workspace = true
 anyhow.workspace = true
 arrow.workspace = true
+blake3.workspace = true
 byteorder.workspace = true
 crossbeam.workspace = true
 crc32fast = { version = "1.5.0", optional = true }
