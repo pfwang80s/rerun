@@ -11,10 +11,14 @@
 
 use crate::remote_fixed_layout::{RemoteMcapSlice, ValidatedFixedLayout};
 
-mod ambiguous_zero;
+pub(crate) mod ambiguous_zero;
+pub(crate) use ambiguous_zero::{
+    AmbiguousChunkClassification, PreparedAmbiguousZeroAggregateReservations,
+    PreparedAmbiguousZeroBodyPlan, PreparedAmbiguousZeroResolutionSeed,
+};
 pub(crate) mod definitions;
-mod materialization;
-mod message_index;
+pub(crate) mod materialization;
+pub(crate) mod message_index;
 pub(crate) mod physical_regions;
 
 const RECORD_ENVELOPE_LEN: usize = super::RECORD_HEADER_LEN;
@@ -32,6 +36,20 @@ pub(crate) struct SummaryCensusLimits {
     max_schema_records: u64,
     max_channel_records: u64,
     max_chunk_index_records: u64,
+}
+
+#[cfg(test)]
+impl SummaryCensusLimits {
+    pub(crate) const fn for_test(object_len: u64, max_records: u64) -> Self {
+        Self {
+            max_header_body_bytes: object_len,
+            max_summary_bytes: object_len,
+            max_summary_records: max_records,
+            max_schema_records: max_records,
+            max_channel_records: max_records,
+            max_chunk_index_records: max_records,
+        }
+    }
 }
 
 /// Allocation-free top-level record counts.

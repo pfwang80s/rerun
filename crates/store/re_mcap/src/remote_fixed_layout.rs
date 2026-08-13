@@ -135,6 +135,7 @@ impl std::error::Error for FixedLayoutError {}
 /// before parsing any Summary record.
 #[derive(Debug)]
 pub struct PreparedFixedLayout {
+    object_len: u64,
     header_body_range: Range<u64>,
     data_end_and_summary_range: Range<u64>,
     summary_start: u64,
@@ -206,6 +207,7 @@ impl PreparedFixedLayout {
         };
 
         Ok(ValidatedFixedLayout {
+            object_len: self.object_len,
             header_body_range: self.header_body_range,
             summary_range: self.summary_start..self.data_end_and_summary_range.end,
             summary_bytes,
@@ -220,6 +222,7 @@ impl PreparedFixedLayout {
 ///
 /// Summary collections remain unparsed.
 pub struct ValidatedFixedLayout<'a> {
+    object_len: u64,
     header_body_range: Range<u64>,
     summary_range: Range<u64>,
     summary_bytes: &'a [u8],
@@ -242,6 +245,10 @@ impl std::fmt::Debug for ValidatedFixedLayout<'_> {
 }
 
 impl<'a> ValidatedFixedLayout<'a> {
+    pub(crate) const fn object_len(&self) -> u64 {
+        self.object_len
+    }
+
     /// The exact Header body range.
     pub fn header_body_range(&self) -> Range<u64> {
         self.header_body_range.clone()
@@ -361,6 +368,7 @@ pub fn prepare_fixed_layout(
     let declared_summary_crc = read_u32(&footer_body[16..20]);
 
     Ok(PreparedFixedLayout {
+        object_len,
         header_body_range: header_body_start..header_body_end,
         data_end_and_summary_range: data_end_start..footer_start,
         summary_start,

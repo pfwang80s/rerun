@@ -181,16 +181,16 @@ struct AmbiguousZeroMaterializationToken {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AmbiguousChunkClassification {
+pub(crate) enum AmbiguousChunkClassification {
     PendingMessageIndex,
     Unresolved,
     IndexNonEmptyZero,
 }
 
-#[derive(Debug)]
-struct AmbiguousChunkState {
-    canonical_ordinal: usize,
-    classification: AmbiguousChunkClassification,
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AmbiguousChunkState {
+    pub(crate) canonical_ordinal: usize,
+    pub(crate) classification: AmbiguousChunkClassification,
 }
 
 struct AmbiguousZeroStage1State {
@@ -344,6 +344,21 @@ pub(crate) struct PreparedAmbiguousZeroBodyPlan<'a> {
     stage2_reservation: AmbiguousZeroStage2Reservation,
 }
 
+/// Move-only seed consumed exclusively by MCAP-025A.
+///
+/// Keeping this transition in the defining module prevents a second owner from being assembled
+/// from a borrowed physical-region view and copied classification scalars.
+pub(crate) struct PreparedAmbiguousZeroResolutionSeed<'a> {
+    pub(crate) physical: ValidatedPhysicalRegions<'a>,
+    pub(crate) ambiguous_chunks: Vec<AmbiguousChunkState>,
+    pub(crate) aggregate_reservations: PreparedAmbiguousZeroAggregateReservations,
+}
+
+pub(crate) struct PreparedAmbiguousZeroAggregateReservations {
+    _stage1: AmbiguousZeroStage1Reservation,
+    _stage2: AmbiguousZeroStage2Reservation,
+}
+
 impl std::fmt::Debug for PreparedAmbiguousZeroBodyPlan<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -371,6 +386,22 @@ impl<'a> PreparedAmbiguousZeroBodyPlan<'a> {
             .iter()
             .filter(|chunk| chunk.classification == AmbiguousChunkClassification::Unresolved)
             .count()
+    }
+
+    pub(crate) fn resolution_classifications_v1(&self) -> &[AmbiguousChunkState] {
+        &self.chunks
+    }
+
+    pub(crate) fn retained_resolution_evidence_bytes_v1(
+        &self,
+    ) -> Result<u64, IndexConsistencyViolation> {
+        let physical = self.physical.retained_bytes_v1()?;
+        let classifications = (self.chunks.len() as u64)
+            .checked_mul(size_of::<AmbiguousChunkState>() as u64)
+            .ok_or(IndexConsistencyViolation::ArithmeticOverflow)?;
+        physical
+            .checked_add(classifications)
+            .ok_or(IndexConsistencyViolation::ArithmeticOverflow)
     }
 
     pub(crate) fn index_nonempty_zero_ordinals(&self) -> impl Iterator<Item = usize> + '_ {
@@ -410,6 +441,29 @@ impl<'a> PreparedAmbiguousZeroBodyPlan<'a> {
                     descriptor: region.raw_descriptor(),
                 }
             })
+    }
+
+    pub(crate) fn into_resolution_seed(self) -> PreparedAmbiguousZeroResolutionSeed<'a> {
+        let Self {
+            physical,
+            chunks,
+            stage1_reservation,
+            stage2_reservation,
+        } = self;
+        // Reuse MCAP-023's already-reserved ambiguous classification backing rather than
+        // allocating a second canonical-sized projection before MCAP-025A admission.
+        re_log::debug_assert!(chunks.iter().all(|chunk| {
+            chunk.classification != AmbiguousChunkClassification::PendingMessageIndex
+        }));
+        let ambiguous_chunks = chunks;
+        PreparedAmbiguousZeroResolutionSeed {
+            physical,
+            ambiguous_chunks,
+            aggregate_reservations: PreparedAmbiguousZeroAggregateReservations {
+                _stage1: stage1_reservation,
+                _stage2: stage2_reservation,
+            },
+        }
     }
 
     #[cfg(test)]

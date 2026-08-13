@@ -6,7 +6,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use super::definitions::ValidatedSummaryDefinitions;
-use super::materialization::BoundedSummaryRecord;
+use super::materialization::{BoundedSummaryRecord, MaterializedSummaryRecords};
 
 const DATA_END_BODY_LEN: usize = size_of::<u32>();
 
@@ -391,6 +391,48 @@ impl<'a> ValidatedPhysicalRegions<'a> {
 
     pub(crate) fn canonical_chunk_count(&self) -> usize {
         self.units.len()
+    }
+
+    /// Checked lower-stage footprint retained while MCAP-025A is admitted.
+    pub(crate) fn retained_bytes_v1(&self) -> Result<u64, IndexConsistencyViolation> {
+        let units = (self.units.len() as u64)
+            .checked_mul(size_of::<StoredPhysicalUnit>() as u64)
+            .ok_or(IndexConsistencyViolation::ArithmeticOverflow)?;
+        let descriptor = self.reservation.descriptor_retained_bytes;
+        let materialized = self.definitions.materialized();
+        let records = (self.definitions.source_record_count() as u64)
+            .checked_mul(size_of::<BoundedSummaryRecord<'a>>() as u64)
+            .ok_or(IndexConsistencyViolation::ArithmeticOverflow)?;
+        let nested = materialized.nested_census();
+        let nested_owned = nested
+            .owned_string_bytes
+            .checked_add(nested.schema_data_bytes)
+            .and_then(|value| value.checked_add(nested.nested_retained_bytes))
+            .ok_or(IndexConsistencyViolation::ArithmeticOverflow)?;
+        let prepared = materialized.prepared();
+        let borrowed_backing = u64::try_from(prepared.header_body().len())
+            .ok()
+            .and_then(|value| {
+                u64::try_from(prepared.summary_bytes().len())
+                    .ok()
+                    .and_then(|summary| value.checked_add(summary))
+            })
+            .ok_or(IndexConsistencyViolation::ArithmeticOverflow)?;
+        let owner_footprint = u64::try_from(
+            size_of::<Self>()
+                + size_of::<ValidatedSummaryDefinitions<'a>>()
+                + size_of::<MaterializedSummaryRecords<'a>>()
+                + size_of::<Arc<()>>()
+                + size_of::<Mutex<()>>(),
+        )
+        .map_err(|_| IndexConsistencyViolation::ArithmeticOverflow)?;
+        units
+            .checked_add(descriptor)
+            .and_then(|v| v.checked_add(records))
+            .and_then(|v| v.checked_add(nested_owned))
+            .and_then(|v| v.checked_add(borrowed_backing))
+            .and_then(|v| v.checked_add(owner_footprint))
+            .ok_or(IndexConsistencyViolation::ArithmeticOverflow)
     }
 
     pub(crate) fn regions(&self) -> impl ExactSizeIterator<Item = CanonicalPhysicalRegion<'_>> {

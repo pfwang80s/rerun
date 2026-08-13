@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+use std::alloc::Layout;
 #[cfg(test)]
 use std::cell::RefCell;
 use std::marker::PhantomData;
@@ -127,7 +128,7 @@ impl std::fmt::Debug for PhysicalChunkScanBudget {
 }
 
 impl PhysicalChunkScanBudget {
-    fn reserve_authority(
+    pub(super) fn reserve_authority(
         &self,
         slots: u64,
         slot_bytes: u64,
@@ -192,7 +193,7 @@ impl PhysicalChunkScanBudget {
     }
 }
 
-struct PhysicalChunkAuthorityReservation {
+pub(super) struct PhysicalChunkAuthorityReservation {
     state: Arc<PhysicalChunkScanBudgetState>,
     slots: u64,
     slot_bytes: u64,
@@ -363,6 +364,29 @@ impl CanonicalDefinitionProjection {
         canonical_channel_ids
             .try_reserve_exact(canonical_channels)
             .map_err(|_allocation| PhysicalChunkValidationError::ProjectionAllocationFailed)?;
+        Self::build_preallocated_v1(
+            definitions,
+            canonical_schemas,
+            canonical_channels,
+            schema_record_indices,
+            channel_slots,
+            canonical_channel_ids,
+        )
+    }
+
+    fn build_preallocated_v1(
+        definitions: &ValidatedSummaryDefinitions<'_>,
+        canonical_schemas: usize,
+        canonical_channels: usize,
+        mut schema_record_indices: Vec<usize>,
+        mut channel_slots: Vec<ChannelDefinitionProjectionSlot>,
+        mut canonical_channel_ids: Vec<u16>,
+    ) -> Result<Self, PhysicalChunkValidationError> {
+        schema_record_indices.resize(DEFINITION_ID_DOMAIN_LEN, MISSING_DEFINITION_RECORD);
+        channel_slots.resize(
+            DEFINITION_ID_DOMAIN_LEN,
+            ChannelDefinitionProjectionSlot::MISSING,
+        );
         let mut schemas_seen = 0_usize;
         for record in definitions.projection_records() {
             match record {
@@ -406,6 +430,53 @@ impl CanonicalDefinitionProjection {
         })
     }
 
+    fn build_prevalidated_v1(
+        definitions: &ValidatedSummaryDefinitions<'_>,
+        canonical_schemas: usize,
+        canonical_channels: usize,
+        mut schema_record_indices: Vec<usize>,
+        mut channel_slots: Vec<ChannelDefinitionProjectionSlot>,
+        mut canonical_channel_ids: Vec<u16>,
+    ) -> Self {
+        schema_record_indices.resize(DEFINITION_ID_DOMAIN_LEN, MISSING_DEFINITION_RECORD);
+        channel_slots.resize(
+            DEFINITION_ID_DOMAIN_LEN,
+            ChannelDefinitionProjectionSlot::MISSING,
+        );
+        let mut schemas_seen = 0_usize;
+        for record in definitions.projection_records() {
+            match record {
+                SummaryDefinitionProjectionRecord::Schema { id, record_index } => {
+                    let slot = &mut schema_record_indices[usize::from(id)];
+                    if *slot == MISSING_DEFINITION_RECORD {
+                        *slot = record_index;
+                        schemas_seen += 1;
+                    }
+                }
+                SummaryDefinitionProjectionRecord::Channel { id, record_index } => {
+                    let slot = &mut channel_slots[usize::from(id)];
+                    if slot.record_index == MISSING_DEFINITION_RECORD {
+                        let dense_ordinal = canonical_channel_ids.len();
+                        canonical_channel_ids.push(id);
+                        *slot = ChannelDefinitionProjectionSlot {
+                            record_index,
+                            dense_ordinal,
+                        };
+                    }
+                }
+            }
+        }
+        re_log::debug_assert_eq!(schemas_seen, canonical_schemas);
+        re_log::debug_assert_eq!(canonical_channel_ids.len(), canonical_channels);
+        Self {
+            schema_record_indices: schema_record_indices.into_boxed_slice(),
+            channel_slots: channel_slots.into_boxed_slice(),
+            canonical_channel_ids: canonical_channel_ids.into_boxed_slice(),
+            #[cfg(test)]
+            lookup_calls: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
     fn schema_record_index(&self, id: u16) -> Option<usize> {
         self.record_lookup();
         let record_index = self.schema_record_indices[usize::from(id)];
@@ -447,7 +518,7 @@ impl SummaryDefinitionLookup for ProjectedSummaryDefinitions<'_, '_, '_> {
     }
 }
 
-struct PhysicalChunkAuthorityState {
+pub(crate) struct PhysicalChunkAuthorityState {
     open: bool,
     slots: Vec<PhysicalChunkSlot>,
 }
@@ -459,12 +530,95 @@ struct PhysicalChunkSourceEvidence<'a> {
     decompression_budget: ChunkDecompressionBudget,
     scan_budget: PhysicalChunkScanBudget,
     state: Arc<Mutex<PhysicalChunkAuthorityState>>,
+    remote_object:
+        Option<Arc<Mutex<crate::remote_physical_resolution::RemotePhysicalObjectStateV1>>>,
     _authority_reservation: PhysicalChunkAuthorityReservation,
 }
 
 /// The unique source-scoped owner of MCAP-021 → 020 → 019 physical evidence.
 pub(crate) struct PhysicalChunkSourceAuthority<'a> {
     shared: Arc<PhysicalChunkSourceEvidence<'a>>,
+}
+
+pub(super) struct PreparedPhysicalChunkAuthorityContextV1 {
+    scan_budget_state: Arc<PhysicalChunkScanBudgetState>,
+    slots: Vec<PhysicalChunkSlot>,
+    schema_record_indices: Vec<usize>,
+    channel_slots: Vec<ChannelDefinitionProjectionSlot>,
+    canonical_channel_ids: Vec<u16>,
+    canonical_schemas: usize,
+    canonical_channels: usize,
+}
+
+pub(super) struct PreparedPhysicalChunkAuthorityAllocationV1Bound {
+    slots: Vec<PhysicalChunkSlot>,
+    schema_record_indices: Vec<usize>,
+    channel_slots: Vec<ChannelDefinitionProjectionSlot>,
+    canonical_channel_ids: Vec<u16>,
+    reservation: PhysicalChunkAuthorityReservation,
+    source_generation: NonZeroU64,
+    canonical_schemas: usize,
+    canonical_channels: usize,
+}
+
+pub(super) struct PreparedPhysicalChunkAuthorityClaimV1 {
+    reservation: PhysicalChunkAuthorityReservation,
+    slots: u64,
+    slot_bytes: u64,
+    definition_projection_bytes: u64,
+    source_generation: NonZeroU64,
+}
+
+impl PreparedPhysicalChunkAuthorityClaimV1 {
+    fn issue_from_resolution_transaction_v1(
+        scan_budget: &PhysicalChunkScanBudget,
+        slots: u64,
+        slot_bytes: u64,
+        definition_projection_bytes: u64,
+        source_generation: NonZeroU64,
+    ) -> Result<Self, PhysicalChunkValidationError> {
+        Ok(Self {
+            reservation: scan_budget.reserve_authority(
+                slots,
+                slot_bytes,
+                definition_projection_bytes,
+            )?,
+            slots,
+            slot_bytes,
+            definition_projection_bytes,
+            source_generation,
+        })
+    }
+}
+
+impl PreparedPhysicalChunkAuthorityContextV1 {
+    pub(super) fn canonical_counts_v1(&self) -> (usize, usize, usize) {
+        (
+            self.slots.capacity(),
+            self.canonical_schemas,
+            self.canonical_channels,
+        )
+    }
+
+    pub(super) fn matches_scan_budget_v1(&self, scan_budget: &PhysicalChunkScanBudget) -> bool {
+        Arc::ptr_eq(&self.scan_budget_state, &scan_budget.state)
+    }
+
+    pub(super) fn issue_child_claim_v1(
+        scan_budget: &PhysicalChunkScanBudget,
+        slots: u64,
+        slot_bytes: u64,
+        definition_projection_bytes: u64,
+        source_generation: NonZeroU64,
+    ) -> Result<PreparedPhysicalChunkAuthorityClaimV1, PhysicalChunkValidationError> {
+        PreparedPhysicalChunkAuthorityClaimV1::issue_from_resolution_transaction_v1(
+            scan_budget,
+            slots,
+            slot_bytes,
+            definition_projection_bytes,
+            source_generation,
+        )
+    }
 }
 
 /// Lifetime-free, sealed source-generation binding for downstream remote capabilities.
@@ -475,6 +629,13 @@ pub(crate) struct PhysicalChunkSourceAuthority<'a> {
 pub(crate) struct PhysicalChunkSourceBindingV1 {
     state: Arc<Mutex<PhysicalChunkAuthorityState>>,
     source_generation: NonZeroU64,
+    remote_object:
+        Option<Arc<Mutex<crate::remote_physical_resolution::RemotePhysicalObjectStateV1>>>,
+}
+
+pub(super) struct BoundPhysicalChunkObjectIdentityV1 {
+    pub(super) state: Arc<Mutex<crate::remote_physical_resolution::RemotePhysicalObjectStateV1>>,
+    pub(super) generation: NonZeroU64,
 }
 
 /// Sealed pairing of one physical source generation with the definitions it owns.
@@ -531,6 +692,20 @@ impl<'definitions, 'input> PhysicalChunkDefinitionsCapabilityV1<'definitions, 'i
 }
 
 impl PhysicalChunkSourceBindingV1 {
+    pub(super) fn matches_v1(&self, other: &Self) -> bool {
+        self.source_generation == other.source_generation
+            && Arc::ptr_eq(&self.state, &other.state)
+            && match (&self.remote_object, &other.remote_object) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    pub(super) fn close_v1(&self) {
+        self.state.lock().open = false;
+    }
+
     pub(crate) fn ensure_current_v1(&self) -> Result<(), PhysicalChunkValidationError> {
         if self.state.lock().open {
             Ok(())
@@ -542,6 +717,11 @@ impl PhysicalChunkSourceBindingV1 {
     pub(crate) fn ensure_matches_v1(&self, other: &Self) {
         if self.source_generation != other.source_generation
             || !Arc::ptr_eq(&self.state, &other.state)
+            || !match (&self.remote_object, &other.remote_object) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
         {
             physical_chunk_fatal_control_plane("source binding changed");
         }
@@ -556,6 +736,7 @@ impl PhysicalChunkSourceBindingV1 {
             })),
             source_generation: allocate_source_generation()
                 .expect("test physical source generation is available"),
+            remote_object: None,
         }
     }
 
@@ -568,6 +749,7 @@ impl PhysicalChunkSourceBindingV1 {
                 slots: Vec::new(),
             })),
             source_generation: allocate_source_generation()?,
+            remote_object: None,
         })
     }
 }
@@ -655,11 +837,79 @@ impl<State> std::fmt::Debug for PhysicalChunkReadLease<'_, State> {
 }
 
 impl<'a> PhysicalChunkSourceAuthority<'a> {
-    pub(crate) fn new(
-        physical: ValidatedPhysicalRegions<'a>,
-        decompression_budget: ChunkDecompressionBudget,
-        scan_budget: PhysicalChunkScanBudget,
-    ) -> Result<Self, PhysicalChunkValidationError> {
+    pub(super) fn allocation_census_v1(
+        physical: &ValidatedPhysicalRegions<'_>,
+        scan_budget: &PhysicalChunkScanBudget,
+    ) -> Result<(u64, u64), PhysicalChunkValidationError> {
+        let definitions = physical.definitions();
+        let limits = scan_budget.state.limits;
+        let schemas = definitions.canonical_schema_count();
+        let channels = definitions.canonical_channel_count();
+        if schemas > limits.max_canonical_schemas {
+            return Err(PhysicalChunkValidationError::CanonicalSchemaLimitExceeded);
+        }
+        if channels > limits.max_canonical_channels {
+            return Err(PhysicalChunkValidationError::CanonicalChannelLimitExceeded);
+        }
+        let slots =
+            Self::checked_vec_footprint_v1::<PhysicalChunkSlot>(physical.canonical_chunk_count())?;
+        let schema_record_indices =
+            Self::checked_vec_footprint_v1::<usize>(usize::from(u16::MAX) + 1)?;
+        let channel_slots = Self::checked_vec_footprint_v1::<ChannelDefinitionProjectionSlot>(
+            usize::from(u16::MAX) + 1,
+        )?;
+        let canonical_channel_ids = Self::checked_vec_footprint_v1::<u16>(
+            usize::try_from(channels)
+                .map_err(|_layout_error| PhysicalChunkValidationError::ArithmeticOverflow)?,
+        )?;
+        let authority_state = Self::checked_owned_footprint_v1::<PhysicalChunkAuthorityState>()?;
+        let authority = slots
+            .checked_add(schema_record_indices)
+            .and_then(|value| value.checked_add(channel_slots))
+            .and_then(|value| value.checked_add(canonical_channel_ids))
+            .and_then(|value| value.checked_add(authority_state))
+            .ok_or(PhysicalChunkValidationError::ArithmeticOverflow)?;
+        let projection = CanonicalDefinitionProjection::retained_bytes(channels)?;
+        Ok((authority, projection))
+    }
+
+    fn checked_vec_footprint_v1<T>(count: usize) -> Result<u64, PhysicalChunkValidationError> {
+        let layout = Layout::array::<T>(count)
+            .map_err(|_layout_error| PhysicalChunkValidationError::ArithmeticOverflow)?;
+        let bytes = layout
+            .size()
+            .max(1)
+            .checked_add(layout.align().saturating_sub(1))
+            .ok_or(PhysicalChunkValidationError::ArithmeticOverflow)?
+            / layout.align()
+            * layout.align();
+        u64::try_from(
+            bytes
+                .checked_add(size_of::<usize>())
+                .ok_or(PhysicalChunkValidationError::ArithmeticOverflow)?,
+        )
+        .map_err(|_layout_error| PhysicalChunkValidationError::ArithmeticOverflow)
+    }
+
+    fn checked_owned_footprint_v1<T>() -> Result<u64, PhysicalChunkValidationError> {
+        Self::checked_vec_footprint_v1::<T>(1)
+    }
+
+    pub(super) fn prepare_source_generation_v1() -> Result<NonZeroU64, PhysicalChunkValidationError>
+    {
+        allocate_source_generation()
+    }
+
+    pub(super) fn physical_region_v1(
+        &self,
+        canonical_ordinal: usize,
+    ) -> Option<crate::remote_summary::physical_regions::CanonicalPhysicalRegion<'_>> {
+        self.shared.physical.region(canonical_ordinal)
+    }
+    pub(super) fn prepare_context_v1(
+        physical: &ValidatedPhysicalRegions<'_>,
+        scan_budget: &PhysicalChunkScanBudget,
+    ) -> Result<PreparedPhysicalChunkAuthorityContextV1, PhysicalChunkValidationError> {
         let definitions = physical.definitions();
         let canonical_schemas = definitions.canonical_schema_count();
         let canonical_channels = definitions.canonical_channel_count();
@@ -670,27 +920,16 @@ impl<'a> PhysicalChunkSourceAuthority<'a> {
         if canonical_channels > limits.max_canonical_channels {
             return Err(PhysicalChunkValidationError::CanonicalChannelLimitExceeded);
         }
+        for region in physical.regions() {
+            validate_expected_raw_extent(region.raw_descriptor())?;
+        }
         let canonical_schema_capacity = usize::try_from(canonical_schemas)
             .map_err(|_overflow| PhysicalChunkValidationError::ArithmeticOverflow)?;
         let canonical_channel_capacity = usize::try_from(canonical_channels)
             .map_err(|_overflow| PhysicalChunkValidationError::ArithmeticOverflow)?;
-        let definition_projection_bytes =
-            CanonicalDefinitionProjection::retained_bytes(canonical_channels)?;
-
-        for region in physical.regions() {
-            validate_expected_raw_extent(region.raw_descriptor())?;
-        }
-
-        let canonical_chunks = u64::try_from(physical.canonical_chunk_count())
-            .map_err(|_overflow| PhysicalChunkValidationError::ArithmeticOverflow)?;
-        let slot_bytes = canonical_chunks
-            .checked_mul(size_of::<PhysicalChunkSlot>() as u64)
-            .ok_or(PhysicalChunkValidationError::ArithmeticOverflow)?;
-        let reservation = scan_budget.reserve_authority(
-            canonical_chunks,
-            slot_bytes,
-            definition_projection_bytes,
-        )?;
+        // This only prepares exact-capacity backing. The enclosing resolution transaction owns
+        // the one combined root/child claim and is the only production path that can authorize
+        // these allocations for use.
         let mut slots = Vec::new();
         slots
             .try_reserve_exact(physical.canonical_chunk_count())
@@ -699,14 +938,136 @@ impl<'a> PhysicalChunkSourceAuthority<'a> {
             physical.canonical_chunk_count(),
             PhysicalChunkSlot::Vacant { last_generation: 0 },
         );
-        let definition_projection = CanonicalDefinitionProjection::build(
-            definitions,
-            canonical_schema_capacity,
-            canonical_channel_capacity,
-        )?;
+        let mut schema_record_indices = Vec::new();
+        schema_record_indices
+            .try_reserve_exact(usize::from(u16::MAX) + 1)
+            .map_err(|_allocation| PhysicalChunkValidationError::AuthorityAllocationFailed)?;
+        let mut channel_slots = Vec::new();
+        channel_slots
+            .try_reserve_exact(usize::from(u16::MAX) + 1)
+            .map_err(|_allocation| PhysicalChunkValidationError::AuthorityAllocationFailed)?;
+        let mut canonical_channel_ids = Vec::new();
+        canonical_channel_ids
+            .try_reserve_exact(canonical_channel_capacity)
+            .map_err(|_allocation| PhysicalChunkValidationError::AuthorityAllocationFailed)?;
+        Ok(PreparedPhysicalChunkAuthorityContextV1 {
+            scan_budget_state: Arc::clone(&scan_budget.state),
+            slots,
+            schema_record_indices,
+            channel_slots,
+            canonical_channel_ids,
+            canonical_schemas: canonical_schema_capacity,
+            canonical_channels: canonical_channel_capacity,
+        })
+    }
 
-        let source_generation = allocate_source_generation()?;
-        Ok(Self {
+    pub(super) fn bind_prepared_allocation_to_claim_v1(
+        physical: &ValidatedPhysicalRegions<'_>,
+        mut allocation: PreparedPhysicalChunkAuthorityContextV1,
+        claim: PreparedPhysicalChunkAuthorityClaimV1,
+    ) -> PreparedPhysicalChunkAuthorityAllocationV1Bound {
+        let PreparedPhysicalChunkAuthorityClaimV1 {
+            reservation,
+            slots,
+            slot_bytes,
+            definition_projection_bytes,
+            source_generation,
+        } = claim;
+        let definitions = physical.definitions();
+        re_log::debug_assert!(Arc::ptr_eq(
+            &allocation.scan_budget_state,
+            &reservation.state
+        ));
+        re_log::debug_assert_eq!(slots, physical.canonical_chunk_count() as u64);
+        re_log::debug_assert!(slot_bytes >= slots * size_of::<PhysicalChunkSlot>() as u64);
+        re_log::debug_assert_eq!(
+            definition_projection_bytes,
+            CanonicalDefinitionProjection::retained_bytes(definitions.canonical_channel_count())
+                .unwrap_or(0)
+        );
+        allocation.slots.resize(
+            physical.canonical_chunk_count(),
+            PhysicalChunkSlot::Vacant { last_generation: 0 },
+        );
+        PreparedPhysicalChunkAuthorityAllocationV1Bound {
+            slots: allocation.slots,
+            schema_record_indices: allocation.schema_record_indices,
+            channel_slots: allocation.channel_slots,
+            canonical_channel_ids: allocation.canonical_channel_ids,
+            reservation,
+            source_generation,
+            canonical_schemas: allocation.canonical_schemas,
+            canonical_channels: allocation.canonical_channels,
+        }
+    }
+
+    pub(super) fn new(
+        physical: ValidatedPhysicalRegions<'a>,
+        decompression_budget: ChunkDecompressionBudget,
+        scan_budget: PhysicalChunkScanBudget,
+    ) -> Result<Self, PhysicalChunkValidationError> {
+        let allocation = Self::prepare_context_v1(&physical, &scan_budget)?;
+        let (slots, _, _) = allocation.canonical_counts_v1();
+        let slots = u64::try_from(slots)
+            .map_err(|_overflow| PhysicalChunkValidationError::ArithmeticOverflow)?;
+        let slot_bytes = slots
+            .checked_mul(size_of::<PhysicalChunkSlot>() as u64)
+            .ok_or(PhysicalChunkValidationError::ArithmeticOverflow)?;
+        let projection = CanonicalDefinitionProjection::retained_bytes(
+            physical.definitions().canonical_channel_count(),
+        )?;
+        let claim = PreparedPhysicalChunkAuthorityClaimV1::issue_from_resolution_transaction_v1(
+            &scan_budget,
+            slots,
+            slot_bytes,
+            projection,
+            allocate_source_generation()?,
+        )?;
+        let allocation = Self::bind_prepared_allocation_to_claim_v1(&physical, allocation, claim);
+        Ok(Self::new_preallocated_v1(
+            physical,
+            decompression_budget,
+            scan_budget,
+            allocation,
+            None,
+        ))
+    }
+
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "move-only bound identity transfers its Arc owner into the source"
+    )]
+    pub(super) fn new_preallocated_v1(
+        physical: ValidatedPhysicalRegions<'a>,
+        decompression_budget: ChunkDecompressionBudget,
+        scan_budget: PhysicalChunkScanBudget,
+        allocation: PreparedPhysicalChunkAuthorityAllocationV1Bound,
+        bound_object: Option<BoundPhysicalChunkObjectIdentityV1>,
+    ) -> Self {
+        let PreparedPhysicalChunkAuthorityAllocationV1Bound {
+            slots,
+            schema_record_indices,
+            channel_slots,
+            canonical_channel_ids,
+            reservation,
+            source_generation,
+            canonical_schemas,
+            canonical_channels,
+        } = allocation;
+        let definition_projection = CanonicalDefinitionProjection::build_prevalidated_v1(
+            physical.definitions(),
+            canonical_schemas,
+            canonical_channels,
+            schema_record_indices,
+            channel_slots,
+            canonical_channel_ids,
+        );
+
+        let remote_object = bound_object.as_ref().map(|bound| Arc::clone(&bound.state));
+        if let Some(bound) = bound_object.as_ref() {
+            re_log::debug_assert_eq!(bound.generation, source_generation);
+        }
+        Self {
             shared: Arc::new(PhysicalChunkSourceEvidence {
                 physical,
                 definition_projection,
@@ -717,9 +1078,10 @@ impl<'a> PhysicalChunkSourceAuthority<'a> {
                     open: true,
                     slots,
                 })),
+                remote_object,
                 _authority_reservation: reservation,
             }),
-        })
+        }
     }
 
     pub(crate) fn select(
@@ -795,6 +1157,7 @@ impl<'a> PhysicalChunkSourceAuthority<'a> {
         PhysicalChunkSourceBindingV1 {
             state: Arc::clone(&self.shared.state),
             source_generation: self.shared.source_generation.0,
+            remote_object: self.shared.remote_object.as_ref().map(Arc::clone),
         }
     }
 
@@ -804,6 +1167,23 @@ impl<'a> PhysicalChunkSourceAuthority<'a> {
         PhysicalChunkDefinitionsCapabilityV1 {
             definitions: self.shared.physical.definitions(),
             binding: self.binding_for_remote_assignment_v1(),
+        }
+    }
+
+    pub(super) fn ensure_slot_vacant_v1(
+        &self,
+        canonical_ordinal: usize,
+    ) -> Result<(), PhysicalChunkValidationError> {
+        let state = self.shared.state.lock();
+        if !state.open {
+            return Err(PhysicalChunkValidationError::SourceClosed);
+        }
+        match state.slots.get(canonical_ordinal) {
+            Some(PhysicalChunkSlot::Vacant { .. }) => Ok(()),
+            Some(PhysicalChunkSlot::Live { .. }) => {
+                Err(PhysicalChunkValidationError::DuplicateLiveRead)
+            }
+            None => Err(PhysicalChunkValidationError::UnknownCanonicalOrdinal),
         }
     }
 }
@@ -1018,7 +1398,7 @@ fn validate_physical_chunk_header(
 }
 
 #[cfg(test)]
-fn install_exact_physical_chunk_record_for_test(
+pub(super) fn install_exact_physical_chunk_record_for_test(
     lease: PhysicalChunkReadLease<'_, PendingHeaderValidation>,
     bytes: Box<[u8]>,
 ) -> Result<HeaderValidatedPhysicalChunkRead<'_>, PhysicalChunkValidationError> {
@@ -1029,7 +1409,7 @@ fn install_exact_physical_chunk_record_for_test(
 }
 
 #[cfg(test)]
-fn install_header_validated_payload_for_test(
+pub(super) fn install_header_validated_payload_for_test(
     validated: HeaderValidatedPhysicalChunkRead<'_>,
 ) -> Result<ExactCompressedChunkInput<'_>, PhysicalChunkValidationError> {
     install_header_validated_payload_with_hook_for_test(validated, || {})
@@ -1157,6 +1537,29 @@ impl ValidatedPhysicalChunkScan<'_> {
             .lease()
             .and_then(PhysicalChunkReadLease::ensure_current)
             .is_ok()
+    }
+
+    pub(super) fn source_binding_v1(
+        &self,
+    ) -> Result<PhysicalChunkSourceBindingV1, PhysicalChunkValidationError> {
+        let lease = self.output.identity().lease()?;
+        lease.ensure_current()?;
+        let core = lease.core();
+        Ok(PhysicalChunkSourceBindingV1 {
+            state: Arc::clone(&core.shared.state),
+            source_generation: core.source_generation,
+            remote_object: core.shared.remote_object.as_ref().map(Arc::clone),
+        })
+    }
+
+    pub(super) fn canonical_ordinal_v1(&self) -> Result<usize, PhysicalChunkValidationError> {
+        let lease = self.output.identity().lease()?;
+        lease.ensure_current()?;
+        Ok(lease.core().canonical_ordinal)
+    }
+
+    pub(super) const fn extent_for_resolution_v1(&self) -> ValidatedPhysicalChunkExtent {
+        self.extent
     }
 }
 
@@ -1395,6 +1798,7 @@ impl<'a> PhysicalChunkScanConsumer<'a> {
             binding: PhysicalChunkSourceBindingV1 {
                 state: Arc::clone(&core.shared.state),
                 source_generation: core.source_generation,
+                remote_object: core.shared.remote_object.as_ref().map(Arc::clone),
             },
             inner: self.inner,
         })
@@ -2026,7 +2430,7 @@ fn allocate_source_generation() -> Result<NonZeroU64, PhysicalChunkValidationErr
 
 #[cfg(test)]
 impl PhysicalChunkScanLimits {
-    fn generous() -> Self {
+    pub(super) fn generous() -> Self {
         Self {
             max_records_per_chunk: 100_000,
             max_messages_per_chunk: 100_000,
@@ -2047,7 +2451,7 @@ impl PhysicalChunkScanLimits {
 
 #[cfg(test)]
 impl PhysicalChunkScanBudget {
-    fn for_test(limits: PhysicalChunkScanLimits) -> Self {
+    pub(super) fn for_test(limits: PhysicalChunkScanLimits) -> Self {
         Self {
             state: Arc::new(PhysicalChunkScanBudgetState {
                 limits,

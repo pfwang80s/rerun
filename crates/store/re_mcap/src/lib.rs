@@ -114,6 +114,14 @@ mod remote_decompression;
 #[cfg(any(target_arch = "wasm32", test))]
 mod remote_chunk_scan;
 
+// Exactly-once MCAP-023/025 ownership coordinator. The public Wasm surface exposes only opaque,
+// sealed owner types needed by the future Viewer adapter; constructors remain artifact-gated.
+#[cfg(target_arch = "wasm32")]
+pub mod remote_physical_resolution;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod remote_physical_resolution;
+
 // Neutral compile-time boundary between the ROS 2 initializer and the future protobuf initializer.
 // It can own only the opaque post-EOF authority and is not a descendant of either implementation.
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]

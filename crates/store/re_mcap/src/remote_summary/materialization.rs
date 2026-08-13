@@ -850,7 +850,7 @@ impl<'a> SliceCursor<'a> {
 
 #[cfg(test)]
 impl SummaryMaterializationLimits {
-    pub(super) const fn for_test(
+    pub(crate) const fn for_test(
         max_channel_metadata_entries_per_record: u64,
         max_channel_metadata_key_bytes: u64,
         max_channel_metadata_value_bytes: u64,
@@ -871,7 +871,7 @@ impl SummaryMaterializationLimits {
 
 #[cfg(test)]
 impl SummaryMaterializationBudget {
-    pub(super) fn for_test(
+    pub(crate) fn for_test(
         limits: SummaryMaterializationLimits,
         max_active_reservations: u64,
         census_capacity: NestedPreflightCensus,
