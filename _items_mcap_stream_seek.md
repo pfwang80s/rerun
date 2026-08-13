@@ -21,7 +21,7 @@ compatibility `open/start` 不提供无扩展名远程 MCAP 流式能力；这�
 除专门冻结既有行为的测试提交外，每个提交在合入时都必须可编译、可运行相关测试，并且默认关闭尚未接通的公开能力。
 若一项过大，必须先在本文中拆项并更新依赖，再开始编码；若一项过小，应与相邻项合并，避免只移动类型而没有可验证行为的提交。
 任务编号表示建议的集成顺序，不表示所有任务都必须串行；依赖满足后可以在不同分支并行开发。
-当前唯一显式编号例外是产品于2026-08-13批准的`MCAP-030A → MCAP-032 → MCAP-031 → MCAP-033`，因为032必须先签发031消费的stable partition/root identity authority。
+当前显式编号例外是产品于2026-08-13批准的`MCAP-023/025 → MCAP-025A → MCAP-032 → MCAP-031 → MCAP-033`，因为025A必须先闭合ambiguous-zero evidence与physical authority的唯一ownership，032再签发031消费的stable partition/root identity authority。
 跨 crate 协议优先采用 Web-only additive path，既有 native、非 Web 和非 MCAP compatibility path 在本项目结束时仍保持原入口、原所有权和原行为。
 
 状态约定如下：
@@ -57,7 +57,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | --- | --- | --- | --- | --- |
 | M0 | MCAP-001…005 | 5/5 | 已完成 | 既有公开行为、fixture、Chrome origin、确定性调度和脱敏断言可复用 |
 | M1 | MCAP-006…012 | 7/7 | 已完成 | URL、validator、时间、wire、Store generation 和 remote runtime interner 边界冻结 |
-| M2 | MCAP-013…033（含 MCAP-030A） | 19/22 | 进行中 | 不接 TimeControl 即可安全完成 metadata opening、bounded decoder initialization、局部 Chunk 验证和 terminal batch 派生 |
+| M2 | MCAP-013…033（含 MCAP-025A、MCAP-030A） | 19/23 | 进行中 | 不接 TimeControl 即可安全完成 metadata opening、bounded decoder initialization、局部 Chunk 验证和 terminal batch 派生 |
 | M3 | MCAP-034…042 | 0/6 | 未开始 | Web remote-MCAP partition、root、coverage、reclaim 和 existing-identifier 能力可用 |
 | M4 | MCAP-043…057 | 0/15 | 未开始 | compatibility 和 strict lane 的身份、状态、回放、dispose 与 teardown 闭合 |
 | M5 | MCAP-058…066 | 0/0 | 已移出 | legacy HTTP adapter 保留现有 Web 路径，不进入 remote-MCAP 项目 |
@@ -67,7 +67,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M8 | MCAP-089…105 | 0/17 | 未开始 | foreground-only window playback、seek、query isolation、mutation arbitration 和 reload 闭合 |
 | M9 | MCAP-106…114 | 0/9 | 未开始 | two-phase runner、strict startup、UI/API 文档和桌面 Chrome E2E 全部通过 |
 
-有效工作项总数为 89，当前进度为 31/89；26 个 `[~]` 项不计入分母且不产生提交。
+有效工作项总数为 90，当前进度为 31/90；26 个 `[~]` 项不计入分母且不产生提交。
 关键路径为 `M0 → M1 → M2/M3 → M4/M6/M7 → GA → M8 → M9`。
 M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前保持 feature-disabled。
 
@@ -320,6 +320,23 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 验收：空/非空状态、Chunk header、ChunkIndex descriptor和实际min/max必须精确一致，未选Message的非法时间也失败，最大密度fixture在处理第一个超限元素前停止；compile/API测试证明caller/MCAP-033不能传CRC或metadata，scanner与cache也无法脱离同一lease identity接收任意同长度`Box<[u8]>`。
 - 负责人：kola；提交：`a7615316266ae96bfb575a7d8cb7a1b5280d1c52`；备注：2026-08-08 完成production-disarmed方案A，以source-scoped physical authority和per-canonical-ordinal move-only typed lease独占MCAP-021→020→019 evidence，并以allocation-free完整Chunk header validator从exact body派生CRC、payload和MCAP-024 identity/decompression链；完整semantic scanner验证全部records、未选Channel和raw/canonical extent，使用固定u16 domain O(1) Summary projection、bounded result/cache/reclaim、stale source/read generation与backing→permit→lease Drop顺序。设计修订补齐projection budget/lifetime、metadata key/value单字段cap，并移除metadata duplicate quadratic prefix rescan：borrowed whole-Chunk pass只做单次线性structure/UTF-8/cap/scalar验证，取得scan/result reservation后才由parser duplicate rejection或encoded-entry/map-cardinality差异和projection exact-set闭合；Dafee多轮深审后无中级及以上问题且无设计缺陷。真实门限为scanner 29/29、all-features tests check、all-features/tests clippy `-D warnings`、no-default-features all-targets、rustfmt与diff-check通过；完整re_mcap为186/187，唯一失败是既有129-byte Git LFS `attachments.mcap` pointer，doc1/1与compile-fail4/4通过；本机无pixi/cargo-nextest，Wasm仍因缺clang阻断于既有lz4-sys/zstd-sys构建脚本，真实Chrome Range owner适配仍保留给MCAP-033。
 
+### [ ] MCAP-025A — 闭合 remote object、ambiguous-zero 与 physical authority ownership
+
+- 建议提交：`Bind remote MCAP physical source resolution ownership`。
+- 依赖：MCAP-009、MCAP-015、MCAP-023、MCAP-025。
+- 变更：增加fresh-per-open、sealed、non-`Clone`的`BoundRemoteObjectCapability`，在Wasm-only Web Viewer opening adapter中以不可导出的session identity把`re_web::BoundChromeRangeObject` validator owner与`re_mcap`只能比较不能构造的opaque physical-object binding封成不可分离owner；URL、query、Authorization、Cookie和ETag原文不得进入session identity、manifest identity、lower binding、日志或可序列化字段，`re_web`与`re_mcap`互不新增直接依赖。
+- 变更：增加move-only `PreparedPhysicalSourceResolution`，以上层capability为enclosing owner并一次性消费其matching lower binding、MCAP-023的`PreparedAmbiguousZeroBodyPlan`、decompression/source profile和全部aggregate/slot/final-layout reservations，再从plan内部持有的MCAP-021→020→019 evidence构造且独占MCAP-025 `PhysicalChunkSourceAuthority`；`re_mcap` inner owner不持有validator wire bytes，不得分别复制、重建或双消费evidence/binding。
+- 变更：coordinator冻结unresolved canonical ordinal的唯一升序序列，只能为当前next ordinal从内部authority签发one-shot lease，并只接受同一lease经MCAP-025完整header/decompression/scan链返回的ambiguous extent resolution；matching result提交classification后必须先Drop scan/decompressed backing与live lease并恢复该ordinal slot，才能推进next ordinal或finalize，duplicate、out-of-order、cross-source、wrong-object、wrong-generation和stale result在改变classification前fail-closed。
+- 变更：在首个resolution Fetch前checked-census并一次预留完整classification、canonical conversion与overlap-safe interval projection的最终retained peak；所有frozen ordinals恰好resolution一次后，`finalize`只能成功一次并move生成私有拥有`ResolvedCanonicalPhysicalLayout`的`ResolvedPhysicalSourceAuthority` inner owner，layout不能被拆出或比authority活得更久，且不能在成功prefix后进行未预留的fallible allocation。
+- 变更：enclosing final capability继续持有Web validator owner，inner owner持有matching lower binding、完整physical/definition evidence、MCAP-025 authority及全部live reservations，并只提供canonical extent与overlap-safe interval projection的sealed borrow；MCAP-032 inner manifest与Wasm-only outer manifest wrapper沿同一嵌套ownership消费，不能只复制identity后释放validator或inner owner。
+- 变更：未完成或失败的coordinator `Drop`先关闭authority并使全部迟到lease/result失效，再按backing/evidence/reservation顺序释放；不得发布partial layout、partial classification、manifest identity或Store effect，也不得让caller从已解析scalar重建final owner。
+- 变更：本项保持production-disarmed，不依赖MCAP-043，也不创建source status、operation或public opening lifecycle；仅允许模块内sealed test issuer和MCAP-088验证过的artifact issuer构造capability，真正public opening由MCAP-043以后使用matching opening token接通，因此不存在025A↔043依赖循环。
+- 验收：覆盖fresh open identity、same URL reopen identity不同、URL/ETag不进入identity、strong/deployment-assumed validator绑定、wrong content length/object capability，以及capability、plan、profile和budget的cross-source组合全部在authority或Fetch前失败。
+- 验收：覆盖零、一个和多个unresolved ordinal，严格升序、duplicate、skip/out-of-order、wrong lease、stale source/read generation、scanner failure、result仍持有claim时推进/finalize、coordinator early Drop和finalize twice；失败时classification/layout不可观察，authority关闭且全部reservation逐位归零，成功finalize时不存在resolution遗留live claim。
+- 验收：合法final owner给出完整canonical `NoIndexedMessages | Known` extent、保留重叠canonical time intervals且查询不漏更早开始的长区间，并能继续签发matching MCAP-025 leases；physical byte regions仍必须满足MCAP-021全局不重叠，compile/API测试证明raw plan、borrowed regions、裸ordinal、scalar extent、session token或独立validator不能构造final owner。
+- 验收：dependency/API测试证明`re_mcap`没有`re_web`依赖、`re_web`没有`re_mcap`依赖且inner code没有HTTP validator wire access，Wasm-only upper capability与lower binding不能分离、替换或cross-object组合；production审计证明025A没有public route、native或server call edge，MCAP-043之前只有sealed test/artifact issuer可达，existing native/local MCAP与所有nonremote Web行为不变。
+- 负责人：TBD；提交：TBD；备注：2026-08-13 产品批准新增本项，以解除MCAP-023 final plan与MCAP-025 authority对同一sealed physical evidence的ownership cycle；完成后再实施MCAP-032。
+
 ### [x] MCAP-026 — 建立 bounded ROS 2 reflection initializer
 
 - 建议提交：`Add bounded remote ROS2 schema initialization`。
@@ -402,8 +419,9 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 ### [ ] MCAP-032 — 构建 immutable manifest 与全 session metadata preflight
 
 - 建议提交：`Build bounded immutable remote MCAP manifest`。
-- 依赖：MCAP-009、MCAP-021、MCAP-023、MCAP-025、MCAP-026、MCAP-027、MCAP-029、MCAP-030、MCAP-030A。
-- 顺序决策：本项不依赖完整MCAP-031，并在031之前实施；只消费已经完成的physical source authority、immutable Channel group、validation/resource contract和sealed executable output-shape contract，不执行payload decode或构造Arrow rows。
+- 依赖：MCAP-009、MCAP-025A、MCAP-026、MCAP-027、MCAP-029、MCAP-030、MCAP-030A。
+- 顺序决策：本项不依赖完整MCAP-031，并在031之前实施；只消费MCAP-025A finalized owner、immutable Channel group、validation/resource contract和sealed executable output-shape contract，不执行payload decode或构造Arrow rows。
+- 变更：physical input只能move消费`ResolvedPhysicalSourceAuthority`并borrow其`ResolvedCanonicalPhysicalLayout`；不得分别接受MCAP-023 plan、MCAP-025 authority、raw classification、extent vector或session scalar，也不得再次执行ambiguous-zero resolution。
 - 变更：构建canonical indexed extent、overlap-safe interval index、Channel-group table，并以sealed ownership保留MCAP-026/027 bounded initializer results，再checked-compute全文件partition、empty entry、root descriptor、external-origin和registration metadata headroom。
 - 变更：本项独占接管MCAP-029的non-`Clone` group owner，并把MCAP-030当前直接move该owner的pre-integration入口收窄为从完整manifest借用same-lifetime group projection、initializer/factory capability和partition/root descriptor；不能复制owner或让030/032各自消费一次。
 - 变更：immutable manifest是`DerivationPartitionKey`、stable partition descriptor、root descriptor namespace和root `ChunkId`的唯一authority；它为每个canonical source unit/group签发opaque partition descriptor及versioned root issuer，031、registration、GC和refetch只能消费该同一authority。
@@ -508,9 +526,11 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 ### [ ] MCAP-043 — 实现 source status owner、terminal registry 与 first-cause latch
 
 - 建议提交：`Add bounded open-source terminal ownership`。
-- 依赖：MCAP-004、MCAP-006。
+- 依赖：MCAP-004、MCAP-006、MCAP-025A。
 - 变更：增加 `OpenSourceToken`、`OpenSourceStatusOwner`、固定容量/字节 terminal registry、oldest eviction、bounded diagnostics、terminal revision 和 first-terminal-cause-wins latch。
+- 变更：为matching remote opening token增加one-shot sealed object-capability issuer authority；它只能在后续probe产生完整typed `BoundRemoteObject`后签发MCAP-025A capability，不能接受分离的session/content-length/consistency/validator scalars，也不能由native、nonremote route或Rerun服务端取得。
 - 验收：pre-claim、opening、active failure 和 administrative cleanup 都恰好终态化一次；fatal cause 不被 explicit/pressure/background close 覆盖；高水位和 eviction 可观测且脱敏。
+- 验收：wrong/stale/reused opening token、重复签发、字段拆分重组和status owner终态化后签发均失败；025A仍不反向依赖043，dependency/API测试证明不存在cycle且production-disarmed issuer在本项接通前不可达。
 - 负责人：TBD；提交：TBD；备注：TBD。
 
 ### [ ] MCAP-044 — 实现 remote slot、client registry 与 close-once
@@ -1153,11 +1173,11 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 | --- | --- |
 | Web-only 范围、现有兼容边界与公开行为 | MCAP-001、MCAP-054、MCAP-105、MCAP-108、MCAP-112 |
 | Secret URL、validator、time type 与安全输入 | MCAP-007 至 MCAP-009、MCAP-014 至 MCAP-016、MCAP-045、MCAP-069 |
-| Chrome Range、retry、Summary、index 与 Chunk validation | MCAP-013 至 MCAP-025、MCAP-033、MCAP-067、MCAP-088 |
+| Chrome Range、retry、Summary、index 与 Chunk validation | MCAP-013 至 MCAP-025A、MCAP-033、MCAP-067、MCAP-088 |
 | Header/Summary 三阶段 allocation barrier、Summary opcode/group 语法与 definition canonicalization | MCAP-017 至 MCAP-020 |
 | Descriptor-only physical ownership 与 full MessageIndex record alignment | MCAP-021、MCAP-022 |
-| Physical Chunk source authority、pending-header typestate、per-ordinal read lease 与 exact-body owner handoff | MCAP-021、MCAP-024、MCAP-025、MCAP-033、MCAP-088 |
-| ROS 2/protobuf bounded initializer、decoder assignment、manifest identity authority与两阶段decode | MCAP-026 至 MCAP-033；实施顺序为030A后先032再031 |
+| Bound remote object、ambiguous-zero resolution、Physical Chunk source authority、pending-header typestate、per-ordinal read lease 与 exact-body owner handoff | MCAP-009、MCAP-015、MCAP-021、MCAP-023 至 MCAP-025A、MCAP-033、MCAP-043、MCAP-088 |
+| ROS 2/protobuf bounded initializer、decoder assignment、manifest identity authority与两阶段decode | MCAP-026 至 MCAP-033；实施顺序为025A与030A后先032再031 |
 | Web remote Store roots、registration 与 coverage | MCAP-034 至 MCAP-037、MCAP-039、MCAP-042、MCAP-092 |
 | Open slot、source/operation/recording lifecycle | MCAP-043 至 MCAP-057 |
 | Remote-MCAP page execution | MCAP-067、MCAP-068、MCAP-073、MCAP-080 |
@@ -1172,13 +1192,14 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 
 ## 16. 最终项目完成检查表
 
-- [ ] 89 个有效工作项均填写负责人、commit SHA和验收结果，26 个 `[~]` 项保留范围决策记录且没有实现提交。
+- [ ] 90 个有效工作项均填写负责人、commit SHA和验收结果，26 个 `[~]` 项保留范围决策记录且没有实现提交。
 - [ ] 每个提交都可在其依赖点独立构建和回退，没有只靠后续提交修复的已知不通过测试。
 - [ ] compatibility API只有文档明确列出的accepted regression，其余characterization tests保持通过。
 - [ ] strict remote-MCAP API、compatibility MCAP 分支、page execution和remote session都覆盖success/failure/close/stop/stale callback，排除路由由差分测试证明不变。
 - [ ] 所有remote-MCAP不可信输入在对应Fetch、copy、allocation、intern、Store mutation或public effect之前完成容量和一致性检查；排除路由继续既有边界且由差分测试保护。
 - [ ] ROS 2/protobuf remote initializer只消费same-source sealed definitions，在首次allocation前完成strict whole-schema census和峰值预留；后续assignment/manifest/decode复用同一sealed result且release artifact不存在无界重初始化call edge。
 - [ ] immutable manifest是`DerivationPartitionKey`、stable partition/root descriptor和root `ChunkId`的唯一authority；MCAP-032先于031完成，decode只消费matching issuer且任何失败零partial publication。
+- [ ] fresh-per-open `BoundRemoteObjectCapability`、MCAP-023 plan和MCAP-025 authority只能经MCAP-025A exactly-once resolution owner合并；032只消费final owner，partial/stale/out-of-order resolution不能产生canonical layout或留下reservation。
 - [ ] admitted protobuf decode覆盖default/null、presence、oneof、enum、repeated、packed、map、nested message和unknown-field policy的完整bounded Arrow语义，并与local normalized output逐项差分。
 - [ ] 每个physical Chunk只能沿021→020→019 evidence owner、source authority、one-shot pending lease、MCAP-025 header-validated transition、MCAP-024 output和scanner/cache链流动；caller无法传CRC/codec metadata，duplicate-live、stale generation、index/header mismatch、CRC与body copy overlap门通过。
 - [ ] remote recording的所有查询只能通过完整presentation revision的sealed facade，编译期边界测试通过。
