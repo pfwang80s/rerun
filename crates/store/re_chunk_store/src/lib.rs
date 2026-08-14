@@ -22,6 +22,8 @@ mod dataframe;
 mod drop_time_range;
 pub mod entity_tree;
 mod events;
+#[cfg(any(target_arch = "wasm32", test))]
+mod external_refetchable_root;
 mod gc;
 mod lazy_store;
 mod lineage;
@@ -58,6 +60,13 @@ pub use self::events::{
     ChunkComponentMeta, ChunkDeletionReason, ChunkMeta, ChunkStoreDiff, ChunkStoreDiffAddition,
     ChunkStoreDiffDeletion, ChunkStoreDiffSchemaAddition, ChunkStoreDiffVirtualAddition,
     ChunkStoreEvent,
+};
+#[cfg(any(target_arch = "wasm32", test))]
+pub use self::external_refetchable_root::{
+    ExternalRefetchableRootDescriptorIdentityV1, ExternalRefetchableRootDescriptorV1,
+    ExternalRefetchableRootErrorV1, ExternalRefetchableRootExistenceV1,
+    ExternalRefetchableRootOriginV1, WebRemoteMcapRootCapabilityV1,
+    WebRemoteMcapRootRefetchPermitV1, WebRemoteMcapStoreConfigV1,
 };
 pub use self::gc::{GarbageCollectionOptions, GarbageCollectionTarget};
 pub use self::lineage::{ChunkDirectLineage, ChunkDirectLineageReport};

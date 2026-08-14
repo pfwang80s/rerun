@@ -17,6 +17,8 @@ pub(crate) struct TrackedDirectChunkLineage {
     /// reference this lineage.
     pub(crate) ref_count: u32,
     pub(crate) descends_from_manifest: bool,
+    #[cfg(any(target_arch = "wasm32", test))]
+    pub(crate) descends_from_external_source: bool,
 }
 
 impl std::ops::Deref for TrackedDirectChunkLineage {
@@ -87,6 +89,10 @@ pub enum ChunkDirectLineage {
     /// Redap server is still available).
     RootFromManifest { is_static: bool },
 
+    /// This chunk is a persistent Web remote-MCAP root backed by an external Range source.
+    #[cfg(any(target_arch = "wasm32", test))]
+    RootFromExternalSource(crate::ExternalRefetchableRootOriginV1),
+
     /// This chunk's data was originally logged from volatile memory.
     ///
     /// Once garbage collected, this data will be unrecoverable.
@@ -109,6 +115,13 @@ impl std::fmt::Debug for ChunkDirectLineage {
             Self::RootFromManifest { is_static } => {
                 write!(f, "origin:(static: {is_static})")
             }
+
+            #[cfg(any(target_arch = "wasm32", test))]
+            Self::RootFromExternalSource(origin) => write!(
+                f,
+                "external-origin:({:?})",
+                origin.descriptor_v1().identity_v1()
+            ),
 
             Self::Volatile => f.write_str("origin:<volatile> (cannot be re-fetched)"),
         }
@@ -136,6 +149,11 @@ impl From<&ChunkDirectLineageReport> for ChunkDirectLineage {
             ChunkDirectLineageReport::RootFromManifest { is_static } => Self::RootFromManifest {
                 is_static: *is_static,
             },
+
+            #[cfg(any(target_arch = "wasm32", test))]
+            ChunkDirectLineageReport::RootFromExternalSource(origin) => {
+                Self::RootFromExternalSource(origin.clone())
+            }
 
             ChunkDirectLineageReport::Volatile => Self::Volatile,
         }
@@ -182,6 +200,11 @@ impl ChunkDirectLineage {
                 })
             }
 
+            #[cfg(any(target_arch = "wasm32", test))]
+            Self::RootFromExternalSource(origin) => Some(
+                ChunkDirectLineageReport::RootFromExternalSource(origin.clone()),
+            ),
+
             Self::Volatile => Some(ChunkDirectLineageReport::Volatile),
         }
     }
@@ -191,6 +214,8 @@ impl ChunkDirectLineage {
             Self::SplitFrom(chunk_id, _) => Some(Either::Left(std::iter::once(chunk_id))),
             Self::CompactedFrom(chunks) => Some(Either::Right(chunks.iter())),
             Self::RootFromManifest { .. } | Self::Volatile => None,
+            #[cfg(any(target_arch = "wasm32", test))]
+            Self::RootFromExternalSource(_) => None,
         }
         .into_iter()
         .flatten()
@@ -248,6 +273,10 @@ pub enum ChunkDirectLineageReport {
     /// Redap server is still available).
     RootFromManifest { is_static: bool },
 
+    /// This chunk is a persistent Web remote-MCAP root backed by an external Range source.
+    #[cfg(any(target_arch = "wasm32", test))]
+    RootFromExternalSource(crate::ExternalRefetchableRootOriginV1),
+
     /// This chunk's data was originally logged from volatile memory.
     ///
     /// Once garbage collected, this data will be unrecoverable.
@@ -269,6 +298,11 @@ impl std::fmt::Debug for ChunkDirectLineageReport {
             Self::RootFromManifest { is_static } => {
                 write!(f, "RootFromManifest(static: {is_static})")
             }
+            #[cfg(any(target_arch = "wasm32", test))]
+            Self::RootFromExternalSource(origin) => f
+                .debug_tuple("RootFromExternalSource")
+                .field(&origin.descriptor_v1().identity_v1())
+                .finish(),
             Self::Volatile => write!(f, "Volatile"),
         }
     }
@@ -367,10 +401,12 @@ impl ChunkStore {
             // which point it must be a root, by definition.
             return true;
         };
-        matches!(
-            lineage.lineage,
-            ChunkDirectLineage::RootFromManifest { .. } | ChunkDirectLineage::Volatile
-        )
+        match lineage.lineage {
+            ChunkDirectLineage::RootFromManifest { .. } | ChunkDirectLineage::Volatile => true,
+            #[cfg(any(target_arch = "wasm32", test))]
+            ChunkDirectLineage::RootFromExternalSource(_) => true,
+            ChunkDirectLineage::SplitFrom(_, _) | ChunkDirectLineage::CompactedFrom(_) => false,
+        }
     }
 
     /// Returns the roots from which a given chunk was derived from.
@@ -403,6 +439,9 @@ impl ChunkStore {
             Some(ChunkDirectLineage::RootFromManifest { .. } | ChunkDirectLineage::Volatile) => {
                 roots.push(*chunk_id);
             }
+
+            #[cfg(any(target_arch = "wasm32", test))]
+            Some(ChunkDirectLineage::RootFromExternalSource(_)) => roots.push(*chunk_id),
 
             None => {}
         }
@@ -485,6 +524,13 @@ impl ChunkStore {
         self.chunks_lineage
             .get(chunk)
             .is_some_and(|l| l.descends_from_manifest)
+    }
+
+    #[cfg(any(target_arch = "wasm32", test))]
+    pub(crate) fn descends_from_external_source(&self, chunk: &ChunkId) -> bool {
+        self.chunks_lineage
+            .get(chunk)
+            .is_some_and(|lineage| lineage.descends_from_external_source)
     }
 
     /// Returns true if either the specified chunk or one of its ancestors resulted from a split.

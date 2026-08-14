@@ -637,6 +637,8 @@ impl ChunkStore {
 
         let Self {
             id: _,
+            #[cfg(any(target_arch = "wasm32", test))]
+                web_remote_mcap_store_token_v1: _,
             config: _,
             schema: _,                            // purely additive
             physical_chunks_per_chunk_id: _,      // handled by shallow impl
@@ -713,6 +715,8 @@ impl ChunkStore {
 
         let Self {
             id: _,
+            #[cfg(any(target_arch = "wasm32", test))]
+                web_remote_mcap_store_token_v1: _,
             config: _,
             schema: _, // purely additive
             physical_chunks_per_chunk_id,

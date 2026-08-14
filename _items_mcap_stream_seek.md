@@ -58,7 +58,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M0 | MCAP-001…005 | 5/5 | 已完成 | 既有公开行为、fixture、Chrome origin、确定性调度和脱敏断言可复用 |
 | M1 | MCAP-006…012 | 7/7 | 已完成 | URL、validator、时间、wire、Store generation 和 remote runtime interner 边界冻结 |
 | M2 | MCAP-013…033（含 MCAP-025A、MCAP-030A、MCAP-030B） | 24/24 | 已完成 | 不接 TimeControl 即可安全完成 metadata opening、bounded decoder initialization、局部 Chunk 验证和 terminal batch 派生 |
-| M3 | MCAP-034…042 | 0/6 | 未开始 | Web remote-MCAP partition、root、coverage、reclaim 和 existing-identifier 能力可用 |
+| M3 | MCAP-034…042 | 1/6 | 进行中 | Web remote-MCAP partition、root、coverage、reclaim 和 existing-identifier 能力可用 |
 | M4 | MCAP-043…057 | 0/15 | 未开始 | compatibility 和 strict lane 的身份、状态、回放、dispose 与 teardown 闭合 |
 | M5 | MCAP-058…066 | 0/0 | 已移出 | legacy HTTP adapter 保留现有 Web 路径，不进入 remote-MCAP 项目 |
 | M6 | MCAP-067…080 | 0/5 | 未开始 | remote-MCAP page execution、hidden suspension、安全字符串和 teardown 闭合 |
@@ -67,7 +67,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M8 | MCAP-089…105 | 0/17 | 未开始 | foreground-only window playback、seek、query isolation、mutation arbitration 和 reload 闭合 |
 | M9 | MCAP-106…114 | 0/9 | 未开始 | two-phase runner、strict startup、UI/API 文档和桌面 Chrome E2E 全部通过 |
 
-有效工作项总数为 91，当前进度为 36/91；26 个 `[~]` 项不计入分母且不产生提交。
+有效工作项总数为 91，当前进度为 37/91；26 个 `[~]` 项不计入分母且不产生提交。
 关键路径为 `M0 → M1 → M2/M3 → M4/M6/M7 → GA → M8 → M9`。
 M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前保持 feature-disabled。
 
@@ -462,13 +462,13 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 
 ## 7. M3 — Store、residency 与 subscriber 基础
 
-### [ ] MCAP-034 — 持久化 external-refetchable root origin
+### [x] MCAP-034 — 持久化 external-refetchable root origin
 
 - 建议提交：`Add persistent refetchable root descriptors`。
 - 依赖：MCAP-006、MCAP-029。
 - 变更：增加只由 Web remote-MCAP Store config/capability 可构造的稳定 root origin、exact root existence query、refetch capability 和 descriptor identity。
 - 验收：root 在插入、GC 删除、重新 Fetch 和重载后保持相同 identity，representation terminal 后 capability 可先撤销，native 与普通 volatile/manifest root 语义不变。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：kola；提交：本提交；备注：2026-08-14 完成production-disarmed的Web remote-MCAP external-refetchable root origin：Store-scoped move-only capability签发稳定descriptor identity、exact Resident/Unloaded query与one-shot refetch permit；origin跨deep GC保留，显式revoke或capability Drop撤销所有未消费permit但不删除origin。same StoreId跨实例、clone authority、ordinary insert绕过permit和RRD manifest identity collision均在mutation/event前fail-closed；普通Web/RRD路径只增加O(1) token判断，native production通过cfg完全隔离。Dafee三轮最终0 High/0 Medium/0 Low且无设计偏离；focused6/6、re_chunk_store lib64/64、all-features lib/tests Clippy `-D warnings`、check、rustfmt与diff-check通过，production route继续disarmed。
 
 ### [ ] MCAP-035 — 实现 partition/root 原子 registration 与 residency
 

@@ -359,6 +359,8 @@ impl SizeBytes for ChunkStore {
             temporal_chunk_ids_per_entity,
             temporal_chunk_ids_per_entity_per_component,
             id,
+            #[cfg(any(target_arch = "wasm32", test))]
+                web_remote_mcap_store_token_v1: _,
             config,
             schema,
             physical_chunk_ids_per_min_row_id,

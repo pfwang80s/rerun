@@ -519,6 +519,9 @@ impl QueriedChunkIdTracker {
 pub struct ChunkStore {
     pub(crate) id: StoreId,
 
+    #[cfg(any(target_arch = "wasm32", test))]
+    pub(crate) web_remote_mcap_store_token_v1: Option<u64>,
+
     /// The configuration of the chunk store (e.g. compaction settings).
     pub(crate) config: ChunkStoreConfig,
 
@@ -699,6 +702,8 @@ impl Clone for ChunkStore {
         re_tracing::profile_function!();
         Self {
             id: self.id.clone(),
+            #[cfg(any(target_arch = "wasm32", test))]
+            web_remote_mcap_store_token_v1: None,
             config: self.config.clone(),
             schema: self.schema.clone(),
             physical_chunks_per_chunk_id: self.physical_chunks_per_chunk_id.clone(),
@@ -726,6 +731,8 @@ impl std::fmt::Display for ChunkStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self {
             id,
+            #[cfg(any(target_arch = "wasm32", test))]
+                web_remote_mcap_store_token_v1: _,
             config,
             schema: _,
             physical_chunks_per_chunk_id,
@@ -808,6 +815,8 @@ impl ChunkStore {
     pub fn new(id: StoreId, config: ChunkStoreConfig) -> Self {
         Self {
             id,
+            #[cfg(any(target_arch = "wasm32", test))]
+            web_remote_mcap_store_token_v1: None,
             config,
             schema: Default::default(),
             physical_chunk_ids_per_min_row_id: Default::default(),
