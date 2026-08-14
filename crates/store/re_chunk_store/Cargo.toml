@@ -22,6 +22,9 @@ all-features = true
 [features]
 default = []
 
+## Exposes production-disarmed Web remote-MCAP Store capabilities to downstream integration tests.
+remote_mcap_test = []
+
 ## Enables `parking_lot`'s deadlock detection background thread.
 deadlock_detection = ["parking_lot/deadlock_detection"]
 

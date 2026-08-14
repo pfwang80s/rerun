@@ -14,6 +14,12 @@ use crate::{
 
 static NEXT_WEB_REMOTE_MCAP_STORE_TOKEN_V1: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebRemoteMcapStoreIdentityV1 {
+    store_id: StoreId,
+    store_token: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, re_byte_size::SizeBytes)]
 pub struct ExternalRefetchableRootDescriptorIdentityV1(ChunkId);
 
@@ -45,6 +51,31 @@ pub struct ExternalRefetchableRootOriginV1 {
 }
 
 impl ExternalRefetchableRootOriginV1 {
+    /// Canonical retained-byte accounting for the V1 persistent origin encoding.
+    pub const ENCODED_BYTES_V1: u64 = 1 + 16 + 16 + 8 + 1;
+
+    /// Conservative retained-byte accounting for one occupied lineage bucket.
+    pub const STORE_LINEAGE_BUCKET_BYTES_V1: u64 = (std::mem::size_of::<ChunkId>()
+        + std::mem::size_of::<TrackedDirectChunkLineage>()
+        + 32) as u64;
+
+    pub fn store_lineage_retained_bytes_for_roots_v1(
+        roots: u64,
+        capacity_slack: u64,
+    ) -> Option<u64> {
+        Self::store_lineage_capacity_bytes_for_roots_v1(roots, capacity_slack)?
+            .checked_add(roots.checked_mul(Self::ENCODED_BYTES_V1)?)
+    }
+
+    pub fn store_lineage_capacity_bytes_for_roots_v1(
+        roots: u64,
+        capacity_slack: u64,
+    ) -> Option<u64> {
+        roots
+            .checked_mul(capacity_slack)?
+            .checked_mul(Self::STORE_LINEAGE_BUCKET_BYTES_V1)
+    }
+
     pub fn descriptor_v1(&self) -> ExternalRefetchableRootDescriptorV1 {
         self.descriptor
     }
@@ -76,6 +107,9 @@ pub enum ExternalRefetchableRootErrorV1 {
     #[error("the physical root does not match its sealed descriptor")]
     ChunkMismatch,
 
+    #[error("failed to reserve external root metadata")]
+    ReservationFailed,
+
     #[error(transparent)]
     Store(#[from] ChunkStoreError),
 }
@@ -88,8 +122,9 @@ pub struct WebRemoteMcapStoreConfigV1 {
 }
 
 impl WebRemoteMcapStoreConfigV1 {
-    #[cfg(test)]
-    pub(crate) fn for_test_v1() -> Self {
+    #[cfg(any(test, feature = "remote_mcap_test"))]
+    #[doc(hidden)]
+    pub fn for_test_v1() -> Self {
         let store_token = NEXT_WEB_REMOTE_MCAP_STORE_TOKEN_V1
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
                 token.checked_add(1)
@@ -132,20 +167,82 @@ impl WebRemoteMcapRootCapabilityV1 {
         .ok_or(ExternalRefetchableRootErrorV1::WrongStore)
     }
 
-    pub fn register_root_origin_v1(
+    pub fn validate_store_v1(
+        &self,
+        store: &ChunkStore,
+    ) -> Result<(), ExternalRefetchableRootErrorV1> {
+        self.ensure_active_v1()?;
+        self.ensure_store_v1(store)
+    }
+
+    pub fn store_identity_v1(
+        &self,
+        store: &ChunkStore,
+    ) -> Result<WebRemoteMcapStoreIdentityV1, ExternalRefetchableRootErrorV1> {
+        self.validate_store_v1(store)?;
+        Ok(WebRemoteMcapStoreIdentityV1 {
+            store_id: store.id.clone(),
+            store_token: self.store_token,
+        })
+    }
+
+    pub fn try_reserve_root_origins_v1(
         &self,
         store: &mut ChunkStore,
+        additional: usize,
+    ) -> Result<u64, ExternalRefetchableRootErrorV1> {
+        self.validate_store_v1(store)?;
+        let before = store.chunks_lineage.capacity();
+        store
+            .chunks_lineage
+            .try_reserve(additional)
+            .map_err(|_error| ExternalRefetchableRootErrorV1::ReservationFailed)?;
+        let additional_capacity = store
+            .chunks_lineage
+            .capacity()
+            .checked_sub(before)
+            .ok_or(ExternalRefetchableRootErrorV1::ReservationFailed)?;
+        u64::try_from(additional_capacity)
+            .ok()
+            .and_then(|capacity| {
+                capacity.checked_mul(ExternalRefetchableRootOriginV1::STORE_LINEAGE_BUCKET_BYTES_V1)
+            })
+            .ok_or(ExternalRefetchableRootErrorV1::ReservationFailed)
+    }
+
+    pub fn validate_root_origin_v1(
+        &self,
+        store: &ChunkStore,
         root_chunk_id: ChunkId,
         is_static: bool,
     ) -> Result<ExternalRefetchableRootDescriptorV1, ExternalRefetchableRootErrorV1> {
-        self.ensure_active_v1()?;
-        self.ensure_store_v1(store)?;
+        self.validate_store_v1(store)?;
         let descriptor = ExternalRefetchableRootDescriptorV1 {
             root_chunk_id,
             identity: ExternalRefetchableRootDescriptorIdentityV1(root_chunk_id),
             store_token: self.store_token,
             is_static,
         };
+        match store.chunks_lineage.get(&root_chunk_id) {
+            None => Ok(descriptor),
+            Some(lineage) => {
+                let ChunkDirectLineage::RootFromExternalSource(existing) = &lineage.lineage else {
+                    return Err(ExternalRefetchableRootErrorV1::OriginConflict);
+                };
+                (existing.descriptor == descriptor)
+                    .then_some(descriptor)
+                    .ok_or(ExternalRefetchableRootErrorV1::OriginConflict)
+            }
+        }
+    }
+
+    pub fn register_root_origin_v1(
+        &self,
+        store: &mut ChunkStore,
+        root_chunk_id: ChunkId,
+        is_static: bool,
+    ) -> Result<ExternalRefetchableRootDescriptorV1, ExternalRefetchableRootErrorV1> {
+        let descriptor = self.validate_root_origin_v1(store, root_chunk_id, is_static)?;
         let origin = ExternalRefetchableRootOriginV1 { descriptor };
         match store.chunks_lineage.entry(root_chunk_id) {
             std::collections::hash_map::Entry::Vacant(entry) => {

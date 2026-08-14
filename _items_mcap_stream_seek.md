@@ -58,7 +58,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M0 | MCAP-001…005 | 5/5 | 已完成 | 既有公开行为、fixture、Chrome origin、确定性调度和脱敏断言可复用 |
 | M1 | MCAP-006…012 | 7/7 | 已完成 | URL、validator、时间、wire、Store generation 和 remote runtime interner 边界冻结 |
 | M2 | MCAP-013…033（含 MCAP-025A、MCAP-030A、MCAP-030B） | 24/24 | 已完成 | 不接 TimeControl 即可安全完成 metadata opening、bounded decoder initialization、局部 Chunk 验证和 terminal batch 派生 |
-| M3 | MCAP-034…042 | 1/6 | 进行中 | Web remote-MCAP partition、root、coverage、reclaim 和 existing-identifier 能力可用 |
+| M3 | MCAP-034…042 | 2/6 | 进行中 | Web remote-MCAP partition、root、coverage、reclaim 和 existing-identifier 能力可用 |
 | M4 | MCAP-043…057 | 0/15 | 未开始 | compatibility 和 strict lane 的身份、状态、回放、dispose 与 teardown 闭合 |
 | M5 | MCAP-058…066 | 0/0 | 已移出 | legacy HTTP adapter 保留现有 Web 路径，不进入 remote-MCAP 项目 |
 | M6 | MCAP-067…080 | 0/5 | 未开始 | remote-MCAP page execution、hidden suspension、安全字符串和 teardown 闭合 |
@@ -67,7 +67,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M8 | MCAP-089…105 | 0/17 | 未开始 | foreground-only window playback、seek、query isolation、mutation arbitration 和 reload 闭合 |
 | M9 | MCAP-106…114 | 0/9 | 未开始 | two-phase runner、strict startup、UI/API 文档和桌面 Chrome E2E 全部通过 |
 
-有效工作项总数为 91，当前进度为 37/91；26 个 `[~]` 项不计入分母且不产生提交。
+有效工作项总数为 91，当前进度为 38/91；26 个 `[~]` 项不计入分母且不产生提交。
 关键路径为 `M0 → M1 → M2/M3 → M4/M6/M7 → GA → M8 → M9`。
 M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前保持 feature-disabled。
 
@@ -470,13 +470,13 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 验收：root 在插入、GC 删除、重新 Fetch 和重载后保持相同 identity，representation terminal 后 capability 可先撤销，native 与普通 volatile/manifest root 语义不变。
 - 负责人：kola；提交：本提交；备注：2026-08-14 完成production-disarmed的Web remote-MCAP external-refetchable root origin：Store-scoped move-only capability签发稳定descriptor identity、exact Resident/Unloaded query与one-shot refetch permit；origin跨deep GC保留，显式revoke或capability Drop撤销所有未消费permit但不删除origin。same StoreId跨实例、clone authority、ordinary insert绕过permit和RRD manifest identity collision均在mutation/event前fail-closed；普通Web/RRD路径只增加O(1) token判断，native production通过cfg完全隔离。Dafee三轮最终0 High/0 Medium/0 Low且无设计偏离；focused6/6、re_chunk_store lib64/64、all-features lib/tests Clippy `-D warnings`、check、rustfmt与diff-check通过，production route继续disarmed。
 
-### [ ] MCAP-035 — 实现 partition/root 原子 registration 与 residency
+### [x] MCAP-035 — 实现 partition/root 原子 registration 与 residency
 
 - 建议提交：`Add atomic remote partition registration`。
 - 依赖：MCAP-032、MCAP-034。
 - 变更：为 Web remote-MCAP 专用 Store 增加 capability-gated `PartitionResidency`、session counters、`CompleteEmpty`、root descriptor 和 external-origin bytes 的整批 preflight/commit，既有 `EntityDb` constructor 和 native mutation API 不变。
 - 验收：任一 cap 或 identity conflict 时 registry 逐位不变；合法 manifest 全量 registration 不在中途失败；Store event 是 root resident/nonresident 的唯一真源。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：kola；提交：本提交；备注：2026-08-14 完成production-disarmed的Web remote-MCAP partition/root原子registration与residency：sealed OpeningStatic/CompleteEmpty authority、四项hard caps、index/ChunkStore lineage/temporary delta统一reservation及Drop退款；整批preflight完成后才执行Store reserve与无失败commit，任一cap、identity、kind、排序或origin冲突均保持registry、lineage、counters、bytes与events逐位不变。Index绑定opaque Store instance；同StoreId foreign event只能触发bound Store exact existence reconciliation，不能污染状态；delta maps与sorted root binary search保证线性期望复杂度。Dafee四轮最终0 High/0 Medium/0 Low且无设计偏离；residency11/11、manifest3/3、dispatch3/3、re_chunk_store64/64、两crate all-features Clippy `-D warnings`/check、cargo fmt与diff-check通过；本机无cargo-nextest，使用cargo test兜底，production route继续disarmed。
 
 ### [ ] MCAP-036 — 增量维护 indexed extent 与 loaded coverage
 

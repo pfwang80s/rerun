@@ -519,7 +519,7 @@ impl QueriedChunkIdTracker {
 pub struct ChunkStore {
     pub(crate) id: StoreId,
 
-    #[cfg(any(target_arch = "wasm32", test))]
+    #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
     pub(crate) web_remote_mcap_store_token_v1: Option<u64>,
 
     /// The configuration of the chunk store (e.g. compaction settings).
@@ -702,7 +702,7 @@ impl Clone for ChunkStore {
         re_tracing::profile_function!();
         Self {
             id: self.id.clone(),
-            #[cfg(any(target_arch = "wasm32", test))]
+            #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
             web_remote_mcap_store_token_v1: None,
             config: self.config.clone(),
             schema: self.schema.clone(),
@@ -731,7 +731,7 @@ impl std::fmt::Display for ChunkStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self {
             id,
-            #[cfg(any(target_arch = "wasm32", test))]
+            #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
                 web_remote_mcap_store_token_v1: _,
             config,
             schema: _,
@@ -815,7 +815,7 @@ impl ChunkStore {
     pub fn new(id: StoreId, config: ChunkStoreConfig) -> Self {
         Self {
             id,
-            #[cfg(any(target_arch = "wasm32", test))]
+            #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
             web_remote_mcap_store_token_v1: None,
             config,
             schema: Default::default(),

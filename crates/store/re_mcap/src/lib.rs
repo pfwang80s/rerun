@@ -159,6 +159,11 @@ mod remote_chunk_validation_count;
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
 mod remote_manifest;
 
+// Partition/root registration consumes only sealed manifest identities and the capability-gated
+// Web remote-MCAP Store origin API. It remains absent from native production builds.
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+mod remote_partition_residency;
+
 // Admitted second-pass dispatch remains crate-private and production-disarmed until the Web
 // Store mutation arbiter is wired to the complete terminal contract.
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]

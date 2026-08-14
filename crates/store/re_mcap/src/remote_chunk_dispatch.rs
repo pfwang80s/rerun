@@ -51,6 +51,7 @@ pub(crate) enum RemoteChunkTerminalV1 {
 
 pub(crate) struct RemoteTypedChunkHandoffV1 {
     chunk: Chunk,
+    root: crate::remote_manifest::ManifestRootDescriptorV1,
     _reservation: crate::remote_chunk_validation_count::RemoteTypedOutputReservationV1,
 }
 
@@ -93,11 +94,21 @@ impl RemoteTypedChunkHandoffV1 {
     pub(crate) const fn chunk_v1(&self) -> &Chunk {
         &self.chunk
     }
+
+    pub(crate) const fn root_v1(&self) -> crate::remote_manifest::ManifestRootDescriptorV1 {
+        self.root
+    }
 }
 
 impl RemoteTypedPartitionHandoffV1 {
     pub(crate) fn chunks_v1(&self) -> impl ExactSizeIterator<Item = &Chunk> {
         self.chunks.iter().map(RemoteTypedChunkHandoffV1::chunk_v1)
+    }
+
+    pub(crate) fn root_handoffs_v1(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &RemoteTypedChunkHandoffV1> {
+        self.chunks.iter()
     }
 }
 
@@ -1159,6 +1170,7 @@ pub(crate) fn build_ros_scalar_chunk_v1(
         .map_err(|_| RemoteChunkDispatchFailureV1::PlanMismatch)?;
     Ok(RemoteTypedChunkHandoffV1 {
         chunk,
+        root,
         _reservation: output_reservation,
     })
 }
@@ -1269,6 +1281,7 @@ fn build_protobuf_chunk_v1(
     }
     Ok(RemoteTypedChunkHandoffV1 {
         chunk,
+        root,
         _reservation: output_reservation,
     })
 }

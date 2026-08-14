@@ -57,7 +57,7 @@ impl ChunkStore {
     pub fn insert_rrd_manifest(&mut self, rrd_manifest: Arc<RrdManifest>) -> Vec<ChunkStoreEvent> {
         re_tracing::profile_function!();
 
-        #[cfg(any(target_arch = "wasm32", test))]
+        #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
         if self.web_remote_mcap_store_token_v1.is_some() {
             let collides_with_external_origin = rrd_manifest
                 .static_map()
@@ -87,7 +87,7 @@ impl ChunkStore {
 
         let Self {
             id: _,
-            #[cfg(any(target_arch = "wasm32", test))]
+            #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
                 web_remote_mcap_store_token_v1: _,
             config: _,
             schema: _,                            // handled below
@@ -120,7 +120,11 @@ impl ChunkStore {
                             lineage: ChunkDirectLineage::RootFromManifest { is_static: true },
                             ref_count: 0,
                             descends_from_manifest: true,
-                            #[cfg(any(target_arch = "wasm32", test))]
+                            #[cfg(any(
+                                target_arch = "wasm32",
+                                test,
+                                feature = "remote_mcap_test"
+                            ))]
                             descends_from_external_source: false,
                         },
                     )
@@ -147,7 +151,11 @@ impl ChunkStore {
                             lineage: ChunkDirectLineage::RootFromManifest { is_static: false },
                             ref_count: 0,
                             descends_from_manifest: true,
-                            #[cfg(any(target_arch = "wasm32", test))]
+                            #[cfg(any(
+                                target_arch = "wasm32",
+                                test,
+                                feature = "remote_mcap_test"
+                            ))]
                             descends_from_external_source: false,
                         },
                     )
@@ -252,7 +260,7 @@ impl ChunkStore {
     /// * Inserting a duplicated [`ChunkId`] will result in a no-op.
     /// * Inserting an empty [`Chunk`] will result in a no-op.
     pub fn insert_chunk(&mut self, chunk: &Arc<Chunk>) -> ChunkStoreResult<Vec<ChunkStoreEvent>> {
-        #[cfg(any(target_arch = "wasm32", test))]
+        #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
         if matches!(
             self.direct_lineage(&chunk.id()),
             Some(ChunkDirectLineage::RootFromExternalSource(_))
@@ -280,11 +288,11 @@ impl ChunkStore {
                 chunks.iter().any(|c| self.descends_from_manifest(c))
             }
             ChunkDirectLineage::RootFromManifest { .. } => true,
-            #[cfg(any(target_arch = "wasm32", test))]
+            #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
             ChunkDirectLineage::RootFromExternalSource(_) => false,
             ChunkDirectLineage::Volatile => false,
         };
-        #[cfg(any(target_arch = "wasm32", test))]
+        #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
         let descends_from_external_source = match &lineage {
             ChunkDirectLineage::SplitFrom(chunk_id, _) => {
                 self.descends_from_external_source(chunk_id)
@@ -292,7 +300,7 @@ impl ChunkStore {
             ChunkDirectLineage::CompactedFrom(chunks) => chunks
                 .iter()
                 .any(|chunk_id| self.descends_from_external_source(chunk_id)),
-            #[cfg(any(target_arch = "wasm32", test))]
+            #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
             ChunkDirectLineage::RootFromExternalSource(_) => true,
             ChunkDirectLineage::RootFromManifest { .. } | ChunkDirectLineage::Volatile => false,
         };
@@ -303,7 +311,7 @@ impl ChunkStore {
                     // Zero for now, add to this later.
                     ref_count: 0,
                     descends_from_manifest,
-                    #[cfg(any(target_arch = "wasm32", test))]
+                    #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
                     descends_from_external_source,
                     lineage: lineage.clone(),
                 });
@@ -928,7 +936,7 @@ impl ChunkStore {
                     if lineage.descends_from_manifest || 0 < lineage.ref_count {
                         continue;
                     }
-                    #[cfg(any(target_arch = "wasm32", test))]
+                    #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
                     if lineage.descends_from_external_source {
                         continue;
                     }
@@ -1154,7 +1162,7 @@ impl ChunkStore {
 
         let Self {
             id: _,
-            #[cfg(any(target_arch = "wasm32", test))]
+            #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
                 web_remote_mcap_store_token_v1: _,
             config: _,
             schema,
@@ -2312,7 +2320,7 @@ mod tests {
                 lineage: ChunkDirectLineage::Volatile,
                 ref_count: 1,
                 descends_from_manifest: false,
-                #[cfg(any(target_arch = "wasm32", test))]
+                #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
                 descends_from_external_source: false,
             },
         );
@@ -2326,7 +2334,7 @@ mod tests {
                     lineage: ChunkDirectLineage::CompactedFrom(vec![newest].into_boxed_slice()),
                     ref_count: 1,
                     descends_from_manifest: false,
-                    #[cfg(any(target_arch = "wasm32", test))]
+                    #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
                     descends_from_external_source: false,
                 },
             );
@@ -2356,7 +2364,7 @@ mod tests {
                     lineage: ChunkDirectLineage::RootFromManifest { is_static: false },
                     ref_count: 1,
                     descends_from_manifest: true,
-                    #[cfg(any(target_arch = "wasm32", test))]
+                    #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
                     descends_from_external_source: false,
                 },
             ),
@@ -2366,7 +2374,7 @@ mod tests {
                     lineage: ChunkDirectLineage::Volatile,
                     ref_count: 2, // referenced by `middle` and by something external
                     descends_from_manifest: false,
-                    #[cfg(any(target_arch = "wasm32", test))]
+                    #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
                     descends_from_external_source: false,
                 },
             ),
@@ -2378,7 +2386,7 @@ mod tests {
                     ),
                     ref_count: 1,
                     descends_from_manifest: false,
-                    #[cfg(any(target_arch = "wasm32", test))]
+                    #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
                     descends_from_external_source: false,
                 },
             ),
@@ -2388,7 +2396,7 @@ mod tests {
                     lineage: ChunkDirectLineage::CompactedFrom(vec![middle].into_boxed_slice()),
                     ref_count: 1,
                     descends_from_manifest: false,
-                    #[cfg(any(target_arch = "wasm32", test))]
+                    #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
                     descends_from_external_source: false,
                 },
             ),
@@ -2418,7 +2426,7 @@ mod tests {
             lineage: ChunkDirectLineage::SplitFrom(parent, vec![sibling].into_boxed_slice()),
             ref_count,
             descends_from_manifest: false,
-            #[cfg(any(target_arch = "wasm32", test))]
+            #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
             descends_from_external_source: false,
         };
 
@@ -2429,7 +2437,7 @@ mod tests {
                     lineage: ChunkDirectLineage::Volatile,
                     ref_count: 2,
                     descends_from_manifest: false,
-                    #[cfg(any(target_arch = "wasm32", test))]
+                    #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
                     descends_from_external_source: false,
                 },
             ),

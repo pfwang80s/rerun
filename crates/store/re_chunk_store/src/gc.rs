@@ -637,7 +637,7 @@ impl ChunkStore {
 
         let Self {
             id: _,
-            #[cfg(any(target_arch = "wasm32", test))]
+            #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
                 web_remote_mcap_store_token_v1: _,
             config: _,
             schema: _,                            // purely additive
@@ -715,7 +715,7 @@ impl ChunkStore {
 
         let Self {
             id: _,
-            #[cfg(any(target_arch = "wasm32", test))]
+            #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
                 web_remote_mcap_store_token_v1: _,
             config: _,
             schema: _, // purely additive

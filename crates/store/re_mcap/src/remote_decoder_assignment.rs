@@ -1048,9 +1048,18 @@ fn dispatch_group_from_finalized_source_disarmed_v1<'input>(
         .find(|assignment| assignment.channel_id() == channel_id)
         .ok_or(PhaseAMeasurementDispatchSetupErrorV1::ChannelAssignment)?
         .group_id();
-    let manifest =
-        crate::remote_manifest::ImmutableRemoteMcapManifestV1::build_v1(source, groups, 64)
-            .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::Manifest)?;
+    let registration_limits =
+        crate::remote_manifest::RemoteRegistrationLimitsV1::generous_disarmed_v1(64);
+    let registration_budget = crate::remote_manifest::RemoteRegistrationBudgetV1::new_disarmed_v1(
+        registration_limits.max_registry_retained_bytes,
+    );
+    let manifest = crate::remote_manifest::ImmutableRemoteMcapManifestV1::build_v1(
+        source,
+        groups,
+        registration_limits,
+        &registration_budget,
+    )
+    .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::Manifest)?;
     let authority = manifest
         .temporal_partition_v1(0, group_id)
         .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::TemporalPartition)?;

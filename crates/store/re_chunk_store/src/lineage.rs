@@ -17,7 +17,7 @@ pub(crate) struct TrackedDirectChunkLineage {
     /// reference this lineage.
     pub(crate) ref_count: u32,
     pub(crate) descends_from_manifest: bool,
-    #[cfg(any(target_arch = "wasm32", test))]
+    #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
     pub(crate) descends_from_external_source: bool,
 }
 
@@ -90,7 +90,7 @@ pub enum ChunkDirectLineage {
     RootFromManifest { is_static: bool },
 
     /// This chunk is a persistent Web remote-MCAP root backed by an external Range source.
-    #[cfg(any(target_arch = "wasm32", test))]
+    #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
     RootFromExternalSource(crate::ExternalRefetchableRootOriginV1),
 
     /// This chunk's data was originally logged from volatile memory.
@@ -116,7 +116,7 @@ impl std::fmt::Debug for ChunkDirectLineage {
                 write!(f, "origin:(static: {is_static})")
             }
 
-            #[cfg(any(target_arch = "wasm32", test))]
+            #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
             Self::RootFromExternalSource(origin) => write!(
                 f,
                 "external-origin:({:?})",
@@ -150,7 +150,7 @@ impl From<&ChunkDirectLineageReport> for ChunkDirectLineage {
                 is_static: *is_static,
             },
 
-            #[cfg(any(target_arch = "wasm32", test))]
+            #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
             ChunkDirectLineageReport::RootFromExternalSource(origin) => {
                 Self::RootFromExternalSource(origin.clone())
             }
@@ -200,7 +200,7 @@ impl ChunkDirectLineage {
                 })
             }
 
-            #[cfg(any(target_arch = "wasm32", test))]
+            #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
             Self::RootFromExternalSource(origin) => Some(
                 ChunkDirectLineageReport::RootFromExternalSource(origin.clone()),
             ),
@@ -214,7 +214,7 @@ impl ChunkDirectLineage {
             Self::SplitFrom(chunk_id, _) => Some(Either::Left(std::iter::once(chunk_id))),
             Self::CompactedFrom(chunks) => Some(Either::Right(chunks.iter())),
             Self::RootFromManifest { .. } | Self::Volatile => None,
-            #[cfg(any(target_arch = "wasm32", test))]
+            #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
             Self::RootFromExternalSource(_) => None,
         }
         .into_iter()
@@ -274,7 +274,7 @@ pub enum ChunkDirectLineageReport {
     RootFromManifest { is_static: bool },
 
     /// This chunk is a persistent Web remote-MCAP root backed by an external Range source.
-    #[cfg(any(target_arch = "wasm32", test))]
+    #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
     RootFromExternalSource(crate::ExternalRefetchableRootOriginV1),
 
     /// This chunk's data was originally logged from volatile memory.
@@ -298,7 +298,7 @@ impl std::fmt::Debug for ChunkDirectLineageReport {
             Self::RootFromManifest { is_static } => {
                 write!(f, "RootFromManifest(static: {is_static})")
             }
-            #[cfg(any(target_arch = "wasm32", test))]
+            #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
             Self::RootFromExternalSource(origin) => f
                 .debug_tuple("RootFromExternalSource")
                 .field(&origin.descriptor_v1().identity_v1())
@@ -403,7 +403,7 @@ impl ChunkStore {
         };
         match lineage.lineage {
             ChunkDirectLineage::RootFromManifest { .. } | ChunkDirectLineage::Volatile => true,
-            #[cfg(any(target_arch = "wasm32", test))]
+            #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
             ChunkDirectLineage::RootFromExternalSource(_) => true,
             ChunkDirectLineage::SplitFrom(_, _) | ChunkDirectLineage::CompactedFrom(_) => false,
         }
@@ -440,7 +440,7 @@ impl ChunkStore {
                 roots.push(*chunk_id);
             }
 
-            #[cfg(any(target_arch = "wasm32", test))]
+            #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
             Some(ChunkDirectLineage::RootFromExternalSource(_)) => roots.push(*chunk_id),
 
             None => {}
@@ -526,7 +526,7 @@ impl ChunkStore {
             .is_some_and(|l| l.descends_from_manifest)
     }
 
-    #[cfg(any(target_arch = "wasm32", test))]
+    #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
     pub(crate) fn descends_from_external_source(&self, chunk: &ChunkId) -> bool {
         self.chunks_lineage
             .get(chunk)

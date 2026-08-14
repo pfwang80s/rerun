@@ -6,6 +6,8 @@
 #![allow(dead_code)]
 
 use re_chunk::ChunkId;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::remote_channel_group::{ImmutableRemoteChannelGroupsV1, StableDecoderGroupIdV1};
 use crate::remote_physical_resolution::ResolvedRemotePhysicalSourceRefV1;
@@ -13,6 +15,96 @@ use crate::remote_physical_resolution::ResolvedRemotePhysicalSourceRefV1;
 const MANIFEST_VERSION_V1: u16 = 1;
 const MAX_MANIFEST_RETAINED_BYTES_V1: u64 = 64 * 1024 * 1024;
 const OPENING_STATIC_MAX_EXTERNAL_ORIGIN_BYTES_V1: u64 = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteRegistrationLimitsV1 {
+    pub(crate) max_registered_partitions: u64,
+    pub(crate) max_complete_empty_entries: u64,
+    pub(crate) max_root_descriptors: u64,
+    pub(crate) max_external_origin_bytes: u64,
+    pub(crate) max_registry_retained_bytes: u64,
+}
+
+impl RemoteRegistrationLimitsV1 {
+    pub(crate) const fn generous_disarmed_v1(max_partitions: u64) -> Self {
+        Self {
+            max_registered_partitions: max_partitions,
+            max_complete_empty_entries: max_partitions,
+            max_root_descriptors: 1_000_000,
+            max_external_origin_bytes: 128_000_000,
+            max_registry_retained_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RemoteRegistrationBudgetV1 {
+    state: Arc<RemoteRegistrationBudgetStateV1>,
+}
+
+struct RemoteRegistrationBudgetStateV1 {
+    max_bytes: u64,
+    used_bytes: AtomicU64,
+}
+
+impl RemoteRegistrationBudgetV1 {
+    pub(crate) fn new_disarmed_v1(max_bytes: u64) -> Self {
+        Self {
+            state: Arc::new(RemoteRegistrationBudgetStateV1 {
+                max_bytes,
+                used_bytes: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    pub(crate) fn reserve_v1(
+        &self,
+        bytes: u64,
+    ) -> Result<RemoteRegistrationReservationV1, RemoteManifestErrorV1> {
+        self.state
+            .used_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes)
+                    .filter(|next| *next <= self.state.max_bytes)
+            })
+            .map_err(|_used| RemoteManifestErrorV1::ResourceLimitExceeded)?;
+        Ok(RemoteRegistrationReservationV1 {
+            state: Arc::clone(&self.state),
+            bytes,
+        })
+    }
+
+    #[cfg(test)]
+    fn used_bytes_v1(&self) -> u64 {
+        self.state.used_bytes.load(Ordering::Acquire)
+    }
+}
+
+pub(crate) struct RemoteRegistrationReservationV1 {
+    state: Arc<RemoteRegistrationBudgetStateV1>,
+    bytes: u64,
+}
+
+impl RemoteRegistrationReservationV1 {
+    pub(crate) const fn bytes_v1(&self) -> u64 {
+        self.bytes
+    }
+
+    pub(crate) fn reserve_temporary_v1(&self, bytes: u64) -> Result<Self, RemoteManifestErrorV1> {
+        RemoteRegistrationBudgetV1 {
+            state: Arc::clone(&self.state),
+        }
+        .reserve_v1(bytes)
+    }
+}
+
+impl Drop for RemoteRegistrationReservationV1 {
+    fn drop(&mut self) {
+        self.state
+            .used_bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
 
 fn partition_count_v1(units: usize, groups: usize) -> Result<usize, RemoteManifestErrorV1> {
     units
@@ -27,6 +119,11 @@ pub(crate) struct RemoteMcapSessionIdV1(re_tuid::Tuid);
 impl RemoteMcapSessionIdV1 {
     fn fresh() -> Self {
         Self(re_tuid::Tuid::new())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_registration_test_v1(value: u128) -> Self {
+        Self(re_tuid::Tuid::from_u128(value))
     }
 }
 
@@ -49,6 +146,16 @@ pub(crate) struct DerivationPartitionKeyV1 {
     kind: DerivationPartitionKindV1,
 }
 
+impl DerivationPartitionKeyV1 {
+    pub(crate) const fn session_id_v1(self) -> RemoteMcapSessionIdV1 {
+        self.source_unit.session
+    }
+
+    pub(crate) const fn kind_v1(self) -> DerivationPartitionKindV1 {
+        self.kind
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ManifestRootDescriptorV1 {
     key: DerivationPartitionKeyV1,
@@ -63,6 +170,10 @@ impl ManifestRootDescriptorV1 {
 
     pub(crate) const fn output_ordinal_v1(self) -> u32 {
         self.output_ordinal
+    }
+
+    pub(crate) const fn partition_key_v1(self) -> DerivationPartitionKeyV1 {
+        self.key
     }
 }
 
@@ -99,6 +210,35 @@ impl ManifestPartitionDescriptorV1 {
         };
         bytes[20..24].copy_from_slice(&kind.to_le_bytes());
         bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_registration_test_v1(
+        session: RemoteMcapSessionIdV1,
+        source_ordinal: u32,
+        kind: DerivationPartitionKindV1,
+        registration_bound: u32,
+    ) -> (Self, ManifestRootDescriptorIssuerV1) {
+        let key = DerivationPartitionKeyV1 {
+            source_unit: SourceUnitIdV1 {
+                session,
+                source_generation: 1,
+                ordinal: source_ordinal,
+            },
+            kind,
+        };
+        (
+            Self {
+                key,
+                registration_bound,
+                root_namespace: 1,
+            },
+            ManifestRootDescriptorIssuerV1 {
+                key,
+                registration_bound,
+                namespace: 1,
+            },
+        )
     }
 }
 
@@ -158,6 +298,17 @@ pub(crate) struct ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
     session_id: RemoteMcapSessionIdV1,
     partitions: Box<[ManifestPartitionDescriptorV1]>,
     issuers: Box<[ManifestRootDescriptorIssuerV1]>,
+    registration_capacity: RemoteRegistrationCapacityV1,
+    registration_reservation: Option<RemoteRegistrationReservationV1>,
+    registration_temporary_reservation: Option<RemoteRegistrationReservationV1>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteRegistrationCapacityV1 {
+    pub(crate) max_registered_partitions: u64,
+    pub(crate) max_complete_empty_entries: u64,
+    pub(crate) max_root_descriptors: u64,
+    pub(crate) max_external_origin_bytes: u64,
 }
 
 /// Opaque authority for one temporal source-unit/group partition.
@@ -172,7 +323,47 @@ pub(crate) struct ManifestTemporalPartitionAuthorityV1<'manifest, 'a, 'd, 'i, 's
     issuer: &'manifest ManifestRootDescriptorIssuerV1,
 }
 
-impl<'a, 'd, 'i, 's, 'w> ManifestTemporalPartitionAuthorityV1<'_, 'a, 'd, 'i, 's, 'w> {
+pub(crate) struct ManifestOpeningStaticAuthorityV1<'manifest, 'a, 'd, 'i, 's, 'w> {
+    manifest: Option<&'manifest ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w>>,
+    partition: ManifestPartitionDescriptorV1,
+    issuer: &'manifest ManifestRootDescriptorIssuerV1,
+}
+
+impl ManifestOpeningStaticAuthorityV1<'_, '_, '_, '_, '_, '_> {
+    pub(crate) const fn partition_v1(&self) -> ManifestPartitionDescriptorV1 {
+        self.partition
+    }
+
+    pub(crate) fn issue_root_v1(
+        &self,
+        output_ordinal: u32,
+    ) -> Result<ManifestRootDescriptorV1, RemoteManifestErrorV1> {
+        self.issuer.descriptor_v1(output_ordinal)
+    }
+
+    pub(crate) fn ensure_current_v1(&self) -> Result<(), RemoteManifestErrorV1> {
+        self.manifest.map_or(Ok(()), |manifest| {
+            manifest
+                .groups
+                .ensure_current_for_validation_v1()
+                .map_err(|_error| RemoteManifestErrorV1::StaleSource)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_registration_test_v1(
+        partition: ManifestPartitionDescriptorV1,
+        issuer: &ManifestRootDescriptorIssuerV1,
+    ) -> ManifestOpeningStaticAuthorityV1<'_, 'static, 'static, 'static, 'static, 'static> {
+        ManifestOpeningStaticAuthorityV1 {
+            manifest: None,
+            partition,
+            issuer,
+        }
+    }
+}
+
+impl<'d, 'i, 's, 'w> ManifestTemporalPartitionAuthorityV1<'_, '_, 'd, 'i, 's, 'w> {
     pub(crate) const fn source_unit_ordinal_v1(&self) -> u32 {
         self.source_unit_ordinal
     }
@@ -226,7 +417,7 @@ impl<'a, 'd, 'i, 's, 'w> ManifestTemporalPartitionAuthorityV1<'_, 'a, 'd, 'i, 's
         self.manifest
             .groups
             .ensure_current_for_validation_v1()
-            .map_err(|_| RemoteManifestErrorV1::StaleSource)
+            .map_err(|_error| RemoteManifestErrorV1::StaleSource)
     }
 
     pub(crate) fn matches_group_v1(&self, group_id: StableDecoderGroupIdV1) -> bool {
@@ -238,10 +429,11 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
     pub(crate) fn build_v1(
         source: ResolvedRemotePhysicalSourceRefV1<'a, 'i>,
         groups: ImmutableRemoteChannelGroupsV1<'d, 'i, 's, 'w>,
-        max_partitions: u32,
+        limits: RemoteRegistrationLimitsV1,
+        budget: &RemoteRegistrationBudgetV1,
     ) -> Result<Self, RemoteManifestErrorV1> {
         let session_id = RemoteMcapSessionIdV1::fresh();
-        Self::build_with_session_v1(source, groups, session_id, max_partitions)
+        Self::build_with_session_v1(source, groups, session_id, limits, budget)
     }
 
     #[cfg(test)]
@@ -249,18 +441,19 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
         source: ResolvedRemotePhysicalSourceRefV1<'a, 'i>,
         groups: ImmutableRemoteChannelGroupsV1<'d, 'i, 's, 'w>,
         session_id: RemoteMcapSessionIdV1,
-        max_partitions: u32,
+        limits: RemoteRegistrationLimitsV1,
+        budget: &RemoteRegistrationBudgetV1,
     ) -> Result<Self, RemoteManifestErrorV1> {
         groups
             .ensure_current_for_validation_v1()
-            .map_err(|_| RemoteManifestErrorV1::StaleSource)?;
+            .map_err(|_error| RemoteManifestErrorV1::StaleSource)?;
         let units = source.layout_v1().canonical_chunk_count_v1();
         let source_generation = source.source_generation_v1();
         let group_count = groups.groups_v1().len();
         let count = partition_count_v1(units, group_count)?;
         if count
-            > usize::try_from(max_partitions)
-                .map_err(|_| RemoteManifestErrorV1::ArithmeticOverflow)?
+            > usize::try_from(limits.max_registered_partitions)
+                .map_err(|_error| RemoteManifestErrorV1::ArithmeticOverflow)?
         {
             return Err(RemoteManifestErrorV1::ResourceLimitExceeded);
         }
@@ -268,13 +461,17 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
         // estimate intentionally includes empty-entry descriptors, root issuers, external-origin
         // headroom, the transferred group owner and vector backing storage.
         let empty_entries = u64::try_from(units)
-            .map_err(|_| RemoteManifestErrorV1::ArithmeticOverflow)?
+            .map_err(|_error| RemoteManifestErrorV1::ArithmeticOverflow)?
             .checked_mul(
                 u64::try_from(group_count)
-                    .map_err(|_| RemoteManifestErrorV1::ArithmeticOverflow)?,
+                    .map_err(|_error| RemoteManifestErrorV1::ArithmeticOverflow)?,
             )
             .ok_or(RemoteManifestErrorV1::ArithmeticOverflow)?;
+        let complete_empty_entries = empty_entries
+            .checked_add(1)
+            .ok_or(RemoteManifestErrorV1::ArithmeticOverflow)?;
         let mut external_origin_bytes = 0_u64;
+        let mut root_descriptors = 0_u64;
         for group in groups.groups_v1() {
             let per_partition = group
                 .registration_bounds_v1()
@@ -284,7 +481,17 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
                     per_partition
                         .checked_mul(
                             u64::try_from(units)
-                                .map_err(|_| RemoteManifestErrorV1::ArithmeticOverflow)?,
+                                .map_err(|_error| RemoteManifestErrorV1::ArithmeticOverflow)?,
+                        )
+                        .ok_or(RemoteManifestErrorV1::ArithmeticOverflow)?,
+                )
+                .ok_or(RemoteManifestErrorV1::ArithmeticOverflow)?;
+            root_descriptors = root_descriptors
+                .checked_add(
+                    u64::from(group.registration_bounds_v1().max_roots_per_partition_v1())
+                        .checked_mul(
+                            u64::try_from(units)
+                                .map_err(|_error| RemoteManifestErrorV1::ArithmeticOverflow)?,
                         )
                         .ok_or(RemoteManifestErrorV1::ArithmeticOverflow)?,
                 )
@@ -293,16 +500,47 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
         external_origin_bytes = external_origin_bytes
             .checked_add(OPENING_STATIC_MAX_EXTERNAL_ORIGIN_BYTES_V1)
             .ok_or(RemoteManifestErrorV1::ArithmeticOverflow)?;
+        root_descriptors = root_descriptors
+            .checked_add(1)
+            .ok_or(RemoteManifestErrorV1::ArithmeticOverflow)?;
+        if complete_empty_entries > limits.max_complete_empty_entries
+            || root_descriptors > limits.max_root_descriptors
+            || external_origin_bytes > limits.max_external_origin_bytes
+        {
+            return Err(RemoteManifestErrorV1::ResourceLimitExceeded);
+        }
+        let registration_capacity = RemoteRegistrationCapacityV1 {
+            max_registered_partitions: u64::try_from(count)
+                .map_err(|_error| RemoteManifestErrorV1::ArithmeticOverflow)?,
+            max_complete_empty_entries: complete_empty_entries,
+            max_root_descriptors: root_descriptors,
+            max_external_origin_bytes: external_origin_bytes,
+        };
+        let registry_retained_bytes =
+            crate::remote_partition_residency::registry_retained_bytes_for_capacity_v1(
+                registration_capacity,
+            )?;
+        if registry_retained_bytes > limits.max_registry_retained_bytes {
+            return Err(RemoteManifestErrorV1::ResourceLimitExceeded);
+        }
+        let registration_reservation = budget.reserve_v1(registry_retained_bytes)?;
+        let registration_temporary_bytes =
+            crate::remote_partition_residency::temporary_registration_bytes_v1(
+                registration_capacity.max_registered_partitions,
+                registration_capacity.max_root_descriptors,
+            )
+            .map_err(|_error| RemoteManifestErrorV1::ResourceLimitExceeded)?;
+        let registration_temporary_reservation = budget.reserve_v1(registration_temporary_bytes)?;
         let descriptor_bytes = u64::try_from(std::mem::size_of::<ManifestPartitionDescriptorV1>())
-            .map_err(|_| RemoteManifestErrorV1::ArithmeticOverflow)?
+            .map_err(|_error| RemoteManifestErrorV1::ArithmeticOverflow)?
             .checked_mul(
-                u64::try_from(count).map_err(|_| RemoteManifestErrorV1::ArithmeticOverflow)?,
+                u64::try_from(count).map_err(|_error| RemoteManifestErrorV1::ArithmeticOverflow)?,
             )
             .ok_or(RemoteManifestErrorV1::ArithmeticOverflow)?;
         let issuer_bytes = u64::try_from(std::mem::size_of::<ManifestRootDescriptorIssuerV1>())
-            .map_err(|_| RemoteManifestErrorV1::ArithmeticOverflow)?
+            .map_err(|_error| RemoteManifestErrorV1::ArithmeticOverflow)?
             .checked_mul(
-                u64::try_from(count).map_err(|_| RemoteManifestErrorV1::ArithmeticOverflow)?,
+                u64::try_from(count).map_err(|_error| RemoteManifestErrorV1::ArithmeticOverflow)?,
             )
             .ok_or(RemoteManifestErrorV1::ArithmeticOverflow)?;
         let retained_bytes = groups
@@ -310,7 +548,7 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
             .checked_add(descriptor_bytes)
             .and_then(|value| value.checked_add(issuer_bytes))
             .and_then(|value| value.checked_add(external_origin_bytes))
-            .and_then(|value| value.checked_add(empty_entries))
+            .and_then(|value| value.checked_add(complete_empty_entries))
             .ok_or(RemoteManifestErrorV1::ArithmeticOverflow)?;
         if retained_bytes > MAX_MANIFEST_RETAINED_BYTES_V1 {
             return Err(RemoteManifestErrorV1::ResourceLimitExceeded);
@@ -341,7 +579,7 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
                 session: session_id,
                 source_generation,
                 ordinal: u32::try_from(ordinal)
-                    .map_err(|_| RemoteManifestErrorV1::ArithmeticOverflow)?,
+                    .map_err(|_error| RemoteManifestErrorV1::ArithmeticOverflow)?,
             };
             for group in groups.groups_v1() {
                 let kind = DerivationPartitionKindV1::TemporalChannelGroup(group.group_id());
@@ -372,6 +610,9 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
             session_id,
             partitions: partitions.into_boxed_slice(),
             issuers: issuers.into_boxed_slice(),
+            registration_capacity,
+            registration_reservation: Some(registration_reservation),
+            registration_temporary_reservation: Some(registration_temporary_reservation),
         })
     }
 
@@ -390,6 +631,30 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
     }
     pub(crate) fn source_generation_v1(&self) -> u64 {
         self.source.source_generation_v1()
+    }
+
+    pub(crate) const fn registration_capacity_v1(&self) -> RemoteRegistrationCapacityV1 {
+        self.registration_capacity
+    }
+
+    pub(crate) fn take_registration_reservation_v1(
+        &mut self,
+    ) -> Result<
+        (
+            RemoteRegistrationReservationV1,
+            RemoteRegistrationReservationV1,
+        ),
+        RemoteManifestErrorV1,
+    > {
+        let permanent = self
+            .registration_reservation
+            .take()
+            .ok_or(RemoteManifestErrorV1::InvalidPartition)?;
+        let temporary = self
+            .registration_temporary_reservation
+            .take()
+            .ok_or(RemoteManifestErrorV1::InvalidPartition)?;
+        Ok((permanent, temporary))
     }
 
     pub(crate) fn temporal_partition_v1(
@@ -423,6 +688,27 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
             manifest: self,
             source_unit_ordinal,
             group_id,
+            partition: *partition,
+            issuer,
+        })
+    }
+
+    pub(crate) fn opening_static_partition_v1(
+        &self,
+    ) -> Result<ManifestOpeningStaticAuthorityV1<'_, 'a, 'd, 'i, 's, 'w>, RemoteManifestErrorV1>
+    {
+        let partition = self
+            .partitions
+            .first()
+            .filter(|partition| partition.key.kind == DerivationPartitionKindV1::OpeningStatic)
+            .ok_or(RemoteManifestErrorV1::InvalidPartition)?;
+        let issuer = self
+            .issuers
+            .first()
+            .filter(|issuer| issuer.key == partition.key)
+            .ok_or(RemoteManifestErrorV1::InvalidPartition)?;
+        Ok(ManifestOpeningStaticAuthorityV1 {
+            manifest: Some(self),
             partition: *partition,
             issuer,
         })
@@ -514,5 +800,23 @@ mod tests {
             partition_count_v1(usize::MAX, 2),
             Err(RemoteManifestErrorV1::ArithmeticOverflow)
         );
+    }
+
+    #[test]
+    fn registration_budget_is_atomic_and_refunds_on_drop() {
+        let budget = RemoteRegistrationBudgetV1::new_disarmed_v1(10);
+        let first = budget.reserve_v1(6).unwrap();
+        assert_eq!(budget.used_bytes_v1(), 6);
+        assert_eq!(
+            budget.reserve_v1(5).err(),
+            Some(RemoteManifestErrorV1::ResourceLimitExceeded)
+        );
+        assert_eq!(budget.used_bytes_v1(), 6);
+        drop(first);
+        assert_eq!(budget.used_bytes_v1(), 0);
+        let all = budget.reserve_v1(10).unwrap();
+        assert_eq!(budget.used_bytes_v1(), 10);
+        drop(all);
+        assert_eq!(budget.used_bytes_v1(), 0);
     }
 }
