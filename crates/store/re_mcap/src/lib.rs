@@ -159,6 +159,9 @@ mod remote_chunk_validation_count;
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
 mod remote_manifest;
 
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+mod remote_loaded_coverage;
+
 // Partition/root registration consumes only sealed manifest identities and the capability-gated
 // Web remote-MCAP Store origin API. It remains absent from native production builds.
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]

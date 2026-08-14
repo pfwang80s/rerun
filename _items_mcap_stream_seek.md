@@ -58,7 +58,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M0 | MCAP-001…005 | 5/5 | 已完成 | 既有公开行为、fixture、Chrome origin、确定性调度和脱敏断言可复用 |
 | M1 | MCAP-006…012 | 7/7 | 已完成 | URL、validator、时间、wire、Store generation 和 remote runtime interner 边界冻结 |
 | M2 | MCAP-013…033（含 MCAP-025A、MCAP-030A、MCAP-030B） | 24/24 | 已完成 | 不接 TimeControl 即可安全完成 metadata opening、bounded decoder initialization、局部 Chunk 验证和 terminal batch 派生 |
-| M3 | MCAP-034…042 | 2/6 | 进行中 | Web remote-MCAP partition、root、coverage、reclaim 和 existing-identifier 能力可用 |
+| M3 | MCAP-034…042 | 3/6 | 进行中 | Web remote-MCAP partition、root、coverage、reclaim 和 existing-identifier 能力可用 |
 | M4 | MCAP-043…057 | 0/15 | 未开始 | compatibility 和 strict lane 的身份、状态、回放、dispose 与 teardown 闭合 |
 | M5 | MCAP-058…066 | 0/0 | 已移出 | legacy HTTP adapter 保留现有 Web 路径，不进入 remote-MCAP 项目 |
 | M6 | MCAP-067…080 | 0/5 | 未开始 | remote-MCAP page execution、hidden suspension、安全字符串和 teardown 闭合 |
@@ -67,7 +67,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M8 | MCAP-089…105 | 0/17 | 未开始 | foreground-only window playback、seek、query isolation、mutation arbitration 和 reload 闭合 |
 | M9 | MCAP-106…114 | 0/9 | 未开始 | two-phase runner、strict startup、UI/API 文档和桌面 Chrome E2E 全部通过 |
 
-有效工作项总数为 91，当前进度为 38/91；26 个 `[~]` 项不计入分母且不产生提交。
+有效工作项总数为 91，当前进度为 39/91；26 个 `[~]` 项不计入分母且不产生提交。
 关键路径为 `M0 → M1 → M2/M3 → M4/M6/M7 → GA → M8 → M9`。
 M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前保持 feature-disabled。
 
@@ -478,13 +478,13 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 验收：任一 cap 或 identity conflict 时 registry 逐位不变；合法 manifest 全量 registration 不在中途失败；Store event 是 root resident/nonresident 的唯一真源。
 - 负责人：kola；提交：本提交；备注：2026-08-14 完成production-disarmed的Web remote-MCAP partition/root原子registration与residency：sealed OpeningStatic/CompleteEmpty authority、四项hard caps、index/ChunkStore lineage/temporary delta统一reservation及Drop退款；整批preflight完成后才执行Store reserve与无失败commit，任一cap、identity、kind、排序或origin冲突均保持registry、lineage、counters、bytes与events逐位不变。Index绑定opaque Store instance；同StoreId foreign event只能触发bound Store exact existence reconciliation，不能污染状态；delta maps与sorted root binary search保证线性期望复杂度。Dafee四轮最终0 High/0 Medium/0 Low且无设计偏离；residency11/11、manifest3/3、dispatch3/3、re_chunk_store64/64、两crate all-features Clippy `-D warnings`/check、cargo fmt与diff-check通过；本机无cargo-nextest，使用cargo test兜底，production route继续disarmed。
 
-### [ ] MCAP-036 — 增量维护 indexed extent 与 loaded coverage
+### [x] MCAP-036 — 增量维护 indexed extent 与 loaded coverage
 
 - 建议提交：`Track remote indexed and loaded time coverage`。
 - 依赖：MCAP-032、MCAP-035。
 - 变更：分离 immutable indexed extent、source-unit satisfied counters、loaded interval coverage 和完整 indexed-extent coverage helper，不修改 `EntityDb::time_range_for`。
 - 验收：重叠 roots、CompleteEmpty、GC 删除、reload 和 NoIndexedMessages 均产生正确 coverage，查询不会每帧重建 Chunk × group cross-product。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：kola；提交：本提交；备注：2026-08-14 完成production-disarmed的incremental indexed/loaded coverage：immutable `CanonicalIndexedExtent`区分Known与NoIndexedMessages，closed-endpoint coverage cells、per-source selected-group satisfied counters与cached loaded ranges/Complete helper增量维护overlap、gap、CompleteEmpty、GC删除和reload。Coverage retained/temporary逐allocation复用锁定release-Wasm dlmalloc footprint，并在首次allocation前从同一budget组合reserve、RAII退款；Store event按ChunkId只reconcile affected partitions，每batch最多重建一次，getter只读缓存，不修改`EntityDb::time_range_for`。Dafee二轮最终0 High/0 Medium/1 Low且无设计偏离；唯一Low为尚缺真实resolved-source production-builder fixture。coverage8/8、residency16/16、manifest3/3、dispatch3/3、re_chunk_store64/64、两crate all-features Clippy `-D warnings`/check、cargo fmt与diff-check通过；完整re_mcap的5个既有失败位于未修改区域，production route继续disarmed。
 
 ### [ ] MCAP-037 — 冻结 remote Store 的 deterministic insertion 配置
 

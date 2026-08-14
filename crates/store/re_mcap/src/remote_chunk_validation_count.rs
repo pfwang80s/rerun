@@ -974,7 +974,7 @@ fn exact_retained_bytes(
     Ok(bytes)
 }
 
-fn locked_footprint(layout: Layout) -> Result<u64, RemoteValidationCountErrorV1> {
+pub(crate) fn locked_footprint(layout: Layout) -> Result<u64, RemoteValidationCountErrorV1> {
     let requested = u64::try_from(layout.size()).map_err(|_error| arithmetic_error())?;
     if requested == 0 {
         return Ok(0);

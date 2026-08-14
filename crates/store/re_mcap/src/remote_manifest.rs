@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::remote_channel_group::{ImmutableRemoteChannelGroupsV1, StableDecoderGroupIdV1};
+use crate::remote_loaded_coverage::{CanonicalIndexedExtentV1, RemoteTemporalCoveragePlanV1};
 use crate::remote_physical_resolution::ResolvedRemotePhysicalSourceRefV1;
 
 const MANIFEST_VERSION_V1: u16 = 1;
@@ -75,7 +76,7 @@ impl RemoteRegistrationBudgetV1 {
     }
 
     #[cfg(test)]
-    fn used_bytes_v1(&self) -> u64 {
+    pub(crate) fn used_bytes_v1(&self) -> u64 {
         self.state.used_bytes.load(Ordering::Acquire)
     }
 }
@@ -153,6 +154,10 @@ impl DerivationPartitionKeyV1 {
 
     pub(crate) const fn kind_v1(self) -> DerivationPartitionKindV1 {
         self.kind
+    }
+
+    pub(crate) const fn source_unit_ordinal_v1(self) -> u32 {
+        self.source_unit.ordinal
     }
 }
 
@@ -301,6 +306,9 @@ pub(crate) struct ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
     registration_capacity: RemoteRegistrationCapacityV1,
     registration_reservation: Option<RemoteRegistrationReservationV1>,
     registration_temporary_reservation: Option<RemoteRegistrationReservationV1>,
+    indexed_extent: CanonicalIndexedExtentV1,
+    temporal_coverage_plan: Option<RemoteTemporalCoveragePlanV1>,
+    temporal_coverage_reservation: Option<RemoteRegistrationReservationV1>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -450,6 +458,12 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
         let units = source.layout_v1().canonical_chunk_count_v1();
         let source_generation = source.source_generation_v1();
         let group_count = groups.groups_v1().len();
+        let expected_selected_group_count = u32::try_from(group_count)
+            .map_err(|_error| RemoteManifestErrorV1::ArithmeticOverflow)?;
+        let temporal_coverage_census =
+            RemoteTemporalCoveragePlanV1::census_upper_bound_for_units_v1(units)
+                .map_err(|_error| RemoteManifestErrorV1::ResourceLimitExceeded)?;
+        let temporal_coverage_bytes = temporal_coverage_census.retained_bytes;
         let count = partition_count_v1(units, group_count)?;
         if count
             > usize::try_from(limits.max_registered_partitions)
@@ -549,10 +563,28 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
             .and_then(|value| value.checked_add(issuer_bytes))
             .and_then(|value| value.checked_add(external_origin_bytes))
             .and_then(|value| value.checked_add(complete_empty_entries))
+            .and_then(|value| value.checked_add(temporal_coverage_bytes))
             .ok_or(RemoteManifestErrorV1::ArithmeticOverflow)?;
         if retained_bytes > MAX_MANIFEST_RETAINED_BYTES_V1 {
             return Err(RemoteManifestErrorV1::ResourceLimitExceeded);
         }
+        let temporal_coverage_reservation = budget.reserve_v1(temporal_coverage_bytes)?;
+        let temporal_coverage_temporary_reservation =
+            budget.reserve_v1(temporal_coverage_census.construction_temporary_bytes)?;
+        let temporal_coverage_plan = RemoteTemporalCoveragePlanV1::build_v1(
+            &source,
+            expected_selected_group_count,
+            &temporal_coverage_temporary_reservation,
+        )
+        .map_err(|_error| RemoteManifestErrorV1::ResourceLimitExceeded)?;
+        drop(temporal_coverage_temporary_reservation);
+        if !matches!(
+            temporal_coverage_plan.retained_index_bytes_v1(),
+            Ok(actual) if actual <= temporal_coverage_bytes
+        ) {
+            return Err(RemoteManifestErrorV1::ResourceLimitExceeded);
+        }
+        let indexed_extent = temporal_coverage_plan.indexed_extent_v1();
 
         let mut partitions = Vec::with_capacity(count);
         let mut issuers = Vec::with_capacity(count);
@@ -613,6 +645,9 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
             registration_capacity,
             registration_reservation: Some(registration_reservation),
             registration_temporary_reservation: Some(registration_temporary_reservation),
+            indexed_extent,
+            temporal_coverage_plan: Some(temporal_coverage_plan),
+            temporal_coverage_reservation: Some(temporal_coverage_reservation),
         })
     }
 
@@ -635,6 +670,30 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
 
     pub(crate) const fn registration_capacity_v1(&self) -> RemoteRegistrationCapacityV1 {
         self.registration_capacity
+    }
+
+    pub(crate) const fn indexed_extent_v1(&self) -> CanonicalIndexedExtentV1 {
+        self.indexed_extent
+    }
+
+    pub(crate) fn take_temporal_coverage_plan_v1(
+        &mut self,
+    ) -> Result<
+        (
+            RemoteTemporalCoveragePlanV1,
+            RemoteRegistrationReservationV1,
+        ),
+        RemoteManifestErrorV1,
+    > {
+        let plan = self
+            .temporal_coverage_plan
+            .take()
+            .ok_or(RemoteManifestErrorV1::InvalidPartition)?;
+        let reservation = self
+            .temporal_coverage_reservation
+            .take()
+            .ok_or(RemoteManifestErrorV1::InvalidPartition)?;
+        Ok((plan, reservation))
     }
 
     pub(crate) fn take_registration_reservation_v1(

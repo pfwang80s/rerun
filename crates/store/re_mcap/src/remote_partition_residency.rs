@@ -4,7 +4,7 @@
 
 use std::collections::BTreeSet;
 
-use ahash::HashMap;
+use ahash::{HashMap, HashSet};
 use re_byte_size::SizeBytes as _;
 use re_chunk::{Chunk, ChunkId};
 use re_chunk_store::{
@@ -14,6 +14,10 @@ use re_chunk_store::{
 };
 
 use crate::remote_chunk_dispatch::{RemoteChunkTerminalV1, RemoteTypedPartitionHandoffV1};
+use crate::remote_loaded_coverage::{
+    CanonicalIndexedExtentV1, CompleteIndexedCoverageV1, PartitionSatisfactionTransitionV1,
+    RemoteLoadedCoverageIndexV1, RemoteTemporalCoveragePlanV1,
+};
 use crate::remote_manifest::{
     DerivationPartitionKeyV1, DerivationPartitionKindV1, ImmutableRemoteMcapManifestV1,
     ManifestOpeningStaticAuthorityV1, ManifestPartitionDescriptorV1, ManifestRootDescriptorV1,
@@ -71,6 +75,8 @@ pub(crate) struct RefetchableRootIndexV1 {
     roots: HashMap<ChunkId, RegisteredRootV1>,
     store_origin_capacity_bytes: u64,
     allocated_store_origin_capacity_bytes: u64,
+    loaded_coverage: RemoteLoadedCoverageIndexV1,
+    _loaded_coverage_reservation: RemoteRegistrationReservationV1,
     _reservation: RemoteRegistrationReservationV1,
     temporary_reservation: RemoteRegistrationReservationV1,
 }
@@ -83,6 +89,7 @@ struct RegistrySnapshotV1 {
     partitions: HashMap<DerivationPartitionKeyV1, PartitionResidencyV1>,
     roots: HashMap<ChunkId, RegisteredRootV1>,
     allocated_store_origin_capacity_bytes: u64,
+    loaded_coverage: crate::remote_loaded_coverage::RemoteLoadedCoverageSnapshotV1,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -416,6 +423,7 @@ impl RefetchableRootIndexV1 {
             partitions: self.partitions.clone(),
             roots: self.roots.clone(),
             allocated_store_origin_capacity_bytes: self.allocated_store_origin_capacity_bytes,
+            loaded_coverage: self.loaded_coverage.snapshot_v1(),
         }
     }
 
@@ -462,6 +470,12 @@ impl RefetchableRootIndexV1 {
         let (reservation, temporary_reservation) = manifest
             .take_registration_reservation_v1()
             .map_err(|_error| RootRegistrationErrorV1::ResourceLimitExceeded)?;
+        let (coverage_plan, loaded_coverage_reservation) = manifest
+            .take_temporal_coverage_plan_v1()
+            .map_err(|_error| RootRegistrationErrorV1::ResourceLimitExceeded)?;
+        let loaded_coverage =
+            RemoteLoadedCoverageIndexV1::from_plan_v1(coverage_plan, &loaded_coverage_reservation)
+                .map_err(|_error| RootRegistrationErrorV1::ResourceLimitExceeded)?;
         if actual_bytes > reservation.bytes_v1() {
             return Err(RootRegistrationErrorV1::ResourceLimitExceeded);
         }
@@ -479,6 +493,8 @@ impl RefetchableRootIndexV1 {
                 )
                 .ok_or(RootRegistrationErrorV1::ResourceLimitExceeded)?,
             allocated_store_origin_capacity_bytes: 0,
+            loaded_coverage,
+            _loaded_coverage_reservation: loaded_coverage_reservation,
             _reservation: reservation,
             temporary_reservation,
         })
@@ -490,6 +506,7 @@ impl RefetchableRootIndexV1 {
         limits: RemoteRegistrationCapacityV1,
         store: &ChunkStore,
         capability: &WebRemoteMcapRootCapabilityV1,
+        coverage_plan: RemoteTemporalCoveragePlanV1,
     ) -> Result<Self, RootRegistrationErrorV1> {
         let bytes = registry_retained_bytes_for_capacity_v1(limits)
             .map_err(|_error| RootRegistrationErrorV1::ResourceLimitExceeded)?;
@@ -497,9 +514,13 @@ impl RefetchableRootIndexV1 {
             limits.max_registered_partitions,
             limits.max_root_descriptors,
         )?;
+        let coverage_bytes = coverage_plan
+            .retained_index_bytes_v1()
+            .map_err(|_error| RootRegistrationErrorV1::ResourceLimitExceeded)?;
         let budget = crate::remote_manifest::RemoteRegistrationBudgetV1::new_disarmed_v1(
             bytes
                 .checked_add(temporary_bytes)
+                .and_then(|bytes| bytes.checked_add(coverage_bytes))
                 .ok_or(RootRegistrationErrorV1::ResourceLimitExceeded)?,
         );
         let reservation = budget
@@ -507,6 +528,9 @@ impl RefetchableRootIndexV1 {
             .map_err(|_error| RootRegistrationErrorV1::ResourceLimitExceeded)?;
         let temporary_reservation = budget
             .reserve_v1(temporary_bytes)
+            .map_err(|_error| RootRegistrationErrorV1::ResourceLimitExceeded)?;
+        let loaded_coverage_reservation = budget
+            .reserve_v1(coverage_bytes)
             .map_err(|_error| RootRegistrationErrorV1::ResourceLimitExceeded)?;
         let mut partitions = HashMap::default();
         let mut roots = HashMap::default();
@@ -522,6 +546,9 @@ impl RefetchableRootIndexV1 {
                     .map_err(|_error| RootRegistrationErrorV1::ResourceLimitExceeded)?,
             )
             .map_err(|_error| RootRegistrationErrorV1::ResourceLimitExceeded)?;
+        let loaded_coverage =
+            RemoteLoadedCoverageIndexV1::from_plan_v1(coverage_plan, &loaded_coverage_reservation)
+                .map_err(|_error| RootRegistrationErrorV1::ResourceLimitExceeded)?;
         Ok(Self {
             session_id,
             store_identity: capability.store_identity_v1(store)?,
@@ -536,6 +563,8 @@ impl RefetchableRootIndexV1 {
                 )
                 .ok_or(RootRegistrationErrorV1::ResourceLimitExceeded)?,
             allocated_store_origin_capacity_bytes: 0,
+            loaded_coverage,
+            _loaded_coverage_reservation: loaded_coverage_reservation,
             _reservation: reservation,
             temporary_reservation,
         })
@@ -621,6 +650,14 @@ impl RefetchableRootIndexV1 {
             let partition_key = registration.partition.key_v1();
             if partition_key.session_id_v1() != self.session_id {
                 return Err(RootRegistrationErrorV1::InvalidManifestIdentity);
+            }
+            if matches!(
+                partition_key.kind_v1(),
+                DerivationPartitionKindV1::TemporalChannelGroup(_)
+            ) {
+                self.loaded_coverage
+                    .validate_temporal_source_unit_v1(partition_key.source_unit_ordinal_v1())
+                    .map_err(|_error| RootRegistrationErrorV1::InvalidManifestIdentity)?;
             }
             if let PreparedPartitionOutcomeV1::Roots { roots, root_ids } = &registration.outcome {
                 if roots.is_empty()
@@ -811,6 +848,7 @@ impl RefetchableRootIndexV1 {
         }
         self.roots.extend(root_delta);
 
+        let mut coverage_ranges_dirty = false;
         for registration in registrations {
             let partition_key = registration.partition.key_v1();
             if self
@@ -832,7 +870,25 @@ impl RefetchableRootIndexV1 {
                 }
             };
             self.partitions.insert(partition_key, residency);
+            if matches!(
+                self.partitions.get(&partition_key),
+                Some(PartitionResidencyV1::CompleteEmpty)
+            ) && matches!(
+                partition_key.kind_v1(),
+                DerivationPartitionKindV1::TemporalChannelGroup(_)
+            ) {
+                coverage_ranges_dirty |= self
+                    .loaded_coverage
+                    .apply_partition_transition_in_batch_v1(
+                        partition_key.source_unit_ordinal_v1(),
+                        PartitionSatisfactionTransitionV1::BecameSatisfied,
+                    )
+                    .expect("sealed temporal partition registration matches its coverage plan");
+            }
         }
+        self.loaded_coverage
+            .finish_transition_batch_v1(coverage_ranges_dirty)
+            .expect("sealed temporal partition registration keeps coverage counters consistent");
         self.counters = next_counters;
         Ok(())
     }
@@ -881,18 +937,113 @@ impl RefetchableRootIndexV1 {
         if events.is_empty() {
             return Ok(());
         }
-        for root in self.roots.values_mut() {
-            root.load_state =
-                match store.external_refetchable_root_existence_v1(root.external_descriptor) {
-                    Ok(ExternalRefetchableRootExistenceV1::Resident) => {
-                        RefetchableRootLoadStateV1::FullyLoaded
-                    }
-                    Ok(ExternalRefetchableRootExistenceV1::Unloaded) | Err(_) => {
-                        RefetchableRootLoadStateV1::Unloaded
-                    }
-                };
+
+        let max_affected_partitions = events
+            .len()
+            .checked_mul(2)
+            .map(|count| count.min(self.partitions.len()))
+            .ok_or(RootRegistrationErrorV1::ResourceLimitExceeded)?;
+        let mut affected_partitions = HashSet::<DerivationPartitionKeyV1>::default();
+        affected_partitions
+            .try_reserve(max_affected_partitions)
+            .map_err(|_error| RootRegistrationErrorV1::ResourceLimitExceeded)?;
+        let affected_temporary_bytes = temporary_registration_bytes_with_hash_slack_v1(
+            u64::try_from(affected_partitions.capacity())
+                .map_err(|_error| RootRegistrationErrorV1::ResourceLimitExceeded)?,
+            0,
+            1,
+        )?;
+        if affected_temporary_bytes > self.temporary_reservation.bytes_v1() {
+            return Err(RootRegistrationErrorV1::ResourceLimitExceeded);
         }
+        for event in events {
+            let mut observe_root = |root_id: ChunkId| {
+                if let Some(root) = self.roots.get(&root_id) {
+                    affected_partitions.insert(root.partition);
+                }
+            };
+            if let Some(addition) = event.diff.to_addition() {
+                observe_root(addition.chunk_before_processing.id());
+                observe_root(addition.chunk_after_processing.id());
+            } else if let Some(deletion) = event.diff.to_deletion() {
+                observe_root(deletion.chunk.id());
+            }
+        }
+
+        let partitions = &self.partitions;
+        let roots = &mut self.roots;
+        let loaded_coverage = &mut self.loaded_coverage;
+        let mut coverage_ranges_dirty = false;
+        for partition_key in affected_partitions.iter().copied() {
+            let Some(residency) = partitions.get(&partition_key) else {
+                continue;
+            };
+            let PartitionResidencyV1::Roots(root_ids) = residency else {
+                continue;
+            };
+            let was_satisfied = root_ids.iter().all(|root_id| {
+                roots
+                    .get(root_id)
+                    .is_some_and(|root| root.load_state == RefetchableRootLoadStateV1::FullyLoaded)
+            });
+            for root_id in root_ids {
+                let root = roots
+                    .get_mut(root_id)
+                    .expect("registered partition roots have matching root descriptors");
+                root.load_state =
+                    match store.external_refetchable_root_existence_v1(root.external_descriptor) {
+                        Ok(ExternalRefetchableRootExistenceV1::Resident) => {
+                            RefetchableRootLoadStateV1::FullyLoaded
+                        }
+                        Ok(ExternalRefetchableRootExistenceV1::Unloaded) | Err(_) => {
+                            RefetchableRootLoadStateV1::Unloaded
+                        }
+                    };
+            }
+            let is_satisfied = root_ids.iter().all(|root_id| {
+                roots
+                    .get(root_id)
+                    .is_some_and(|root| root.load_state == RefetchableRootLoadStateV1::FullyLoaded)
+            });
+            if matches!(
+                partition_key.kind_v1(),
+                DerivationPartitionKindV1::TemporalChannelGroup(_)
+            ) && was_satisfied != is_satisfied
+            {
+                let transition = if is_satisfied {
+                    PartitionSatisfactionTransitionV1::BecameSatisfied
+                } else {
+                    PartitionSatisfactionTransitionV1::BecameUnsatisfied
+                };
+                coverage_ranges_dirty |= loaded_coverage
+                    .apply_partition_transition_in_batch_v1(
+                        partition_key.source_unit_ordinal_v1(),
+                        transition,
+                    )
+                    .expect("registered temporal partitions match their coverage plan");
+            }
+        }
+        loaded_coverage
+            .finish_transition_batch_v1(coverage_ranges_dirty)
+            .expect("registered temporal partitions keep coverage counters consistent");
         Ok(())
+    }
+
+    pub(crate) fn loaded_ranges_v1(&self) -> &[re_log_types::AbsoluteTimeRange] {
+        self.loaded_coverage.loaded_ranges_v1()
+    }
+
+    pub(crate) const fn indexed_extent_v1(&self) -> CanonicalIndexedExtentV1 {
+        self.loaded_coverage.indexed_extent_v1()
+    }
+
+    pub(crate) fn complete_indexed_coverage_v1(&self) -> CompleteIndexedCoverageV1 {
+        self.loaded_coverage.complete_indexed_coverage_v1()
+    }
+
+    #[cfg(test)]
+    fn coverage_rebuild_count_v1(&self) -> u64 {
+        self.loaded_coverage.rebuild_count_v1()
     }
 
     pub(crate) fn is_partition_fully_resident_v1(
@@ -1035,7 +1186,32 @@ mod tests {
         store: &ChunkStore,
         capability: &WebRemoteMcapRootCapabilityV1,
     ) -> RefetchableRootIndexV1 {
-        RefetchableRootIndexV1::new_v1(session, limits, store, capability).unwrap()
+        RefetchableRootIndexV1::new_v1(
+            session,
+            limits,
+            store,
+            capability,
+            RemoteTemporalCoveragePlanV1::for_test_v1(&[None; 8], 1),
+        )
+        .unwrap()
+    }
+
+    fn new_index_with_coverage(
+        session: RemoteMcapSessionIdV1,
+        limits: RemoteRegistrationCapacityV1,
+        store: &ChunkStore,
+        capability: &WebRemoteMcapRootCapabilityV1,
+        intervals: &[Option<(i64, i64)>],
+        expected_selected_group_count: u32,
+    ) -> RefetchableRootIndexV1 {
+        RefetchableRootIndexV1::new_v1(
+            session,
+            limits,
+            store,
+            capability,
+            RemoteTemporalCoveragePlanV1::for_test_v1(intervals, expected_selected_group_count),
+        )
+        .unwrap()
     }
 
     fn generous_limits() -> RemoteRegistrationCapacityV1 {
@@ -1458,6 +1634,283 @@ mod tests {
         assert_eq!(index.snapshot_v1(), registered);
         assert_eq!(index.counters_v1().root_descriptors, u64::from(ROOTS));
         assert_eq!(index.roots.len(), usize::try_from(ROOTS).unwrap());
+    }
+
+    #[test]
+    fn complete_empty_is_loaded_and_survives_gc() {
+        let session = RemoteMcapSessionIdV1::for_registration_test_v1(11);
+        let (partition, _) = temporal_partition(session, 0, 1);
+        let (mut store, capability) = store_and_capability();
+        let mut index = new_index_with_coverage(
+            session,
+            generous_limits(),
+            &store,
+            &capability,
+            &[Some((10, 20))],
+            1,
+        );
+        index
+            .register_commit_set_v1(
+                &mut store,
+                &capability,
+                vec![PreparedPartitionRegistrationV1::complete_empty_v1(
+                    partition,
+                )],
+            )
+            .unwrap();
+
+        assert_eq!(
+            index.indexed_extent_v1(),
+            CanonicalIndexedExtentV1::Known(re_log_types::AbsoluteTimeRange::new(10, 20))
+        );
+        assert_eq!(
+            index.loaded_ranges_v1(),
+            &[re_log_types::AbsoluteTimeRange::new(10, 20)]
+        );
+        assert_eq!(
+            index.complete_indexed_coverage_v1(),
+            CompleteIndexedCoverageV1::Complete
+        );
+
+        let (events, _) = store.gc(&GarbageCollectionOptions::gc_everything());
+        if !events.is_empty() {
+            index
+                .observe_store_events_v1(&store, &capability, &events)
+                .unwrap();
+        }
+        assert_eq!(
+            index.loaded_ranges_v1(),
+            &[re_log_types::AbsoluteTimeRange::new(10, 20)]
+        );
+
+        let registered = index.snapshot_v1();
+        index
+            .register_commit_set_v1(
+                &mut store,
+                &capability,
+                vec![PreparedPartitionRegistrationV1::complete_empty_v1(
+                    partition,
+                )],
+            )
+            .unwrap();
+        assert_eq!(index.snapshot_v1(), registered);
+    }
+
+    #[test]
+    fn gc_and_reload_update_cached_loaded_coverage() {
+        let session = RemoteMcapSessionIdV1::for_registration_test_v1(12);
+        let (partition, issuer) = temporal_partition(session, 0, 1);
+        let registration = roots_registration(partition, &issuer, [0]);
+        let PreparedPartitionOutcomeV1::Roots { roots, .. } = &registration.outcome else {
+            unreachable!();
+        };
+        let root_chunk_id = roots[0].manifest_descriptor.root_chunk_id_v1();
+        let (mut store, capability) = store_and_capability();
+        let mut index = new_index_with_coverage(
+            session,
+            generous_limits(),
+            &store,
+            &capability,
+            &[Some((0, 10))],
+            1,
+        );
+        index
+            .register_commit_set_v1(&mut store, &capability, vec![registration])
+            .unwrap();
+        assert!(index.loaded_ranges_v1().is_empty());
+
+        let descriptor = index.roots[&root_chunk_id].external_descriptor;
+        let permit = capability.issue_refetch_v1(&store, descriptor).unwrap();
+        let addition = store
+            .insert_external_refetchable_root_v1(permit, &temporal_chunk(root_chunk_id))
+            .unwrap();
+        index
+            .observe_store_events_v1(&store, &capability, &addition)
+            .unwrap();
+        assert_eq!(
+            index.loaded_ranges_v1(),
+            &[re_log_types::AbsoluteTimeRange::new(0, 10)]
+        );
+        assert_eq!(
+            index.complete_indexed_coverage_v1(),
+            CompleteIndexedCoverageV1::Complete
+        );
+
+        let (deletion, _) = store.gc(&GarbageCollectionOptions::gc_everything());
+        index
+            .observe_store_events_v1(&store, &capability, &deletion)
+            .unwrap();
+        assert!(index.loaded_ranges_v1().is_empty());
+        assert_eq!(
+            index.complete_indexed_coverage_v1(),
+            CompleteIndexedCoverageV1::Incomplete
+        );
+
+        let permit = capability.issue_refetch_v1(&store, descriptor).unwrap();
+        let reload = store
+            .insert_external_refetchable_root_v1(permit, &temporal_chunk(root_chunk_id))
+            .unwrap();
+        index
+            .observe_store_events_v1(&store, &capability, &reload)
+            .unwrap();
+        assert_eq!(
+            index.loaded_ranges_v1(),
+            &[re_log_types::AbsoluteTimeRange::new(0, 10)]
+        );
+
+        let reloaded = index.snapshot_v1();
+        index
+            .observe_store_events_v1(&store, &capability, &reload)
+            .unwrap();
+        assert_eq!(index.snapshot_v1(), reloaded);
+    }
+
+    #[test]
+    fn complete_empty_batch_rebuilds_loaded_ranges_once() {
+        let session = RemoteMcapSessionIdV1::for_registration_test_v1(14);
+        let (first, _) = temporal_partition(session, 0, 1);
+        let (second, _) = temporal_partition(session, 1, 1);
+        let (mut store, capability) = store_and_capability();
+        let mut index = new_index_with_coverage(
+            session,
+            generous_limits(),
+            &store,
+            &capability,
+            &[Some((0, 10)), Some((5, 15))],
+            1,
+        );
+        let before = index.coverage_rebuild_count_v1();
+
+        index
+            .register_commit_set_v1(
+                &mut store,
+                &capability,
+                vec![
+                    PreparedPartitionRegistrationV1::complete_empty_v1(first),
+                    PreparedPartitionRegistrationV1::complete_empty_v1(second),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(index.coverage_rebuild_count_v1(), before + 1);
+        assert_eq!(
+            index.loaded_ranges_v1(),
+            &[re_log_types::AbsoluteTimeRange::new(0, 15)]
+        );
+    }
+
+    #[test]
+    fn root_event_batch_reconciles_only_affected_partitions_and_rebuilds_once() {
+        let session = RemoteMcapSessionIdV1::for_registration_test_v1(15);
+        let (first_partition, first_issuer) = temporal_partition(session, 0, 1);
+        let (second_partition, second_issuer) = temporal_partition(session, 1, 1);
+        let first_registration = roots_registration(first_partition, &first_issuer, [0]);
+        let second_registration = roots_registration(second_partition, &second_issuer, [0]);
+        let first_root = match &first_registration.outcome {
+            PreparedPartitionOutcomeV1::Roots { roots, .. } => {
+                roots[0].manifest_descriptor.root_chunk_id_v1()
+            }
+            PreparedPartitionOutcomeV1::CompleteEmpty => unreachable!(),
+        };
+        let second_root = match &second_registration.outcome {
+            PreparedPartitionOutcomeV1::Roots { roots, .. } => {
+                roots[0].manifest_descriptor.root_chunk_id_v1()
+            }
+            PreparedPartitionOutcomeV1::CompleteEmpty => unreachable!(),
+        };
+        let (mut store, capability) = store_and_capability();
+        let mut index = new_index_with_coverage(
+            session,
+            generous_limits(),
+            &store,
+            &capability,
+            &[Some((0, 10)), Some((5, 15))],
+            1,
+        );
+        index
+            .register_commit_set_v1(
+                &mut store,
+                &capability,
+                vec![first_registration, second_registration],
+            )
+            .unwrap();
+
+        let mut additions = Vec::new();
+        for root_id in [first_root, second_root] {
+            let descriptor = index.roots[&root_id].external_descriptor;
+            let permit = capability.issue_refetch_v1(&store, descriptor).unwrap();
+            additions.extend(
+                store
+                    .insert_external_refetchable_root_v1(permit, &temporal_chunk(root_id))
+                    .unwrap(),
+            );
+        }
+        let before_additions = index.coverage_rebuild_count_v1();
+        index
+            .observe_store_events_v1(&store, &capability, &additions)
+            .unwrap();
+        assert_eq!(index.coverage_rebuild_count_v1(), before_additions + 1);
+        assert_eq!(
+            index.loaded_ranges_v1(),
+            &[re_log_types::AbsoluteTimeRange::new(0, 15)]
+        );
+
+        let loaded = index.snapshot_v1();
+        index
+            .observe_store_events_v1(&store, &capability, &additions)
+            .unwrap();
+        assert_eq!(index.snapshot_v1(), loaded);
+
+        let irrelevant = ChunkStoreEvent {
+            store_id: store.id().clone(),
+            store_generation: store.generation(),
+            event_id: u64::MAX,
+            diff: re_chunk_store::ChunkStoreDiff::SchemaAddition(
+                re_chunk_store::ChunkStoreDiffSchemaAddition {
+                    new_columns: Vec::new(),
+                },
+            ),
+        };
+        index
+            .observe_store_events_v1(&store, &capability, &[irrelevant])
+            .unwrap();
+        assert_eq!(index.snapshot_v1(), loaded);
+
+        let (deletions, _) = store.gc(&GarbageCollectionOptions::gc_everything());
+        let before_deletions = index.coverage_rebuild_count_v1();
+        index
+            .observe_store_events_v1(&store, &capability, &deletions)
+            .unwrap();
+        assert_eq!(index.coverage_rebuild_count_v1(), before_deletions + 1);
+        assert!(index.loaded_ranges_v1().is_empty());
+    }
+
+    #[test]
+    fn out_of_range_temporal_source_fails_before_registry_or_coverage_mutation() {
+        let session = RemoteMcapSessionIdV1::for_registration_test_v1(13);
+        let (partition, _) = temporal_partition(session, 1, 1);
+        let (mut store, capability) = store_and_capability();
+        let mut index = new_index_with_coverage(
+            session,
+            generous_limits(),
+            &store,
+            &capability,
+            &[Some((0, 10))],
+            1,
+        );
+        let before = index.snapshot_v1();
+
+        assert_eq!(
+            index.register_commit_set_v1(
+                &mut store,
+                &capability,
+                vec![PreparedPartitionRegistrationV1::complete_empty_v1(
+                    partition,
+                )],
+            ),
+            Err(RootRegistrationErrorV1::InvalidManifestIdentity)
+        );
+        assert_eq!(index.snapshot_v1(), before);
     }
 
     #[test]
