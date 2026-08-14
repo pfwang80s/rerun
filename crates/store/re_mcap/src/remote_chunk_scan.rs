@@ -1588,14 +1588,19 @@ pub(crate) struct RemoteMessageEnvelopeIterV1<'a> {
     binding: PhysicalChunkSourceBindingV1,
     records: RecordSequence<'a>,
     row_bound: u64,
+    top_level_record_absolute_offset: u64,
 }
 
 pub(crate) struct RemoteMessageEnvelopeV1<'a> {
     binding: PhysicalChunkSourceBindingV1,
     pub(crate) channel_id: u16,
     pub(crate) sequence: u64,
+    pub(crate) log_time: u64,
+    pub(crate) publish_time: u64,
     payload: &'a [u8],
     pub(crate) row_bound: u64,
+    pub(crate) record_local_offset: u64,
+    pub(crate) top_level_record_absolute_offset: u64,
 }
 
 impl<'a> RemoteMessageEnvelopeIterV1<'a> {
@@ -1610,8 +1615,8 @@ impl<'a> RemoteMessageEnvelopeIterV1<'a> {
             let mut cursor = BorrowedCursor::new(record.body);
             let channel_id = cursor.u16()?;
             let sequence = u64::from(cursor.u32()?);
-            let _log_time = cursor.u64()?;
-            let _publish_time = cursor.u64()?;
+            let log_time = cursor.u64()?;
+            let publish_time = cursor.u64()?;
             let payload = cursor.take_exact(cursor.remaining())?;
             cursor.finish()?;
             let row = self.row_bound;
@@ -1623,8 +1628,12 @@ impl<'a> RemoteMessageEnvelopeIterV1<'a> {
                 binding: self.binding.clone(),
                 channel_id,
                 sequence,
+                log_time,
+                publish_time,
                 payload,
                 row_bound: row,
+                record_local_offset: record.offset,
+                top_level_record_absolute_offset: self.top_level_record_absolute_offset,
             }));
         }
         Ok(None)
@@ -1656,6 +1665,8 @@ impl<'a> RemoteMessageEnvelopeV1<'a> {
         binding: PhysicalChunkSourceBindingV1,
         channel_id: u16,
         sequence: u64,
+        log_time: u64,
+        publish_time: u64,
         payload: &'a [u8],
         row_bound: u64,
     ) -> Self {
@@ -1663,13 +1674,40 @@ impl<'a> RemoteMessageEnvelopeV1<'a> {
             binding,
             channel_id,
             sequence,
+            log_time,
+            publish_time,
             payload,
             row_bound,
+            record_local_offset: row_bound,
+            top_level_record_absolute_offset: 1,
+        }
+    }
+
+    pub(crate) fn new_with_source_offsets_for_dispatch_test_v1(
+        binding: PhysicalChunkSourceBindingV1,
+        top_level_record_absolute_offset: u64,
+        record_local_offset: u64,
+    ) -> Self {
+        Self {
+            binding,
+            channel_id: 1,
+            sequence: 0,
+            log_time: 0,
+            publish_time: 0,
+            payload: &[],
+            row_bound: 0,
+            record_local_offset,
+            top_level_record_absolute_offset,
         }
     }
 }
 
 impl PhysicalChunkMessageEvidenceV1<'_> {
+    pub(crate) fn canonical_ordinal_v1(&self) -> Result<usize, PhysicalChunkValidationError> {
+        self.ensure_current_v1()?;
+        self.inner.canonical_ordinal_v1()
+    }
+
     pub(crate) fn message_envelopes_v1(
         &self,
     ) -> Result<RemoteMessageEnvelopeIterV1<'_>, PhysicalChunkValidationError> {
@@ -1678,6 +1716,14 @@ impl PhysicalChunkMessageEvidenceV1<'_> {
             binding: self.binding.clone(),
             records: RecordSequence::new(self.inner.output.bytes()),
             row_bound: 0,
+            top_level_record_absolute_offset: self
+                .inner
+                .output
+                .identity()
+                .lease()?
+                .region()
+                .raw_descriptor()
+                .chunk_start_offset,
         })
     }
     pub(crate) fn ensure_current_v1(&self) -> Result<(), PhysicalChunkValidationError> {
@@ -2197,6 +2243,7 @@ fn validate_expected_raw_extent(
 struct RecordView<'a> {
     opcode: u8,
     body: &'a [u8],
+    offset: u64,
 }
 
 struct RecordSequence<'a> {
@@ -2214,11 +2261,17 @@ impl<'a> RecordSequence<'a> {
         if self.cursor.is_empty() {
             return Ok(None);
         }
+        let offset = u64::try_from(self.cursor.position())
+            .map_err(|_| PhysicalChunkValidationError::ArithmeticOverflow)?;
         let opcode = self.cursor.u8()?;
         let body_len = usize::try_from(self.cursor.u64()?)
             .map_err(|_overflow| PhysicalChunkValidationError::ArithmeticOverflow)?;
         let body = self.cursor.take_exact(body_len)?;
-        Ok(Some(RecordView { opcode, body }))
+        Ok(Some(RecordView {
+            opcode,
+            body,
+            offset,
+        }))
     }
 }
 

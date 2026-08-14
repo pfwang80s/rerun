@@ -45,6 +45,26 @@ pub(crate) fn seal_remote_ros2_projection_eof_v1<'definitions, 'input, 'source, 
 impl<'definitions, 'input, 'source, 'wire>
     RemoteProtobufProjectionEofContinuationV1<'definitions, 'input, 'source, 'wire>
 {
+    pub(super) fn executable_channel_view_v1(
+        &self,
+        channel_record_index: u32,
+    ) -> Result<
+        crate::remote_ros2_reflection::RemoteRos2ExecutableChannelViewV1<
+            '_,
+            'definitions,
+            'input,
+            'source,
+            'wire,
+        >,
+        crate::remote_ros2_reflection::RemoteRos2InitializationError,
+    > {
+        let index = usize::try_from(channel_record_index).map_err(|_| {
+            crate::remote_ros2_reflection::RemoteRos2InitializationError::ResourceLimitExceeded(
+                crate::remote_ros2_reflection::RemoteRos2ResourceLimit::Arithmetic,
+            )
+        })?;
+        self.authority.executable_channel_view_v1(index)
+    }
     pub(super) fn ensure_current_for_assignment_v1(
         &self,
     ) -> Result<(), crate::remote_ros2_reflection::RemoteRos2InitializationError> {

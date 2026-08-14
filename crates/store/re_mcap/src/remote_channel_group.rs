@@ -459,8 +459,24 @@ impl ImmutableRemoteChannelGroupsV1<'_, '_, '_, '_> {
         })
     }
 
+    pub(crate) fn channels_for_group_v1(&self, group_id: StableDecoderGroupIdV1) -> Option<&[u16]> {
+        let group = self.groups.get(usize::try_from(group_id.0).ok()?)?;
+        (group.group_id == group_id).then(|| &self.memberships[group.membership.clone()])
+    }
+
     pub(crate) fn assignments_v1(&self) -> &[TemporalChannelAssignmentV1] {
         &self.assignments
+    }
+
+    pub(crate) fn bind_executable_factory_v1(
+        &self,
+        channel_id: u16,
+    ) -> Result<
+        crate::remote_protobuf_descriptor::RemoteExecutableFactoryV1<'_, '_, '_, '_, '_>,
+        crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1,
+    > {
+        self._assignment_owner
+            .bind_executable_factory_v1(channel_id)
     }
 
     pub(crate) fn retained_bytes_for_validation_v1(&self) -> u64 {

@@ -587,7 +587,7 @@ pub(crate) fn validated_physical_regions_for_test(
 pub(crate) mod tests {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::borrow::Cow;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::ambiguous_zero::{
@@ -622,9 +622,133 @@ pub(crate) mod tests {
 
     struct TrackingAllocator;
 
+    const MAX_SCOPED_TRACKED_ALLOCATIONS: usize = 4_096;
+
+    #[derive(Clone, Copy)]
+    struct TrackedAllocation {
+        pointer: usize,
+        raw_bytes: usize,
+        locked_bytes: u64,
+    }
+
+    impl TrackedAllocation {
+        const EMPTY: Self = Self {
+            pointer: 0,
+            raw_bytes: 0,
+            locked_bytes: 0,
+        };
+    }
+
+    struct ScopedAllocationState {
+        allocations: [TrackedAllocation; MAX_SCOPED_TRACKED_ALLOCATIONS],
+        len: usize,
+        live_raw_bytes: u64,
+        high_water_raw_bytes: u64,
+        live_locked_bytes: u64,
+        high_water_locked_bytes: u64,
+        overflowed: bool,
+    }
+
+    impl ScopedAllocationState {
+        #[expect(
+            clippy::large_stack_arrays,
+            reason = "the test allocator registry must remain fixed-size and allocation-free"
+        )]
+        const fn empty() -> Self {
+            Self {
+                allocations: [TrackedAllocation::EMPTY; MAX_SCOPED_TRACKED_ALLOCATIONS],
+                len: 0,
+                live_raw_bytes: 0,
+                high_water_raw_bytes: 0,
+                live_locked_bytes: 0,
+                high_water_locked_bytes: 0,
+                overflowed: false,
+            }
+        }
+
+        fn reset(&mut self) {
+            self.allocations[..self.len].fill(TrackedAllocation::EMPTY);
+            self.len = 0;
+            self.live_raw_bytes = 0;
+            self.high_water_raw_bytes = 0;
+            self.live_locked_bytes = 0;
+            self.high_water_locked_bytes = 0;
+            self.overflowed = false;
+        }
+
+        fn insert(&mut self, pointer: *mut u8, layout: Layout) {
+            if pointer.is_null() || layout.size() == 0 {
+                return;
+            }
+            let Ok(locked_bytes) =
+                crate::remote_chunk_validation_count::locked_footprint_for_test_v1(layout)
+            else {
+                self.overflowed = true;
+                return;
+            };
+            let Some(slot) = self.allocations.get_mut(self.len) else {
+                self.overflowed = true;
+                return;
+            };
+            *slot = TrackedAllocation {
+                pointer: pointer.addr(),
+                raw_bytes: layout.size(),
+                locked_bytes,
+            };
+            self.len += 1;
+            let Ok(raw_bytes) = u64::try_from(layout.size()) else {
+                self.overflowed = true;
+                return;
+            };
+            let Some(live_raw) = self.live_raw_bytes.checked_add(raw_bytes) else {
+                self.overflowed = true;
+                return;
+            };
+            let Some(live_locked) = self.live_locked_bytes.checked_add(locked_bytes) else {
+                self.overflowed = true;
+                return;
+            };
+            self.live_raw_bytes = live_raw;
+            self.high_water_raw_bytes = self.high_water_raw_bytes.max(live_raw);
+            self.live_locked_bytes = live_locked;
+            self.high_water_locked_bytes = self.high_water_locked_bytes.max(live_locked);
+        }
+
+        fn remove(&mut self, pointer: *mut u8) -> bool {
+            let address = pointer.addr();
+            let Some(index) = self.allocations[..self.len]
+                .iter()
+                .position(|allocation| allocation.pointer == address)
+            else {
+                return false;
+            };
+            let allocation = self.allocations[index];
+            self.len -= 1;
+            self.allocations[index] = self.allocations[self.len];
+            self.allocations[self.len] = TrackedAllocation::EMPTY;
+            let Ok(raw_bytes) = u64::try_from(allocation.raw_bytes) else {
+                self.overflowed = true;
+                return true;
+            };
+            let Some(live_raw) = self.live_raw_bytes.checked_sub(raw_bytes) else {
+                self.overflowed = true;
+                return true;
+            };
+            let Some(live_locked) = self.live_locked_bytes.checked_sub(allocation.locked_bytes)
+            else {
+                self.overflowed = true;
+                return true;
+            };
+            self.live_raw_bytes = live_raw;
+            self.live_locked_bytes = live_locked;
+            true
+        }
+    }
+
     thread_local! {
         static TRACK_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
         static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+        static SCOPED_ALLOCATIONS: RefCell<ScopedAllocationState> = const { RefCell::new(ScopedAllocationState::empty()) };
     }
 
     #[expect(
@@ -635,38 +759,79 @@ pub(crate) mod tests {
     // the wrapper only increments a thread-local counter before allocation or reallocation.
     unsafe impl GlobalAlloc for TrackingAllocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            record_allocation();
             // SAFETY: This wrapper preserves `System`'s allocation contract unchanged.
-            unsafe { System.alloc(layout) }
+            let pointer = unsafe { System.alloc(layout) };
+            record_allocation(pointer, layout);
+            pointer
         }
 
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            record_allocation();
             // SAFETY: This wrapper preserves `System`'s allocation contract unchanged.
-            unsafe { System.alloc_zeroed(layout) }
+            let pointer = unsafe { System.alloc_zeroed(layout) };
+            record_allocation(pointer, layout);
+            pointer
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            record_deallocation(ptr);
             // SAFETY: `ptr` and `layout` came from the matching `System` allocation call.
             unsafe { System.dealloc(ptr, layout) }
         }
 
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            record_allocation();
             // SAFETY: This wrapper preserves `System`'s reallocation contract unchanged.
-            unsafe { System.realloc(ptr, layout, new_size) }
+            let new_pointer = unsafe { System.realloc(ptr, layout, new_size) };
+            record_reallocation(ptr, new_pointer, layout, new_size);
+            new_pointer
         }
     }
 
     #[global_allocator]
     static GLOBAL_ALLOCATOR: TrackingAllocator = TrackingAllocator;
 
-    fn record_allocation() {
+    fn record_allocation(pointer: *mut u8, layout: Layout) {
         let _ignored = TRACK_THIS_THREAD.try_with(|tracking| {
-            if tracking.get() {
+            tracking.get().then(|| {
                 let _ignored = ALLOCATIONS.try_with(|count| {
                     count.set(count.get().saturating_add(1));
                 });
+                let _ignored =
+                    SCOPED_ALLOCATIONS.try_with(|state| state.borrow_mut().insert(pointer, layout));
+            })
+        });
+    }
+
+    fn record_deallocation(pointer: *mut u8) {
+        let _ignored = SCOPED_ALLOCATIONS.try_with(|state| {
+            let _removed = state.borrow_mut().remove(pointer);
+        });
+    }
+
+    fn record_reallocation(
+        old_pointer: *mut u8,
+        new_pointer: *mut u8,
+        old_layout: Layout,
+        new_bytes: usize,
+    ) {
+        if new_pointer.is_null() {
+            return;
+        }
+        let tracked = SCOPED_ALLOCATIONS
+            .try_with(|state| state.borrow_mut().remove(old_pointer))
+            .unwrap_or(false);
+        let _ignored = TRACK_THIS_THREAD.try_with(|tracking| {
+            if tracking.get() || tracked {
+                let _ignored = ALLOCATIONS.try_with(|count| {
+                    count.set(count.get().saturating_add(1));
+                });
+                let Ok(new_layout) = Layout::from_size_align(new_bytes, old_layout.align()) else {
+                    let _ignored = SCOPED_ALLOCATIONS.try_with(|state| {
+                        state.borrow_mut().overflowed = true;
+                    });
+                    return;
+                };
+                let _ignored = SCOPED_ALLOCATIONS
+                    .try_with(|state| state.borrow_mut().insert(new_pointer, new_layout));
             }
         });
     }
@@ -676,12 +841,29 @@ pub(crate) mod tests {
     impl AllocationGuard {
         pub(crate) fn start() -> Self {
             ALLOCATIONS.with(|count| count.set(0));
+            SCOPED_ALLOCATIONS.with(|state| state.borrow_mut().reset());
             TRACK_THIS_THREAD.with(|tracking| tracking.set(true));
             Self
         }
 
         pub(crate) fn count() -> u64 {
             ALLOCATIONS.with(Cell::get)
+        }
+
+        pub(crate) fn high_water_bytes() -> u64 {
+            SCOPED_ALLOCATIONS.with(|state| {
+                let state = state.borrow();
+                assert!(!state.overflowed, "scoped allocator registry overflowed");
+                state.high_water_raw_bytes
+            })
+        }
+
+        pub(crate) fn high_water_locked_bytes() -> u64 {
+            SCOPED_ALLOCATIONS.with(|state| {
+                let state = state.borrow();
+                assert!(!state.overflowed, "scoped allocator registry overflowed");
+                state.high_water_locked_bytes
+            })
         }
     }
 

@@ -153,6 +153,16 @@ mod remote_chunk_validation_count;
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
 mod remote_manifest;
 
+// Admitted second-pass dispatch remains crate-private and production-disarmed until the Web
+// Store mutation arbiter is wired to the complete terminal contract.
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+mod remote_chunk_dispatch;
+
+// Sealed typed output contracts bridge bounded initializer state to the remote Chunk builder.
+// They remain absent from native/local MCAP APIs and ordinary Viewer code.
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+mod remote_typed_output;
+
 // Bounded ROS 2 reflection initialization remains crate-private and production-disarmed until the
 // remote decoder policy and resource profile are sealed.
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]

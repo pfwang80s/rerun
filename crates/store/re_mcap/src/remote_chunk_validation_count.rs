@@ -14,6 +14,7 @@ use crate::remote_channel_group::{ImmutableRemoteChannelGroupsV1, StableDecoderG
 use crate::remote_chunk_scan::{
     PhysicalChunkMessageEvidenceV1, PhysicalChunkValidationError, ValidatedPhysicalChunkExtent,
 };
+use crate::remote_manifest::ManifestTemporalPartitionAuthorityV1;
 
 const REMOTE_VALIDATION_COUNT_PROFILE_VERSION_V1: u16 = 1;
 const REMOTE_DECODER_RESOURCE_BOUND_VERSION_V1: u16 = 1;
@@ -22,6 +23,180 @@ const LOCKED_WASM_DLMALLOC_CHUNK_OVERHEAD_V1: u64 = 4;
 const LOCKED_WASM_DLMALLOC_MIN_CHUNK_V1: u64 = 16;
 const LOCKED_WASM_DLMALLOC_TOP_FOOT_V1: u64 = 40;
 const LOCKED_WASM_DLMALLOC_PAGE_V1: u64 = 64 * 1024;
+const REMOTE_TYPED_OUTPUT_CENSUS_VERSION_V1: u16 = 1;
+const CANONICAL_MESSAGE_TIMELINE_COUNT_V1: usize = 2;
+const TYPED_COMPONENT_COUNT_V1: usize = 1;
+const MAX_SCALAR_WIDTH_BYTES_V1: usize = std::mem::size_of::<u64>();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RemoteTypedOutputPeakCensusV1 {
+    profile_version: u16,
+    simultaneous_bytes: u64,
+}
+
+impl RemoteTypedOutputPeakCensusV1 {
+    fn from_layouts_v1(
+        rows: u64,
+        retained_metadata_bytes: u64,
+    ) -> Result<Self, RemoteValidationCountErrorV1> {
+        let rows = usize::try_from(rows).map_err(|_| arithmetic_error())?;
+        let rows_plus_one = rows.checked_add(1).ok_or_else(arithmetic_error)?;
+        let validity_bytes = rows.checked_add(7).ok_or_else(arithmetic_error)? / 8;
+        let map_columns = CANONICAL_MESSAGE_TIMELINE_COUNT_V1
+            .checked_add(TYPED_COMPONENT_COUNT_V1)
+            .ok_or_else(arithmetic_error)?;
+        let map_slots = map_columns
+            .checked_next_power_of_two()
+            .and_then(|slots| slots.checked_mul(2))
+            .ok_or_else(arithmetic_error)?;
+
+        let mut total = 0_u64;
+        let mut charge = |bytes: u64| -> Result<(), RemoteValidationCountErrorV1> {
+            total = total.checked_add(bytes).ok_or_else(arithmetic_error)?;
+            Ok(())
+        };
+        let array = |layout: Layout| locked_footprint(layout);
+        let repeated =
+            |layout: Layout, count: usize| -> Result<u64, RemoteValidationCountErrorV1> {
+                array(layout)?
+                    .checked_mul(u64::try_from(count).map_err(|_| arithmetic_error())?)
+                    .ok_or_else(arithmetic_error)
+            };
+
+        // Fixed owners and map tables retained simultaneously while `ChunkBuilder::build`
+        // materializes the final `Chunk`.
+        charge(array(Layout::new::<re_chunk::ChunkBuilder>())?)?;
+        charge(array(Layout::new::<re_chunk::Chunk>())?)?;
+        charge(array(Layout::new::<re_chunk::ChunkComponents>())?)?;
+        charge(array(
+            Layout::array::<usize>(map_slots).map_err(|_| arithmetic_error())?,
+        )?)?;
+
+        // `ChunkBuilder` staging: row IDs, two timeline value vectors, and one component slot
+        // vector. Every row also retains its independently allocated scalar array and one-child
+        // Struct field vector until concatenation completes.
+        charge(array(
+            Layout::array::<re_chunk::RowId>(rows).map_err(|_| arithmetic_error())?,
+        )?)?;
+        charge(repeated(
+            Layout::array::<i64>(rows).map_err(|_| arithmetic_error())?,
+            CANONICAL_MESSAGE_TIMELINE_COUNT_V1,
+        )?)?;
+        charge(array(
+            Layout::array::<Option<arrow::array::ArrayRef>>(rows)
+                .map_err(|_| arithmetic_error())?,
+        )?)?;
+        charge(repeated(
+            Layout::array::<u8>(MAX_SCALAR_WIDTH_BYTES_V1).map_err(|_| arithmetic_error())?,
+            rows,
+        )?)?;
+        charge(repeated(
+            Layout::array::<arrow::array::ArrayRef>(TYPED_COMPONENT_COUNT_V1)
+                .map_err(|_| arithmetic_error())?,
+            rows,
+        )?)?;
+
+        // Each retained row owns a primitive Arrow array and its wrapping struct array.
+        // In addition to the value and child-reference buffers above, those arrays retain
+        // separate `ArrayData`, Arc control, and `Field`/`Fields` heap owners until component
+        // concatenation completes.
+        charge(repeated(Layout::new::<arrow::array::ArrayData>(), rows)?)?;
+        charge(repeated(
+            Layout::new::<std::sync::Arc<arrow::array::ArrayData>>(),
+            rows,
+        )?)?;
+        charge(repeated(Layout::new::<arrow::datatypes::Field>(), rows)?)?;
+        charge(repeated(Layout::new::<arrow::datatypes::Fields>(), rows)?)?;
+        charge(repeated(Layout::new::<arrow::array::ArrayData>(), rows)?)?;
+        charge(repeated(
+            Layout::new::<std::sync::Arc<arrow::array::ArrayData>>(),
+            rows,
+        )?)?;
+
+        // Final Arrow/Chunk backing overlaps all staging above at the build safe point.
+        charge(array(
+            Layout::array::<[u8; 16]>(rows).map_err(|_| arithmetic_error())?,
+        )?)?;
+        charge(repeated(
+            Layout::array::<i64>(rows).map_err(|_| arithmetic_error())?,
+            CANONICAL_MESSAGE_TIMELINE_COUNT_V1,
+        )?)?;
+        charge(array(
+            Layout::array::<u8>(
+                rows.checked_mul(MAX_SCALAR_WIDTH_BYTES_V1)
+                    .ok_or_else(arithmetic_error)?,
+            )
+            .map_err(|_| arithmetic_error())?,
+        )?)?;
+        charge(array(
+            Layout::array::<i32>(rows_plus_one).map_err(|_| arithmetic_error())?,
+        )?)?;
+        charge(repeated(
+            Layout::array::<u8>(validity_bytes).map_err(|_| arithmetic_error())?,
+            TYPED_COMPONENT_COUNT_V1 + 1,
+        )?)?;
+
+        // `ChunkBuilder::build`, `arrays_to_list_array`, and `Chunk::from_native_row_ids`
+        // overlap these fixed heap owners at the final construction safe point. They remain
+        // distinct allocations even where their payload bytes were already charged above.
+        charge(repeated(Layout::new::<usize>(), 2)?)?; // staging map RawTables
+        charge(array(Layout::new::<Vec<&dyn arrow::array::Array>>())?)?; // sparse refs
+        charge(array(Layout::new::<Vec<&dyn arrow::array::Array>>())?)?; // dense refs
+        charge(array(Layout::new::<arrow::buffer::Buffer>())?)?; // concatenated child values
+        charge(array(Layout::new::<arrow::array::ArrayData>())?)?; // concatenated child data
+        charge(array(
+            Layout::new::<std::sync::Arc<arrow::array::ArrayData>>(),
+        )?)?;
+        charge(array(Layout::new::<arrow::buffer::Buffer>())?)?; // list offsets
+        charge(array(Layout::new::<arrow::buffer::Buffer>())?)?; // list null bitmap
+        charge(array(
+            Layout::new::<std::sync::Arc<arrow::datatypes::Field>>(),
+        )?)?;
+        charge(array(Layout::new::<arrow::buffer::Buffer>())?)?; // native row IDs
+        charge(array(Layout::new::<arrow::array::ArrayData>())?)?; // row-ID Arrow data
+        charge(repeated(
+            Layout::new::<arrow::buffer::Buffer>(),
+            CANONICAL_MESSAGE_TIMELINE_COUNT_V1,
+        )?)?;
+        charge(repeated(Layout::new::<usize>(), 2)?)?; // final map RawTables
+
+        // Entity/field/component/archetype strings may be cloned by the builder and retained by
+        // the completed chunk at the overlap point. Charge both owners from sealed descriptor
+        // lengths rather than a fixed allowance.
+        let metadata = usize::try_from(retained_metadata_bytes).map_err(|_| arithmetic_error())?;
+        charge(repeated(
+            Layout::array::<u8>(metadata).map_err(|_| arithmetic_error())?,
+            2,
+        )?)?;
+
+        Ok(Self {
+            profile_version: REMOTE_TYPED_OUTPUT_CENSUS_VERSION_V1,
+            simultaneous_bytes: total,
+        })
+    }
+}
+
+fn typed_output_peak_bytes_v1(
+    rows: u64,
+    retained_metadata_bytes: u64,
+) -> Result<u64, RemoteValidationCountErrorV1> {
+    let census = RemoteTypedOutputPeakCensusV1::from_layouts_v1(rows, retained_metadata_bytes)?;
+    if census.profile_version != REMOTE_TYPED_OUTPUT_CENSUS_VERSION_V1 {
+        return Err(arithmetic_error());
+    }
+    Ok(census.simultaneous_bytes)
+}
+
+#[cfg(test)]
+pub(crate) fn typed_output_peak_for_descriptor_test_v1(
+    rows: u64,
+    descriptor: &crate::remote_typed_output::RemoteTypedOutputDescriptorV1,
+) -> Result<u64, RemoteValidationCountErrorV1> {
+    let retained_metadata_bytes = descriptor
+        .retained_metadata_bytes_v1()
+        .ok_or_else(arithmetic_error)?;
+    typed_output_peak_bytes_v1(rows, retained_metadata_bytes)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RemoteValidationCountResourceLimitV1 {
@@ -71,6 +246,17 @@ fn map_physical_error(error: PhysicalChunkValidationError) -> RemoteValidationCo
     }
 }
 
+fn ensure_matching_source_unit_ordinal_v1(
+    evidence_ordinal: usize,
+    authority_ordinal: u32,
+) -> Result<(), RemoteValidationCountErrorV1> {
+    if u32::try_from(evidence_ordinal).ok() == Some(authority_ordinal) {
+        Ok(())
+    } else {
+        Err(RemoteValidationCountErrorV1::ManifestMismatch)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct UnfrozenRemoteValidationCountLimitsV1 {
     profile_version: u16,
@@ -87,6 +273,7 @@ struct RemoteValidationCountBudgetUsageV1 {
     active_plans: u64,
     retained_bytes: u64,
     combined_retained_bytes: u64,
+    output_bytes: u64,
 }
 
 struct RemoteValidationCountBudgetStateV1 {
@@ -99,6 +286,54 @@ struct RemoteValidationCountBudgetStateV1 {
 
 pub(crate) struct RemoteValidationCountBudgetV1 {
     state: Arc<RemoteValidationCountBudgetStateV1>,
+}
+
+/// A plan-owned reservation for typed Arrow/Chunk output.
+///
+/// It charges the same aggregate root as validation plans, so independently issued descriptors
+/// cannot create private per-descriptor capacity. The reservation remains live through the sealed
+/// typed-chunk handoff.
+pub(crate) struct RemoteTypedOutputReservationV1 {
+    state: Arc<RemoteValidationCountBudgetStateV1>,
+    bytes: u64,
+}
+
+impl Drop for RemoteTypedOutputReservationV1 {
+    fn drop(&mut self) {
+        let mut usage = self.state.usage.lock();
+        usage.output_bytes = usage
+            .output_bytes
+            .checked_sub(self.bytes)
+            .expect("typed output budget underflowed");
+    }
+}
+
+fn reserve_typed_output_state_v1(
+    state: &Arc<RemoteValidationCountBudgetStateV1>,
+    rows: u64,
+    retained_metadata_bytes: u64,
+) -> Result<RemoteTypedOutputReservationV1, RemoteValidationCountErrorV1> {
+    let bytes = typed_output_peak_bytes_v1(rows, retained_metadata_bytes)?;
+    let mut usage = state.usage.lock();
+    let next = usage
+        .output_bytes
+        .checked_add(bytes)
+        .ok_or_else(arithmetic_error)?;
+    let combined_next = usage
+        .combined_retained_bytes
+        .checked_add(next)
+        .ok_or_else(arithmetic_error)?;
+    if combined_next > state.max_aggregate_combined_retained_bytes {
+        return Err(RemoteValidationCountErrorV1::ResourceLimitExceeded(
+            RemoteValidationCountResourceLimitV1::ReservationCapacity,
+        ));
+    }
+    usage.output_bytes = next;
+    drop(usage);
+    Ok(RemoteTypedOutputReservationV1 {
+        state: Arc::clone(state),
+        bytes,
+    })
 }
 
 impl RemoteValidationCountBudgetV1 {
@@ -144,10 +379,15 @@ impl RemoteValidationCountBudgetV1 {
                 usage.combined_retained_bytes,
                 combined_retained_bytes,
             )?,
+            output_bytes: usage.output_bytes,
         };
         if next.active_plans > self.state.max_active_plans
             || next.retained_bytes > self.state.max_aggregate_retained_bytes
-            || next.combined_retained_bytes > self.state.max_aggregate_combined_retained_bytes
+            || next
+                .combined_retained_bytes
+                .checked_add(next.output_bytes)
+                .ok_or_else(arithmetic_error)?
+                > self.state.max_aggregate_combined_retained_bytes
         {
             return Err(RemoteValidationCountErrorV1::ResourceLimitExceeded(
                 RemoteValidationCountResourceLimitV1::ReservationCapacity,
@@ -159,6 +399,14 @@ impl RemoteValidationCountBudgetV1 {
             retained_bytes,
             combined_retained_bytes,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reserve_typed_output_for_test_v1(
+        &self,
+        rows: u64,
+    ) -> Result<RemoteTypedOutputReservationV1, RemoteValidationCountErrorV1> {
+        reserve_typed_output_state_v1(&self.state, rows, 0)
     }
 
     #[cfg(test)]
@@ -184,6 +432,51 @@ impl UnfrozenRemoteValidationCountLimitsV1 {
     pub(crate) const fn with_combined_limit_for_test_v1(mut self, limit: u64) -> Self {
         self.max_combined_retained_bytes = limit;
         self
+    }
+}
+
+#[cfg(test)]
+mod typed_output_peak_tests {
+    use super::*;
+
+    #[test]
+    fn locked_census_is_explicit_and_overflow_closed() {
+        let empty = RemoteTypedOutputPeakCensusV1::from_layouts_v1(0, 0).unwrap();
+        let one = RemoteTypedOutputPeakCensusV1::from_layouts_v1(1, 0).unwrap();
+        let with_metadata = RemoteTypedOutputPeakCensusV1::from_layouts_v1(1, 17).unwrap();
+        assert_eq!(empty.profile_version, REMOTE_TYPED_OUTPUT_CENSUS_VERSION_V1);
+        assert!(empty.simultaneous_bytes > 0);
+        assert!(one.simultaneous_bytes > empty.simultaneous_bytes);
+        assert!(with_metadata.simultaneous_bytes > one.simultaneous_bytes);
+        assert!(typed_output_peak_bytes_v1(u64::MAX, 0).is_err());
+    }
+
+    #[test]
+    fn exact_output_limit_accepts_and_one_byte_short_rejects() {
+        let limits = UnfrozenRemoteValidationCountLimitsV1::generous_for_test_v1();
+        let retained = typed_output_peak_bytes_v1(2, 0).unwrap();
+        let exact = RemoteValidationCountBudgetV1::new_for_test_v1(
+            limits.with_combined_limit_for_test_v1(retained),
+            1,
+            0,
+            retained,
+        );
+        let reservation = exact.reserve_typed_output_for_test_v1(2).unwrap();
+        drop(reservation);
+        assert!(exact.is_idle_for_test_v1());
+
+        let short = RemoteValidationCountBudgetV1::new_for_test_v1(
+            limits.with_combined_limit_for_test_v1(retained - 1),
+            1,
+            0,
+            retained - 1,
+        );
+        assert!(matches!(
+            short.reserve_typed_output_for_test_v1(2),
+            Err(RemoteValidationCountErrorV1::ResourceLimitExceeded(
+                RemoteValidationCountResourceLimitV1::ReservationCapacity
+            ))
+        ));
     }
 }
 
@@ -219,6 +512,24 @@ pub(crate) struct ExactChannelDispatchCountV1 {
     selected_group: StableDecoderGroupIdV1,
 }
 
+impl ExactChannelDispatchCountV1 {
+    pub(crate) const fn channel_id_v1(self) -> u16 {
+        self.channel_id
+    }
+
+    pub(crate) const fn message_count_v1(self) -> u64 {
+        self.message_count
+    }
+
+    pub(crate) const fn payload_bytes_v1(self) -> u64 {
+        self.payload_bytes
+    }
+
+    pub(crate) const fn selected_group_v1(self) -> StableDecoderGroupIdV1 {
+        self.selected_group
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DecoderDispatchResourceBoundV1 {
     version: u16,
@@ -227,10 +538,17 @@ pub(crate) struct DecoderDispatchResourceBoundV1 {
     exact_payload_bytes: u64,
 }
 
-pub(crate) struct ValidatedChunkDispatchPlanV1<'definitions, 'input, 'source, 'wire> {
-    // Keep the physical/decompressed owner before the manifest initializer owner.
+pub(crate) struct ValidatedChunkDispatchPlanV1<'manifest, 'a, 'definitions, 'input, 'source, 'wire>
+{
     evidence: PhysicalChunkMessageEvidenceV1<'input>,
-    manifest: ImmutableRemoteChannelGroupsV1<'definitions, 'input, 'source, 'wire>,
+    authority: &'manifest ManifestTemporalPartitionAuthorityV1<
+        'manifest,
+        'a,
+        'definitions,
+        'input,
+        'source,
+        'wire,
+    >,
     channels: Box<[ExactChannelDispatchCountV1]>,
     selected_groups: Box<[StableDecoderGroupIdV1]>,
     resource_bounds: Box<[DecoderDispatchResourceBoundV1]>,
@@ -238,7 +556,7 @@ pub(crate) struct ValidatedChunkDispatchPlanV1<'definitions, 'input, 'source, 'w
     _reservation: RemoteValidationCountReservationV1,
 }
 
-impl ValidatedChunkDispatchPlanV1<'_, '_, '_, '_> {
+impl ValidatedChunkDispatchPlanV1<'_, '_, '_, '_, '_, '_> {
     pub(crate) fn ensure_current_v1(&self) -> Result<(), RemoteValidationCountErrorV1> {
         self.evidence
             .ensure_current_v1()
@@ -247,6 +565,62 @@ impl ValidatedChunkDispatchPlanV1<'_, '_, '_, '_> {
 
     pub(crate) fn channels_v1(&self) -> &[ExactChannelDispatchCountV1] {
         &self.channels
+    }
+
+    pub(crate) fn evidence_v1(&self) -> &PhysicalChunkMessageEvidenceV1<'_> {
+        &self.evidence
+    }
+
+    pub(crate) fn expected_rows_v1(&self) -> u64 {
+        self.channels.iter().fold(0_u64, |total, channel| {
+            total
+                .checked_add(channel.message_count)
+                .unwrap_or_else(|| unreachable!("validated message-count sum overflowed"))
+        })
+    }
+
+    pub(crate) fn expected_payload_bytes_v1(&self) -> u64 {
+        self.channels.iter().fold(0_u64, |total, channel| {
+            total
+                .checked_add(channel.payload_bytes)
+                .unwrap_or_else(|| unreachable!("validated payload-byte sum overflowed"))
+        })
+    }
+
+    pub(crate) fn bind_executable_factory_v1(
+        &self,
+        channel_id: u16,
+    ) -> Result<
+        crate::remote_protobuf_descriptor::RemoteExecutableFactoryV1<'_, '_, '_, '_, '_>,
+        crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1,
+    > {
+        if !self.channels.iter().any(|row| row.channel_id == channel_id) {
+            return Err(
+                crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1::ConfigMismatch,
+            );
+        }
+        self.authority.bind_executable_factory_v1(channel_id)
+    }
+
+    pub(crate) fn authority_v1(
+        &self,
+    ) -> &ManifestTemporalPartitionAuthorityV1<'_, '_, '_, '_, '_, '_> {
+        self.authority
+    }
+
+    pub(crate) fn reserve_typed_output_v1(
+        &self,
+        rows: u64,
+        descriptor: &crate::remote_typed_output::RemoteTypedOutputDescriptorV1,
+    ) -> Result<RemoteTypedOutputReservationV1, RemoteValidationCountErrorV1> {
+        // V1 only admits one scalar component per row. This bound intentionally includes the
+        // simultaneous builder staging, two timeline cells, row ids, Arrow buffers, chunk
+        // metadata, and allocator overhead. MCAP-088 may tighten this measured profile, but may
+        // not raise it without changing the profile version.
+        let retained_metadata_bytes = descriptor
+            .retained_metadata_bytes_v1()
+            .ok_or_else(arithmetic_error)?;
+        reserve_typed_output_state_v1(&self._reservation.state, rows, retained_metadata_bytes)
     }
 
     #[cfg(test)]
@@ -308,12 +682,26 @@ pub(crate) fn exact_combined_retained_bytes_for_test_v1(
     )
 }
 
-pub(crate) fn validate_and_count_physical_chunk_v1<'definitions, 'input, 'source, 'wire>(
+pub(crate) fn validate_and_count_with_authority_v1<
+    'manifest,
+    'a,
+    'definitions,
+    'input,
+    'source,
+    'wire,
+>(
     evidence: PhysicalChunkMessageEvidenceV1<'input>,
-    manifest: ImmutableRemoteChannelGroupsV1<'definitions, 'input, 'source, 'wire>,
+    authority: &'manifest ManifestTemporalPartitionAuthorityV1<
+        'manifest,
+        'a,
+        'definitions,
+        'input,
+        'source,
+        'wire,
+    >,
     budget: &RemoteValidationCountBudgetV1,
 ) -> Result<
-    ValidatedChunkDispatchPlanV1<'definitions, 'input, 'source, 'wire>,
+    ValidatedChunkDispatchPlanV1<'manifest, 'a, 'definitions, 'input, 'source, 'wire>,
     RemoteValidationCountErrorV1,
 > {
     if budget.state.limits.profile_version != REMOTE_VALIDATION_COUNT_PROFILE_VERSION_V1 {
@@ -322,6 +710,11 @@ pub(crate) fn validate_and_count_physical_chunk_v1<'definitions, 'input, 'source
         ));
     }
     evidence.ensure_current_v1().map_err(map_physical_error)?;
+    let evidence_ordinal = evidence
+        .canonical_ordinal_v1()
+        .map_err(map_physical_error)?;
+    ensure_matching_source_unit_ordinal_v1(evidence_ordinal, authority.source_unit_ordinal_v1())?;
+    let manifest = authority.groups_v1();
     manifest
         .ensure_current_for_validation_v1()
         .map_err(|_error| RemoteValidationCountErrorV1::StaleSource)?;
@@ -436,7 +829,7 @@ pub(crate) fn validate_and_count_physical_chunk_v1<'definitions, 'input, 'source
     let extent = evidence.extent_v1().map_err(map_physical_error)?;
     Ok(ValidatedChunkDispatchPlanV1 {
         evidence,
-        manifest,
+        authority,
         channels: channels.into_boxed_slice(),
         selected_groups: selected_groups.into_boxed_slice(),
         resource_bounds: resource_bounds.into_boxed_slice(),
@@ -514,6 +907,13 @@ fn locked_footprint(layout: Layout) -> Result<u64, RemoteValidationCountErrorV1>
     )
 }
 
+#[cfg(test)]
+pub(crate) fn locked_footprint_for_test_v1(
+    layout: Layout,
+) -> Result<u64, RemoteValidationCountErrorV1> {
+    locked_footprint(layout)
+}
+
 fn checked_add(left: u64, right: u64) -> Result<u64, RemoteValidationCountErrorV1> {
     left.checked_add(right).ok_or_else(arithmetic_error)
 }
@@ -527,6 +927,30 @@ fn arithmetic_error() -> RemoteValidationCountErrorV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cross_ordinal_evidence_is_rejected_before_reservation() {
+        assert_eq!(ensure_matching_source_unit_ordinal_v1(0, 0), Ok(()));
+        assert_eq!(
+            ensure_matching_source_unit_ordinal_v1(0, 1),
+            Err(RemoteValidationCountErrorV1::ManifestMismatch)
+        );
+        assert_eq!(
+            ensure_matching_source_unit_ordinal_v1(usize::MAX, u32::MAX),
+            Err(RemoteValidationCountErrorV1::ManifestMismatch)
+        );
+
+        let source = include_str!("remote_chunk_validation_count.rs");
+        let ordinal_check = source
+            .find(
+                "ensure_matching_source_unit_ordinal_v1(evidence_ordinal, authority.source_unit_ordinal_v1())?",
+            )
+            .expect("validation checks the sealed evidence/authority ordinal");
+        let reservation = source
+            .find("let reservation = budget.reserve")
+            .expect("validation eventually reserves retained ownership");
+        assert!(ordinal_check < reservation);
+    }
 
     #[test]
     fn exact_peak_budget_rejects_one_byte_short_and_restores_on_drop() {

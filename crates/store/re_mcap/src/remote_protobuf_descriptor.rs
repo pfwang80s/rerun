@@ -18,6 +18,7 @@ use sha2::{Digest as _, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
+use re_sdk_types::reflection::ComponentDescriptorExt as _;
 
 use crate::remote_chunk_scan::{PhysicalChunkSourceBindingV1, RemoteMessageEnvelopeV1};
 use crate::remote_protobuf_projection_boundary::{
@@ -459,6 +460,8 @@ struct RemoteProtobufCensusV1 {
     resolution_steps: u64,
     retained_bytes: u64,
     working_bytes: u64,
+    output_nodes: u64,
+    output_roots: u64,
 }
 
 struct RemoteProtobufStepOwnerV1 {
@@ -3529,6 +3532,30 @@ struct BoundedProtobufOneofV1 {
     name: ByteSpanV1,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteOutputNodeKindV1 {
+    Scalar(FieldKindV1),
+    Message(u32),
+    Enum(u32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RemoteProtobufOutputNodeV1 {
+    owner_message: u32,
+    ordinal: u32,
+    name: ByteSpanV1,
+    tag: u32,
+    kind: RemoteOutputNodeKindV1,
+    nullable: bool,
+    repeated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RemoteProtobufOutputRootV1 {
+    schema_id: u16,
+    root_message: u32,
+}
+
 #[derive(Clone, Copy)]
 enum MaterializationRecordV1<'definitions> {
     Schema(SchemaInputV1<'definitions>),
@@ -3544,6 +3571,8 @@ enum MaterializationRecordV1<'definitions> {
     SortedDependency(u32),
     Resolution(FieldResolutionProjectionV1),
     NamedMessage(u32),
+    OutputNode(RemoteProtobufOutputNodeV1),
+    OutputRoot(RemoteProtobufOutputRootV1),
 }
 
 fn walk_materialization_v1<'definitions>(
@@ -3581,7 +3610,7 @@ fn walk_materialization_v1<'definitions>(
                 resolution_for_field_v1(projection, message_index, ordinal, steps)?;
             let kind = effective_field_kind_v1(projection, field, resolved_symbol)?;
             steps.consume()?;
-            emit(MaterializationRecordV1::Field(BoundedProtobufFieldV1 {
+            let bounded_field = BoundedProtobufFieldV1 {
                 message_index: checked_u32(message_index)?,
                 ordinal: checked_u32(ordinal)?,
                 name: field.name,
@@ -3593,7 +3622,42 @@ fn walk_materialization_v1<'definitions>(
                 oneof_index: field.oneof_index,
                 proto3_optional: field.proto3_optional,
                 resolved_symbol: resolved_symbol.map(checked_u32).transpose()?,
-            }))?;
+            };
+            emit(MaterializationRecordV1::Field(bounded_field))?;
+            let output_kind = match kind {
+                FieldKindV1::Message => RemoteOutputNodeKindV1::Message(
+                    projection
+                        .symbols
+                        .get(
+                            resolved_symbol
+                                .ok_or(RemoteProtobufInitializationErrorV1::InvalidRemoteSchema)?,
+                        )?
+                        .node_index,
+                ),
+                FieldKindV1::Enum => RemoteOutputNodeKindV1::Enum(
+                    projection
+                        .symbols
+                        .get(
+                            resolved_symbol
+                                .ok_or(RemoteProtobufInitializationErrorV1::InvalidRemoteSchema)?,
+                        )?
+                        .node_index,
+                ),
+                scalar => RemoteOutputNodeKindV1::Scalar(scalar),
+            };
+            steps.consume()?;
+            emit(MaterializationRecordV1::OutputNode(
+                RemoteProtobufOutputNodeV1 {
+                    owner_message: checked_u32(message_index)?,
+                    ordinal: checked_u32(ordinal)?,
+                    name: field.name,
+                    tag: u32::try_from(field.number)
+                        .map_err(|_| RemoteProtobufInitializationErrorV1::InvalidRemoteSchema)?,
+                    kind: output_kind,
+                    nullable: field.label != FieldLabelV1::Required,
+                    repeated: field.label == FieldLabelV1::Repeated,
+                },
+            ))?;
         }
         for ordinal in 0..usize::try_from(message.direct_oneofs).map_err(|_overflow| {
             RemoteProtobufInitializationErrorV1::ResourceLimitExceeded(
@@ -3661,8 +3725,14 @@ fn walk_materialization_v1<'definitions>(
     }
     for index in 0..projection.named_messages.len {
         steps.consume()?;
-        emit(MaterializationRecordV1::NamedMessage(
-            projection.named_messages.get(index)?,
+        let root_message = projection.named_messages.get(index)?;
+        emit(MaterializationRecordV1::NamedMessage(root_message))?;
+        steps.consume()?;
+        emit(MaterializationRecordV1::OutputRoot(
+            RemoteProtobufOutputRootV1 {
+                schema_id: projection.inputs.get(index)?.schema_id,
+                root_message,
+            },
         ))?;
     }
     Ok(())
@@ -3683,6 +3753,8 @@ struct MaterializationCountsV1 {
     sorted_dependencies: u64,
     resolutions: u64,
     named_messages: u64,
+    output_nodes: u64,
+    output_roots: u64,
 }
 
 impl MaterializationCountsV1 {
@@ -3704,6 +3776,8 @@ impl MaterializationCountsV1 {
             MaterializationRecordV1::SortedDependency(_) => &mut self.sorted_dependencies,
             MaterializationRecordV1::Resolution(_) => &mut self.resolutions,
             MaterializationRecordV1::NamedMessage(_) => &mut self.named_messages,
+            MaterializationRecordV1::OutputNode(_) => &mut self.output_nodes,
+            MaterializationRecordV1::OutputRoot(_) => &mut self.output_roots,
         };
         *counter = checked_add(*counter, 1)?;
         Ok(())
@@ -3731,7 +3805,9 @@ impl MaterializationCountsV1 {
                         RemoteProtobufResourceLimitV1::Arithmetic,
                     )
                 })?
-            && self.named_messages == census.schemas;
+            && self.named_messages == census.schemas
+            && self.output_nodes == census.fields
+            && self.output_roots == census.schemas;
         if exact {
             Ok(())
         } else {
@@ -3818,6 +3894,8 @@ struct BoundedProtobufDescriptorGraphV1<'definitions> {
     sorted_dependencies: FixedProtobufArenaV1<u32>,
     resolutions: FixedProtobufArenaV1<FieldResolutionProjectionV1>,
     named_messages: FixedProtobufArenaV1<u32>,
+    output_nodes: FixedProtobufArenaV1<RemoteProtobufOutputNodeV1>,
+    output_roots: FixedProtobufArenaV1<RemoteProtobufOutputRootV1>,
 }
 
 /// Sealed executable decoder/config identity derived only inside the bounded initializer module.
@@ -4159,6 +4237,9 @@ impl BoundedProtobufDescriptorGraphV1<'_> {
             && self.sorted_dependencies.storage.len() == self.dependencies.storage.len()
             && self.resolutions.storage.len() == projection.resolutions.len
             && self.named_messages.storage.len() == checked_usize(census.schemas)?;
+        let exact = exact
+            && self.output_nodes.storage.len() == checked_usize(census.fields)?
+            && self.output_roots.storage.len() == checked_usize(census.schemas)?;
         if exact {
             Ok(())
         } else {
@@ -4216,6 +4297,30 @@ impl BoundedProtobufDescriptorGraphV1<'_> {
             hash_option_u32(&mut hasher, field.oneof_index);
             hasher.update([field.proto3_optional as u8]);
             hash_option_u32(&mut hasher, field.resolved_symbol);
+        }
+        for root in self.output_roots.as_slice() {
+            hasher.update(root.schema_id.to_le_bytes());
+            hasher.update(root.root_message.to_le_bytes());
+        }
+        for node in self.output_nodes.as_slice() {
+            hasher.update(node.owner_message.to_le_bytes());
+            hasher.update(node.ordinal.to_le_bytes());
+            self.hash_span_v1(&mut hasher, node.name)?;
+            hasher.update(node.tag.to_le_bytes());
+            hasher.update([node.nullable as u8, node.repeated as u8]);
+            match node.kind {
+                RemoteOutputNodeKindV1::Scalar(kind) => {
+                    hasher.update([0, kind as u8]);
+                }
+                RemoteOutputNodeKindV1::Message(index) => {
+                    hasher.update([1]);
+                    hasher.update(index.to_le_bytes());
+                }
+                RemoteOutputNodeKindV1::Enum(index) => {
+                    hasher.update([2]);
+                    hasher.update(index.to_le_bytes());
+                }
+            }
         }
         for value in self.enum_values.as_slice() {
             hasher.update(value.enum_index.to_le_bytes());
@@ -4315,8 +4420,8 @@ fn hash_option_u32(hasher: &mut Sha256, value: Option<u32>) {
     }
 }
 
-const REMOTE_PROTOBUF_GRAPH_ARENA_COUNT_V1: usize = 13;
-const REMOTE_PROTOBUF_ARENA_COUNT_V1: usize = 14;
+const REMOTE_PROTOBUF_GRAPH_ARENA_COUNT_V1: usize = 15;
+const REMOTE_PROTOBUF_ARENA_COUNT_V1: usize = 16;
 
 fn allocate_graph_v1<'definitions>(
     census: RemoteProtobufCensusV1,
@@ -4361,6 +4466,8 @@ fn allocate_graph_v1<'definitions>(
             })?
         ),
         named_messages: arena!(u32, census.schemas),
+        output_nodes: arena!(RemoteProtobufOutputNodeV1, census.fields),
+        output_roots: arena!(RemoteProtobufOutputRootV1, census.schemas),
     };
     if index != REMOTE_PROTOBUF_GRAPH_ARENA_COUNT_V1 {
         protobuf_fatal_invariant("protobuf arena directory count changed");
@@ -4388,6 +4495,8 @@ fn push_materialization_record_v1<'definitions>(
         }
         MaterializationRecordV1::Resolution(value) => graph.resolutions.push(value),
         MaterializationRecordV1::NamedMessage(value) => graph.named_messages.push(value),
+        MaterializationRecordV1::OutputNode(value) => graph.output_nodes.push(value),
+        MaterializationRecordV1::OutputRoot(value) => graph.output_roots.push(value),
     }
 }
 
@@ -4492,6 +4601,8 @@ fn checked_retained_bytes_v1(
         })?
     );
     charge!(u32, census.schemas);
+    charge!(RemoteProtobufOutputNodeV1, census.fields);
+    charge!(RemoteProtobufOutputRootV1, census.schemas);
     charge!((u16, FrozenRemoteExecutableConfigV1), census.schemas);
     checked_add(
         retained,
@@ -4726,6 +4837,8 @@ pub(crate) fn prepare_remote_protobuf_census_v1<'definitions, 'input, 'source, '
     verify_artifact_stage_identity(rerun_remote_protobuf_graph_stage_v1(), 0x2702);
     validate_descriptor_projection_v1(&mut projection, &limits, &mut resolution_steps)?;
     census.resolution_steps = resolution_steps.consumed;
+    census.output_nodes = census.fields;
+    census.output_roots = census.schemas;
 
     let mut dry_run_steps = RemoteProtobufStepOwnerV1::new(
         limits.max_materialization_steps,
@@ -4775,6 +4888,93 @@ pub(crate) struct BoundedRemoteDecoderInitializersV1<'definitions, 'input, 'sour
 impl<'definitions, 'input, 'source, 'wire>
     BoundedRemoteDecoderInitializersV1<'definitions, 'input, 'source, 'wire>
 {
+    pub(crate) fn bind_assignment_factory_v1<'a>(
+        &'a self,
+        assignment: &'a crate::remote_decoder_assignment::RemoteChannelDecoderAssignmentV1,
+    ) -> Result<
+        RemoteExecutableFactoryV1<'a, 'definitions, 'input, 'source, 'wire>,
+        RemoteExecutableAdapterErrorV1,
+    > {
+        self.ensure_current_for_assignment_v1()
+            .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?;
+        let view = self
+            .continuation
+            .executable_channel_view_v1(assignment.canonical_channel_record_index_v1())
+            .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?;
+        let channel_id = view
+            .channel_id_v1()
+            .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?;
+        if channel_id != assignment.channel_id() {
+            return Err(RemoteExecutableAdapterErrorV1::ConfigMismatch);
+        }
+        let owner = assignment.owner();
+        if owner == crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Raw {
+            return Err(RemoteExecutableAdapterErrorV1::UnsupportedSemantic);
+        }
+        let config = match owner {
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Protobuf => {
+                let schema_id = view
+                    .schema_id_v1()
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?;
+                let config = self
+                    .executable_configs
+                    .as_slice()
+                    .iter()
+                    .find(|(id, _)| *id == schema_id)
+                    .map(|(_, config)| *config)
+                    .ok_or(RemoteExecutableAdapterErrorV1::ConfigMismatch)?;
+                if !self.protobuf.has_schema_id(schema_id) {
+                    return Err(RemoteExecutableAdapterErrorV1::ConfigMismatch);
+                }
+                config
+            }
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Ros2Reflection => {
+                let mut hasher = Sha256::new();
+                let versions = view
+                    .policy_versions_v1()
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?;
+                hasher.update(b"rerun.remote-mcap.executable-config.v1\0");
+                hasher.update(versions.0.to_le_bytes());
+                hasher.update(versions.1.to_le_bytes());
+                hasher.update(versions.2.to_le_bytes());
+                hasher.update([1]);
+                hasher.update(
+                    view.ros2_config_digest_v1()
+                        .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?,
+                );
+                let full = hasher.finalize();
+                let mut digest = [0; 16];
+                digest.copy_from_slice(&full[..16]);
+                FrozenRemoteExecutableConfigV1 {
+                    kind: 1,
+                    schema_handle: view
+                        .schema_id_v1()
+                        .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?,
+                    canonical_digest: digest,
+                    max_roots_per_partition: 1,
+                    max_external_origin_bytes_per_partition: 128,
+                }
+            }
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Raw => unreachable!(),
+        };
+        if config != assignment.executable_config() {
+            return Err(RemoteExecutableAdapterErrorV1::ConfigMismatch);
+        }
+        let binding = view
+            .physical_source_binding_v1()
+            .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?
+            .clone();
+        assignment.ensure_source_matches_v1(&binding);
+        Ok(RemoteExecutableFactoryV1 {
+            owner,
+            config,
+            channel_id,
+            binding,
+            view,
+            protobuf: &self.protobuf,
+        })
+    }
+
     pub(crate) fn protobuf_schema_count(&self) -> usize {
         self.protobuf.schemas.as_slice().len()
     }
@@ -4893,6 +5093,118 @@ pub(crate) struct BoundedRemoteChannelRecognitionV1<
     executable_configs: &'item [(u16, FrozenRemoteExecutableConfigV1)],
 }
 
+/// Repeatable assignment-bound factory. Each call can mint one independently reserved one-shot
+/// adapter, while the factory itself remains tied to the retained initializer and assignment.
+pub(crate) struct RemoteExecutableFactoryV1<'a, 'definitions, 'input, 'source, 'wire> {
+    owner: crate::remote_decoder_assignment::RemoteDecoderOwnerV1,
+    config: FrozenRemoteExecutableConfigV1,
+    channel_id: u16,
+    binding: PhysicalChunkSourceBindingV1,
+    view: crate::remote_ros2_reflection::RemoteRos2ExecutableChannelViewV1<
+        'a,
+        'definitions,
+        'input,
+        'source,
+        'wire,
+    >,
+    protobuf: &'a BoundedProtobufDescriptorGraphV1<'definitions>,
+}
+
+impl RemoteExecutableFactoryV1<'_, '_, '_, '_, '_> {
+    pub(crate) fn channel_id_v1(&self) -> u16 {
+        self.channel_id
+    }
+
+    pub(crate) fn channel_topic_v1(&self) -> Result<&str, RemoteExecutableAdapterErrorV1> {
+        self.view
+            .channel_topic_v1()
+            .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)
+    }
+
+    pub(crate) fn typed_archetype_name_v1(&self) -> Result<String, RemoteExecutableAdapterErrorV1> {
+        self.view
+            .typed_archetype_name_v1()
+            .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)
+    }
+
+    pub(crate) fn time_type_v1(
+        &self,
+    ) -> Result<crate::remote_time::RemoteMcapTimeType, RemoteExecutableAdapterErrorV1> {
+        self.view
+            .time_type_v1()
+            .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)
+    }
+
+    pub(crate) fn config_digest_v1(&self) -> [u8; 16] {
+        self.config.canonical_digest_v1()
+    }
+
+    pub(crate) fn typed_output_descriptor_v1(
+        &self,
+    ) -> Result<
+        crate::remote_typed_output::RemoteTypedOutputDescriptorV1,
+        RemoteExecutableAdapterErrorV1,
+    > {
+        use crate::remote_decoder_assignment::RemoteDecoderOwnerV1;
+        use crate::remote_typed_output::RemoteTypedOutputKindV1;
+
+        self.view
+            .channel_id_v1()
+            .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?;
+        let kind = match self.owner {
+            RemoteDecoderOwnerV1::Ros2Reflection => RemoteTypedOutputKindV1::Ros2Reflection,
+            RemoteDecoderOwnerV1::Protobuf => RemoteTypedOutputKindV1::Protobuf,
+            RemoteDecoderOwnerV1::Raw => {
+                return Err(RemoteExecutableAdapterErrorV1::UnsupportedSemantic);
+            }
+        };
+        let fields = match self.owner {
+            RemoteDecoderOwnerV1::Ros2Reflection => self
+                .view
+                .typed_field_contract_v1()
+                .map_err(|_| RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature)?,
+            RemoteDecoderOwnerV1::Protobuf => {
+                return Err(RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature);
+            }
+            RemoteDecoderOwnerV1::Raw => unreachable!(),
+        };
+        if fields.len() != 1 {
+            return Err(RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature);
+        }
+        Ok(crate::remote_typed_output::issue_from_live_factory_v1(
+            self.channel_id,
+            kind,
+            self.config.canonical_digest_v1(),
+            self.config.schema_handle,
+            self.binding.clone(),
+            fields,
+            self.view
+                .channel_topic_v1()
+                .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?
+                .to_owned(),
+            re_sdk_types::ComponentDescriptor::partial("message").with_builtin_archetype(
+                re_sdk_types::ArchetypeName::try_new(self.typed_archetype_name_v1()?)
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature)?,
+            ),
+            self.view
+                .time_type_v1()
+                .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?,
+        ))
+    }
+
+    pub(crate) fn prepare_adapter_v1<'a>(
+        &'a self,
+        num_rows: u64,
+        payload_bytes: u64,
+        budget: &RemoteExecutableAdapterBudgetV1,
+    ) -> Result<RemoteExecutableDecoderAdapterV1<'a>, RemoteExecutableAdapterErrorV1> {
+        self.view
+            .channel_id_v1()
+            .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?;
+        prepare_adapter_from_authority_v1(self, num_rows, payload_bytes, budget)
+    }
+}
+
 /// Errors raised by the sealed, bounded executable adapter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RemoteExecutableAdapterErrorV1 {
@@ -4968,7 +5280,36 @@ pub(crate) struct RemoteNormalizedEnvelopeV1 {
 pub(crate) struct RemoteNormalizedBatchV1 {
     envelopes: Vec<RemoteNormalizedEnvelopeV1>,
     rows: u64,
+    input_payload_bytes: u64,
     _reservation: Option<RemoteExecutableAdapterReservationV1>,
+}
+
+pub(crate) struct RemoteTypedDecodedBatchV1 {
+    normalized: RemoteNormalizedBatchV1,
+    binding: PhysicalChunkSourceBindingV1,
+    config_digest: [u8; 16],
+    channel_id: u16,
+}
+
+impl RemoteTypedDecodedBatchV1 {
+    pub(crate) fn rows_v1(&self) -> u64 {
+        self.normalized.rows_v1()
+    }
+    pub(crate) fn input_payload_bytes_v1(&self) -> u64 {
+        self.normalized.input_payload_bytes_v1()
+    }
+    pub(crate) fn envelopes_v1(&self) -> &[RemoteNormalizedEnvelopeV1] {
+        self.normalized.envelopes_v1()
+    }
+    pub(crate) fn binding_v1(&self) -> &PhysicalChunkSourceBindingV1 {
+        &self.binding
+    }
+    pub(crate) const fn config_digest_v1(&self) -> [u8; 16] {
+        self.config_digest
+    }
+    pub(crate) const fn channel_id_v1(&self) -> u16 {
+        self.channel_id
+    }
 }
 
 impl RemoteNormalizedBatchV1 {
@@ -4977,6 +5318,10 @@ impl RemoteNormalizedBatchV1 {
     }
     pub(crate) fn envelopes_v1(&self) -> &[RemoteNormalizedEnvelopeV1] {
         &self.envelopes
+    }
+
+    pub(crate) fn input_payload_bytes_v1(&self) -> u64 {
+        self.input_payload_bytes
     }
 }
 
@@ -5157,6 +5502,14 @@ pub(crate) struct RemoteExecutableDecoderAdapterV1<'a> {
 }
 
 impl BoundedRemoteChannelRecognitionV1<'_, '_, '_, '_, '_, '_> {
+    pub(crate) fn canonical_channel_record_index_v1(
+        &self,
+    ) -> Result<u32, RemoteProtobufInitializationErrorV1> {
+        self.ros2
+            .canonical_channel_record_index_v1()
+            .map_err(map_ros_recognition_error)
+    }
+
     pub(crate) fn channel_id(&self) -> Result<u16, RemoteProtobufInitializationErrorV1> {
         self.ros2.channel_id().map_err(map_ros_recognition_error)
     }
@@ -5421,6 +5774,119 @@ impl RemoteExecutableRecognitionAuthorityV1
     }
 }
 
+impl RemoteExecutableRecognitionAuthorityV1 for RemoteExecutableFactoryV1<'_, '_, '_, '_, '_> {
+    fn ensure_current_for_adapter_v1(&self) -> Result<(), RemoteExecutableAdapterErrorV1> {
+        self.view
+            .channel_id_v1()
+            .map(|_| ())
+            .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)
+    }
+
+    fn config_for_adapter_v1(
+        &self,
+        owner: crate::remote_decoder_assignment::RemoteDecoderOwnerV1,
+    ) -> Result<FrozenRemoteExecutableConfigV1, RemoteExecutableAdapterErrorV1> {
+        (owner == self.owner)
+            .then_some(self.config)
+            .ok_or(RemoteExecutableAdapterErrorV1::ConfigMismatch)
+    }
+
+    fn channel_id_for_adapter_v1(&self) -> Result<u16, RemoteExecutableAdapterErrorV1> {
+        let current = self
+            .view
+            .channel_id_v1()
+            .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?;
+        (current == self.channel_id)
+            .then_some(current)
+            .ok_or(RemoteExecutableAdapterErrorV1::ConfigMismatch)
+    }
+
+    fn physical_binding_for_adapter_v1(
+        &self,
+    ) -> Result<&PhysicalChunkSourceBindingV1, RemoteExecutableAdapterErrorV1> {
+        let current = self
+            .view
+            .physical_source_binding_v1()
+            .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?;
+        current.ensure_matches_v1(&self.binding);
+        Ok(&self.binding)
+    }
+
+    fn decode_payload_for_adapter_v1(
+        &self,
+        owner: crate::remote_decoder_assignment::RemoteDecoderOwnerV1,
+        payload: &[u8],
+        max_steps: u64,
+        max_output_bytes: u64,
+        max_field_values: usize,
+    ) -> Result<(Vec<RemoteNormalizedFieldV1>, Vec<u8>, u64), RemoteExecutableAdapterErrorV1> {
+        match owner {
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Ros2Reflection => self
+                .view
+                .decode_ros2_payload_v1(payload, max_steps, max_output_bytes, max_field_values),
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Protobuf => {
+                self.protobuf.decode_schema_payload_v1(
+                    self.view
+                        .schema_id_v1()
+                        .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?,
+                    payload,
+                    max_steps,
+                    max_output_bytes,
+                    max_field_values,
+                )
+            }
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Raw => {
+                Err(RemoteExecutableAdapterErrorV1::UnsupportedSemantic)
+            }
+        }
+    }
+}
+
+fn prepare_adapter_from_authority_v1<'a>(
+    authority: &'a dyn RemoteExecutableRecognitionAuthorityV1,
+    num_rows: u64,
+    payload_bytes: u64,
+    budget: &RemoteExecutableAdapterBudgetV1,
+) -> Result<RemoteExecutableDecoderAdapterV1<'a>, RemoteExecutableAdapterErrorV1> {
+    authority.ensure_current_for_adapter_v1()?;
+    let limits = budget.limits;
+    if num_rows > limits.max_rows || payload_bytes > limits.max_payload_bytes {
+        return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+    }
+    let retained_bytes = payload_bytes
+        .checked_add(limits.max_scratch_bytes)
+        .and_then(|value| value.checked_add(limits.max_builder_bytes.checked_mul(num_rows)?))
+        .and_then(|value| value.checked_add(limits.max_output_bytes.checked_mul(num_rows)?))
+        .ok_or(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+    if retained_bytes > limits.max_global_bytes {
+        return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+    }
+    let reservation = budget.reserve_v1(retained_bytes)?;
+    let owner = [
+        crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Ros2Reflection,
+        crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Protobuf,
+    ]
+    .into_iter()
+    .find(|owner| authority.config_for_adapter_v1(*owner).is_ok())
+    .ok_or(RemoteExecutableAdapterErrorV1::ConfigMismatch)?;
+    let config = authority.config_for_adapter_v1(owner)?;
+    Ok(RemoteExecutableDecoderAdapterV1 {
+        recognition: authority,
+        owner,
+        config,
+        rows: num_rows,
+        payload_bytes,
+        max_steps: limits.max_steps,
+        max_output_bytes: limits.max_output_bytes,
+        max_builder_bytes: limits.max_builder_bytes,
+        channel_id: authority.channel_id_for_adapter_v1()?,
+        physical_binding: authority.physical_binding_for_adapter_v1()?.clone(),
+        consumed: false,
+        reservation: Some(reservation),
+        poisoned: false,
+    })
+}
+
 fn normalized_span_v1(
     value: RemoteNormalizedValueV1,
 ) -> Result<Option<(usize, usize, bool)>, RemoteExecutableAdapterErrorV1> {
@@ -5450,12 +5916,34 @@ fn normalized_span_v1(
 
 impl RemoteExecutableDecoderAdapterV1<'_> {
     fn max_field_values_v1(&self) -> Result<usize, RemoteExecutableAdapterErrorV1> {
-        usize::try_from(
-            self.max_builder_bytes
-                / u64::try_from(std::mem::size_of::<RemoteNormalizedFieldV1>())
-                    .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?,
-        )
-        .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)
+        let element_bytes = u64::try_from(std::mem::size_of::<RemoteNormalizedFieldV1>())
+            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        let upper = usize::try_from(self.max_builder_bytes / element_bytes)
+            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        let mut low = 0_usize;
+        let mut high = upper;
+        while low < high {
+            let distance = high
+                .checked_sub(low)
+                .ok_or(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+            let middle = low
+                .checked_add(distance / 2)
+                .and_then(|value| value.checked_add(distance % 2))
+                .ok_or(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+            let layout = Layout::array::<RemoteNormalizedFieldV1>(middle)
+                .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+            if locked_wasm_allocation_footprint_v1(layout)
+                .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?
+                <= self.max_builder_bytes
+            {
+                low = middle;
+            } else {
+                high = middle
+                    .checked_sub(1)
+                    .ok_or(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+            }
+        }
+        Ok(low)
     }
 
     fn validate_normalized_v1(
@@ -5569,7 +6057,7 @@ impl RemoteExecutableDecoderAdapterV1<'_> {
     pub(crate) fn execute_batch_v1(
         mut self,
         evidence: &crate::remote_chunk_scan::PhysicalChunkMessageEvidenceV1<'_>,
-    ) -> Result<RemoteNormalizedBatchV1, RemoteExecutableAdapterErrorV1> {
+    ) -> Result<RemoteTypedDecodedBatchV1, RemoteExecutableAdapterErrorV1> {
         self.recognition.ensure_current_for_adapter_v1()?;
         if self.recognition.config_for_adapter_v1(self.owner)? != self.config {
             return Err(RemoteExecutableAdapterErrorV1::ConfigMismatch);
@@ -5653,10 +6141,16 @@ impl RemoteExecutableDecoderAdapterV1<'_> {
             return Err(RemoteExecutableAdapterErrorV1::ConfigMismatch);
         }
         self.consumed = true;
-        Ok(RemoteNormalizedBatchV1 {
-            envelopes,
-            rows: self.rows,
-            _reservation: self.reservation.take(),
+        Ok(RemoteTypedDecodedBatchV1 {
+            binding: self.physical_binding.clone(),
+            config_digest: self.config.canonical_digest_v1(),
+            channel_id: self.channel_id,
+            normalized: RemoteNormalizedBatchV1 {
+                envelopes,
+                rows: self.rows,
+                input_payload_bytes: payload_bytes,
+                _reservation: self.reservation.take(),
+            },
         })
     }
 
@@ -5903,10 +6397,35 @@ mod executable_adapter_tests {
                 usage.active = true;
                 usage.retained_bytes = 56;
             }
+            let max_fields = adapter.max_field_values_v1().unwrap();
+            let exact = locked_wasm_allocation_footprint_v1(
+                Layout::array::<RemoteNormalizedFieldV1>(max_fields).unwrap(),
+            )
+            .unwrap();
+            assert!(exact <= adapter.max_builder_bytes);
+            let raw_upper = usize::try_from(
+                adapter.max_builder_bytes
+                    / u64::try_from(std::mem::size_of::<RemoteNormalizedFieldV1>()).unwrap(),
+            )
+            .unwrap();
+            if max_fields < raw_upper {
+                let one_more = locked_wasm_allocation_footprint_v1(
+                    Layout::array::<RemoteNormalizedFieldV1>(max_fields + 1).unwrap(),
+                )
+                .unwrap();
+                assert!(one_more > adapter.max_builder_bytes);
+            }
             // Unit tests use the envelope constructor supplied by the physical validation stage.
             let binding = authority.binding.clone();
-            let envelope =
-                RemoteMessageEnvelopeV1::new_for_adapter_test_v1(binding, 1, 0, &[8, 1, 16, 2], 0);
+            let envelope = RemoteMessageEnvelopeV1::new_for_adapter_test_v1(
+                binding,
+                1,
+                0,
+                10,
+                11,
+                &[8, 1, 16, 2],
+                0,
+            );
             let output = adapter.execute_envelope_v1(envelope).unwrap();
             assert_eq!(output.rows_v1(), 1);
             assert_eq!(output.fields_v1().len(), 2);
@@ -5916,6 +6435,8 @@ mod executable_adapter_tests {
                     authority.binding.clone(),
                     1,
                     0,
+                    10,
+                    11,
                     &[8, 1, 16, 2],
                     0
                 )),
@@ -5957,7 +6478,15 @@ mod executable_adapter_tests {
             poisoned: false,
         };
         assert_eq!(
-            adapter.execute_envelope_v1(RemoteMessageEnvelopeV1::new_for_adapter_test_v1(crate::remote_chunk_scan::PhysicalChunkSourceBindingV1::new_unscanned_for_assignment_test_v1(), 1, 0, &[1, 2, 3], 0)),
+            adapter.execute_envelope_v1(RemoteMessageEnvelopeV1::new_for_adapter_test_v1(
+                crate::remote_chunk_scan::PhysicalChunkSourceBindingV1::new_unscanned_for_assignment_test_v1(),
+                1,
+                0,
+                10,
+                11,
+                &[1, 2, 3],
+                0,
+            )),
             Err(RemoteExecutableAdapterErrorV1::StaleSource)
         );
     }
@@ -5994,6 +6523,8 @@ mod executable_adapter_tests {
             authority.binding.clone(),
             1,
             0,
+            10,
+            11,
             &[10, 4, 1, 2],
             0,
         );
@@ -6005,6 +6536,8 @@ mod executable_adapter_tests {
             authority.binding.clone(),
             1,
             0,
+            10,
+            11,
             &[8, 1, 16, 2],
             0,
         );

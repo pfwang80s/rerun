@@ -87,6 +87,19 @@ impl ManifestPartitionDescriptorV1 {
     pub(crate) const fn registration_bound_v1(self) -> u32 {
         self.registration_bound
     }
+
+    pub(crate) fn identity_bytes_v1(self) -> [u8; 24] {
+        let mut bytes = [0_u8; 24];
+        bytes[..8].copy_from_slice(&self.key.source_unit.source_generation.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.key.source_unit.ordinal.to_le_bytes());
+        bytes[12..20].copy_from_slice(&self.root_namespace.to_le_bytes().repeat(4));
+        let kind = match self.key.kind {
+            DerivationPartitionKindV1::TemporalChannelGroup(group) => group.as_u32(),
+            DerivationPartitionKindV1::OpeningStatic => u32::MAX,
+        };
+        bytes[20..24].copy_from_slice(&kind.to_le_bytes());
+        bytes
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +160,80 @@ pub(crate) struct ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
     issuers: Box<[ManifestRootDescriptorIssuerV1]>,
 }
 
+/// Opaque authority for one temporal source-unit/group partition.
+///
+/// This ties the selected group and its executable factories to the matching partition and root
+/// issuer; callers cannot construct or rebind those pieces independently.
+pub(crate) struct ManifestTemporalPartitionAuthorityV1<'manifest, 'a, 'd, 'i, 's, 'w> {
+    manifest: &'manifest ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w>,
+    source_unit_ordinal: u32,
+    group_id: StableDecoderGroupIdV1,
+    partition: ManifestPartitionDescriptorV1,
+    issuer: &'manifest ManifestRootDescriptorIssuerV1,
+}
+
+impl<'a, 'd, 'i, 's, 'w> ManifestTemporalPartitionAuthorityV1<'_, 'a, 'd, 'i, 's, 'w> {
+    pub(crate) const fn source_unit_ordinal_v1(&self) -> u32 {
+        self.source_unit_ordinal
+    }
+
+    pub(crate) const fn group_id_v1(&self) -> StableDecoderGroupIdV1 {
+        self.group_id
+    }
+
+    pub(crate) fn session_identity_v1(&self) -> u128 {
+        self.manifest.session_identity_v1()
+    }
+
+    pub(crate) const fn partition_v1(&self) -> ManifestPartitionDescriptorV1 {
+        self.partition
+    }
+
+    pub(crate) fn issue_root_v1(
+        &self,
+        output_ordinal: u32,
+    ) -> Result<ManifestRootDescriptorV1, RemoteManifestErrorV1> {
+        self.issuer.descriptor_v1(output_ordinal)
+    }
+
+    pub(crate) fn groups_v1(&self) -> &ImmutableRemoteChannelGroupsV1<'d, 'i, 's, 'w> {
+        &self.manifest.groups
+    }
+
+    pub(crate) fn channels_v1(&self) -> &[u16] {
+        self.manifest
+            .groups
+            .channels_for_group_v1(self.group_id)
+            .expect("manifest authority retains its resolved group")
+    }
+
+    pub(crate) fn bind_executable_factory_v1(
+        &self,
+        channel_id: u16,
+    ) -> Result<
+        crate::remote_protobuf_descriptor::RemoteExecutableFactoryV1<'_, '_, '_, '_, '_>,
+        crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1,
+    > {
+        if !self.channels_v1().contains(&channel_id) {
+            return Err(
+                crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1::ConfigMismatch,
+            );
+        }
+        self.manifest.groups.bind_executable_factory_v1(channel_id)
+    }
+
+    pub(crate) fn ensure_current_v1(&self) -> Result<(), RemoteManifestErrorV1> {
+        self.manifest
+            .groups
+            .ensure_current_for_validation_v1()
+            .map_err(|_| RemoteManifestErrorV1::StaleSource)
+    }
+
+    pub(crate) fn matches_group_v1(&self, group_id: StableDecoderGroupIdV1) -> bool {
+        self.group_id == group_id
+    }
+}
+
 impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
     pub(crate) fn build_v1(
         source: ResolvedRemotePhysicalSourceRefV1<'a, 'i>,
@@ -182,7 +269,10 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
         // headroom, the transferred group owner and vector backing storage.
         let empty_entries = u64::try_from(units)
             .map_err(|_| RemoteManifestErrorV1::ArithmeticOverflow)?
-            .checked_mul(u64::try_from(group_count).map_err(|_| RemoteManifestErrorV1::ArithmeticOverflow)?)
+            .checked_mul(
+                u64::try_from(group_count)
+                    .map_err(|_| RemoteManifestErrorV1::ArithmeticOverflow)?,
+            )
             .ok_or(RemoteManifestErrorV1::ArithmeticOverflow)?;
         let mut external_origin_bytes = 0_u64;
         for group in groups.groups_v1() {
@@ -192,7 +282,10 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
             external_origin_bytes = external_origin_bytes
                 .checked_add(
                     per_partition
-                        .checked_mul(u64::try_from(units).map_err(|_| RemoteManifestErrorV1::ArithmeticOverflow)?)
+                        .checked_mul(
+                            u64::try_from(units)
+                                .map_err(|_| RemoteManifestErrorV1::ArithmeticOverflow)?,
+                        )
                         .ok_or(RemoteManifestErrorV1::ArithmeticOverflow)?,
                 )
                 .ok_or(RemoteManifestErrorV1::ArithmeticOverflow)?;
@@ -202,11 +295,15 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
             .ok_or(RemoteManifestErrorV1::ArithmeticOverflow)?;
         let descriptor_bytes = u64::try_from(std::mem::size_of::<ManifestPartitionDescriptorV1>())
             .map_err(|_| RemoteManifestErrorV1::ArithmeticOverflow)?
-            .checked_mul(u64::try_from(count).map_err(|_| RemoteManifestErrorV1::ArithmeticOverflow)?)
+            .checked_mul(
+                u64::try_from(count).map_err(|_| RemoteManifestErrorV1::ArithmeticOverflow)?,
+            )
             .ok_or(RemoteManifestErrorV1::ArithmeticOverflow)?;
         let issuer_bytes = u64::try_from(std::mem::size_of::<ManifestRootDescriptorIssuerV1>())
             .map_err(|_| RemoteManifestErrorV1::ArithmeticOverflow)?
-            .checked_mul(u64::try_from(count).map_err(|_| RemoteManifestErrorV1::ArithmeticOverflow)?)
+            .checked_mul(
+                u64::try_from(count).map_err(|_| RemoteManifestErrorV1::ArithmeticOverflow)?,
+            )
             .ok_or(RemoteManifestErrorV1::ArithmeticOverflow)?;
         let retained_bytes = groups
             .retained_bytes_for_validation_v1()
@@ -287,8 +384,48 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
     pub(crate) fn session_id_v1(&self) -> RemoteMcapSessionIdV1 {
         self.session_id
     }
+
+    pub(crate) fn session_identity_v1(&self) -> u128 {
+        self.session_id.0.as_u128()
+    }
     pub(crate) fn source_generation_v1(&self) -> u64 {
         self.source.source_generation_v1()
+    }
+
+    pub(crate) fn temporal_partition_v1(
+        &self,
+        source_unit_ordinal: u32,
+        group_id: StableDecoderGroupIdV1,
+    ) -> Result<ManifestTemporalPartitionAuthorityV1<'_, 'a, 'd, 'i, 's, 'w>, RemoteManifestErrorV1>
+    {
+        let key = DerivationPartitionKeyV1 {
+            source_unit: SourceUnitIdV1 {
+                session: self.session_id,
+                source_generation: self.source.source_generation_v1(),
+                ordinal: source_unit_ordinal,
+            },
+            kind: DerivationPartitionKindV1::TemporalChannelGroup(group_id),
+        };
+        let partition = self
+            .partitions
+            .iter()
+            .find(|descriptor| descriptor.key == key)
+            .ok_or(RemoteManifestErrorV1::InvalidPartition)?;
+        let issuer = self
+            .issuers
+            .iter()
+            .find(|issuer| issuer.key == key)
+            .ok_or(RemoteManifestErrorV1::InvalidPartition)?;
+        if self.groups.resolve_group(group_id).is_none() {
+            return Err(RemoteManifestErrorV1::InvalidPartition);
+        }
+        Ok(ManifestTemporalPartitionAuthorityV1 {
+            manifest: self,
+            source_unit_ordinal,
+            group_id,
+            partition: *partition,
+            issuer,
+        })
     }
 }
 
@@ -363,13 +500,19 @@ mod tests {
             namespace: 1,
         };
         assert_ne!(a, temporal.descriptor_v1(0).unwrap().root_chunk_id_v1());
-        assert!(matches!(issuer.descriptor_v1(2), Err(RemoteManifestErrorV1::InvalidPartition)));
+        assert!(matches!(
+            issuer.descriptor_v1(2),
+            Err(RemoteManifestErrorV1::InvalidPartition)
+        ));
     }
 
     #[test]
     fn checked_partition_count_covers_empty_and_overflow() {
         assert_eq!(partition_count_v1(0, 0).unwrap(), 1);
         assert_eq!(partition_count_v1(2, 3).unwrap(), 7);
-        assert_eq!(partition_count_v1(usize::MAX, 2), Err(RemoteManifestErrorV1::ArithmeticOverflow));
+        assert_eq!(
+            partition_count_v1(usize::MAX, 2),
+            Err(RemoteManifestErrorV1::ArithmeticOverflow)
+        );
     }
 }

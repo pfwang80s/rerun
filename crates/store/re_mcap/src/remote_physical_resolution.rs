@@ -7,8 +7,8 @@
 
 use std::alloc::Layout;
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use re_log_types::TimeInt;
@@ -26,7 +26,7 @@ use crate::remote_summary::{
     AmbiguousChunkClassification, PreparedAmbiguousZeroAggregateReservations,
     PreparedAmbiguousZeroResolutionSeed,
 };
-use crate::remote_time::{canonicalize_raw_mcap_time, RawMcapTime};
+use crate::remote_time::{RawMcapTime, canonicalize_raw_mcap_time};
 
 static NEXT_REMOTE_OBJECT_GENERATION_V1: AtomicU64 = AtomicU64::new(1);
 
@@ -816,6 +816,16 @@ pub(crate) enum ResolvedDefinitionDescriptorV1<'a> {
 }
 
 impl ResolvedRemotePhysicalSourceUnitMetadataRefV1<'_> {
+    #[cfg(test)]
+    pub(crate) fn definitions_capability_for_full_chain_test_v1(
+        &self,
+    ) -> PhysicalChunkDefinitionsCapabilityV1<'_, '_> {
+        self.definitions
+            .source_binding_v1()
+            .ensure_matches_v1(self.binding);
+        self.definitions.clone()
+    }
+
     pub(crate) fn canonical_ordinal_v1(&self) -> usize {
         self.canonical_ordinal
     }
@@ -1880,12 +1890,12 @@ mod tests {
 
     use super::*;
     use crate::remote_chunk_scan::{
-        install_exact_physical_chunk_record_for_test, install_header_validated_payload_for_test,
-        scan_decompressed_physical_chunk, PhysicalChunkScanLimits,
+        PhysicalChunkScanLimits, install_exact_physical_chunk_record_for_test,
+        install_header_validated_payload_for_test, scan_decompressed_physical_chunk,
     };
     use crate::testing::{
-        AdversarialMcapFixture, AdversarialMcapFixtureBuilder, FixtureChunk, FixtureCrc,
-        FixtureMessage, RawTimeRange,
+        AdversarialMcapFixture, AdversarialMcapFixtureBuilder, FixtureChannel, FixtureChunk,
+        FixtureCrc, FixtureMessage, FixtureSchema, PartitionFixture, RawTimeRange,
     };
 
     assert_not_impl_any!(RemotePhysicalObjectBindingV1: Clone, Copy);
@@ -1925,7 +1935,7 @@ mod tests {
         fixture: &AdversarialMcapFixture,
         budget: AggregateResolutionBudgetRootV1,
     ) -> PreparedBoundRemotePhysicalSourceV1<&'static str, PreparedAmbiguousZeroBodyPlan<'_>> {
-        use crate::remote_fixed_layout::{prepare_fixed_layout, RemoteMcapSlice};
+        use crate::remote_fixed_layout::{RemoteMcapSlice, prepare_fixed_layout};
         use crate::remote_summary::ambiguous_zero::{AmbiguousZeroBudget, AmbiguousZeroLimits};
         use crate::remote_summary::materialization::{
             NestedPreflightCensus, SummaryMaterializationBudget, SummaryMaterializationLimits,
@@ -2112,6 +2122,222 @@ mod tests {
             scan_decompressed_physical_chunk(output).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn finalized_owner_typed_ros_scalar_matches_local_decoder_chunk() {
+        use crate::decoders::{
+            DecoderRegistry, McapRos2ReflectionDecoder, TestEmitter, TopicFilter,
+        };
+        use arrow::array::{Array as _, Int32Array, StructArray};
+
+        let payload = [0, 1, 0, 0, 42, 0, 0, 0];
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_schemas([FixtureSchema::new(7, "pkg/Root", "ros2msg").with_data(b"int32 value")])
+            .with_channels([FixtureChannel::schema_less(1, "/root").with_schema(7, "cdr")])
+            .with_chunks([FixtureChunk::single(
+                FixtureMessage::new(1, 0, 1)
+                    .with_publish_time(3)
+                    .with_data(payload),
+            )])
+            .with_partition_fixture(PartitionFixture::default())
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+
+        let exact = retained_layout_bytes(1).unwrap();
+        let resolved = bound_pair(&fixture, layout_budget(1, exact))
+            .prepare()
+            .unwrap()
+            .finalize_v1()
+            .unwrap();
+        let manifest_source = resolved.source_v1();
+        let metadata_source = resolved.source_v1();
+        let unit = metadata_source.source_unit_v1(0).unwrap();
+        let metadata = unit.metadata_v1().unwrap();
+        let physical = metadata.definitions_capability_for_full_chain_test_v1();
+        let record = fixture.layout.chunks[0].record;
+        let validated = install_exact_physical_chunk_record_for_test(
+            unit.issue_lease_v1().unwrap(),
+            fixture.bytes[record.start..record.end]
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .unwrap();
+        let compressed = install_header_validated_payload_for_test(validated).unwrap();
+        let decompressed = crate::remote_decompression::decompress_exact_chunk(compressed).unwrap();
+        let scan = scan_decompressed_physical_chunk(decompressed).unwrap();
+        let cache = crate::remote_chunk_scan::PhysicalChunkScanCacheEntry::new(scan).unwrap();
+        let evidence = cache.consumer().into_message_evidence_v1().unwrap();
+        let remote =
+            crate::remote_decoder_assignment::execute_ros_scalar_from_finalized_source_for_test_v1(
+                manifest_source,
+                &physical,
+                evidence,
+                1,
+            );
+
+        let summary = fixture.read_upstream_summary().unwrap().unwrap();
+        let plan = DecoderRegistry::empty()
+            .register_message_decoder::<McapRos2ReflectionDecoder>()
+            .plan(&fixture.bytes, &summary, &TopicFilter::default())
+            .unwrap();
+        let emitter = TestEmitter::default();
+        plan.run(
+            &fixture.bytes,
+            &summary,
+            re_log_types::TimeType::TimestampNs,
+            &*emitter,
+        )
+        .unwrap();
+        let local = emitter.finish();
+        let [local] = local.as_slice() else {
+            panic!("the local reflection oracle must emit exactly one chunk");
+        };
+
+        // Root and row identities deliberately belong to different authorities. Everything else
+        // must be byte-for-byte schema/value equivalent to the established local decoder.
+        assert_eq!(remote.entity_path(), local.entity_path());
+        assert_eq!(remote.timelines(), local.timelines());
+        assert_eq!(remote.num_rows(), local.num_rows());
+        let remote_components = remote.components().iter().collect::<Vec<_>>();
+        let [(remote_component, remote_column)] = remote_components.as_slice() else {
+            panic!("the remote scalar chunk must contain exactly one component");
+        };
+        let local_components = local.components().iter().collect::<Vec<_>>();
+        let [(local_component, local_column)] = local_components.as_slice() else {
+            panic!("the local scalar chunk must contain exactly one component");
+        };
+        assert_eq!(remote_component, local_component);
+        assert_eq!(remote_column.descriptor, local_column.descriptor);
+        assert_eq!(
+            remote_column.list_array.data_type(),
+            local_column.list_array.data_type(),
+            "the complete Arrow schema, including field names/nullability, must match",
+        );
+        assert_eq!(
+            remote_column.list_array.value_offsets(),
+            local_column.list_array.value_offsets()
+        );
+        assert_eq!(
+            remote_column.list_array.null_count(),
+            local_column.list_array.null_count()
+        );
+        let remote_struct = remote_column
+            .list_array
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let local_struct = local_column
+            .list_array
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(remote_struct.data_type(), local_struct.data_type());
+        assert_eq!(remote_struct.null_count(), local_struct.null_count());
+        assert_eq!(
+            remote_struct
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            local_struct
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+        );
+        assert_ne!(remote.id(), local.id());
+        assert_ne!(
+            remote.row_ids().collect::<Vec<_>>(),
+            local.row_ids().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typed_output_locked_peak_covers_multi_row_bool_and_u64_builds() {
+        fn run_case(definition: &str, payloads: &[Vec<u8>]) {
+            let messages = payloads.iter().enumerate().map(|(index, payload)| {
+                let sequence = u32::try_from(index).unwrap();
+                let timestamp = u64::try_from(index).unwrap();
+                FixtureMessage::new(1, sequence, timestamp + 1)
+                    .with_publish_time(timestamp + 101)
+                    .with_data(payload.clone())
+            });
+            let fixture = AdversarialMcapFixtureBuilder::new()
+                .with_schemas([
+                    FixtureSchema::new(7, "pkg/Root", "ros2msg").with_data(definition.as_bytes())
+                ])
+                .with_channels([FixtureChannel::schema_less(1, "/root").with_schema(7, "cdr")])
+                .with_chunks([FixtureChunk::new(messages)])
+                .with_partition_fixture(PartitionFixture::default())
+                .with_summary_crc(FixtureCrc::Zero)
+                .build()
+                .unwrap();
+
+            let exact = retained_layout_bytes(1).unwrap();
+            let resolved = bound_pair(&fixture, layout_budget(1, exact))
+                .prepare()
+                .unwrap()
+                .finalize_v1()
+                .unwrap();
+            let manifest_source = resolved.source_v1();
+            let metadata_source = resolved.source_v1();
+            let unit = metadata_source.source_unit_v1(0).unwrap();
+            let metadata = unit.metadata_v1().unwrap();
+            let physical = metadata.definitions_capability_for_full_chain_test_v1();
+            let record = fixture.layout.chunks[0].record;
+            let validated = install_exact_physical_chunk_record_for_test(
+                unit.issue_lease_v1().unwrap(),
+                fixture.bytes[record.start..record.end]
+                    .to_vec()
+                    .into_boxed_slice(),
+            )
+            .unwrap();
+            let compressed = install_header_validated_payload_for_test(validated).unwrap();
+            let decompressed =
+                crate::remote_decompression::decompress_exact_chunk(compressed).unwrap();
+            let scan = scan_decompressed_physical_chunk(decompressed).unwrap();
+            let cache = crate::remote_chunk_scan::PhysicalChunkScanCacheEntry::new(scan).unwrap();
+            let evidence = cache.consumer().into_message_evidence_v1().unwrap();
+            let chunk = crate::remote_decoder_assignment::execute_ros_scalar_from_finalized_source_for_test_v1(
+                manifest_source,
+                &physical,
+                evidence,
+                1,
+            );
+            assert_eq!(chunk.num_rows(), payloads.len());
+        }
+
+        let int32_payloads = [1_i32, 2, 3]
+            .into_iter()
+            .map(|value| {
+                let mut payload = vec![0, 1, 0, 0];
+                payload.extend_from_slice(&value.to_le_bytes());
+                payload
+            })
+            .collect::<Vec<_>>();
+        run_case("int32 value", &int32_payloads);
+
+        let bool_payloads = [false, true, false]
+            .into_iter()
+            .map(|value| vec![0, 1, 0, 0, u8::from(value)])
+            .collect::<Vec<_>>();
+        run_case("bool value", &bool_payloads);
+
+        let u64_payloads = [1_u64, u64::from(u32::MAX) + 1, u64::MAX]
+            .into_iter()
+            .map(|value| {
+                let mut payload = vec![0, 1, 0, 0];
+                payload.extend_from_slice(&value.to_le_bytes());
+                payload
+            })
+            .collect::<Vec<_>>();
+        run_case("uint64 value", &u64_payloads);
     }
 
     #[test]
@@ -2508,10 +2734,12 @@ mod tests {
             crate::remote_decompression::decompress_exact_chunk(input).unwrap_err(),
             crate::remote_decompression::ChunkDecompressionError::ChunkChecksumMismatch
         );
-        assert!(prepared
-            .inner_mut_v1()
-            .issue_next_resolution_lease_v1()
-            .is_ok());
+        assert!(
+            prepared
+                .inner_mut_v1()
+                .issue_next_resolution_lease_v1()
+                .is_ok()
+        );
         drop(prepared);
         assert_eq!(
             root.usage_for_test_v1(),
@@ -2540,10 +2768,12 @@ mod tests {
                 .unwrap_err(),
             PhysicalChunkValidationError::FullRecordLengthMismatch
         );
-        assert!(prepared
-            .inner_mut_v1()
-            .issue_next_resolution_lease_v1()
-            .is_ok());
+        assert!(
+            prepared
+                .inner_mut_v1()
+                .issue_next_resolution_lease_v1()
+                .is_ok()
+        );
         drop(prepared);
         assert_eq!(
             root.usage_for_test_v1(),

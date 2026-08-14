@@ -6,6 +6,11 @@
 //! a fixed set of contiguous arenas containing only borrowed source spans.
 
 #![allow(dead_code)]
+#![allow(
+    clippy::elidable_lifetime_names,
+    clippy::unnested_or_patterns,
+    clippy::return_and_then
+)]
 #![expect(
     clippy::map_err_ignore,
     reason = "remote request errors intentionally erase parser/allocation internals"
@@ -1366,6 +1371,13 @@ pub(crate) enum UnsupportedForRemote {
     TopicFilterExpression,
 }
 
+fn remote_field_ordinal_v1(member_index: usize, specification_member_start: usize) -> Option<u32> {
+    member_index
+        .checked_sub(specification_member_start)?
+        .checked_add(1)
+        .and_then(|ordinal| u32::try_from(ordinal).ok())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RemoteRos2ResourceLimit {
     SemanticConfigChannels,
@@ -2147,6 +2159,8 @@ struct RemoteRos2Census {
     recognition_steps: u64,
     retained_bytes: u64,
     working_bytes: u64,
+    output_nodes: u64,
+    output_roots: u64,
 }
 
 /// Move-only token proving complete allocation-free grammar and dependency validation.
@@ -2246,6 +2260,23 @@ struct ComplexTypeResolutionV1 {
     target_specification_index: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RemoteRos2OutputNodeV1 {
+    specification_index: u32,
+    member_index: u32,
+    name: SourceTextSpan,
+    ty: ParsedTypeV1,
+    nullable: bool,
+    nested_target: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RemoteRos2OutputRootV1 {
+    schema_id: u16,
+    specification_index: u32,
+    has_ros2_timestamp: bool,
+}
+
 /// Sealed bounded representation consumed by later remote decoder stages.
 pub(crate) struct Ros2InitializedRemoteDefinitionsV1<'definitions, 'input, 'source, 'wire> {
     source: RemoteDefinitionsCapability<'definitions, 'input, 'source>,
@@ -2257,6 +2288,8 @@ pub(crate) struct Ros2InitializedRemoteDefinitionsV1<'definitions, 'input, 'sour
     members: FixedArena<ParsedMemberV1>,
     resolutions: FixedArena<ComplexTypeResolutionV1>,
     executable_config_digests: FixedArena<(u16, [u8; 16])>,
+    output_nodes: FixedArena<RemoteRos2OutputNodeV1>,
+    output_roots: FixedArena<RemoteRos2OutputRootV1>,
     projection_steps: u64,
     recognition_steps: u64,
     reservation: RemoteRos2ResultReservation,
@@ -2382,7 +2415,310 @@ pub(crate) struct RemoteRos2ChannelRecognitionV1<
     protobuf_schema_id: Option<u16>,
 }
 
+/// Repeatable executable borrow over one canonical Channel.
+///
+/// Only the retained initializer owner can create this view. It exposes no raw schema bytes and
+/// revalidates the same source/policy/profile generation on every operation.
+pub(crate) struct RemoteRos2ExecutableChannelViewV1<'borrow, 'definitions, 'input, 'source, 'wire> {
+    transition: &'borrow RemoteRos2ToProtobufTransitionV1<'definitions, 'input, 'source, 'wire>,
+    channel_record_index: usize,
+}
+
+impl<'borrow, 'definitions, 'input, 'source, 'wire>
+    RemoteRos2ExecutableChannelViewV1<'borrow, 'definitions, 'input, 'source, 'wire>
+{
+    pub(crate) fn typed_field_contract_v1(
+        &self,
+    ) -> Result<
+        Box<[crate::remote_typed_output::RemoteTypedFieldContractV1]>,
+        RemoteRos2InitializationError,
+    > {
+        self.transition.ensure_current()?;
+        let schema_id = self.schema_id_v1()?;
+        let root = self
+            .transition
+            .payload
+            .initialized
+            .output_roots
+            .as_slice()
+            .iter()
+            .find(|root| root.schema_id == schema_id)
+            .ok_or(RemoteRos2InitializationError::InvalidRemoteSchema)?;
+        let mut fields = Vec::new();
+        for node in self
+            .transition
+            .payload
+            .initialized
+            .output_nodes
+            .as_slice()
+            .iter()
+            .filter(|node| node.specification_index == root.specification_index)
+        {
+            let kind = match node.ty.element {
+                ElementTypeV1::Primitive(PrimitiveTypeV1::Int8) => {
+                    crate::remote_typed_output::RemoteTypedScalarKindV1::Int8
+                }
+                ElementTypeV1::Primitive(PrimitiveTypeV1::Int16) => {
+                    crate::remote_typed_output::RemoteTypedScalarKindV1::Int16
+                }
+                ElementTypeV1::Primitive(PrimitiveTypeV1::Int32) => {
+                    crate::remote_typed_output::RemoteTypedScalarKindV1::Int32
+                }
+                ElementTypeV1::Primitive(PrimitiveTypeV1::Int64) => {
+                    crate::remote_typed_output::RemoteTypedScalarKindV1::Int64
+                }
+                ElementTypeV1::Primitive(
+                    PrimitiveTypeV1::UInt8 | PrimitiveTypeV1::Byte | PrimitiveTypeV1::Char,
+                ) => crate::remote_typed_output::RemoteTypedScalarKindV1::UInt8,
+                ElementTypeV1::Primitive(PrimitiveTypeV1::UInt16) => {
+                    crate::remote_typed_output::RemoteTypedScalarKindV1::UInt16
+                }
+                ElementTypeV1::Primitive(PrimitiveTypeV1::UInt32) => {
+                    crate::remote_typed_output::RemoteTypedScalarKindV1::UInt32
+                }
+                ElementTypeV1::Primitive(PrimitiveTypeV1::UInt64) => {
+                    crate::remote_typed_output::RemoteTypedScalarKindV1::UInt64
+                }
+                ElementTypeV1::Primitive(PrimitiveTypeV1::Float32) => {
+                    crate::remote_typed_output::RemoteTypedScalarKindV1::Float32
+                }
+                ElementTypeV1::Primitive(PrimitiveTypeV1::Float64) => {
+                    crate::remote_typed_output::RemoteTypedScalarKindV1::Float64
+                }
+                ElementTypeV1::Primitive(PrimitiveTypeV1::Bool) => {
+                    crate::remote_typed_output::RemoteTypedScalarKindV1::Bool
+                }
+                _ => {
+                    return Err(RemoteRos2InitializationError::UnsupportedForRemote(
+                        UnsupportedForRemote::GrammarFeature,
+                    ));
+                }
+            };
+            if !matches!(node.ty.array, ArraySizeV1::Scalar) {
+                return Err(RemoteRos2InitializationError::UnsupportedForRemote(
+                    UnsupportedForRemote::GrammarFeature,
+                ));
+            }
+            fields.push(crate::remote_typed_output::RemoteTypedFieldContractV1::new(
+                remote_field_ordinal_v1(
+                    usize::try_from(node.member_index).map_err(|_| {
+                        RemoteRos2InitializationError::ResourceLimitExceeded(
+                            RemoteRos2ResourceLimit::Arithmetic,
+                        )
+                    })?,
+                    self.transition
+                        .payload
+                        .initialized
+                        .specifications
+                        .as_slice()
+                        .get(usize::try_from(root.specification_index).map_err(|_| {
+                            RemoteRos2InitializationError::ResourceLimitExceeded(
+                                RemoteRos2ResourceLimit::Arithmetic,
+                            )
+                        })?)
+                        .ok_or(RemoteRos2InitializationError::InvalidRemoteSchema)?
+                        .members
+                        .start,
+                )
+                .ok_or(RemoteRos2InitializationError::InvalidRemoteSchema)?,
+                kind,
+                text_for_span(
+                    self.transition.payload.initialized.source.definitions,
+                    node.name,
+                )?
+                .to_owned(),
+            ));
+        }
+        if fields.is_empty() {
+            return Err(RemoteRos2InitializationError::InvalidRemoteSchema);
+        }
+        Ok(fields.into_boxed_slice())
+    }
+    pub(crate) fn channel_id_v1(&self) -> Result<u16, RemoteRos2InitializationError> {
+        self.transition.ensure_current()?;
+        self.transition
+            .payload
+            .initialized
+            .source
+            .definitions
+            .channel_at_record(self.channel_record_index)
+            .map(|channel| channel.id)
+            .ok_or(RemoteRos2InitializationError::InvalidRemoteSchema)
+    }
+
+    pub(crate) fn schema_id_v1(&self) -> Result<u16, RemoteRos2InitializationError> {
+        self.transition.ensure_current()?;
+        self.transition
+            .payload
+            .initialized
+            .source
+            .definitions
+            .channel_at_record(self.channel_record_index)
+            .map(|channel| channel.schema_id)
+            .filter(|schema_id| *schema_id != 0)
+            .ok_or(RemoteRos2InitializationError::InvalidRemoteSchema)
+    }
+
+    pub(crate) fn channel_topic_v1(&self) -> Result<&str, RemoteRos2InitializationError> {
+        self.transition.ensure_current()?;
+        self.transition
+            .payload
+            .initialized
+            .source
+            .definitions
+            .channel_at_record(self.channel_record_index)
+            .map(|channel| channel.topic.as_str())
+            .ok_or(RemoteRos2InitializationError::InvalidRemoteSchema)
+    }
+
+    pub(crate) fn typed_archetype_name_v1(&self) -> Result<String, RemoteRos2InitializationError> {
+        self.transition.ensure_current()?;
+        let schema_id = self.schema_id_v1()?;
+        let root = self
+            .transition
+            .payload
+            .initialized
+            .output_roots
+            .as_slice()
+            .iter()
+            .find(|root| root.schema_id == schema_id)
+            .ok_or(RemoteRos2InitializationError::InvalidRemoteSchema)?;
+        let spec = self
+            .transition
+            .payload
+            .initialized
+            .specifications
+            .as_slice()
+            .get(
+                usize::try_from(root.specification_index)
+                    .map_err(|_| RemoteRos2InitializationError::InvalidRemoteSchema)?,
+            )
+            .ok_or(RemoteRos2InitializationError::InvalidRemoteSchema)?;
+        Ok(text_for_span(
+            self.transition.payload.initialized.source.definitions,
+            spec.name,
+        )?
+        .replace('/', "."))
+    }
+
+    pub(crate) fn time_type_v1(&self) -> Result<RemoteMcapTimeType, RemoteRos2InitializationError> {
+        self.transition.ensure_current()?;
+        Ok(self
+            .transition
+            .payload
+            .initialized
+            .source
+            .semantic_config
+            .state
+            .time_type)
+    }
+
+    pub(crate) fn physical_source_binding_v1(
+        &self,
+    ) -> Result<&PhysicalChunkSourceBindingV1, RemoteRos2InitializationError> {
+        self.transition.ensure_current()?;
+        Ok(&self
+            .transition
+            .payload
+            .initialized
+            .source
+            .semantic_config
+            .state
+            .physical_source)
+    }
+
+    pub(crate) fn policy_versions_v1(
+        &self,
+    ) -> Result<(u16, u16, u16), RemoteRos2InitializationError> {
+        self.transition.ensure_current()?;
+        Ok(self
+            .transition
+            .policy_descriptor_v1()
+            .canonical_versions_for_manifest_v1())
+    }
+
+    pub(crate) fn ros2_config_digest_v1(&self) -> Result<[u8; 16], RemoteRos2InitializationError> {
+        let schema_id = self.schema_id_v1()?;
+        self.transition
+            .payload
+            .initialized
+            .executable_config_digests
+            .as_slice()
+            .iter()
+            .find(|(id, _)| *id == schema_id)
+            .map(|(_, digest)| *digest)
+            .ok_or(RemoteRos2InitializationError::InvalidRemoteSchema)
+    }
+
+    pub(crate) fn decode_ros2_payload_v1(
+        &self,
+        payload: &[u8],
+        max_steps: u64,
+        max_output_bytes: u64,
+        max_field_values: usize,
+    ) -> Result<
+        (
+            Vec<crate::remote_protobuf_descriptor::RemoteNormalizedFieldV1>,
+            Vec<u8>,
+            u64,
+        ),
+        crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1,
+    > {
+        self.transition.ensure_current().map_err(|_| {
+            crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1::StaleSource
+        })?;
+        decode_materialized_ros2_payload_v1(
+            &self.transition.payload.initialized,
+            self.schema_id_v1().map_err(|_| {
+                crate::remote_protobuf_descriptor::RemoteExecutableAdapterErrorV1::StaleSource
+            })?,
+            payload,
+            max_steps,
+            max_output_bytes,
+            max_field_values,
+        )
+    }
+}
+
+impl<'definitions, 'input, 'source, 'wire>
+    RemoteRos2ToProtobufTransitionV1<'definitions, 'input, 'source, 'wire>
+{
+    pub(crate) fn executable_channel_view_v1(
+        &self,
+        channel_record_index: usize,
+    ) -> Result<
+        RemoteRos2ExecutableChannelViewV1<'_, 'definitions, 'input, 'source, 'wire>,
+        RemoteRos2InitializationError,
+    > {
+        self.ensure_current()?;
+        if self
+            .payload
+            .initialized
+            .source
+            .definitions
+            .channel_at_record(channel_record_index)
+            .is_none()
+        {
+            return Err(RemoteRos2InitializationError::InvalidRemoteSchema);
+        }
+        Ok(RemoteRos2ExecutableChannelViewV1 {
+            transition: self,
+            channel_record_index,
+        })
+    }
+}
+
 impl RemoteRos2ChannelRecognitionV1<'_, '_, '_, '_, '_, '_> {
+    pub(crate) fn canonical_channel_record_index_v1(
+        &self,
+    ) -> Result<u32, RemoteRos2InitializationError> {
+        self.owner.transition.ensure_current()?;
+        u32::try_from(self.channel_record_index).map_err(|_| {
+            RemoteRos2InitializationError::ResourceLimitExceeded(
+                RemoteRos2ResourceLimit::Arithmetic,
+            )
+        })
+    }
     pub(crate) fn channel_id(&self) -> Result<u16, RemoteRos2InitializationError> {
         self.owner.transition.ensure_current()?;
         let definitions = self.owner.transition.payload.initialized.source.definitions;
@@ -3040,6 +3376,16 @@ pub(crate) struct RemoteRos2ProjectionEofAuthorityV1<'definitions, 'input, 'sour
 impl<'definitions, 'input, 'source, 'wire>
     RemoteRos2ProjectionEofAuthorityV1<'definitions, 'input, 'source, 'wire>
 {
+    pub(crate) fn executable_channel_view_v1(
+        &self,
+        channel_record_index: usize,
+    ) -> Result<
+        RemoteRos2ExecutableChannelViewV1<'_, 'definitions, 'input, 'source, 'wire>,
+        RemoteRos2InitializationError,
+    > {
+        self.transition
+            .executable_channel_view_v1(channel_record_index)
+    }
     pub(crate) fn ensure_current_for_assignment_v1(
         &self,
     ) -> Result<(), RemoteRos2InitializationError> {
@@ -5289,9 +5635,19 @@ fn compute_arena_peak(
     let resolution_bytes =
         arena_allocation_footprint::<ComplexTypeResolutionV1>(census.dependency_edges)?;
     let digest_bytes = arena_allocation_footprint::<(u16, [u8; 16])>(census.schemas)?;
+    let output_node_bytes =
+        arena_allocation_footprint::<RemoteRos2OutputNodeV1>(census.output_nodes)?;
+    let output_root_bytes =
+        arena_allocation_footprint::<RemoteRos2OutputRootV1>(census.output_roots)?;
     let retained = checked_add(
         checked_add(schema_bytes, specification_bytes)?,
-        checked_add(checked_add(member_bytes, resolution_bytes)?, digest_bytes)?,
+        checked_add(
+            checked_add(member_bytes, resolution_bytes)?,
+            checked_add(
+                digest_bytes,
+                checked_add(output_node_bytes, output_root_bytes)?,
+            )?,
+        )?,
     )?;
     census.retained_bytes = checked_add(retained, remote_ros2_result_inline_bytes_v1()?)?;
     if census.retained_bytes > limits.max_retained_bytes {
@@ -5388,6 +5744,8 @@ struct Ros2ArenaDirectoryV1 {
     members: FixedArena<ParsedMemberV1>,
     resolutions: FixedArena<ComplexTypeResolutionV1>,
     executable_config_digests: FixedArena<(u16, [u8; 16])>,
+    output_nodes: FixedArena<RemoteRos2OutputNodeV1>,
+    output_roots: FixedArena<RemoteRos2OutputRootV1>,
 }
 
 fn sealed_fixed_working_bytes_v1() -> Result<u64, RemoteRos2InitializationError> {
@@ -5441,6 +5799,8 @@ pub(crate) fn prepare_remote_ros2_census_v1<'definitions, 'input, 'source, 'wire
         census_one_schema(definitions, schema, &limits, &mut census, steps, scratch)
     })?;
     census.census_steps = census_steps.consumed;
+    census.output_nodes = census.fields;
+    census.output_roots = census.schemas;
     compute_arena_peak(&mut census, &limits)?;
 
     // This is the allocation-free dry run of the exact materialization control flow.
@@ -5573,7 +5933,7 @@ impl<T> FixedArena<T> {
 fn consume_arena_allocation_steps(
     steps: &mut RemoteRos2StepOwnershipV1,
 ) -> Result<(), RemoteRos2InitializationError> {
-    for _arena in 0..5 {
+    for _arena in 0..7 {
         steps.consume()?;
     }
     Ok(())
@@ -5594,12 +5954,18 @@ fn allocate_remote_ros2_arenas(
     let resolutions = FixedArena::try_new(checked_usize(census.dependency_edges)?, 3, gate)?;
     steps.consume()?;
     let executable_config_digests = FixedArena::try_new(checked_usize(census.schemas)?, 4, gate)?;
+    steps.consume()?;
+    let output_nodes = FixedArena::try_new(checked_usize(census.output_nodes)?, 5, gate)?;
+    steps.consume()?;
+    let output_roots = FixedArena::try_new(checked_usize(census.output_roots)?, 6, gate)?;
     Ok(Ros2ArenaDirectoryV1 {
         schemas,
         specifications,
         members,
         resolutions,
         executable_config_digests,
+        output_nodes,
+        output_roots,
     })
 }
 
@@ -5608,6 +5974,8 @@ trait RemoteRos2MaterializationSink {
     fn specification_len(&self) -> usize;
     fn member_len(&self) -> usize;
     fn resolution_len(&self) -> usize;
+    fn output_node_len(&self) -> usize;
+    fn output_root_len(&self) -> usize;
 
     fn push_schema(&mut self, value: ParsedSchemaV1) -> Result<(), RemoteRos2InitializationError>;
     fn push_specification(
@@ -5619,6 +5987,14 @@ trait RemoteRos2MaterializationSink {
         &mut self,
         value: ComplexTypeResolutionV1,
     ) -> Result<(), RemoteRos2InitializationError>;
+    fn push_output_node(
+        &mut self,
+        value: RemoteRos2OutputNodeV1,
+    ) -> Result<(), RemoteRos2InitializationError>;
+    fn push_output_root(
+        &mut self,
+        value: RemoteRos2OutputRootV1,
+    ) -> Result<(), RemoteRos2InitializationError>;
 }
 
 #[derive(Default)]
@@ -5627,6 +6003,8 @@ struct CountingMaterializationSink {
     specifications: usize,
     members: usize,
     resolutions: usize,
+    output_nodes: usize,
+    output_roots: usize,
 }
 
 impl CountingMaterializationSink {
@@ -5645,6 +6023,8 @@ impl CountingMaterializationSink {
             && self.specifications == checked_usize(census.specifications)?
             && self.members == checked_usize(census.members)?
             && self.resolutions == checked_usize(census.dependency_edges)?
+            && self.output_nodes == checked_usize(census.output_nodes)?
+            && self.output_roots == checked_usize(census.output_roots)?
         {
             Ok(())
         } else {
@@ -5669,6 +6049,12 @@ impl RemoteRos2MaterializationSink for CountingMaterializationSink {
     fn resolution_len(&self) -> usize {
         self.resolutions
     }
+    fn output_node_len(&self) -> usize {
+        self.output_nodes
+    }
+    fn output_root_len(&self) -> usize {
+        self.output_roots
+    }
 
     fn push_schema(&mut self, _value: ParsedSchemaV1) -> Result<(), RemoteRos2InitializationError> {
         Self::increment(&mut self.schemas)
@@ -5691,6 +6077,18 @@ impl RemoteRos2MaterializationSink for CountingMaterializationSink {
     ) -> Result<(), RemoteRos2InitializationError> {
         Self::increment(&mut self.resolutions)
     }
+    fn push_output_node(
+        &mut self,
+        _value: RemoteRos2OutputNodeV1,
+    ) -> Result<(), RemoteRos2InitializationError> {
+        Self::increment(&mut self.output_nodes)
+    }
+    fn push_output_root(
+        &mut self,
+        _value: RemoteRos2OutputRootV1,
+    ) -> Result<(), RemoteRos2InitializationError> {
+        Self::increment(&mut self.output_roots)
+    }
 }
 
 impl RemoteRos2MaterializationSink for Ros2ArenaDirectoryV1 {
@@ -5708,6 +6106,12 @@ impl RemoteRos2MaterializationSink for Ros2ArenaDirectoryV1 {
 
     fn resolution_len(&self) -> usize {
         self.resolutions.len()
+    }
+    fn output_node_len(&self) -> usize {
+        self.output_nodes.len()
+    }
+    fn output_root_len(&self) -> usize {
+        self.output_roots.len()
     }
 
     fn push_schema(&mut self, value: ParsedSchemaV1) -> Result<(), RemoteRos2InitializationError> {
@@ -5730,6 +6134,18 @@ impl RemoteRos2MaterializationSink for Ros2ArenaDirectoryV1 {
         value: ComplexTypeResolutionV1,
     ) -> Result<(), RemoteRos2InitializationError> {
         self.resolutions.push(value)
+    }
+    fn push_output_node(
+        &mut self,
+        value: RemoteRos2OutputNodeV1,
+    ) -> Result<(), RemoteRos2InitializationError> {
+        self.output_nodes.push(value)
+    }
+    fn push_output_root(
+        &mut self,
+        value: RemoteRos2OutputRootV1,
+    ) -> Result<(), RemoteRos2InitializationError> {
+        self.output_roots.push(value)
     }
 }
 
@@ -5796,6 +6212,55 @@ fn materialize_one_schema(
                 ty: member.ty,
                 literal: member.literal,
             })?;
+            if member.kind == ParsedMemberKindV1::Field {
+                let nested_target = if let ElementTypeV1::Complex(type_span) = member.ty.element {
+                    let definitions = definitions.unwrap_or_else(|| {
+                        remote_ros2_fatal_invariant("complex output materialization has no source")
+                    });
+                    Some(resolve_complex_type(
+                        definitions,
+                        schema,
+                        local_specification_index,
+                        type_span,
+                        spec_count,
+                        steps,
+                    )?)
+                } else {
+                    None
+                };
+                steps.consume()?;
+                sink.push_output_node(RemoteRos2OutputNodeV1 {
+                    specification_index: u32::try_from(specification_index).map_err(|_| {
+                        RemoteRos2InitializationError::ResourceLimitExceeded(
+                            RemoteRos2ResourceLimit::Arithmetic,
+                        )
+                    })?,
+                    member_index: u32::try_from(member_index).map_err(|_| {
+                        RemoteRos2InitializationError::ResourceLimitExceeded(
+                            RemoteRos2ResourceLimit::Arithmetic,
+                        )
+                    })?,
+                    name: member.name,
+                    ty: member.ty,
+                    nullable: true,
+                    nested_target: nested_target
+                        .map(|target| {
+                            specification_start.checked_add(target).ok_or(
+                                RemoteRos2InitializationError::ResourceLimitExceeded(
+                                    RemoteRos2ResourceLimit::Arithmetic,
+                                ),
+                            )
+                        })
+                        .transpose()?
+                        .map(u32::try_from)
+                        .transpose()
+                        .map_err(|_| {
+                            RemoteRos2InitializationError::ResourceLimitExceeded(
+                                RemoteRos2ResourceLimit::Arithmetic,
+                            )
+                        })?,
+                })?;
+            }
             if let ElementTypeV1::Complex(type_span) = member.ty.element {
                 let definitions = definitions.unwrap_or_else(|| {
                     remote_ros2_fatal_invariant("complex materialization has no source")
@@ -5846,6 +6311,16 @@ fn materialize_one_schema(
         schema_id: schema.id,
         schema_record_index: schema.record_index,
         specifications: specification_start..specification_end,
+    })?;
+    steps.consume()?;
+    sink.push_output_root(RemoteRos2OutputRootV1 {
+        schema_id: schema.id,
+        specification_index: u32::try_from(specification_start).map_err(|_| {
+            RemoteRos2InitializationError::ResourceLimitExceeded(
+                RemoteRos2ResourceLimit::Arithmetic,
+            )
+        })?,
+        has_ros2_timestamp: true,
     })?;
     Ok(())
 }
@@ -5928,6 +6403,34 @@ fn materialize_remote_ros2_definitions_v1_with_gate<'definitions, 'input, 'sourc
             hasher.update((resolution.member_index as u64).to_le_bytes());
             hasher.update((resolution.target_specification_index as u64).to_le_bytes());
         }
+        for root in arenas
+            .output_roots
+            .as_slice()
+            .iter()
+            .filter(|root| root.schema_id == schema.schema_id)
+        {
+            hasher.update(root.schema_id.to_le_bytes());
+            hasher.update(root.specification_index.to_le_bytes());
+            hasher.update([root.has_ros2_timestamp as u8]);
+        }
+        for node in arenas.output_nodes.as_slice().iter().filter(|node| {
+            usize::try_from(node.specification_index)
+                .ok()
+                .is_some_and(|index| schema.specifications.contains(&index))
+        }) {
+            hasher.update(node.specification_index.to_le_bytes());
+            hasher.update(node.member_index.to_le_bytes());
+            hasher.update(text_for_span(source.definitions, node.name)?.as_bytes());
+            encode_parsed_type_v1(&mut hasher, node.ty);
+            hasher.update([node.nullable as u8]);
+            match node.nested_target {
+                Some(target) => {
+                    hasher.update([1]);
+                    hasher.update(target.to_le_bytes());
+                }
+                None => hasher.update([0]),
+            }
+        }
         let full = hasher.finalize();
         let mut digest = [0; 16];
         digest.copy_from_slice(&full[..16]);
@@ -5943,6 +6446,8 @@ fn materialize_remote_ros2_definitions_v1_with_gate<'definitions, 'input, 'sourc
         members: arenas.members,
         resolutions: arenas.resolutions,
         executable_config_digests: arenas.executable_config_digests,
+        output_nodes: arenas.output_nodes,
+        output_roots: arenas.output_roots,
         projection_steps: census.projection_steps,
         recognition_steps: census.recognition_steps,
         reservation: result_reservation,
@@ -6275,6 +6780,16 @@ mod tests {
 
     use super::*;
     use crate::remote_protobuf_projection_boundary::RemoteProtobufProjectionEofContinuationV1;
+
+    #[test]
+    fn typed_field_ordinal_matches_decoder_spec_local_order() {
+        assert_eq!(super::remote_field_ordinal_v1(0, 0), Some(1));
+        // Constants/synthetic members still occupy an ordinal in the decoder walk.
+        assert_eq!(super::remote_field_ordinal_v1(3, 0), Some(4));
+        // Nested specifications restart ordinals at their own member range.
+        assert_eq!(super::remote_field_ordinal_v1(8, 8), Some(1));
+        assert_eq!(super::remote_field_ordinal_v1(7, 8), None);
+    }
 
     static_assertions::assert_not_impl_any!(
         RemoteDecoderTopicSignatureEvidenceV1<'static, 'static, 'static, 'static>: Clone, Copy
