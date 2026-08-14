@@ -120,9 +120,9 @@ pub(crate) struct RemoteDecoderPolicyWireV1<'wire> {
     fallback_identity: &'wire str,
 }
 
-#[cfg(test)]
 impl RemoteDecoderPolicyWireV1<'static> {
-    pub(crate) fn canonical_for_protobuf_test_v1() -> Self {
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) fn canonical_for_phase_a_measurement_v1() -> Self {
         Self {
             allowlist_version: REMOTE_ALLOWLIST_VERSION_V1,
             assignment_version: REMOTE_POLICY_VERSION_V1,
@@ -132,6 +132,12 @@ impl RemoteDecoderPolicyWireV1<'static> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn canonical_for_protobuf_test_v1() -> Self {
+        Self::canonical_for_phase_a_measurement_v1()
+    }
+
+    #[cfg(test)]
     pub(crate) fn exact_identity_for_assignment_test_v1(
         &self,
     ) -> (u16, u16, u16, *const (), *const u8, usize) {
@@ -145,6 +151,7 @@ impl RemoteDecoderPolicyWireV1<'static> {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn unknown_version_for_assignment_test_v1() -> Self {
         Self {
             assignment_version: REMOTE_POLICY_VERSION_V1 + 1,
@@ -152,6 +159,7 @@ impl RemoteDecoderPolicyWireV1<'static> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn reordered_for_assignment_test_v1() -> Self {
         Self {
             decoder_identities: &REORDERED_DECODER_IDENTITIES_FOR_ASSIGNMENT_TEST_V1,
@@ -159,6 +167,7 @@ impl RemoteDecoderPolicyWireV1<'static> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn noncanonical_fallback_for_assignment_test_v1() -> Self {
         Self {
             fallback_identity: "raw:v1-noncanonical",
@@ -560,8 +569,8 @@ impl RemoteDefinitionsSourceState {
         self.generation.get() == generation
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_for_protobuf_test_v1(
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) fn new_for_phase_a_measurement_v1(
         physical_source: PhysicalChunkSourceBindingV1,
         viewer_scope: &RemoteViewerScopeState,
         protobuf_profile_scope: &crate::remote_protobuf_projection_boundary::RemoteProtobufProfileScopeV1,
@@ -580,6 +589,15 @@ impl RemoteDefinitionsSourceState {
             semantic_match_count: Cell::new(0),
             semantic_selection_count: Cell::new(0),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_protobuf_test_v1(
+        physical_source: PhysicalChunkSourceBindingV1,
+        viewer_scope: &RemoteViewerScopeState,
+        protobuf_profile_scope: &crate::remote_protobuf_projection_boundary::RemoteProtobufProfileScopeV1,
+    ) -> Self {
+        Self::new_for_phase_a_measurement_v1(physical_source, viewer_scope, protobuf_profile_scope)
     }
 
     #[cfg(test)]
@@ -1229,21 +1247,31 @@ pub(crate) struct RemoteRos2ProfileScopeV1 {
     _sealed_identity: u8,
 }
 
-#[cfg(test)]
 impl RemoteViewerScopeState {
-    pub(crate) const fn new_for_protobuf_test_v1(identity: u8) -> Self {
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) const fn new_for_phase_a_measurement_v1(identity: u8) -> Self {
         Self {
             _sealed_identity: identity,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) const fn new_for_protobuf_test_v1(identity: u8) -> Self {
+        Self::new_for_phase_a_measurement_v1(identity)
+    }
 }
 
-#[cfg(test)]
 impl RemoteRos2ProfileScopeV1 {
-    pub(crate) const fn new_for_protobuf_test_v1(identity: u8) -> Self {
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) const fn new_for_phase_a_measurement_v1(identity: u8) -> Self {
         Self {
             _sealed_identity: identity,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn new_for_protobuf_test_v1(identity: u8) -> Self {
+        Self::new_for_phase_a_measurement_v1(identity)
     }
 }
 
@@ -1275,9 +1303,9 @@ impl RemoteDefinitionsCapability<'_, '_, '_> {
     }
 }
 
-#[cfg(test)]
 impl<'definitions, 'input, 'source> RemoteDefinitionsCapability<'definitions, 'input, 'source> {
-    pub(crate) fn new_for_protobuf_test_v1(
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) fn new_for_phase_a_measurement_v1(
         physical: &PhysicalChunkDefinitionsCapabilityV1<'definitions, 'input>,
         source: &'source RemoteDefinitionsSourceState,
         policy: &FrozenRemoteDecoderPolicyV1<'_>,
@@ -1293,6 +1321,17 @@ impl<'definitions, 'input, 'source> RemoteDefinitionsCapability<'definitions, 'i
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_protobuf_test_v1(
+        physical: &PhysicalChunkDefinitionsCapabilityV1<'definitions, 'input>,
+        source: &'source RemoteDefinitionsSourceState,
+        policy: &FrozenRemoteDecoderPolicyV1<'_>,
+        budget: &RemoteRos2InitializationBudget<'source, '_>,
+    ) -> Result<Self, RemoteRos2InitializationError> {
+        Self::new_for_phase_a_measurement_v1(physical, source, policy, budget)
+    }
+
+    #[cfg(test)]
     pub(crate) fn new_for_semantic_config_conflict_test_v1(
         physical: &PhysicalChunkDefinitionsCapabilityV1<'definitions, 'input>,
         source: &'source RemoteDefinitionsSourceState,
@@ -1711,9 +1750,9 @@ pub(crate) struct RemoteRos2InitializationBudget<'source, 'wire> {
     policy_wire: &'wire RemoteDecoderPolicyWireV1<'wire>,
 }
 
-#[cfg(test)]
 impl UnfrozenRemoteRos2LimitsV1 {
-    pub(crate) fn generous_for_protobuf_test_v1() -> Self {
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) fn generous_for_phase_a_measurement_v1() -> Self {
         Self {
             max_schemas: 32,
             max_definition_bytes: 1_000_000,
@@ -1740,17 +1779,22 @@ impl UnfrozenRemoteRos2LimitsV1 {
             max_working_bytes: 16_000_000,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn generous_for_protobuf_test_v1() -> Self {
+        Self::generous_for_phase_a_measurement_v1()
+    }
 }
 
-#[cfg(test)]
 impl<'source, 'wire> RemoteRos2InitializationBudget<'source, 'wire> {
-    pub(crate) fn new_for_protobuf_test_v1(
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) fn new_for_phase_a_measurement_v1(
         source: &'source RemoteDefinitionsSourceState,
         viewer_scope: &RemoteViewerScopeState,
         profile_scope: &RemoteRos2ProfileScopeV1,
         policy_wire: &'wire RemoteDecoderPolicyWireV1<'wire>,
     ) -> Self {
-        let limits = UnfrozenRemoteRos2LimitsV1::generous_for_protobuf_test_v1();
+        let limits = UnfrozenRemoteRos2LimitsV1::generous_for_phase_a_measurement_v1();
         Self {
             state: Arc::new(RemoteRos2BudgetState {
                 limits,
@@ -1766,7 +1810,7 @@ impl<'source, 'wire> RemoteRos2InitializationBudget<'source, 'wire> {
                 viewer_scope_identity: std::ptr::from_ref(viewer_scope).addr(),
                 profile_scope_identity: std::ptr::from_ref(profile_scope).addr(),
                 policy: freeze_remote_decoder_policy_v1(policy_wire)
-                    .expect("test policy is canonical")
+                    .expect("the Phase A measurement policy is canonical")
                     .value_v1(),
             }),
             source,
@@ -1777,6 +1821,17 @@ impl<'source, 'wire> RemoteRos2InitializationBudget<'source, 'wire> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_protobuf_test_v1(
+        source: &'source RemoteDefinitionsSourceState,
+        viewer_scope: &RemoteViewerScopeState,
+        profile_scope: &RemoteRos2ProfileScopeV1,
+        policy_wire: &'wire RemoteDecoderPolicyWireV1<'wire>,
+    ) -> Self {
+        Self::new_for_phase_a_measurement_v1(source, viewer_scope, profile_scope, policy_wire)
+    }
+
+    #[cfg(test)]
     pub(crate) fn is_idle_for_assignment_test_v1(&self) -> bool {
         *self.state.usage.lock() == self.source.semantic_config_budget_usage_for_test_v1()
     }

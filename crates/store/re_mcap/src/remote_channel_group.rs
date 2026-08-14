@@ -94,8 +94,8 @@ pub(crate) struct UnfrozenRemoteChannelGroupLimitsV1 {
 }
 
 impl UnfrozenRemoteChannelGroupLimitsV1 {
-    #[cfg(test)]
-    const fn generous_for_test_v1() -> Self {
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) const fn generous_for_phase_a_measurement_v1() -> Self {
         Self {
             profile_version: REMOTE_CHANNEL_GROUP_PROFILE_VERSION_V1,
             max_groups: MAX_REMOTE_CHANNEL_GROUPS_V1 as u64,
@@ -104,8 +104,14 @@ impl UnfrozenRemoteChannelGroupLimitsV1 {
         }
     }
 
+    #[cfg(test)]
+    const fn generous_for_test_v1() -> Self {
+        Self::generous_for_phase_a_measurement_v1()
+    }
+
+    #[cfg(test)]
     pub(crate) const fn generous_for_assignment_test_v1() -> Self {
-        Self::generous_for_test_v1()
+        Self::generous_for_phase_a_measurement_v1()
     }
 }
 
@@ -131,8 +137,8 @@ pub(crate) struct RemoteChannelGroupBudgetV1 {
 }
 
 impl RemoteChannelGroupBudgetV1 {
-    #[cfg(test)]
-    pub(crate) fn new_for_test_v1(
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) fn new_for_phase_a_measurement_v1(
         limits: UnfrozenRemoteChannelGroupLimitsV1,
         max_active_results: u64,
         max_aggregate_working_bytes: u64,
@@ -151,6 +157,24 @@ impl RemoteChannelGroupBudgetV1 {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test_v1(
+        limits: UnfrozenRemoteChannelGroupLimitsV1,
+        max_active_results: u64,
+        max_aggregate_working_bytes: u64,
+        max_aggregate_retained_bytes: u64,
+        max_aggregate_combined_bytes: u64,
+    ) -> Self {
+        Self::new_for_phase_a_measurement_v1(
+            limits,
+            max_active_results,
+            max_aggregate_working_bytes,
+            max_aggregate_retained_bytes,
+            max_aggregate_combined_bytes,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn new_for_assignment_test_v1(
         limits: UnfrozenRemoteChannelGroupLimitsV1,
         max_active_results: u64,

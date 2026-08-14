@@ -902,22 +902,52 @@ fn assign_remote_decoders_with_gate_v1<'definitions, 'input, 'source, 'wire>(
 /// This helper exists only to prove the cross-stage capability wiring in host tests. It accepts
 /// the same sealed projections consumed by production stages and does not mint replacement
 /// physical, partition, or root authority.
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RemoteDispatchTestMutationV1 {
+enum RemoteDispatchProbeMutationV1 {
     None,
+    #[cfg(test)]
     InvalidateSource,
+    #[cfg(test)]
     CrossWireFirstDescriptor,
 }
 
-#[cfg(test)]
-pub(crate) fn dispatch_group_from_finalized_source_for_test_v1<'input>(
+#[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PhaseAMeasurementDispatchSetupErrorV1 {
+    Policy,
+    Definitions,
+    Ros2Admission,
+    Ros2Preflight,
+    Ros2Census,
+    Ros2Materialization,
+    ProtobufTransition,
+    ProtobufCensus,
+    ProtobufInitialization,
+    DecoderEligibility,
+    DecoderAssignment,
+    ChannelGroups,
+    ChannelAssignment,
+    Manifest,
+    TemporalPartition,
+    AdapterBudget,
+    ExecutableFactory,
+    OutputDescriptor,
+    AdapterPreparation,
+}
+
+#[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+fn dispatch_group_from_finalized_source_disarmed_v1<'input>(
     source: crate::remote_physical_resolution::ResolvedRemotePhysicalSourceRefV1<'_, 'input>,
     physical: &crate::remote_chunk_scan::PhysicalChunkDefinitionsCapabilityV1<'_, 'input>,
     evidence: crate::remote_chunk_scan::PhysicalChunkMessageEvidenceV1<'input>,
     channel_id: u16,
-    mutation: RemoteDispatchTestMutationV1,
-) -> crate::remote_chunk_dispatch::RemoteChunkTerminalV1 {
+    mutation: RemoteDispatchProbeMutationV1,
+) -> Result<
+    crate::remote_chunk_dispatch::RemoteChunkTerminalV1,
+    PhaseAMeasurementDispatchSetupErrorV1,
+> {
+    #[cfg(not(test))]
+    let _ = mutation;
     use crate::remote_protobuf_descriptor::{
         RemoteExecutableAdapterBudgetRootV1, RemoteExecutableAdapterBudgetV1,
         RemoteExecutableAdapterLimitsV1, RemoteProtobufInitializationBudgetV1,
@@ -933,47 +963,53 @@ pub(crate) fn dispatch_group_from_finalized_source_for_test_v1<'input>(
         prepare_remote_ros2_census_v1,
     };
 
-    let viewer = Box::new(RemoteViewerScopeState::new_for_protobuf_test_v1(1));
-    let ros_profile = Box::new(RemoteRos2ProfileScopeV1::new_for_protobuf_test_v1(1));
+    let viewer = Box::new(RemoteViewerScopeState::new_for_phase_a_measurement_v1(1));
+    let ros_profile = Box::new(RemoteRos2ProfileScopeV1::new_for_phase_a_measurement_v1(1));
     let protobuf_profile = Box::new(RemoteProtobufProfileScopeV1::new_disarmed_v1());
-    let source_state = RemoteDefinitionsSourceState::new_for_protobuf_test_v1(
+    let source_state = RemoteDefinitionsSourceState::new_for_phase_a_measurement_v1(
         physical.source_binding_v1().clone(),
         &viewer,
         &protobuf_profile,
     );
-    let wire = RemoteDecoderPolicyWireV1::canonical_for_protobuf_test_v1();
-    let ros_budget = RemoteRos2InitializationBudget::new_for_protobuf_test_v1(
+    let wire = RemoteDecoderPolicyWireV1::canonical_for_phase_a_measurement_v1();
+    let ros_budget = RemoteRos2InitializationBudget::new_for_phase_a_measurement_v1(
         &source_state,
         &viewer,
         &ros_profile,
         &wire,
     );
-    let policy = freeze_remote_decoder_policy_v1(&wire).unwrap();
-    let definitions = RemoteDefinitionsCapability::new_for_protobuf_test_v1(
+    let policy = freeze_remote_decoder_policy_v1(&wire)
+        .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::Policy)?;
+    let definitions = RemoteDefinitionsCapability::new_for_phase_a_measurement_v1(
         physical,
         &source_state,
         &policy,
         &ros_budget,
     )
-    .unwrap();
-    let ros_owner = begin_remote_ros2_admission_v1(definitions, policy, &ros_budget).unwrap();
-    let signatures = preflight_remote_decoder_topic_signatures_v1(ros_owner).unwrap();
-    let ros_census = prepare_remote_ros2_census_v1(signatures).unwrap();
+    .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::Definitions)?;
+    let ros_owner = begin_remote_ros2_admission_v1(definitions, policy, &ros_budget)
+        .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::Ros2Admission)?;
+    let signatures = preflight_remote_decoder_topic_signatures_v1(ros_owner)
+        .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::Ros2Preflight)?;
+    let ros_census = prepare_remote_ros2_census_v1(signatures)
+        .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::Ros2Census)?;
     let transition = materialize_remote_ros2_definitions_v1(ros_census)
-        .unwrap()
+        .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::Ros2Materialization)?
         .into_protobuf_transition_v1()
-        .unwrap();
+        .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::ProtobufTransition)?;
     let protobuf_budget = RemoteProtobufInitializationBudgetV1::new_disarmed_v1(
         &viewer,
         &protobuf_profile,
-        UnfrozenRemoteProtobufLimitsV1::generous_for_assignment_test_v1(),
+        UnfrozenRemoteProtobufLimitsV1::generous_for_phase_a_measurement_v1(),
         1,
         u64::MAX,
         1,
         u64::MAX,
     );
-    let protobuf_census = prepare_remote_protobuf_census_v1(transition, &protobuf_budget).unwrap();
-    let initializers = initialize_remote_protobuf_v1(protobuf_census).unwrap();
+    let protobuf_census = prepare_remote_protobuf_census_v1(transition, &protobuf_budget)
+        .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::ProtobufCensus)?;
+    let initializers = initialize_remote_protobuf_v1(protobuf_census)
+        .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::ProtobufInitialization)?;
 
     let assignment_budget = RemoteDecoderAssignmentBudgetV1::new_disarmed_v1(
         UnfrozenRemoteDecoderAssignmentLimitsV1 {
@@ -990,32 +1026,37 @@ pub(crate) fn dispatch_group_from_finalized_source_for_test_v1<'input>(
         u64::MAX,
         u64::MAX,
     );
-    let eligibility =
-        prepare_remote_decoder_eligibility_v1(initializers, &assignment_budget).unwrap();
-    let assignments = assign_remote_decoders_v1(eligibility).unwrap();
-    let group_budget = crate::remote_channel_group::RemoteChannelGroupBudgetV1::new_for_assignment_test_v1(
-        crate::remote_channel_group::UnfrozenRemoteChannelGroupLimitsV1::generous_for_assignment_test_v1(),
+    let eligibility = prepare_remote_decoder_eligibility_v1(initializers, &assignment_budget)
+        .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::DecoderEligibility)?;
+    let assignments = assign_remote_decoders_v1(eligibility)
+        .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::DecoderAssignment)?;
+    let group_budget = crate::remote_channel_group::RemoteChannelGroupBudgetV1::new_for_phase_a_measurement_v1(
+        crate::remote_channel_group::UnfrozenRemoteChannelGroupLimitsV1::generous_for_phase_a_measurement_v1(),
         1,
+        u64::MAX,
+        u64::MAX,
         u64::MAX,
     );
     let groups = crate::remote_channel_group::build_immutable_remote_channel_groups_v1(
         assignments,
         &group_budget,
     )
-    .unwrap();
+    .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::ChannelGroups)?;
     let group_id = groups
         .assignments_v1()
         .iter()
         .find(|assignment| assignment.channel_id() == channel_id)
-        .expect("the finalized fixture channel is assigned")
+        .ok_or(PhaseAMeasurementDispatchSetupErrorV1::ChannelAssignment)?
         .group_id();
     let manifest =
         crate::remote_manifest::ImmutableRemoteMcapManifestV1::build_v1(source, groups, 64)
-            .unwrap();
-    let authority = manifest.temporal_partition_v1(0, group_id).unwrap();
+            .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::Manifest)?;
+    let authority = manifest
+        .temporal_partition_v1(0, group_id)
+        .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::TemporalPartition)?;
     let validation_budget =
-        crate::remote_chunk_validation_count::RemoteValidationCountBudgetV1::new_for_test_v1(
-            crate::remote_chunk_validation_count::UnfrozenRemoteValidationCountLimitsV1::generous_for_test_v1(),
+        crate::remote_chunk_validation_count::RemoteValidationCountBudgetV1::new_for_phase_a_measurement_v1(
+            crate::remote_chunk_validation_count::UnfrozenRemoteValidationCountLimitsV1::generous_for_phase_a_measurement_v1(),
             1,
             u64::MAX,
             u64::MAX,
@@ -1027,9 +1068,9 @@ pub(crate) fn dispatch_group_from_finalized_source_for_test_v1<'input>(
     ) {
         Ok(plan) => plan,
         Err(error) => {
-            return crate::remote_chunk_dispatch::RemoteChunkTerminalV1::Failed(
+            return Ok(crate::remote_chunk_dispatch::RemoteChunkTerminalV1::Failed(
                 crate::remote_chunk_dispatch::RemoteChunkDispatchFailureV1::Validation(error),
-            );
+            ));
         }
     };
     let rows = plan.expected_rows_v1();
@@ -1052,48 +1093,124 @@ pub(crate) fn dispatch_group_from_finalized_source_for_test_v1<'input>(
                 adapter_limits,
                 &adapter_root,
             )
-            .unwrap()
+            .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::AdapterBudget)
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     let factories = plan
         .channels_v1()
         .iter()
         .map(|channel| {
             plan.bind_executable_factory_v1(channel.channel_id_v1())
-                .unwrap()
+                .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::ExecutableFactory)
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     let dispatches = factories
         .iter()
         .zip(plan.channels_v1())
         .zip(&adapter_budgets)
         .enumerate()
         .map(|(ordinal, ((factory, channel), adapter_budget))| {
-            let descriptor = factory.typed_output_descriptor_v1().unwrap();
-            let descriptor = if mutation == RemoteDispatchTestMutationV1::CrossWireFirstDescriptor
+            #[cfg(not(test))]
+            let _ = ordinal;
+            let descriptor = factory
+                .typed_output_descriptor_v1()
+                .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::OutputDescriptor)?;
+            #[cfg(test)]
+            let descriptor = if mutation == RemoteDispatchProbeMutationV1::CrossWireFirstDescriptor
                 && ordinal == 0
             {
                 descriptor.cross_wired_source_and_config_for_dispatch_test_v1()
             } else {
                 descriptor
             };
+            #[cfg(not(test))]
+            let descriptor = descriptor;
             let adapter = factory
                 .prepare_adapter_v1(
                     channel.message_count_v1(),
                     channel.payload_bytes_v1(),
                     adapter_budget,
                 )
-                .unwrap();
-            crate::remote_chunk_dispatch::RemoteAdmittedChannelDispatchV1::new_v1(
-                descriptor, adapter,
+                .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::AdapterPreparation)?;
+            Ok(
+                crate::remote_chunk_dispatch::RemoteAdmittedChannelDispatchV1::new_v1(
+                    descriptor, adapter,
+                ),
             )
         })
-        .collect::<Vec<_>>()
+        .collect::<Result<Vec<_>, PhaseAMeasurementDispatchSetupErrorV1>>()?
         .into_boxed_slice();
-    if mutation == RemoteDispatchTestMutationV1::InvalidateSource {
+    #[cfg(test)]
+    if mutation == RemoteDispatchProbeMutationV1::InvalidateSource {
         source_state.invalidate_for_protobuf_test_v1();
     }
-    crate::remote_chunk_dispatch::dispatch_admitted_v1(dispatches, &plan)
+    Ok(crate::remote_chunk_dispatch::dispatch_admitted_v1(
+        dispatches, &plan,
+    ))
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteDispatchTestMutationV1 {
+    None,
+    InvalidateSource,
+    CrossWireFirstDescriptor,
+}
+
+#[cfg(test)]
+pub(crate) fn dispatch_group_from_finalized_source_for_test_v1<'input>(
+    source: crate::remote_physical_resolution::ResolvedRemotePhysicalSourceRefV1<'_, 'input>,
+    physical: &crate::remote_chunk_scan::PhysicalChunkDefinitionsCapabilityV1<'_, 'input>,
+    evidence: crate::remote_chunk_scan::PhysicalChunkMessageEvidenceV1<'input>,
+    channel_id: u16,
+    mutation: RemoteDispatchTestMutationV1,
+) -> crate::remote_chunk_dispatch::RemoteChunkTerminalV1 {
+    let mutation = match mutation {
+        RemoteDispatchTestMutationV1::None => RemoteDispatchProbeMutationV1::None,
+        RemoteDispatchTestMutationV1::InvalidateSource => {
+            RemoteDispatchProbeMutationV1::InvalidateSource
+        }
+        RemoteDispatchTestMutationV1::CrossWireFirstDescriptor => {
+            RemoteDispatchProbeMutationV1::CrossWireFirstDescriptor
+        }
+    };
+    dispatch_group_from_finalized_source_disarmed_v1(
+        source, physical, evidence, channel_id, mutation,
+    )
+    .unwrap_or_else(|error| panic!("phase A dispatch setup failed: {error:?}"))
+}
+
+#[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+pub(crate) fn execute_group_from_finalized_source_for_phase_a_measurement_v1<'input>(
+    source: crate::remote_physical_resolution::ResolvedRemotePhysicalSourceRefV1<'_, 'input>,
+    physical: &crate::remote_chunk_scan::PhysicalChunkDefinitionsCapabilityV1<'_, 'input>,
+    evidence: crate::remote_chunk_scan::PhysicalChunkMessageEvidenceV1<'input>,
+    channel_id: u16,
+) -> Result<Vec<re_chunk::Chunk>, PhaseAMeasurementDispatchErrorV1> {
+    match dispatch_group_from_finalized_source_disarmed_v1(
+        source,
+        physical,
+        evidence,
+        channel_id,
+        RemoteDispatchProbeMutationV1::None,
+    )
+    .map_err(PhaseAMeasurementDispatchErrorV1::Setup)?
+    {
+        crate::remote_chunk_dispatch::RemoteChunkTerminalV1::Complete(handoff) => {
+            Ok(handoff.chunks_v1().cloned().collect())
+        }
+        crate::remote_chunk_dispatch::RemoteChunkTerminalV1::CompleteEmpty => Ok(Vec::new()),
+        crate::remote_chunk_dispatch::RemoteChunkTerminalV1::Failed(error) => {
+            Err(PhaseAMeasurementDispatchErrorV1::Dispatch(error))
+        }
+    }
+}
+
+#[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PhaseAMeasurementDispatchErrorV1 {
+    Setup(PhaseAMeasurementDispatchSetupErrorV1),
+    Dispatch(crate::remote_chunk_dispatch::RemoteChunkDispatchFailureV1),
 }
 
 #[cfg(test)]

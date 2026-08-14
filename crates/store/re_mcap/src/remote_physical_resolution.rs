@@ -108,12 +108,20 @@ impl RemotePhysicalObjectBindingV1 {
         })
     }
 
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    fn issue_for_phase_a_measurement_v1(
+        content_length: NonZeroU64,
+        consistency: RemoteObjectConsistencyClassV1,
+    ) -> Result<Self, PhysicalSourceResolutionErrorV1> {
+        Self::issue(content_length, consistency)
+    }
+
     #[cfg(test)]
     fn issue_for_test(
         content_length: NonZeroU64,
         consistency: RemoteObjectConsistencyClassV1,
     ) -> Result<Self, PhysicalSourceResolutionErrorV1> {
-        Self::issue(content_length, consistency)
+        Self::issue_for_phase_a_measurement_v1(content_length, consistency)
     }
 
     fn ensure_open(&self) -> Result<(), PhysicalSourceResolutionErrorV1> {
@@ -554,8 +562,8 @@ impl<'a, V>
 }
 
 impl<ValidatorOwner> PreparedBoundRemotePhysicalSourceV1<ValidatorOwner, ()> {
-    #[cfg(test)]
-    fn issue_and_prepare_fixed_layout_for_test<'a>(
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    fn issue_and_prepare_fixed_layout_for_phase_a_measurement_v1<'a>(
         validator_owner: ValidatorOwner,
         content_length: NonZeroU64,
         consistency: RemoteObjectConsistencyClassV1,
@@ -569,7 +577,10 @@ impl<ValidatorOwner> PreparedBoundRemotePhysicalSourceV1<ValidatorOwner, ()> {
         >,
         PhysicalSourceResolutionErrorV1,
     > {
-        let lower = RemotePhysicalObjectBindingV1::issue_for_test(content_length, consistency)?;
+        let lower = RemotePhysicalObjectBindingV1::issue_for_phase_a_measurement_v1(
+            content_length,
+            consistency,
+        )?;
         let state = Arc::clone(&lower.state);
         let read_issuer = RemoteObjectReadIssuerV1 {
             object: Arc::clone(&state),
@@ -598,6 +609,31 @@ impl<ValidatorOwner> PreparedBoundRemotePhysicalSourceV1<ValidatorOwner, ()> {
             object_lifetime: RemotePhysicalObjectLifetimeV1 { state },
             validator_owner,
         })
+    }
+
+    #[cfg(test)]
+    fn issue_and_prepare_fixed_layout_for_test<'a>(
+        validator_owner: ValidatorOwner,
+        content_length: NonZeroU64,
+        consistency: RemoteObjectConsistencyClassV1,
+        initial_read: crate::remote_fixed_layout::RemoteMcapSlice<'a>,
+        footer_read: crate::remote_fixed_layout::RemoteMcapSlice<'a>,
+        profile: RemotePhysicalEvidenceProfileV1,
+    ) -> Result<
+        PreparedBoundRemotePhysicalSourceV1<
+            ValidatorOwner,
+            crate::remote_fixed_layout::PreparedFixedLayout,
+        >,
+        PhysicalSourceResolutionErrorV1,
+    > {
+        Self::issue_and_prepare_fixed_layout_for_phase_a_measurement_v1(
+            validator_owner,
+            content_length,
+            consistency,
+            initial_read,
+            footer_read,
+            profile,
+        )
     }
 }
 
@@ -1881,6 +1917,9 @@ fn try_filled<T: Clone>(count: usize, value: T) -> Result<Vec<T>, PhysicalSource
     output.resize(count, value);
     Ok(output)
 }
+
+#[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+pub mod phase_a_measurement;
 
 #[cfg(test)]
 mod tests {

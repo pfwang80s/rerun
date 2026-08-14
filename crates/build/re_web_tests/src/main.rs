@@ -1,6 +1,7 @@
 //! Discovers and runs Rerun web tests.
 
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr as _;
 
@@ -22,6 +23,14 @@ struct Args {
     /// run wasm-bindgen-test in a visible browser.
     #[argh(switch)]
     no_headless: bool,
+
+    /// directory containing an optimized MCAP Phase A proof artifact.
+    #[argh(option)]
+    phase_a_proof_dir: Option<PathBuf>,
+
+    /// write validated MCAP Phase A evidence JSON to this path.
+    #[argh(option)]
+    phase_a_artifact_out: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,7 +73,45 @@ struct WebTestPackage {
     path: PathBuf,
     redap_server: bool,
     mcap_range_server: bool,
+    phase_a_benchmark: bool,
     browsers: Vec<Browser>,
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+
+    for _ in 0..16 {
+        let temporary = parent.join(format!(
+            ".rerun-mcap-phase-a-{}-{:016x}.tmp",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let write_result = file.write_all(bytes).and_then(|()| file.sync_all());
+        drop(file);
+        if let Err(error) = write_result {
+            _ = std::fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+        if let Err(error) = std::fs::rename(&temporary, path) {
+            _ = std::fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+        return Ok(());
+    }
+    bail!("failed to allocate a temporary Phase A evidence artifact")
 }
 
 #[tokio::main]
@@ -172,6 +219,7 @@ fn discover_packages(package_filter: Option<&str>) -> anyhow::Result<Vec<WebTest
                     .into_std_path_buf(),
                 redap_server: metadata_bool(&package.metadata, "redap-server")?,
                 mcap_range_server: metadata_bool(&package.metadata, "mcap-range-server")?,
+                phase_a_benchmark: metadata_bool(&package.metadata, "phase-a-benchmark")?,
                 browsers: metadata_browsers(&package.metadata)?,
             })
         })
@@ -238,7 +286,18 @@ async fn run_package(args: &Args, package: &WebTestPackage) -> anyhow::Result<()
 
     // Spawn the fixture with a synchronous `Drop` fallback first.
     // If the Redap server subsequently fails to start, the fixture still closes both ports.
-    let mcap_range_server = if package.mcap_range_server {
+    let mcap_range_server = if package.phase_a_benchmark {
+        let proof_dir = args
+            .phase_a_proof_dir
+            .as_deref()
+            .context("Phase A benchmark package requires --phase-a-proof-dir")?;
+        Some(
+            re_web_tests::mcap_range_server::McapRangeTestServer::spawn_with_phase_a_proof_v1(
+                proof_dir,
+            )
+            .await?,
+        )
+    } else if package.mcap_range_server {
         Some(re_web_tests::mcap_range_server::McapRangeTestServer::spawn().await?)
     } else {
         None
@@ -295,7 +354,24 @@ async fn run_package(args: &Args, package: &WebTestPackage) -> anyhow::Result<()
         server.shutdown_and_wait().await;
     }
     if let Some(server) = mcap_range_server {
+        let artifact_result = (|| -> anyhow::Result<()> {
+            if package.phase_a_benchmark
+                && status.as_ref().is_ok_and(std::process::ExitStatus::success)
+            {
+                let evidence = server
+                    .phase_a_evidence_v1()
+                    .context("Chrome benchmark returned no Phase A evidence")?;
+                let artifact_out = args
+                    .phase_a_artifact_out
+                    .as_deref()
+                    .context("Phase A benchmark package requires --phase-a-artifact-out")?;
+                let bytes = serde_json::to_vec_pretty(&evidence)?;
+                write_atomic(artifact_out, &bytes)?;
+            }
+            Ok(())
+        })();
         server.shutdown().await;
+        artifact_result?;
     }
 
     let status = status.with_context(|| format!("failed to run wasm-pack for {}", package.name))?;
@@ -319,6 +395,7 @@ mod tests {
             path: PathBuf::from("fixture"),
             redap_server: false,
             mcap_range_server: false,
+            phase_a_benchmark: false,
             browsers,
         }
     }
@@ -400,5 +477,23 @@ mod tests {
         );
         assert!(require_executed_packages(1, Browser::Chrome).is_ok());
         assert!(require_executed_packages(0, Browser::Chrome).is_err());
+    }
+
+    #[test]
+    fn phase_a_evidence_artifact_is_replaced_atomically() {
+        let directory = tempfile::tempdir().expect("artifact directory");
+        let artifact = directory.path().join("evidence.json");
+        write_atomic(&artifact, b"first").expect("first atomic write");
+        assert_eq!(std::fs::read(&artifact).expect("first artifact"), b"first");
+        write_atomic(&artifact, b"second").expect("replacement atomic write");
+        assert_eq!(
+            std::fs::read(&artifact).expect("replacement artifact"),
+            b"second"
+        );
+        let entries = std::fs::read_dir(directory.path())
+            .expect("artifact directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("artifact entries");
+        assert_eq!(entries.len(), 1);
     }
 }

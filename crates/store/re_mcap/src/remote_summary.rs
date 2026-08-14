@@ -38,9 +38,9 @@ pub(crate) struct SummaryCensusLimits {
     max_chunk_index_records: u64,
 }
 
-#[cfg(test)]
 impl SummaryCensusLimits {
-    pub(crate) const fn for_test(object_len: u64, max_records: u64) -> Self {
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) const fn for_phase_a_measurement_v1(object_len: u64, max_records: u64) -> Self {
         Self {
             max_header_body_bytes: object_len,
             max_summary_bytes: object_len,
@@ -49,6 +49,11 @@ impl SummaryCensusLimits {
             max_channel_records: max_records,
             max_chunk_index_records: max_records,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(object_len: u64, max_records: u64) -> Self {
+        Self::for_phase_a_measurement_v1(object_len, max_records)
     }
 }
 

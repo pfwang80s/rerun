@@ -56,7 +56,9 @@ mod backtrace_web;
 #[cfg(target_arch = "wasm32")]
 use backtrace_web::Backtrace;
 
-pub use self::accounting_allocator::{AccountingAllocator, TrackingStatistics};
+pub use self::accounting_allocator::{
+    AccountingAllocator, InstantaneousAllocationByteLedgerV1, TrackingStatistics,
+};
 pub use self::allocation_tracker::{CallstackStatistics, ReadableBacktrace};
 pub use self::memory_limit::MemoryLimit;
 pub use self::memory_use::MemoryUse;

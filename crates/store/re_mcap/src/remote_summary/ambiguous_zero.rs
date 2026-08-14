@@ -877,9 +877,9 @@ fn checked_mul(left: u64, right: u64) -> Result<u64, IndexConsistencyViolation> 
         .ok_or(IndexConsistencyViolation::ArithmeticOverflow)
 }
 
-#[cfg(test)]
 impl AmbiguousZeroLimits {
-    pub(crate) const fn for_test(stage1: [u64; 5], stage2: [u64; 7]) -> Self {
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) const fn for_phase_a_measurement_v1(stage1: [u64; 5], stage2: [u64; 7]) -> Self {
         Self {
             max_ambiguous_chunks: stage1[0],
             max_message_index_bytes: stage1[1],
@@ -895,11 +895,16 @@ impl AmbiguousZeroLimits {
             max_scan_records_upper: stage2[6],
         }
     }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(stage1: [u64; 5], stage2: [u64; 7]) -> Self {
+        Self::for_phase_a_measurement_v1(stage1, stage2)
+    }
 }
 
-#[cfg(test)]
 impl AmbiguousZeroBudget {
-    pub(crate) fn for_test(
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) fn for_phase_a_measurement_v1(
         limits: AmbiguousZeroLimits,
         max_active_stage1: u64,
         max_active_stage2: u64,
@@ -935,6 +940,22 @@ impl AmbiguousZeroBudget {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        limits: AmbiguousZeroLimits,
+        max_active_stage1: u64,
+        max_active_stage2: u64,
+        aggregate_scale: u64,
+    ) -> Self {
+        Self::for_phase_a_measurement_v1(
+            limits,
+            max_active_stage1,
+            max_active_stage2,
+            aggregate_scale,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn usage_for_test(&self) -> [u64; 14] {
         let usage = *self.state.usage.lock();
         [

@@ -2,7 +2,7 @@ mod lib;
 
 use argh::FromArgs;
 use cargo_metadata::camino::Utf8PathBuf;
-use lib::{Profile, Target, build, default_build_dir};
+use lib::{Profile, Target, build, build_mcap_phase_a_proof_v1, default_build_dir};
 
 /// Build the web-viewer.
 #[derive(FromArgs)]
@@ -45,6 +45,10 @@ pub struct Args {
     /// generate a cargo build timings report in `<target-dir>/cargo-timings/`.
     #[argh(switch)]
     timings: bool,
+
+    /// build only the private MCAP Phase A release-Wasm proof artifact into this directory.
+    #[argh(option, long = "mcap-phase-a-proof-out")]
+    mcap_phase_a_proof_out: Option<Utf8PathBuf>,
 }
 
 fn default_features() -> String {
@@ -61,6 +65,14 @@ pub fn main(args: Args) -> anyhow::Result<()> {
             "Exactly one of --release or --debug must be set"
         ));
     };
+
+    if let Some(proof_out) = args.mcap_phase_a_proof_out {
+        anyhow::ensure!(
+            profile == Profile::WebRelease,
+            "MCAP Phase A proof artifacts require --release"
+        );
+        return build_mcap_phase_a_proof_v1(&proof_out);
+    }
 
     let build_dir = args.build_dir.unwrap_or_else(default_build_dir);
 

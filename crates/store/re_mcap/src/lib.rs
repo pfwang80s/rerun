@@ -78,6 +78,12 @@
 /// eight-byte little-endian `u64` body length.
 const RECORD_HEADER_LEN: usize = 1 + std::mem::size_of::<u64>();
 
+#[cfg(any(target_arch = "wasm32", test))]
+pub mod web_body_handoff;
+
+#[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+pub use remote_physical_resolution::phase_a_measurement;
+
 pub mod decoders;
 mod error;
 mod file;

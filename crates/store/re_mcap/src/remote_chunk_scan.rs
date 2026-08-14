@@ -1220,6 +1220,19 @@ impl<'a, State> PhysicalChunkReadLease<'a, State> {
             .expect("a live lease was issued from a canonical physical region")
     }
 
+    pub(super) fn web_completion_identity_parts_v1(
+        &self,
+    ) -> Result<(u64, u64, usize, std::ops::Range<u64>), PhysicalChunkValidationError> {
+        self.ensure_current()?;
+        let core = self.core();
+        Ok((
+            core.source_generation.get(),
+            core.read_generation.get(),
+            core.canonical_ordinal,
+            self.region().chunk_range(),
+        ))
+    }
+
     fn transition<Next>(
         mut self,
     ) -> Result<PhysicalChunkReadLease<'a, Next>, PhysicalChunkValidationError> {
@@ -1300,18 +1313,35 @@ impl Drop for HeaderValidatedPhysicalChunkRead<'_> {
     }
 }
 
-fn validate_physical_chunk_header(
-    mut input: ExactPhysicalChunkRecord<'_>,
-) -> Result<HeaderValidatedPhysicalChunkRead<'_>, PhysicalChunkValidationError> {
-    let lease = input
-        .lease
-        .take()
-        .expect("an exact physical record retains its pending lease");
+pub(super) struct BorrowedHeaderValidatedPhysicalChunkRead<'a, 'body> {
+    body: &'body [u8],
+    lease: Option<PhysicalChunkReadLease<'a, HeaderValidated>>,
+    payload: Range<usize>,
+    codec: ChunkCompressionCodec,
+    compressed_size: u64,
+    uncompressed_size: u64,
+    declared_uncompressed_crc: u32,
+}
+
+impl BorrowedHeaderValidatedPhysicalChunkRead<'_, '_> {
+    pub(super) fn payload_len_v1(&self) -> usize {
+        self.payload.len()
+    }
+}
+
+struct ValidatedPhysicalChunkHeaderV1 {
+    payload: Range<usize>,
+    codec: ChunkCompressionCodec,
+    compressed_size: u64,
+    uncompressed_size: u64,
+    declared_uncompressed_crc: u32,
+}
+
+fn validate_physical_chunk_header_bytes_v1(
+    lease: &PhysicalChunkReadLease<'_, PendingHeaderValidation>,
+    bytes: &[u8],
+) -> Result<ValidatedPhysicalChunkHeaderV1, PhysicalChunkValidationError> {
     lease.ensure_current()?;
-    let bytes = input
-        .bytes
-        .take()
-        .expect("an exact physical record retains its backing");
     let region = lease.region();
     let descriptor = region.raw_descriptor();
     let expected_record_bytes = region
@@ -1327,7 +1357,7 @@ fn validate_physical_chunk_header(
         return Err(PhysicalChunkValidationError::FullRecordLengthMismatch);
     }
 
-    let mut record = BorrowedCursor::new(&bytes);
+    let mut record = BorrowedCursor::new(bytes);
     if record.u8()? != mcap::records::op::CHUNK {
         return Err(PhysicalChunkValidationError::WrongChunkOpcode);
     }
@@ -1386,18 +1416,104 @@ fn validate_physical_chunk_header(
     if payload_end != bytes.len() {
         return Err(PhysicalChunkValidationError::CompressedPayloadRangeMismatch);
     }
-    let codec = ChunkCompressionCodec::from_mcap_name(compression)
-        .unwrap_or(ChunkCompressionCodec::Unsupported);
-    let lease = lease.transition::<HeaderValidated>()?;
-    Ok(HeaderValidatedPhysicalChunkRead {
-        full_record: Some(bytes),
-        lease: Some(lease),
+    Ok(ValidatedPhysicalChunkHeaderV1 {
         payload: payload_start..payload_end,
-        codec,
+        codec: ChunkCompressionCodec::from_mcap_name(compression)
+            .unwrap_or(ChunkCompressionCodec::Unsupported),
         compressed_size,
         uncompressed_size,
         declared_uncompressed_crc,
     })
+}
+
+fn validate_physical_chunk_header(
+    mut input: ExactPhysicalChunkRecord<'_>,
+) -> Result<HeaderValidatedPhysicalChunkRead<'_>, PhysicalChunkValidationError> {
+    let lease = input
+        .lease
+        .take()
+        .expect("an exact physical record retains its pending lease");
+    lease.ensure_current()?;
+    let bytes = input
+        .bytes
+        .take()
+        .expect("an exact physical record retains its backing");
+    let header = validate_physical_chunk_header_bytes_v1(&lease, &bytes)?;
+    let lease = lease.transition::<HeaderValidated>()?;
+    Ok(HeaderValidatedPhysicalChunkRead {
+        full_record: Some(bytes),
+        lease: Some(lease),
+        payload: header.payload,
+        codec: header.codec,
+        compressed_size: header.compressed_size,
+        uncompressed_size: header.uncompressed_size,
+        declared_uncompressed_crc: header.declared_uncompressed_crc,
+    })
+}
+
+pub(super) fn validate_borrowed_physical_chunk_header_v1<'a, 'body>(
+    lease: PhysicalChunkReadLease<'a, PendingHeaderValidation>,
+    body: &'body [u8],
+) -> Result<BorrowedHeaderValidatedPhysicalChunkRead<'a, 'body>, PhysicalChunkValidationError> {
+    let header = validate_physical_chunk_header_bytes_v1(&lease, body)?;
+    let lease = lease.transition::<HeaderValidated>()?;
+    Ok(BorrowedHeaderValidatedPhysicalChunkRead {
+        body,
+        lease: Some(lease),
+        payload: header.payload,
+        codec: header.codec,
+        compressed_size: header.compressed_size,
+        uncompressed_size: header.uncompressed_size,
+        declared_uncompressed_crc: header.declared_uncompressed_crc,
+    })
+}
+
+pub(super) fn install_borrowed_header_validated_payload_copy_v1<'a>(
+    mut validated: BorrowedHeaderValidatedPhysicalChunkRead<'a, '_>,
+) -> Result<ExactCompressedChunkInput<'a>, PhysicalChunkValidationError> {
+    let lease = validated
+        .lease
+        .take()
+        .expect("a borrowed header-validated owner retains its lease");
+    lease.ensure_current()?;
+    let prepared = prepare_header_validated_compressed_chunk_input(
+        lease,
+        validated.codec,
+        validated.compressed_size,
+        validated.uncompressed_size,
+        validated.declared_uncompressed_crc,
+    )?;
+    let payload = validated
+        .body
+        .get(validated.payload)
+        .ok_or(PhysicalChunkValidationError::CompressedPayloadRangeMismatch)?;
+    #[cfg(test)]
+    WEB_DESTINATION_ALLOCATION_ATTEMPTS_V1.with(|attempts| attempts.set(attempts.get() + 1));
+    let mut destination = Vec::new();
+    destination
+        .try_reserve_exact(payload.len())
+        .map_err(|_allocation| PhysicalChunkValidationError::PayloadAllocationFailed)?;
+    destination.extend_from_slice(payload);
+    prepared
+        .install(destination.into_boxed_slice())
+        .map_err(Into::into)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static WEB_DESTINATION_ALLOCATION_ATTEMPTS_V1: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn reset_web_destination_allocation_attempts_for_test_v1() {
+    WEB_DESTINATION_ALLOCATION_ATTEMPTS_V1.with(|attempts| attempts.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn web_destination_allocation_attempts_for_test_v1() -> u64 {
+    WEB_DESTINATION_ALLOCATION_ATTEMPTS_V1.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -2370,7 +2486,7 @@ impl<'a> BorrowedCursor<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PhysicalChunkValidationError {
+pub enum PhysicalChunkValidationError {
     ArithmeticOverflow,
     AuthorityReservationLimitExceeded,
     AuthorityAllocationFailed,
@@ -2484,9 +2600,9 @@ fn allocate_source_generation() -> Result<NonZeroU64, PhysicalChunkValidationErr
     NonZeroU64::new(generation).ok_or(PhysicalChunkValidationError::SourceGenerationExhausted)
 }
 
-#[cfg(test)]
 impl PhysicalChunkScanLimits {
-    pub(super) fn generous() -> Self {
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(super) fn for_phase_a_measurement_v1() -> Self {
         Self {
             max_records_per_chunk: 100_000,
             max_messages_per_chunk: 100_000,
@@ -2503,11 +2619,16 @@ impl PhysicalChunkScanLimits {
             max_result_retained_bytes: 64 * 1024 * 1024,
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn generous() -> Self {
+        Self::for_phase_a_measurement_v1()
+    }
 }
 
-#[cfg(test)]
 impl PhysicalChunkScanBudget {
-    pub(super) fn for_test(limits: PhysicalChunkScanLimits) -> Self {
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(super) fn for_phase_a_measurement_v1(limits: PhysicalChunkScanLimits) -> Self {
         Self {
             state: Arc::new(PhysicalChunkScanBudgetState {
                 limits,
@@ -2526,6 +2647,12 @@ impl PhysicalChunkScanBudget {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn for_test(limits: PhysicalChunkScanLimits) -> Self {
+        Self::for_phase_a_measurement_v1(limits)
+    }
+
+    #[cfg(test)]
     fn usage_for_test(&self) -> PhysicalChunkScanBudgetUsage {
         *self.state.usage.lock()
     }
@@ -2663,6 +2790,10 @@ mod tests {
         fixture.bytes[record.start..record.end]
             .to_vec()
             .into_boxed_slice()
+    }
+
+    fn web_handoff_fixture() -> AdversarialMcapFixture {
+        fixture_with_chunks([FixtureChunk::new([FixtureMessage::new(1, 0, 1)])])
     }
 
     fn issue<'a>(
@@ -2845,6 +2976,258 @@ mod tests {
             authority.shared.state.lock().slots[0],
             PhysicalChunkSlot::Vacant { last_generation: 2 }
         );
+    }
+
+    #[test]
+    fn web_explicit_copy_handoff_revalidates_every_safe_point_and_releases_after_body_drop() {
+        use crate::web_body_handoff::{
+            WEB_PHYSICAL_BODY_PHASE_A_CANDIDATE_PROFILE_V1, WebPendingPhysicalChunkReadV1,
+            WebPhysicalBodyProfileStatusV1, WebPhysicalBodySafePointV1, WebPhysicalBodyStrategyV1,
+            WebPhysicalCopyOverlapBudgetV1, process_explicit_copy_body_v1,
+        };
+
+        let fixture = web_handoff_fixture();
+        let authority = build_authority(&fixture);
+        let body = full_record(&fixture, 0);
+        let pending = WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&authority, 0));
+        let budget = WebPhysicalCopyOverlapBudgetV1::new_unfrozen_phase_a_v1();
+        let mut observed = Vec::new();
+        let completed = process_explicit_copy_body_v1(pending, &body, &budget, |point| {
+            observed.push(point);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            observed,
+            [
+                WebPhysicalBodySafePointV1::BeforeHeaderValidation,
+                WebPhysicalBodySafePointV1::AfterPayloadCopy,
+                WebPhysicalBodySafePointV1::AfterExactDecompression,
+                WebPhysicalBodySafePointV1::AfterPhysicalScan,
+                WebPhysicalBodySafePointV1::BeforeCachePublication,
+            ]
+        );
+        assert_eq!(
+            WEB_PHYSICAL_BODY_PHASE_A_CANDIDATE_PROFILE_V1.strategy,
+            WebPhysicalBodyStrategyV1::ExplicitCopyV1
+        );
+        assert_eq!(
+            WEB_PHYSICAL_BODY_PHASE_A_CANDIDATE_PROFILE_V1.status,
+            WebPhysicalBodyProfileStatusV1::Unfrozen
+        );
+        let (active, retained, high_water) = budget.usage_for_test_v1();
+        assert_eq!(active, 1);
+        assert!(retained > body.len() as u64);
+        assert_eq!(retained, high_water);
+        drop(body);
+        let cache = completed.into_cache_after_body_drop_v1();
+        assert!(cache.is_current_for_test_v1());
+        assert_eq!(budget.usage_for_test_v1(), (0, 0, high_water));
+        drop(cache);
+    }
+
+    #[test]
+    fn web_borrowed_boundary_binds_body_lease_profile_and_all_safe_points() {
+        use crate::web_body_handoff::{
+            WebPendingPhysicalChunkReadV1, WebPhysicalBodySafePointV1, WebPhysicalBudgetProfileV1,
+            WebPhysicalCopyOverlapBudgetV1,
+        };
+
+        let fixture = web_handoff_fixture();
+        let authority = build_authority(&fixture);
+        let pending = WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&authority, 0));
+        let identity = pending.identity_v1().unwrap();
+        let body = full_record(&fixture, 0);
+        let borrowed = pending
+            .bind_borrowed_exact_body_v1(&body, WebPhysicalBudgetProfileV1::UnfrozenPhaseACandidate)
+            .unwrap();
+        assert_eq!(identity.canonical_ordinal_v1(), 0);
+        assert_eq!(
+            identity.budget_profile_v1(),
+            WebPhysicalBudgetProfileV1::UnfrozenPhaseACandidate
+        );
+        let budget = WebPhysicalCopyOverlapBudgetV1::new_unfrozen_phase_a_v1();
+        let mut observed = Vec::new();
+        let completed = borrowed
+            .process_explicit_copy_v1(&budget, |point| {
+                observed.push(point);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            observed,
+            [
+                WebPhysicalBodySafePointV1::BeforeHeaderValidation,
+                WebPhysicalBodySafePointV1::AfterPayloadCopy,
+                WebPhysicalBodySafePointV1::AfterExactDecompression,
+                WebPhysicalBodySafePointV1::AfterPhysicalScan,
+                WebPhysicalBodySafePointV1::BeforeCachePublication,
+            ]
+        );
+        drop(body);
+        let cache = completed.into_cache_after_body_drop_v1();
+        assert!(cache.is_current_for_test_v1());
+        drop(cache);
+    }
+
+    #[test]
+    fn web_borrowed_boundary_rejects_wrong_length_and_profile() {
+        use crate::web_body_handoff::{
+            WebPendingPhysicalChunkReadV1, WebPhysicalBudgetProfileV1,
+            WebPhysicalCompletionBindErrorV1,
+        };
+
+        let fixture = web_handoff_fixture();
+        let authority = build_authority(&fixture);
+        let body = full_record(&fixture, 0);
+        let short = WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&authority, 0));
+        assert!(matches!(
+            short.bind_borrowed_exact_body_v1(
+                &body[..body.len() - 1],
+                WebPhysicalBudgetProfileV1::UnfrozenPhaseACandidate,
+            ),
+            Err(WebPhysicalCompletionBindErrorV1::CrossCombination)
+        ));
+        let wrong_profile = WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&authority, 0));
+        assert!(matches!(
+            wrong_profile
+                .bind_borrowed_exact_body_v1(&body, WebPhysicalBudgetProfileV1::TestMismatched,),
+            Err(WebPhysicalCompletionBindErrorV1::CrossCombination)
+        ));
+    }
+
+    #[test]
+    fn web_header_revalidation_rejects_wrong_token_generation_and_profile_before_copy() {
+        use crate::web_body_handoff::{
+            WebPendingPhysicalChunkReadV1, WebPhysicalBodyHandoffErrorV1,
+            WebPhysicalBodySafePointV1, WebPhysicalCopyOverlapBudgetV1,
+            process_explicit_copy_body_v1,
+        };
+
+        for mismatch in ["attempt token", "source/read generation", "budget profile"] {
+            let fixture = web_handoff_fixture();
+            let authority = build_authority(&fixture);
+            let body = full_record(&fixture, 0);
+            let pending = WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&authority, 0));
+            let budget = WebPhysicalCopyOverlapBudgetV1::new_unfrozen_phase_a_v1();
+            reset_web_destination_allocation_attempts_for_test_v1();
+            let result = process_explicit_copy_body_v1(pending, &body, &budget, |point| {
+                (point != WebPhysicalBodySafePointV1::BeforeHeaderValidation)
+                    .then_some(())
+                    .ok_or(())
+            });
+            assert!(matches!(
+                result,
+                Err(WebPhysicalBodyHandoffErrorV1::RevalidationFailed(
+                    WebPhysicalBodySafePointV1::BeforeHeaderValidation
+                ))
+            ));
+            assert_eq!(
+                web_destination_allocation_attempts_for_test_v1(),
+                0,
+                "{mismatch} must fail before destination allocation"
+            );
+            assert_eq!(budget.usage_for_test_v1(), (0, 0, 0));
+        }
+    }
+
+    #[test]
+    fn web_explicit_copy_overlap_accepts_exact_and_rejects_minus_one_before_copy() {
+        use crate::web_body_handoff::{
+            WebPendingPhysicalChunkReadV1, WebPhysicalBodyHandoffErrorV1,
+            WebPhysicalCopyOverlapBudgetV1, process_explicit_copy_body_v1,
+        };
+
+        let fixture = web_handoff_fixture();
+        let authority = build_authority(&fixture);
+        let body = full_record(&fixture, 0);
+        let probe_budget = WebPhysicalCopyOverlapBudgetV1::new_unfrozen_phase_a_v1();
+        let completed = process_explicit_copy_body_v1(
+            WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&authority, 0)),
+            &body,
+            &probe_budget,
+            |_point| Ok(()),
+        )
+        .unwrap();
+        let exact = probe_budget.usage_for_test_v1().1;
+        drop(body);
+        drop(completed.into_cache_after_body_drop_v1());
+
+        let exact_fixture = web_handoff_fixture();
+        let exact_authority = build_authority(&exact_fixture);
+        let exact_body = full_record(&exact_fixture, 0);
+        let exact_budget = WebPhysicalCopyOverlapBudgetV1::new_for_test_v1(exact);
+        let exact_completed = process_explicit_copy_body_v1(
+            WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&exact_authority, 0)),
+            &exact_body,
+            &exact_budget,
+            |_point| Ok(()),
+        )
+        .unwrap();
+        drop(exact_body);
+        drop(exact_completed.into_cache_after_body_drop_v1());
+
+        let short_fixture = web_handoff_fixture();
+        let short_authority = build_authority(&short_fixture);
+        let short_body = full_record(&short_fixture, 0);
+        let short_budget = WebPhysicalCopyOverlapBudgetV1::new_for_test_v1(exact - 1);
+        reset_web_destination_allocation_attempts_for_test_v1();
+        assert!(matches!(
+            process_explicit_copy_body_v1(
+                WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&short_authority, 0)),
+                &short_body,
+                &short_budget,
+                |_point| Ok(()),
+            ),
+            Err(WebPhysicalBodyHandoffErrorV1::ResourceLimitExceeded)
+        ));
+        assert_eq!(web_destination_allocation_attempts_for_test_v1(), 0);
+        assert_eq!(short_budget.usage_for_test_v1(), (0, 0, 0));
+    }
+
+    #[test]
+    fn web_stale_after_copy_never_reaches_decompression_scan_or_cache() {
+        use crate::web_body_handoff::{
+            WebPendingPhysicalChunkReadV1, WebPhysicalBodyHandoffErrorV1,
+            WebPhysicalBodySafePointV1, WebPhysicalCopyOverlapBudgetV1,
+            process_explicit_copy_body_v1,
+        };
+
+        let fixture = web_handoff_fixture();
+        let authority = build_authority(&fixture);
+        let body = full_record(&fixture, 0);
+        let budget = WebPhysicalCopyOverlapBudgetV1::new_unfrozen_phase_a_v1();
+        let mut observed = Vec::new();
+        reset_web_destination_allocation_attempts_for_test_v1();
+        let result = process_explicit_copy_body_v1(
+            WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&authority, 0)),
+            &body,
+            &budget,
+            |point| {
+                observed.push(point);
+                (point != WebPhysicalBodySafePointV1::AfterPayloadCopy)
+                    .then_some(())
+                    .ok_or(())
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(WebPhysicalBodyHandoffErrorV1::RevalidationFailed(
+                WebPhysicalBodySafePointV1::AfterPayloadCopy
+            ))
+        ));
+        assert_eq!(
+            observed,
+            [
+                WebPhysicalBodySafePointV1::BeforeHeaderValidation,
+                WebPhysicalBodySafePointV1::AfterPayloadCopy,
+            ]
+        );
+        assert_eq!(web_destination_allocation_attempts_for_test_v1(), 1);
+        let (_, retained, high_water) = budget.usage_for_test_v1();
+        assert_eq!(retained, 0);
+        assert!(high_water > 0);
+        assert!(authority.issue(authority.select(0).unwrap()).is_ok());
     }
 
     #[test]

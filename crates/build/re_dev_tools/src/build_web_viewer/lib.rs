@@ -7,10 +7,11 @@ use std::time::Instant;
 use anyhow::Context as _;
 use cargo_metadata::camino::{Utf8Path, Utf8PathBuf};
 use re_build_tools::remote_wasm_contract::{
-    RemoteWasmToolchainAttestationV1, configure_product_wasm_command_v1,
-    configure_remote_ros2_verifier_command_v1, is_canonical_remote_ros2_probe_host_v1,
-    locked_remote_wasm_toolchain_attestation_v1,
+    RemoteWasmToolchainAttestationV1, configure_mcap_phase_a_proof_command_v1,
+    configure_product_wasm_command_v1, configure_remote_ros2_verifier_command_v1,
+    is_canonical_remote_ros2_probe_host_v1, locked_remote_wasm_toolchain_attestation_v1,
 };
+use sha2::{Digest as _, Sha256};
 
 const REMOTE_ROS2_ALLOCATOR_CONTRACT_V1: &[u8] =
     b"AccountingAllocator<System>;tracking=admission-v1";
@@ -127,6 +128,99 @@ impl argh::FromArgValue for Target {
 fn verify_remote_ros2_probe_toolchain() -> anyhow::Result<RemoteWasmToolchainAttestationV1> {
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     locked_remote_wasm_toolchain_attestation_v1(&rustc)
+}
+
+/// Builds the private MCAP Phase A proof with the exact release profile and optimizer used by the
+/// Web Viewer product artifact.
+pub fn build_mcap_phase_a_proof_v1(build_dir: &Utf8Path) -> anyhow::Result<()> {
+    std::env::set_current_dir(workspace_root())?;
+    std::fs::create_dir_all(build_dir)?;
+    let root_dir = workspace_root();
+    let target_dir = Utf8PathBuf::from(format!("{}_mcap_phase_a_proof", target_directory()));
+    let toolchain = verify_remote_ros2_probe_toolchain()?;
+    let mut command = std::process::Command::new(toolchain.canonical_cargo_v1());
+    command.args([
+        "build",
+        "--package=re_mcap_phase_a_chrome",
+        "--lib",
+        "--target=wasm32-unknown-unknown",
+        &format!("--target-dir={target_dir}"),
+        "--profile=web-release",
+        "--config=.cargo/config.toml",
+    ]);
+    configure_mcap_phase_a_proof_command_v1(&mut command, &toolchain)?;
+    eprintln!("{root_dir}> {command:?}");
+    let status = command
+        .current_dir(&root_dir)
+        .status()
+        .context("Failed to build the MCAP Phase A proof artifact")?;
+    anyhow::ensure!(
+        status.success(),
+        "Failed to build the MCAP Phase A proof artifact"
+    );
+
+    let input_wasm = target_dir
+        .join("wasm32-unknown-unknown")
+        .join("web-release")
+        .join("re_mcap_phase_a_chrome.wasm");
+    let mut bindgen = wasm_bindgen_cli_support::Bindgen::new();
+    bindgen
+        .input_path(input_wasm.as_str())
+        .out_name("re_mcap_phase_a_proof")
+        .web(true)?
+        .typescript(false);
+    bindgen
+        .generate(build_dir.as_str())
+        .context("Failed to generate MCAP Phase A proof bindings")?;
+    let optimized_wasm = build_dir.join("re_mcap_phase_a_proof_bg.wasm");
+    optimize_wasm(&root_dir, &optimized_wasm, false)?;
+    let mut payload = vec![0, 1, 0, 0];
+    payload.extend_from_slice(&42_i32.to_le_bytes());
+    let fixture = re_mcap::testing::AdversarialMcapFixtureBuilder::new()
+        .with_schemas([
+            re_mcap::testing::FixtureSchema::new(7, "pkg/Root", "ros2msg")
+                .with_data(b"int32 value"),
+        ])
+        .with_channels([
+            re_mcap::testing::FixtureChannel::schema_less(1, "/phase_a").with_schema(7, "cdr")
+        ])
+        .with_chunks([re_mcap::testing::FixtureChunk::new([
+            re_mcap::testing::FixtureMessage::new(1, 1, 1).with_data(payload),
+        ])])
+        .with_partition_fixture(re_mcap::testing::PartitionFixture::default())
+        .build()
+        .map_err(|error| anyhow::anyhow!("Failed to build the fixed Phase A fixture: {error}"))?;
+    let fixture_name = "phase-a-fixture.mcap";
+    std::fs::write(build_dir.join(fixture_name), &fixture.bytes)?;
+    let module_name = "re_mcap_phase_a_proof.js";
+    let wasm_name = "re_mcap_phase_a_proof_bg.wasm";
+    let module_sha256 = sha256_hex_v1(&std::fs::read(build_dir.join(module_name))?);
+    let wasm_sha256 = sha256_hex_v1(&std::fs::read(build_dir.join(wasm_name))?);
+    let fixture_sha256 = sha256_hex_v1(&fixture.bytes);
+    let git_commit = re_build_tools::git_commit_hash()?;
+    std::fs::write(
+        build_dir.join("proof-manifest-v1.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "rerun-mcap-phase-a-proof-build-v1",
+            "profile": "web-release",
+            "wasm_optimized": true,
+            "module": module_name,
+            "wasm": wasm_name,
+            "fixture": fixture_name,
+            "fixture_length": fixture.bytes.len(),
+            "module_sha256": module_sha256,
+            "wasm_sha256": wasm_sha256,
+            "fixture_sha256": fixture_sha256,
+            "git_commit": git_commit,
+            "browser_family": "chrome-stable"
+        }))?,
+    )?;
+    Ok(())
+}
+
+fn sha256_hex_v1(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Build `re_viewer` as Wasm, generate .js bindings for it, and place it all into the `build_dir` folder.

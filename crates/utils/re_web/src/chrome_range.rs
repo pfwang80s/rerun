@@ -418,6 +418,7 @@ fn validate_bound_validator(
 mod web {
     use std::fmt;
     use std::future::Future;
+    use std::ops::Range;
 
     use js_sys::{Function, JsString, Reflect};
     use wasm_bindgen::{JsCast as _, JsValue};
@@ -435,7 +436,7 @@ mod web {
         BoundedPrefixBody, ExactLengthBodyCompletion, ExactLengthByobPumpConfig,
         ExactLengthByobPumpControl, ExactLengthByobPumpControlError, ExactLengthRangeBody,
         PreparedExactLengthRangeBodyPump, prepare_exact_range_body_pump,
-        read_bounded_prefix_body_prepared, read_exact_range_body_prepared,
+        read_bounded_prefix_body_prepared, read_exact_range_body, read_exact_range_body_prepared,
         read_exact_range_body_prepared_with_completion,
     };
     use crate::range_retry::ChromeRangeAttemptAbortController;
@@ -1249,6 +1250,123 @@ mod web {
             pump_slice_bytes,
         )?;
         prepared.start(BorrowedPumpControl(control), timeout).await
+    }
+
+    #[cfg(rerun_mcap_phase_a_proof_v1)]
+    pub struct PhaseAExactRangeMeasurementV1 {
+        body: ExactLengthRangeBody,
+        retained_high_water_bytes: u64,
+        overflowed: bool,
+    }
+
+    #[cfg(rerun_mcap_phase_a_proof_v1)]
+    impl PhaseAExactRangeMeasurementV1 {
+        pub fn into_parts_v1(self) -> (ExactLengthRangeBody, u64, bool) {
+            (self.body, self.retained_high_water_bytes, self.overflowed)
+        }
+    }
+
+    #[cfg(rerun_mcap_phase_a_proof_v1)]
+    pub async fn fetch_exact_phase_a_measurement_v1(
+        url: &str,
+        range: Range<u64>,
+    ) -> Result<PhaseAExactRangeMeasurementV1, ChromeRangeError> {
+        struct AlwaysVisible;
+
+        #[async_trait::async_trait(?Send)]
+        impl ExactLengthByobPumpControl for AlwaysVisible {
+            async fn wait_until_read_allowed(
+                &mut self,
+            ) -> Result<(), ExactLengthByobPumpControlError> {
+                Ok(())
+            }
+        }
+
+        let requested = RequestedRange::new(range.clone())?;
+        let root =
+            crate::remote_limits::ProductionWebRemoteLimitsV1::start_phase_a_measurement_root_v1()
+                .map_err(|_error| ChromeRangeError::ResourceLimit)?;
+        let viewer = root
+            .create_viewer_scope()
+            .map_err(|_error| ChromeRangeError::ResourceLimit)?;
+        let source = viewer
+            .create_source_scope()
+            .map_err(|_error| ChromeRangeError::ResourceLimit)?;
+        let session = source
+            .create_session_scope()
+            .map_err(|_error| ChromeRangeError::ResourceLimit)?;
+        let range_scope = session
+            .create_range_response_scope()
+            .map_err(|_error| ChromeRangeError::ResourceLimit)?;
+        let work_scope = range_scope
+            .create_work_unit_scope()
+            .map_err(|_error| ChromeRangeError::ResourceLimit)?;
+
+        let headers = web_sys::Headers::new()
+            .map_err(|_error| ChromeRangeError::BrowserAdapterUnavailable)?;
+        headers
+            .set(
+                "Range",
+                &format!("bytes={}-{}", requested.start, requested.end_inclusive),
+            )
+            .map_err(|_error| ChromeRangeError::BrowserAdapterUnavailable)?;
+        let init = web_sys::RequestInit::new();
+        init.set_method("GET");
+        init.set_mode(web_sys::RequestMode::Cors);
+        init.set_headers(&headers);
+        let request = web_sys::Request::new_with_str_and_init(url, &init)
+            .map_err(|_error| ChromeRangeError::BrowserAdapterUnavailable)?;
+        let abort_controller = web_sys::AbortController::new()
+            .map_err(|_error| ChromeRangeError::BrowserAdapterUnavailable)?;
+        let response = JsFuture::from(
+            web_sys::window()
+                .ok_or(ChromeRangeError::BrowserAdapterUnavailable)?
+                .fetch_with_request(&request),
+        )
+        .await
+        .map_err(|_error| ChromeRangeError::BrowserFetchUnavailable)?
+        .dyn_into::<web_sys::Response>()
+        .map_err(|_error| ChromeRangeError::BrowserFetchUnavailable)?;
+        map_visible_status(response.status())?;
+        let content_range = raw_response_header(&response, "Content-Range")?.ok_or(
+            ChromeRangeError::RequiredResponseHeaderUnavailable(
+                RequiredRangeResponseHeader::ContentRange,
+            ),
+        )?;
+        let parsed =
+            parse_content_range(&content_range).ok_or(ChromeRangeError::InvalidContentRange)?;
+        if parsed.start != requested.start || parsed.end_inclusive != requested.end_inclusive {
+            return Err(ChromeRangeError::InvalidContentRange);
+        }
+        let content_length = raw_response_header(&response, "Content-Length")?
+            .and_then(|value| parse_content_length(&value))
+            .ok_or(ChromeRangeError::InvalidContentLength)?;
+        if content_length != requested.expected_bytes.get() {
+            return Err(ChromeRangeError::InvalidContentLength);
+        }
+        let config = ExactLengthByobPumpConfig::new(
+            range,
+            NonZeroU64::new(64 * 1024).expect("the proof BYOB slice is non-zero"),
+        )
+        .map_err(ChromeRangeError::BodyPump)?;
+        let body = read_exact_range_body(
+            &response,
+            &abort_controller,
+            &root,
+            &range_scope,
+            &work_scope,
+            config,
+            &mut AlwaysVisible,
+            std::future::pending(),
+        )
+        .await
+        .map_err(ChromeRangeError::BodyPump)?;
+        let (retained_high_water_bytes, overflowed) = root.phase_a_byte_ledger_v1();
+        Ok(PhaseAExactRangeMeasurementV1 {
+            body,
+            retained_high_water_bytes,
+            overflowed,
+        })
     }
 }
 

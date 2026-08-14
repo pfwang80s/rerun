@@ -722,9 +722,9 @@ fn checked_mul(left: u64, right: u64) -> Result<u64, IndexConsistencyViolation> 
         .ok_or(IndexConsistencyViolation::ArithmeticOverflow)
 }
 
-#[cfg(test)]
 impl MessageIndexRegionLimits {
-    pub(crate) const fn for_test(
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) const fn for_phase_a_measurement_v1(
         max_records_per_region: u64,
         max_entries_per_record: u64,
         max_aggregate_entries: u64,
@@ -732,18 +732,33 @@ impl MessageIndexRegionLimits {
     ) -> Self {
         Self {
             max_records_per_region,
-            nested: MessageIndexPreflightLimits::for_test(
+            nested: MessageIndexPreflightLimits::for_phase_a_measurement_v1(
                 max_entries_per_record,
                 max_aggregate_entries,
             ),
             max_result_retained_bytes,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        max_records_per_region: u64,
+        max_entries_per_record: u64,
+        max_aggregate_entries: u64,
+        max_result_retained_bytes: u64,
+    ) -> Self {
+        Self::for_phase_a_measurement_v1(
+            max_records_per_region,
+            max_entries_per_record,
+            max_aggregate_entries,
+            max_result_retained_bytes,
+        )
+    }
 }
 
-#[cfg(test)]
 impl MessageIndexRegionBudget {
-    pub(crate) fn for_test(
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) fn for_phase_a_measurement_v1(
         limits: MessageIndexRegionLimits,
         max_active_raw_inputs: u64,
         max_raw_input_bytes: u64,
@@ -768,6 +783,28 @@ impl MessageIndexRegionBudget {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        limits: MessageIndexRegionLimits,
+        max_active_raw_inputs: u64,
+        max_raw_input_bytes: u64,
+        max_active_results: u64,
+        max_result_records: u64,
+        max_result_entries: u64,
+        max_result_retained_bytes: u64,
+    ) -> Self {
+        Self::for_phase_a_measurement_v1(
+            limits,
+            max_active_raw_inputs,
+            max_raw_input_bytes,
+            max_active_results,
+            max_result_records,
+            max_result_entries,
+            max_result_retained_bytes,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn usage_for_test(&self) -> (u64, u64, u64, u64, u64, u64) {
         let usage = *self.state.usage.lock();
         (

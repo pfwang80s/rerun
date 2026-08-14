@@ -848,9 +848,9 @@ impl<'a> SliceCursor<'a> {
     }
 }
 
-#[cfg(test)]
 impl SummaryMaterializationLimits {
-    pub(crate) const fn for_test(
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) const fn for_phase_a_measurement_v1(
         max_channel_metadata_entries_per_record: u64,
         max_channel_metadata_key_bytes: u64,
         max_channel_metadata_value_bytes: u64,
@@ -867,11 +867,30 @@ impl SummaryMaterializationLimits {
             max_statistics_channel_message_counts,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        max_channel_metadata_entries_per_record: u64,
+        max_channel_metadata_key_bytes: u64,
+        max_channel_metadata_value_bytes: u64,
+        max_nested_retained_bytes_per_summary: u64,
+        max_chunk_index_message_index_offsets: u64,
+        max_statistics_channel_message_counts: u64,
+    ) -> Self {
+        Self::for_phase_a_measurement_v1(
+            max_channel_metadata_entries_per_record,
+            max_channel_metadata_key_bytes,
+            max_channel_metadata_value_bytes,
+            max_nested_retained_bytes_per_summary,
+            max_chunk_index_message_index_offsets,
+            max_statistics_channel_message_counts,
+        )
+    }
 }
 
-#[cfg(test)]
 impl SummaryMaterializationBudget {
-    pub(crate) fn for_test(
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) fn for_phase_a_measurement_v1(
         limits: SummaryMaterializationLimits,
         max_active_reservations: u64,
         census_capacity: NestedPreflightCensus,
@@ -892,11 +911,22 @@ impl SummaryMaterializationBudget {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        limits: SummaryMaterializationLimits,
+        max_active_reservations: u64,
+        census_capacity: NestedPreflightCensus,
+    ) -> Self {
+        Self::for_phase_a_measurement_v1(limits, max_active_reservations, census_capacity)
+    }
+
+    #[cfg(test)]
     pub(super) fn usage_for_test(&self) -> (u64, NestedPreflightCensus) {
         let usage = *self.state.usage.lock();
         (usage.active_reservations, usage.census)
     }
 
+    #[cfg(test)]
     pub(super) fn profile_id_for_test(&self) -> u64 {
         self.state.profile_id
     }
@@ -920,12 +950,20 @@ impl MaterializedSummaryRecords<'_> {
     }
 }
 
-#[cfg(test)]
 impl MessageIndexPreflightLimits {
-    pub(super) const fn for_test(max_entries_per_record: u64, max_aggregate_entries: u64) -> Self {
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(super) const fn for_phase_a_measurement_v1(
+        max_entries_per_record: u64,
+        max_aggregate_entries: u64,
+    ) -> Self {
         Self {
             max_entries_per_record,
             max_aggregate_entries,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) const fn for_test(max_entries_per_record: u64, max_aggregate_entries: u64) -> Self {
+        Self::for_phase_a_measurement_v1(max_entries_per_record, max_aggregate_entries)
     }
 }

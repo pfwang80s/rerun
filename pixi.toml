@@ -217,6 +217,7 @@ rerun-web-release = { cmd = "cargo run --package rerun-cli --no-default-features
 
 # Compile the web-viewer wasm in release mode.
 rerun-build-web-release = "cargo run -p re_dev_tools -- build-web-viewer --no-default-features --features analytics,map_view --release"
+mcap-phase-a-proof-build = "cargo run -p re_dev_tools -- build-web-viewer --release --mcap-phase-a-proof-out target/mcap-phase-a-proof-v1"
 
 rs-check = "python scripts/ci/rust_checks.py"
 

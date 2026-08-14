@@ -722,9 +722,9 @@ fn checked_mul(left: u64, right: u64) -> Result<u64, IndexConsistencyViolation> 
         .ok_or(IndexConsistencyViolation::ArithmeticOverflow)
 }
 
-#[cfg(test)]
 impl PhysicalRegionLimits {
-    pub(crate) const fn for_test(
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) const fn for_phase_a_measurement_v1(
         max_canonical_chunks: u64,
         max_chunk_record_bytes: u64,
         max_message_index_region_bytes: u64,
@@ -743,11 +743,32 @@ impl PhysicalRegionLimits {
             max_descriptor_retained_bytes,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        max_canonical_chunks: u64,
+        max_chunk_record_bytes: u64,
+        max_message_index_region_bytes: u64,
+        max_compression_bytes: u64,
+        max_compressed_bytes: u64,
+        max_uncompressed_bytes: u64,
+        max_descriptor_retained_bytes: u64,
+    ) -> Self {
+        Self::for_phase_a_measurement_v1(
+            max_canonical_chunks,
+            max_chunk_record_bytes,
+            max_message_index_region_bytes,
+            max_compression_bytes,
+            max_compressed_bytes,
+            max_uncompressed_bytes,
+            max_descriptor_retained_bytes,
+        )
+    }
 }
 
-#[cfg(test)]
 impl PhysicalRegionBudget {
-    pub(crate) fn for_test(
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) fn for_phase_a_measurement_v1(
         limits: PhysicalRegionLimits,
         max_active_reservations: u64,
         max_aggregate_canonical_chunks: u64,
@@ -764,6 +785,22 @@ impl PhysicalRegionBudget {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        limits: PhysicalRegionLimits,
+        max_active_reservations: u64,
+        max_aggregate_canonical_chunks: u64,
+        max_aggregate_descriptor_retained_bytes: u64,
+    ) -> Self {
+        Self::for_phase_a_measurement_v1(
+            limits,
+            max_active_reservations,
+            max_aggregate_canonical_chunks,
+            max_aggregate_descriptor_retained_bytes,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn usage_for_test(&self) -> (u64, u64, u64) {
         let usage = *self.state.usage.lock();
         (

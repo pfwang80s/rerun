@@ -57,7 +57,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | --- | --- | --- | --- | --- |
 | M0 | MCAP-001…005 | 5/5 | 已完成 | 既有公开行为、fixture、Chrome origin、确定性调度和脱敏断言可复用 |
 | M1 | MCAP-006…012 | 7/7 | 已完成 | URL、validator、时间、wire、Store generation 和 remote runtime interner 边界冻结 |
-| M2 | MCAP-013…033（含 MCAP-025A、MCAP-030A） | 19/23 | 进行中 | 不接 TimeControl 即可安全完成 metadata opening、bounded decoder initialization、局部 Chunk 验证和 terminal batch 派生 |
+| M2 | MCAP-013…033（含 MCAP-025A、MCAP-030A、MCAP-030B） | 24/24 | 已完成 | 不接 TimeControl 即可安全完成 metadata opening、bounded decoder initialization、局部 Chunk 验证和 terminal batch 派生 |
 | M3 | MCAP-034…042 | 0/6 | 未开始 | Web remote-MCAP partition、root、coverage、reclaim 和 existing-identifier 能力可用 |
 | M4 | MCAP-043…057 | 0/15 | 未开始 | compatibility 和 strict lane 的身份、状态、回放、dispose 与 teardown 闭合 |
 | M5 | MCAP-058…066 | 0/0 | 已移出 | legacy HTTP adapter 保留现有 Web 路径，不进入 remote-MCAP 项目 |
@@ -67,7 +67,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M8 | MCAP-089…105 | 0/17 | 未开始 | foreground-only window playback、seek、query isolation、mutation arbitration 和 reload 闭合 |
 | M9 | MCAP-106…114 | 0/9 | 未开始 | two-phase runner、strict startup、UI/API 文档和桌面 Chrome E2E 全部通过 |
 
-有效工作项总数为 90，当前进度为 31/90；26 个 `[~]` 项不计入分母且不产生提交。
+有效工作项总数为 91，当前进度为 36/91；26 个 `[~]` 项不计入分母且不产生提交。
 关键路径为 `M0 → M1 → M2/M3 → M4/M6/M7 → GA → M8 → M9`。
 M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前保持 feature-disabled。
 
@@ -449,7 +449,7 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 验收：compile/API测试证明validation plan、030A factory、031 output builder、caller scalar/hash和另一session/generation不能构造partition key、root descriptor或`ChunkId`；same partition+ordinal稳定，cross-domain不同，超过registration bound在decode/publication前失败。
 - 负责人：kola；提交：本提交；备注：2026-08-13 完成production-disarmed的immutable manifest authority：消费MCAP-025A resolved physical source ref与MCAP-029 immutable groups，在任何allocation前校验stale source并checked preflight partition、retained metadata、registration和external-origin headroom；session-level `OpeningStatic` 在零indexed units时仍保留。Root issuer使用固定domain/version与little-endian字段的BLAKE3-128，绑定fresh session、physical generation、source ordinal、partition kind/group和output ordinal；caller scalar/hash、cross-session/generation/kind及超界ordinal均fail-closed。Dafee多轮审查后无中级及以上问题且无设计偏离；focused manifest测试2/2、all-features library check、Clippy `-D warnings`与diff-check通过。完整NoIndexed/max-manifest fixture留待后续集成验收；生产Web route继续disarmed，native Viewer/API和Rerun服务端行为不变。
 
-### [ ] MCAP-033 — 建立 Fetch completion queue、CPU driver 与 Phase A 性能基线
+### [x] MCAP-033 — 建立 Fetch completion queue、CPU driver 与 Phase A 性能基线
 
 - 建议提交：`Add bounded remote MCAP CPU work driver`。
 - 依赖：MCAP-013、MCAP-015、MCAP-022、MCAP-024、MCAP-025、MCAP-030、MCAP-031、MCAP-032。
@@ -458,7 +458,7 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 变更：adapter在header前、copy/transfer后、MCAP-024后以及入ready queue、scanner完成和cache/result安装前校验source/read generation、canonical ordinal、expected full range、attempt token与budget profile；任一stale/mismatch都使每个bytes backing先于其accounting permit释放且lease最后释放，不进入下一sealed state或publication。
 - 验收：retry completion只能产生`RetryPending`且下一driver turn至多启动一个attempt；同一Chunk两阶段不在同一allowance串联，合法查询与upstream indexed reader差分一致，BYOB、opening parse、validation、dispatch、MessageIndex五类路径在待封印hard limits内满足主线程阈值；不满足时阻断GA并记录Worker RFC候选。
 - 验收：zero-copy与copy策略必须在canonical Phase A profile中冻结一种；copy路径报告并限制full response、destination和permit的同时峰值；header前wrong/stale token、generation、ordinal、range或profile使destination allocation为零，copy后stale revalidation使MCAP-024、scanner和cache publication为零并释放destination，caller CRC/codec metadata入口在compile/API边界不存在。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：kola；提交：本提交；备注：2026-08-14 完成production-disarmed的Web remote-MCAP Fetch completion与单work-unit CPU driver：Range completion由同源move-only attempt authority签发，per-operation settlement-once、retry与迟到completion不会影响其他ordinal/range；input/output permit以RAII覆盖执行、ready和真实result owner生命周期，typed budget profile与全部safe point精确绑定，ready容量不足时原位保序park。唯一上层adapter位于re_viewer，re_mcap与re_web不新增直接依赖；validation ready通过one-shot phase token在后续独立turn执行dispatch。Phase A证明使用独立attested cfg，在真实web-release+wasm-opt artifact上经controlled Range、production BYOB、Viewer adapter/driver及025A→030→031 typed pipeline执行五阶段，固定2次warmup与5次sample并报告max；byte-only instantaneous ledger记录实际同时存活峰值，evidence绑定JS/Wasm/fixture SHA-256、git commit与Chrome版本，server严格校验、有界单次接收并由CI上传完整证明产物。Dafee三轮审查闭合全部High/Medium后最终为0 High/0 Medium/0 Low且无设计偏离；driver9/9、Phase A chain3/3、Web evidence/server focused tests、proof all-target Clippy `-D warnings`、rustfmt与diff-check通过。本机release-Wasm/Chrome因缺clang、Chrome/Chromedriver未执行，native re_viewer门限因既有libudev.pc缺失被环境阻断；production route继续disarmed，native Viewer/API/runtime与Rerun服务端行为不变。
 
 ## 7. M3 — Store、residency 与 subscriber 基础
 

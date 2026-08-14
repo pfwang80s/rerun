@@ -1170,8 +1170,8 @@ fn read_lz4_u64(input: &[u8], cursor: &mut usize) -> Result<u64, ChunkDecompress
     })?))
 }
 
-#[cfg(test)]
-pub(crate) fn chunk_decompression_budget_for_test() -> ChunkDecompressionBudget {
+#[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+pub(crate) fn chunk_decompression_budget_for_phase_a_measurement_v1() -> ChunkDecompressionBudget {
     let max_zstd_working_bytes =
         estimate_zstd_working_bytes(22).expect("the test zstd profile is valid");
     ChunkDecompressionBudget {
@@ -1194,6 +1194,11 @@ pub(crate) fn chunk_decompression_budget_for_test() -> ChunkDecompressionBudget 
             usage: Mutex::new(ChunkDecompressionBudgetUsage::default()),
         }),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn chunk_decompression_budget_for_test() -> ChunkDecompressionBudget {
+    chunk_decompression_budget_for_phase_a_measurement_v1()
 }
 
 #[cfg(test)]

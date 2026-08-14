@@ -9106,9 +9106,11 @@ dependencies = [
  "rayon",
  "re_build_tools",
  "re_format",
+ "re_mcap",
  "roxmltree",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "toml",
  "ureq",
@@ -9560,6 +9562,25 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
+]
+
+[[package]]
+name = "re_mcap_phase_a_chrome"
+version = "0.36.0-alpha.1+dev"
+dependencies = [
+ "js-sys",
+ "parking_lot",
+ "re_build_tools",
+ "re_mcap",
+ "re_memory",
+ "re_web",
+ "re_web_tests",
+ "serde",
+ "serde-wasm-bindgen",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+ "web-time",
 ]
 
 [[package]]
@@ -10969,6 +10990,7 @@ dependencies = [
  "re_log_channel",
  "re_log_encoding",
  "re_log_types",
+ "re_mcap",
  "re_memory",
  "re_memory_view",
  "re_mutex",
@@ -11188,6 +11210,7 @@ dependencies = [
  "js-sys",
  "pin-project-lite",
  "re_async",
+ "re_build_tools",
  "re_log_types",
  "re_string_interner",
  "re_tuid",
@@ -11216,6 +11239,8 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "zeroize",

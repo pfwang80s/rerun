@@ -16,6 +16,12 @@ use sha2::{Digest as _, Sha256};
 /// Build-scoped request for the remote ROS 2 verifier artifact.
 pub const REMOTE_ROS2_ARTIFACT_PROBE_ENV_V1: &str = "RERUN_REMOTE_ROS2_ARTIFACT_PROBE_V1";
 
+/// Additional build-scoped request for the MCAP Phase A measurement artifact.
+///
+/// This never enables measurement code by itself: every final consumer must also validate the
+/// locked remote-Wasm attestation before emitting its private proof cfg.
+pub const MCAP_PHASE_A_PROOF_ENV_V1: &str = "RERUN_MCAP_PHASE_A_PROOF_V1";
+
 const CANONICAL_WEB_RUSTFLAGS_V1: [&str; 3] = [
     "--cfg=web_sys_unstable_apis",
     "--cfg=getrandom_backend=\"wasm_js\"",
@@ -112,6 +118,12 @@ pub struct RemoteRos2ArtifactAttestationV1 {
     _toolchain: RemoteWasmToolchainAttestationV1,
 }
 
+/// A sealed proof that the independently requested MCAP Phase A artifact uses the locked
+/// remote-Wasm toolchain contract.
+pub struct McapPhaseAArtifactAttestationV1 {
+    _sealed: RemoteRos2ArtifactAttestationV1,
+}
+
 /// Final Cargo consumer which receives a generated, attestation-bound source capability.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RemoteRos2ArtifactConsumerV1 {
@@ -177,6 +189,7 @@ pub fn configure_product_wasm_command_v1(command: &mut Command) {
         "RUSTFLAGS",
         "CARGO_ENCODED_RUSTFLAGS",
         REMOTE_ROS2_ARTIFACT_PROBE_ENV_V1,
+        MCAP_PHASE_A_PROOF_ENV_V1,
     ] {
         command.env_remove(variable);
     }
@@ -195,6 +208,17 @@ pub fn configure_remote_ros2_verifier_command_v1(
     )
 }
 
+/// Hardens the private MCAP Phase A child and adds its independent measurement request.
+pub fn configure_mcap_phase_a_proof_command_v1(
+    command: &mut Command,
+    toolchain: &RemoteWasmToolchainAttestationV1,
+) -> anyhow::Result<()> {
+    configure_remote_ros2_verifier_command_v1(command, toolchain)?;
+    command.env_remove(REMOTE_ROS2_ARTIFACT_PROBE_ENV_V1);
+    command.env(MCAP_PHASE_A_PROOF_ENV_V1, "1");
+    Ok(())
+}
+
 fn configure_remote_ros2_verifier_command_with_path_v1(
     command: &mut Command,
     toolchain: &RemoteWasmToolchainAttestationV1,
@@ -209,6 +233,7 @@ fn configure_remote_ros2_verifier_command_with_path_v1(
             "RUSTC_LINKER",
             "CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_LINKER",
             REMOTE_ROS2_ARTIFACT_PROBE_ENV_V1,
+            MCAP_PHASE_A_PROOF_ENV_V1,
         ])
     {
         command.env_remove(variable);
@@ -373,9 +398,13 @@ pub fn remote_ros2_artifact_attestation_v1()
     if std::env::var(REMOTE_ROS2_ARTIFACT_PROBE_ENV_V1).as_deref() != Ok("1") {
         return Ok(None);
     }
+    locked_remote_wasm_consumer_attestation_v1().map(Some)
+}
+
+fn locked_remote_wasm_consumer_attestation_v1() -> anyhow::Result<RemoteRos2ArtifactAttestationV1> {
     anyhow::ensure!(
         std::env::var("TARGET").as_deref() == Ok("wasm32-unknown-unknown"),
-        "The remote ROS 2 artifact probe is only valid for wasm32-unknown-unknown"
+        "The locked remote-Wasm artifact is only valid for wasm32-unknown-unknown"
     );
     let rustc = std::env::var_os("RUSTC")
         .context("Cargo did not provide the Rust compiler at the consumer boundary")?;
@@ -390,9 +419,22 @@ pub fn remote_ros2_artifact_attestation_v1()
         |name| std::env::var_os(name),
         toolchain.canonical_rust_lld_v1(),
     )?;
-    Ok(Some(RemoteRos2ArtifactAttestationV1 {
+    Ok(RemoteRos2ArtifactAttestationV1 {
         _toolchain: toolchain,
-    }))
+    })
+}
+
+/// Validates the independent MCAP Phase A request in addition to the locked remote-Wasm
+/// attestation.
+pub fn mcap_phase_a_artifact_attestation_v1()
+-> anyhow::Result<Option<McapPhaseAArtifactAttestationV1>> {
+    println!("cargo::rerun-if-env-changed={MCAP_PHASE_A_PROOF_ENV_V1}");
+    if std::env::var(MCAP_PHASE_A_PROOF_ENV_V1).as_deref() != Ok("1") {
+        return Ok(None);
+    }
+    track_probe_environment_v1();
+    let sealed = locked_remote_wasm_consumer_attestation_v1()?;
+    Ok(Some(McapPhaseAArtifactAttestationV1 { _sealed: sealed }))
 }
 
 fn track_probe_environment_v1() {
@@ -703,6 +745,26 @@ mod tests {
                 OsStr::new("--config"),
                 OsStr::new(DISABLE_RUSTC_WORKSPACE_WRAPPER_CONFIG_V1),
             ]
+        );
+    }
+
+    #[test]
+    fn phase_a_proof_request_is_independent_from_the_ros2_probe_request() {
+        let toolchain = fake_toolchain(Path::new("/locked/sysroot"));
+        let mut command = Command::new("cargo");
+        command.env(REMOTE_ROS2_ARTIFACT_PROBE_ENV_V1, "spoof");
+        configure_mcap_phase_a_proof_command_v1(&mut command, &toolchain).unwrap();
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(OsStr::to_owned)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get(OsStr::new(REMOTE_ROS2_ARTIFACT_PROBE_ENV_V1)),
+            Some(&None)
+        );
+        assert_eq!(
+            environment.get(OsStr::new(MCAP_PHASE_A_PROOF_ENV_V1)),
+            Some(&Some(OsString::from("1")))
         );
     }
 

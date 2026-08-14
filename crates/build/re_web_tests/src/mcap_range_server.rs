@@ -7,16 +7,17 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::Path as FsPath;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, OriginalUri, Path, State};
+use axum::extract::{DefaultBodyLimit, OriginalUri, Path, Request, State};
 use axum::http::header::{
-    ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-    ACCESS_CONTROL_EXPOSE_HEADERS, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
-    CONTENT_TYPE, ETAG, LOCATION,
+    ACCEPT_RANGES, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
+    ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, CACHE_CONTROL, CONTENT_ENCODING,
+    CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LOCATION, RANGE,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
@@ -25,10 +26,16 @@ use axum::{Json, Router};
 use parking_lot::{Mutex, MutexGuard};
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use tokio::sync::{Notify, oneshot, watch};
+
+use crate::phase_a_evidence::PhaseAEvidenceV1;
 
 const ROUTE_PREFIX: &str = "/__mcap_range_fixture/v1";
 const PROTOCOL_VERSION: &str = "mcap-range-fixture-v1";
+const PHASE_A_PROOF_SCHEMA_V1: &str = "rerun-mcap-phase-a-proof-build-v1";
+const PHASE_A_PROOF_MODULE_V1: &str = "re_mcap_phase_a_proof.js";
+const PHASE_A_PROOF_WASM_V1: &str = "re_mcap_phase_a_proof_bg.wasm";
 const MAX_SCENARIOS: usize = 128;
 const MAX_CONTROL_BODY_BYTES: usize = 64 * 1024;
 const MAX_BROWSER_EVENT_BYTES: usize = 1024;
@@ -639,6 +646,27 @@ pub struct FixtureBootstrap {
     pub page_origin: String,
     pub object_origin: String,
     pub control_root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_a_proof_module_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_a_proof_wasm_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_a_result_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_a_fixture_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_a_fixture_length: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_a_build: Option<PhaseABuildBootstrapV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhaseABuildBootstrapV1 {
+    pub wasm_sha256: String,
+    pub js_sha256: String,
+    pub fixture_sha256: String,
+    pub git_commit: String,
+    pub browser_family: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -728,6 +756,32 @@ struct SharedState {
     next_scenario: AtomicU64,
     server_shutdown: watch::Sender<bool>,
     active_bodies: AtomicUsize,
+    phase_a_proof: Option<PhaseAProofArtifactV1>,
+    phase_a_evidence: Mutex<Option<PhaseAEvidenceV1>>,
+}
+
+struct PhaseAProofArtifactV1 {
+    module: Bytes,
+    wasm: Bytes,
+    fixture: Bytes,
+    build: PhaseABuildBootstrapV1,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PhaseAProofManifestV1 {
+    schema: String,
+    profile: String,
+    wasm_optimized: bool,
+    module: String,
+    wasm: String,
+    fixture: String,
+    fixture_length: usize,
+    module_sha256: String,
+    wasm_sha256: String,
+    fixture_sha256: String,
+    git_commit: String,
+    browser_family: String,
 }
 
 impl SharedState {
@@ -783,6 +837,58 @@ pub struct McapRangeTestServer {
 impl McapRangeTestServer {
     /// Bind two OS-assigned loopback ports and start both origins.
     pub async fn spawn() -> Result<Self, std::io::Error> {
+        Self::spawn_inner(None).await
+    }
+
+    pub async fn spawn_with_phase_a_proof_v1(proof_dir: &FsPath) -> anyhow::Result<Self> {
+        let manifest = std::fs::read(proof_dir.join("proof-manifest-v1.json"))?;
+        let manifest: PhaseAProofManifestV1 = serde_json::from_slice(&manifest)?;
+        anyhow::ensure!(
+            manifest.schema == PHASE_A_PROOF_SCHEMA_V1
+                && manifest.profile == "web-release"
+                && manifest.wasm_optimized
+                && manifest.module == PHASE_A_PROOF_MODULE_V1
+                && manifest.wasm == PHASE_A_PROOF_WASM_V1
+                && manifest.fixture == "phase-a-fixture.mcap",
+            "invalid MCAP Phase A proof manifest"
+        );
+        let module = std::fs::read(proof_dir.join(PHASE_A_PROOF_MODULE_V1))?;
+        let wasm = std::fs::read(proof_dir.join(PHASE_A_PROOF_WASM_V1))?;
+        let fixture = std::fs::read(proof_dir.join(&manifest.fixture))?;
+        anyhow::ensure!(
+            !module.is_empty() && !wasm.is_empty() && fixture.len() == manifest.fixture_length,
+            "empty MCAP Phase A proof artifact"
+        );
+        anyhow::ensure!(
+            sha256_hex_v1(&module) == manifest.module_sha256
+                && sha256_hex_v1(&wasm) == manifest.wasm_sha256
+                && sha256_hex_v1(&fixture) == manifest.fixture_sha256
+                && manifest.git_commit.len() == 40
+                && manifest
+                    .git_commit
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+                && manifest.browser_family == "chrome-stable",
+            "MCAP Phase A proof digest or build provenance mismatch"
+        );
+        Ok(Self::spawn_inner(Some(PhaseAProofArtifactV1 {
+            module: Bytes::from(module),
+            wasm: Bytes::from(wasm),
+            fixture: Bytes::from(fixture),
+            build: PhaseABuildBootstrapV1 {
+                wasm_sha256: manifest.wasm_sha256,
+                js_sha256: manifest.module_sha256,
+                fixture_sha256: manifest.fixture_sha256,
+                git_commit: manifest.git_commit,
+                browser_family: manifest.browser_family,
+            },
+        }))
+        .await?)
+    }
+
+    async fn spawn_inner(
+        phase_a_proof: Option<PhaseAProofArtifactV1>,
+    ) -> Result<Self, std::io::Error> {
         let page_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let object_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let page_addr = page_listener.local_addr()?;
@@ -803,6 +909,8 @@ impl McapRangeTestServer {
             next_scenario: AtomicU64::new(1),
             server_shutdown,
             active_bodies: AtomicUsize::new(0),
+            phase_a_proof,
+            phase_a_evidence: Mutex::new(None),
         });
 
         let (page_shutdown_tx, page_shutdown_rx) = oneshot::channel();
@@ -837,6 +945,10 @@ impl McapRangeTestServer {
             page_join: Some(page_join),
             object_join: Some(object_join),
         })
+    }
+
+    pub fn phase_a_evidence_v1(&self) -> Option<PhaseAEvidenceV1> {
+        lock(&self.shared.phase_a_evidence).clone()
     }
 
     pub fn page_addr(&self) -> SocketAddr {
@@ -1070,6 +1182,22 @@ fn router(state: AppState) -> Router {
             get(service_worker_js),
         )
         .route(
+            &format!("{ROUTE_PREFIX}/{{nonce}}/phase-a/proof.js"),
+            get(phase_a_proof_module),
+        )
+        .route(
+            &format!("{ROUTE_PREFIX}/{{nonce}}/phase-a/proof_bg.wasm"),
+            get(phase_a_proof_wasm),
+        )
+        .route(
+            &format!("{ROUTE_PREFIX}/{{nonce}}/phase-a/fixture.mcap"),
+            get(phase_a_fixture).options(control_preflight),
+        )
+        .route(
+            &format!("{ROUTE_PREFIX}/{{nonce}}/phase-a/result"),
+            post(phase_a_result).options(control_preflight),
+        )
+        .route(
             &format!("{ROUTE_PREFIX}/{{nonce}}/object/{{id}}"),
             any(object_response),
         )
@@ -1082,11 +1210,36 @@ fn router(state: AppState) -> Router {
 }
 
 async fn bootstrap(State(state): State<AppState>) -> Response {
+    let proof_root = state.shared.phase_a_proof.as_ref().map(|_| {
+        format!(
+            "{}{ROUTE_PREFIX}/{}/phase-a",
+            state.shared.origin(OriginRole::Page),
+            state.shared.nonce
+        )
+    });
     let mut response = Json(FixtureBootstrap {
         protocol: PROTOCOL_VERSION.to_owned(),
         page_origin: state.shared.origin(OriginRole::Page),
         object_origin: state.shared.origin(OriginRole::Object),
         control_root: format!("{ROUTE_PREFIX}/{}", state.shared.nonce),
+        phase_a_proof_module_url: proof_root.as_ref().map(|root| format!("{root}/proof.js")),
+        phase_a_proof_wasm_url: proof_root
+            .as_ref()
+            .map(|root| format!("{root}/proof_bg.wasm")),
+        phase_a_result_url: proof_root.as_ref().map(|root| format!("{root}/result")),
+        phase_a_fixture_url: proof_root
+            .as_ref()
+            .map(|root| format!("{root}/fixture.mcap")),
+        phase_a_fixture_length: state
+            .shared
+            .phase_a_proof
+            .as_ref()
+            .map(|proof| proof.fixture.len()),
+        phase_a_build: state
+            .shared
+            .phase_a_proof
+            .as_ref()
+            .map(|proof| proof.build.clone()),
     })
     .into_response();
     response
@@ -1096,6 +1249,139 @@ async fn bootstrap(State(state): State<AppState>) -> Response {
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+async fn phase_a_proof_module(
+    State(state): State<AppState>,
+    Path(nonce): Path<String>,
+) -> Result<Response, ProtocolError> {
+    require_nonce(&state.shared, &nonce)?;
+    let proof = state
+        .shared
+        .phase_a_proof
+        .as_ref()
+        .ok_or_else(|| ProtocolError::not_found("phase_a_proof"))?;
+    Ok(control_cors(
+        (
+            [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+            proof.module.clone(),
+        )
+            .into_response(),
+    ))
+}
+
+async fn phase_a_proof_wasm(
+    State(state): State<AppState>,
+    Path(nonce): Path<String>,
+) -> Result<Response, ProtocolError> {
+    require_nonce(&state.shared, &nonce)?;
+    let proof = state
+        .shared
+        .phase_a_proof
+        .as_ref()
+        .ok_or_else(|| ProtocolError::not_found("phase_a_proof"))?;
+    Ok(control_cors(
+        ([(CONTENT_TYPE, "application/wasm")], proof.wasm.clone()).into_response(),
+    ))
+}
+
+async fn phase_a_fixture(
+    State(state): State<AppState>,
+    Path(nonce): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ProtocolError> {
+    require_nonce(&state.shared, &nonce)?;
+    let proof = state
+        .shared
+        .phase_a_proof
+        .as_ref()
+        .ok_or_else(|| ProtocolError::not_found("phase_a_proof"))?;
+    let range = headers
+        .get(RANGE)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ProtocolError::invalid("phase_a_fixture_range"))?;
+    let range = range
+        .strip_prefix("bytes=")
+        .ok_or_else(|| ProtocolError::invalid("phase_a_fixture_range"))?;
+    if range.contains(',') {
+        return Err(ProtocolError::invalid("phase_a_fixture_range"));
+    }
+    let (start, end) = range
+        .split_once('-')
+        .ok_or_else(|| ProtocolError::invalid("phase_a_fixture_range"))?;
+    let start = start
+        .parse::<usize>()
+        .map_err(|_error| ProtocolError::invalid("phase_a_fixture_range"))?;
+    let end = end
+        .parse::<usize>()
+        .map_err(|_error| ProtocolError::invalid("phase_a_fixture_range"))?;
+    if start > end || end >= proof.fixture.len() {
+        return Err(ProtocolError::invalid("phase_a_fixture_range"));
+    }
+    let body = proof.fixture.slice(start..=end);
+    let mut response = (StatusCode::PARTIAL_CONTENT, body).into_response();
+    let headers = response.headers_mut();
+    headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    headers.insert(
+        ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static("content-range, content-length, etag"),
+    );
+    headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(ETAG, HeaderValue::from_static("\"phase-a-fixture-v1\""));
+    headers.insert(
+        CONTENT_RANGE,
+        HeaderValue::from_str(&format!("bytes {start}-{end}/{}", proof.fixture.len()))
+            .map_err(|_error| ProtocolError::invalid("phase_a_fixture_range"))?,
+    );
+    Ok(response)
+}
+
+async fn phase_a_result(
+    State(state): State<AppState>,
+    Path(nonce): Path<String>,
+    request: Request,
+) -> Result<Response, ProtocolError> {
+    require_nonce(&state.shared, &nonce)?;
+    if state.shared.phase_a_proof.is_none() {
+        return Err(ProtocolError::not_found("phase_a_proof"));
+    }
+    if let Some(content_length) = request.headers().get(CONTENT_LENGTH) {
+        let content_length = content_length
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| ProtocolError::invalid("phase_a_evidence_content_length"))?;
+        let max_control_body_bytes =
+            u64::try_from(MAX_CONTROL_BODY_BYTES).expect("the control-body byte cap fits in u64");
+        if content_length > max_control_body_bytes {
+            return Err(ProtocolError::capacity("phase_a_evidence_body"));
+        }
+    }
+    let body = axum::body::to_bytes(request.into_body(), MAX_CONTROL_BODY_BYTES)
+        .await
+        .map_err(|_error| ProtocolError::capacity("phase_a_evidence_body"))?;
+    let evidence = PhaseAEvidenceV1::parse_and_validate_v1(&body)
+        .map_err(|_error| ProtocolError::invalid("phase_a_evidence"))?;
+    let proof = state
+        .shared
+        .phase_a_proof
+        .as_ref()
+        .ok_or_else(|| ProtocolError::not_found("phase_a_proof"))?;
+    if evidence.build.wasm_sha256 != proof.build.wasm_sha256
+        || evidence.build.js_sha256 != proof.build.js_sha256
+        || evidence.build.fixture_sha256 != proof.build.fixture_sha256
+        || evidence.build.git_commit != proof.build.git_commit
+        || evidence.build.browser_family != proof.build.browser_family
+    {
+        return Err(ProtocolError::invalid("phase_a_evidence_build"));
+    }
+    let mut slot = lock(&state.shared.phase_a_evidence);
+    if slot.is_some() {
+        return Err(ProtocolError::invalid("phase_a_evidence_duplicate"));
+    }
+    *slot = Some(evidence);
+    Ok(control_cors(StatusCode::NO_CONTENT.into_response()))
 }
 
 async fn register_scenario_http(
@@ -1222,7 +1508,7 @@ fn control_cors(mut response: Response) -> Response {
     );
     response.headers_mut().insert(
         ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static("content-type"),
+        HeaderValue::from_static("content-type, range"),
     );
     response
         .headers_mut()
@@ -2094,13 +2380,100 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock()
 }
 
+fn sha256_hex_v1(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::time::Duration;
 
     use reqwest::redirect::Policy;
 
     use super::*;
+
+    struct ProofDir(tempfile::TempDir);
+
+    impl ProofDir {
+        fn new() -> Self {
+            Self(tempfile::tempdir().expect("create proof directory"))
+        }
+
+        fn path(&self) -> &Path {
+            self.0.path()
+        }
+
+        fn write_valid(&self) {
+            let module = b"export default 1;";
+            let wasm = b"wasm";
+            let fixture = b"mcap";
+            std::fs::write(
+                self.path().join("proof-manifest-v1.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "schema": PHASE_A_PROOF_SCHEMA_V1,
+                    "profile": "web-release",
+                    "wasm_optimized": true,
+                    "module": PHASE_A_PROOF_MODULE_V1,
+                    "wasm": PHASE_A_PROOF_WASM_V1,
+                    "fixture": "phase-a-fixture.mcap",
+                    "fixture_length": 4,
+                    "module_sha256": sha256_hex_v1(module),
+                    "wasm_sha256": sha256_hex_v1(wasm),
+                    "fixture_sha256": sha256_hex_v1(fixture),
+                    "git_commit": "4".repeat(40),
+                    "browser_family": "chrome-stable",
+                }))
+                .expect("serialize proof manifest"),
+            )
+            .expect("write proof manifest");
+            std::fs::write(self.path().join(PHASE_A_PROOF_MODULE_V1), module)
+                .expect("write proof module");
+            std::fs::write(self.path().join(PHASE_A_PROOF_WASM_V1), wasm)
+                .expect("write proof Wasm");
+            std::fs::write(self.path().join("phase-a-fixture.mcap"), fixture)
+                .expect("write proof fixture");
+        }
+    }
+
+    fn valid_phase_a_evidence() -> PhaseAEvidenceV1 {
+        PhaseAEvidenceV1 {
+            schema: crate::phase_a_evidence::PHASE_A_EVIDENCE_SCHEMA_V1.to_owned(),
+            profile_status: "unfrozen".to_owned(),
+            build_profile: "web-release".to_owned(),
+            wasm_optimized: true,
+            warmup_iterations: crate::phase_a_evidence::PHASE_A_WARMUP_ITERATIONS_V1,
+            sample_iterations: crate::phase_a_evidence::PHASE_A_SAMPLE_ITERATIONS_V1,
+            provenance: crate::phase_a_evidence::PhaseAProvenanceV1 {
+                fixture: "fixed-mcap-phase-a-v1".to_owned(),
+                transport: "controlled-range-byob-v1".to_owned(),
+                pipeline: "re_viewer-production-disarmed-v1".to_owned(),
+            },
+            build: crate::phase_a_evidence::PhaseABuildEvidenceV1 {
+                wasm_sha256: sha256_hex_v1(b"wasm"),
+                js_sha256: sha256_hex_v1(b"export default 1;"),
+                fixture_sha256: sha256_hex_v1(b"mcap"),
+                git_commit: "4".repeat(40),
+                browser_family: "chrome-stable".to_owned(),
+                chrome_version: "140.0.0.0".to_owned(),
+            },
+            stages: crate::phase_a_evidence::REQUIRED_PHASE_A_STAGES_V1
+                .into_iter()
+                .map(|name| crate::phase_a_evidence::PhaseAStageEvidenceV1 {
+                    name: name.to_owned(),
+                    max_duration_micros: 1,
+                    input_bytes: 1,
+                    output_bytes: 1,
+                    completed_count: u64::from(
+                        crate::phase_a_evidence::PHASE_A_SAMPLE_ITERATIONS_V1,
+                    ),
+                    retained_high_water_bytes: 1,
+                    overflowed: false,
+                })
+                .collect(),
+        }
+    }
 
     fn two_chunk_range() -> ScenarioSpec {
         let mut spec = ScenarioSpec::exact_range(64, 4);
@@ -2163,6 +2536,194 @@ mod tests {
             "{}{}/control/scenarios/{}{}",
             bootstrap.page_origin, bootstrap.control_root, id.0, suffix
         )
+    }
+
+    #[tokio::test]
+    async fn phase_a_proof_and_evidence_protocol_is_strict_and_once_only() {
+        let proof_dir = ProofDir::new();
+        proof_dir.write_valid();
+        let server = McapRangeTestServer::spawn_with_phase_a_proof_v1(proof_dir.path())
+            .await
+            .expect("spawn proof fixture");
+        let client = reqwest::Client::new();
+        let bootstrap = bootstrap(&client, &server).await;
+        let module_url = bootstrap
+            .phase_a_proof_module_url
+            .as_deref()
+            .expect("proof module URL");
+        let wasm_url = bootstrap
+            .phase_a_proof_wasm_url
+            .as_deref()
+            .expect("proof Wasm URL");
+        let result_url = bootstrap
+            .phase_a_result_url
+            .as_deref()
+            .expect("proof result URL");
+        let fixture_url = bootstrap
+            .phase_a_fixture_url
+            .as_deref()
+            .expect("proof fixture URL");
+        assert_eq!(bootstrap.phase_a_fixture_length, Some(4));
+        let build = bootstrap
+            .phase_a_build
+            .as_ref()
+            .expect("proof build metadata");
+        assert_eq!(build.wasm_sha256, sha256_hex_v1(b"wasm"));
+
+        let module = client.get(module_url).send().await.expect("proof module");
+        assert_eq!(module.status(), StatusCode::OK);
+        assert_eq!(
+            module
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/javascript; charset=utf-8")
+        );
+        assert_eq!(
+            module
+                .headers()
+                .get(ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("*")
+        );
+        assert!(!module.bytes().await.expect("proof module bytes").is_empty());
+
+        let wasm = client.get(wasm_url).send().await.expect("proof Wasm");
+        assert_eq!(wasm.status(), StatusCode::OK);
+        assert_eq!(
+            wasm.headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/wasm")
+        );
+        assert!(!wasm.bytes().await.expect("proof Wasm bytes").is_empty());
+
+        let fixture = client
+            .get(fixture_url)
+            .header(RANGE, "bytes=1-2")
+            .send()
+            .await
+            .expect("proof fixture range");
+        assert_eq!(fixture.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            fixture
+                .headers()
+                .get(CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok()),
+            Some("bytes 1-2/4")
+        );
+        assert_eq!(
+            fixture
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some("2")
+        );
+        assert_eq!(
+            fixture
+                .headers()
+                .get(ACCEPT_RANGES)
+                .and_then(|value| value.to_str().ok()),
+            Some("bytes")
+        );
+        assert_eq!(
+            fixture
+                .headers()
+                .get(ACCESS_CONTROL_EXPOSE_HEADERS)
+                .and_then(|value| value.to_str().ok()),
+            Some("content-range, content-length, etag")
+        );
+        assert_eq!(fixture.bytes().await.unwrap().as_ref(), b"ca");
+
+        let missing_range = client
+            .get(fixture_url)
+            .send()
+            .await
+            .expect("missing proof fixture range");
+        assert_eq!(missing_range.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        for invalid_range in ["items=0-1", "bytes=0-1,2-3", "bytes=2-1", "bytes=0-4"] {
+            let response = client
+                .get(fixture_url)
+                .header(RANGE, invalid_range)
+                .send()
+                .await
+                .expect("invalid proof fixture range");
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+
+        let invalid = client
+            .post(result_url)
+            .body(b"{}".as_slice())
+            .send()
+            .await
+            .expect("invalid evidence response");
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(server.phase_a_evidence_v1().is_none());
+
+        let oversized_length = client
+            .post(result_url)
+            .header(CONTENT_LENGTH, MAX_CONTROL_BODY_BYTES + 1)
+            .body("{}")
+            .send()
+            .await
+            .expect("oversized evidence length response");
+        assert_eq!(oversized_length.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(server.phase_a_evidence_v1().is_none());
+
+        let evidence = valid_phase_a_evidence();
+        let accepted = client
+            .post(result_url)
+            .json(&evidence)
+            .send()
+            .await
+            .expect("valid evidence response");
+        assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
+        assert_eq!(server.phase_a_evidence_v1(), Some(evidence.clone()));
+
+        let duplicate = client
+            .post(result_url)
+            .json(&evidence)
+            .send()
+            .await
+            .expect("duplicate evidence response");
+        assert_eq!(duplicate.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(server.phase_a_evidence_v1(), Some(evidence));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn phase_a_proof_manifest_and_artifacts_fail_closed() {
+        let proof_dir = ProofDir::new();
+        proof_dir.write_valid();
+        std::fs::write(
+            proof_dir.path().join("proof-manifest-v1.json"),
+            br#"{"schema":"future","profile":"web-release","wasm_optimized":true,"module":"re_mcap_phase_a_proof.js","wasm":"re_mcap_phase_a_proof_bg.wasm"}"#,
+        )
+        .expect("replace proof manifest");
+        assert!(
+            McapRangeTestServer::spawn_with_phase_a_proof_v1(proof_dir.path())
+                .await
+                .is_err()
+        );
+
+        proof_dir.write_valid();
+        std::fs::write(proof_dir.path().join(PHASE_A_PROOF_WASM_V1), b"")
+            .expect("empty proof Wasm");
+        assert!(
+            McapRangeTestServer::spawn_with_phase_a_proof_v1(proof_dir.path())
+                .await
+                .is_err()
+        );
+
+        proof_dir.write_valid();
+        std::fs::write(proof_dir.path().join(PHASE_A_PROOF_MODULE_V1), b"")
+            .expect("empty proof module");
+        assert!(
+            McapRangeTestServer::spawn_with_phase_a_proof_v1(proof_dir.path())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

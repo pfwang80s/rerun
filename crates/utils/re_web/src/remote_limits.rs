@@ -2066,6 +2066,16 @@ impl fmt::Debug for ProductionWebRemoteLimitsV1 {
 }
 
 impl ProductionWebRemoteLimitsV1 {
+    #[cfg(rerun_mcap_phase_a_proof_v1)]
+    pub(crate) fn start_phase_a_measurement_root_v1()
+    -> Result<WasmModuleLimitAccountingRoot, ScopeAccountingError> {
+        let limit = NonZeroU64::new(1_u64 << 40).expect("the proof limit is non-zero");
+        Self {
+            values: [limit; WEB_REMOTE_LIMIT_COUNT],
+        }
+        .start_accounting_root_inner()
+    }
+
     fn raw_limit_value(&self, key: WebRemoteLimitKey) -> NonZeroU64 {
         self.values[key.index()]
     }
@@ -2646,6 +2656,14 @@ struct ScopeAccountingState {
     child_node_usage: BTreeMap<AccountingScopeIdentity, ScopeNodeUsage>,
     reservations: BTreeMap<ReservationIdentity, ReservationRecord>,
     accounting_self: AccountingSelfUsage,
+    phase_a_byte_ledger: PhaseAByteLedgerV1,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PhaseAByteLedgerV1 {
+    current_bytes: u64,
+    high_water_bytes: u64,
+    overflowed: bool,
 }
 
 /// An exact snapshot of scope ownership, usage, revisions, and active reservations.
@@ -3316,6 +3334,7 @@ impl ProductionWebRemoteLimitsV1 {
                 child_node_usage: BTreeMap::new(),
                 reservations: BTreeMap::new(),
                 accounting_self: AccountingSelfUsage::default(),
+                phase_a_byte_ledger: PhaseAByteLedgerV1::default(),
             }),
         });
         let module_scope = WebRemoteAccountingScope {
@@ -3342,6 +3361,12 @@ impl ProductionWebRemoteLimitsV1 {
 }
 
 impl WasmModuleLimitAccountingRoot {
+    #[cfg(rerun_mcap_phase_a_proof_v1)]
+    pub(crate) fn phase_a_byte_ledger_v1(&self) -> (u64, bool) {
+        let ledger = self.inner.state.borrow().phase_a_byte_ledger;
+        (ledger.high_water_bytes, ledger.overflowed)
+    }
+
     pub fn create_viewer_scope(&self) -> Result<ViewerAccountingScope, ScopeAccountingError> {
         create_child_scope(
             &self.inner,
@@ -6097,6 +6122,7 @@ impl PreparedScopedReservations {
         );
         state.next_reservation_sequence = self.next_reservation_sequence;
         state.revision = self.committed_revision;
+        refresh_phase_a_byte_ledger_v1(&mut state);
         drop(state);
 
         let totals = std::mem::take(&mut self.totals);
@@ -6320,6 +6346,7 @@ fn create_child_scope(
     state.next_scope_sequence = next_sequence;
     state.next_scope_generation = next_generation;
     state.revision = next_revision;
+    refresh_phase_a_byte_ledger_v1(&mut state);
     drop(state);
 
     Ok(WebRemoteAccountingScope {
@@ -6471,6 +6498,7 @@ fn close_scope_inner(
     parent_usage.current_bytes = next_parent_bytes;
     state.child_node_usage.remove(&identity);
     state.revision = next_revision;
+    refresh_phase_a_byte_ledger_v1(&mut state);
     Ok(())
 }
 
@@ -6669,7 +6697,40 @@ fn release_reservation_inner(
     state.accounting_self.release_scratch_entries = next_release_scratch_entries;
     state.accounting_self.release_scratch_bytes = next_release_scratch_bytes;
     state.revision = next_revision;
+    refresh_phase_a_byte_ledger_v1(&mut state);
     Ok(())
+}
+
+fn refresh_phase_a_byte_ledger_v1(state: &mut ScopeAccountingState) {
+    let mut total = Some(0_u64);
+    let mut add = |bytes: u64| {
+        total = total.and_then(|current| current.checked_add(bytes));
+    };
+    add(state.global_node_usage.current_bytes);
+    add(state.accounting_self.prepared_bytes);
+    add(state.accounting_self.active_bytes);
+    add(state.accounting_self.request_bytes);
+    add(state.accounting_self.usage_node_bytes);
+    add(state.accounting_self.release_scratch_bytes);
+    for (key, usage) in &state.usage {
+        if matches!(
+            key.key.definition().unit,
+            WebRemoteLimitUnit::Bytes | WebRemoteLimitUnit::Utf8Bytes
+        ) {
+            add(usage.current);
+        }
+    }
+    if let Some(current_bytes) = total {
+        state.phase_a_byte_ledger.current_bytes = current_bytes;
+        state.phase_a_byte_ledger.high_water_bytes = state
+            .phase_a_byte_ledger
+            .high_water_bytes
+            .max(current_bytes);
+    } else {
+        state.phase_a_byte_ledger.current_bytes = u64::MAX;
+        state.phase_a_byte_ledger.high_water_bytes = u64::MAX;
+        state.phase_a_byte_ledger.overflowed = true;
+    }
 }
 
 /// A low-cardinality failure from generation-aware scope accounting.

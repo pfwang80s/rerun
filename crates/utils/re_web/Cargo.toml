@@ -87,3 +87,6 @@ zeroize.workspace = true
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 re_tuid.workspace = true
 wasm-bindgen-test.workspace = true
+
+[build-dependencies]
+re_build_tools.workspace = true

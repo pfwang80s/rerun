@@ -104,6 +104,52 @@ static GLOBAL: GlobalStats = GlobalStats {
     overhead: AtomicCountAndSize::zero(),
 };
 
+thread_local! {
+    static INSTANTANEOUS_BYTE_LEDGER_V1: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// A single-thread scoped ledger of the actual simultaneous live bytes observed by the
+/// [`AccountingAllocator`].
+///
+/// The value is byte-only and includes every allocation that is live in the Wasm module while the
+/// scope is active. It therefore cannot mix logical counts with bytes or add per-key maxima that
+/// did not coexist.
+pub struct InstantaneousAllocationByteLedgerV1 {
+    active: bool,
+}
+
+impl InstantaneousAllocationByteLedgerV1 {
+    /// Starts one non-nested ledger on the current thread.
+    pub fn begin() -> Option<Self> {
+        let current = GLOBAL.live.size.load(Relaxed);
+        INSTANTANEOUS_BYTE_LEDGER_V1.with(|ledger| {
+            if ledger.get().is_some() {
+                None
+            } else {
+                ledger.set(Some(current));
+                Some(Self { active: true })
+            }
+        })
+    }
+
+    /// Returns the greatest actual simultaneous live-byte value observed so far.
+    pub fn high_water_bytes(&self) -> usize {
+        if !self.active {
+            return 0;
+        }
+        INSTANTANEOUS_BYTE_LEDGER_V1.with(|ledger| ledger.get().unwrap_or_default())
+    }
+}
+
+impl Drop for InstantaneousAllocationByteLedgerV1 {
+    fn drop(&mut self) {
+        if self.active {
+            INSTANTANEOUS_BYTE_LEDGER_V1.with(|ledger| ledger.set(None));
+            self.active = false;
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 
 /// Controls which allocations to sample.
@@ -345,6 +391,12 @@ unsafe impl<InnerAllocator: std::alloc::GlobalAlloc> std::alloc::GlobalAlloc
 #[inline]
 fn note_alloc(ptr: *mut u8, size: usize) {
     GLOBAL.live.add(size);
+    let current = GLOBAL.live.size.load(Relaxed);
+    INSTANTANEOUS_BYTE_LEDGER_V1.with(|ledger| {
+        if let Some(high_water) = ledger.get() {
+            ledger.set(Some(high_water.max(current)));
+        }
+    });
 
     if GLOBAL.track_callstacks.load(Relaxed) {
         if size < GLOBAL.small_size.load(Relaxed) {
@@ -408,5 +460,31 @@ fn note_dealloc(ptr: *mut u8, size: usize) {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod instantaneous_ledger_tests {
+    use super::*;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn ledger_tracks_actual_live_byte_high_water_and_is_non_nested() {
+        let _lock = TEST_LOCK.lock();
+        let baseline = GLOBAL.live.size.load(Relaxed);
+        let ledger = InstantaneousAllocationByteLedgerV1::begin().unwrap();
+        assert!(InstantaneousAllocationByteLedgerV1::begin().is_none());
+
+        note_alloc(std::ptr::null_mut(), 17);
+        assert_eq!(ledger.high_water_bytes(), baseline + 17);
+        note_alloc(std::ptr::null_mut(), 29);
+        assert_eq!(ledger.high_water_bytes(), baseline + 46);
+        note_dealloc(std::ptr::null_mut(), 29);
+        assert_eq!(ledger.high_water_bytes(), baseline + 46);
+        note_dealloc(std::ptr::null_mut(), 17);
+
+        drop(ledger);
+        assert!(InstantaneousAllocationByteLedgerV1::begin().is_some());
     }
 }

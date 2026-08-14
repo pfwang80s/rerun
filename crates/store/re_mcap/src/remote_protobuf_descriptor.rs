@@ -241,9 +241,9 @@ pub(crate) struct UnfrozenRemoteProtobufLimitsV1 {
     max_working_bytes: u64,
 }
 
-#[cfg(test)]
 impl UnfrozenRemoteProtobufLimitsV1 {
-    pub(crate) fn generous_for_assignment_test_v1() -> Self {
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) fn generous_for_phase_a_measurement_v1() -> Self {
         Self {
             profile_version: REMOTE_PROTOBUF_PROFILE_VERSION_V1,
             max_schemas: MAX_INLINE_PROTOBUF_SCHEMAS_V1 as u64,
@@ -267,6 +267,11 @@ impl UnfrozenRemoteProtobufLimitsV1 {
             max_retained_bytes: 64_000_000,
             max_working_bytes: 64_000_000,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generous_for_assignment_test_v1() -> Self {
+        Self::generous_for_phase_a_measurement_v1()
     }
 }
 

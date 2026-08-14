@@ -418,8 +418,8 @@ fn reserve_typed_output_state_v1(
 }
 
 impl RemoteValidationCountBudgetV1 {
-    #[cfg(test)]
-    pub(crate) fn new_for_test_v1(
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) fn new_for_phase_a_measurement_v1(
         limits: UnfrozenRemoteValidationCountLimitsV1,
         max_active_plans: u64,
         max_aggregate_retained_bytes: u64,
@@ -434,6 +434,21 @@ impl RemoteValidationCountBudgetV1 {
                 usage: Mutex::new(RemoteValidationCountBudgetUsageV1::default()),
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_v1(
+        limits: UnfrozenRemoteValidationCountLimitsV1,
+        max_active_plans: u64,
+        max_aggregate_retained_bytes: u64,
+        max_aggregate_combined_retained_bytes: u64,
+    ) -> Self {
+        Self::new_for_phase_a_measurement_v1(
+            limits,
+            max_active_plans,
+            max_aggregate_retained_bytes,
+            max_aggregate_combined_retained_bytes,
+        )
     }
 
     fn reserve(
@@ -498,7 +513,8 @@ impl RemoteValidationCountBudgetV1 {
 
 #[cfg(test)]
 impl UnfrozenRemoteValidationCountLimitsV1 {
-    pub(crate) const fn generous_for_test_v1() -> Self {
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    pub(crate) const fn generous_for_phase_a_measurement_v1() -> Self {
         Self {
             profile_version: REMOTE_VALIDATION_COUNT_PROFILE_VERSION_V1,
             max_channels: 256,
@@ -513,6 +529,11 @@ impl UnfrozenRemoteValidationCountLimitsV1 {
     pub(crate) const fn with_combined_limit_for_test_v1(mut self, limit: u64) -> Self {
         self.max_combined_retained_bytes = limit;
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn generous_for_test_v1() -> Self {
+        Self::generous_for_phase_a_measurement_v1()
     }
 }
 
