@@ -58,7 +58,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M0 | MCAP-001…005 | 5/5 | 已完成 | 既有公开行为、fixture、Chrome origin、确定性调度和脱敏断言可复用 |
 | M1 | MCAP-006…012 | 7/7 | 已完成 | URL、validator、时间、wire、Store generation 和 remote runtime interner 边界冻结 |
 | M2 | MCAP-013…033（含 MCAP-025A、MCAP-030A、MCAP-030B） | 24/24 | 已完成 | 不接 TimeControl 即可安全完成 metadata opening、bounded decoder initialization、局部 Chunk 验证和 terminal batch 派生 |
-| M3 | MCAP-034…042 | 3/6 | 进行中 | Web remote-MCAP partition、root、coverage、reclaim 和 existing-identifier 能力可用 |
+| M3 | MCAP-034…042 | 4/6 | 进行中 | Web remote-MCAP partition、root、coverage、reclaim 和 existing-identifier 能力可用 |
 | M4 | MCAP-043…057 | 0/15 | 未开始 | compatibility 和 strict lane 的身份、状态、回放、dispose 与 teardown 闭合 |
 | M5 | MCAP-058…066 | 0/0 | 已移出 | legacy HTTP adapter 保留现有 Web 路径，不进入 remote-MCAP 项目 |
 | M6 | MCAP-067…080 | 0/5 | 未开始 | remote-MCAP page execution、hidden suspension、安全字符串和 teardown 闭合 |
@@ -67,7 +67,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M8 | MCAP-089…105 | 0/17 | 未开始 | foreground-only window playback、seek、query isolation、mutation arbitration 和 reload 闭合 |
 | M9 | MCAP-106…114 | 0/9 | 未开始 | two-phase runner、strict startup、UI/API 文档和桌面 Chrome E2E 全部通过 |
 
-有效工作项总数为 91，当前进度为 39/91；26 个 `[~]` 项不计入分母且不产生提交。
+有效工作项总数为 91，当前进度为 40/91；26 个 `[~]` 项不计入分母且不产生提交。
 关键路径为 `M0 → M1 → M2/M3 → M4/M6/M7 → GA → M8 → M9`。
 M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前保持 feature-disabled。
 
@@ -486,13 +486,13 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 验收：重叠 roots、CompleteEmpty、GC 删除、reload 和 NoIndexedMessages 均产生正确 coverage，查询不会每帧重建 Chunk × group cross-product。
 - 负责人：kola；提交：本提交；备注：2026-08-14 完成production-disarmed的incremental indexed/loaded coverage：immutable `CanonicalIndexedExtent`区分Known与NoIndexedMessages，closed-endpoint coverage cells、per-source selected-group satisfied counters与cached loaded ranges/Complete helper增量维护overlap、gap、CompleteEmpty、GC删除和reload。Coverage retained/temporary逐allocation复用锁定release-Wasm dlmalloc footprint，并在首次allocation前从同一budget组合reserve、RAII退款；Store event按ChunkId只reconcile affected partitions，每batch最多重建一次，getter只读缓存，不修改`EntityDb::time_range_for`。Dafee二轮最终0 High/0 Medium/1 Low且无设计偏离；唯一Low为尚缺真实resolved-source production-builder fixture。coverage8/8、residency16/16、manifest3/3、dispatch3/3、re_chunk_store64/64、两crate all-features Clippy `-D warnings`/check、cargo fmt与diff-check通过；完整re_mcap的5个既有失败位于未修改区域，production route继续disarmed。
 
-### [ ] MCAP-037 — 冻结 remote Store 的 deterministic insertion 配置
+### [x] MCAP-037 — 冻结 remote Store 的 deterministic insertion 配置
 
 - 建议提交：`Add bounded compaction-free remote insertion path`。
 - 依赖：MCAP-031、MCAP-035。
 - 变更：只有 Web remote-MCAP Store 使用 `ChunkStoreConfig::COMPACTION_DISABLED`，decoder 在 insertion 前确定性预分片，并在写入前检查 root/row/output physical bytes 上限；native Store config 不变。
 - 验收：实际 insertion 不运行 compaction candidate election；空 Store、cap-state、相同 start time 和 unsorted timeline fixture 的同步 add/index/event/cache propagation 都在阈值内。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：kola；提交：本提交；备注：2026-08-14 完成production-disarmed的deterministic remote insertion contract：sealed/versioned derived-chunk profile由immutable channel-group/manifest authority冻结，profile digest进入partition/root identity；Web remote Store固定`COMPACTION_DISABLED`，stable output ordinal/root ID与root/row/output/component/timeline hard caps在写入前校验。Production只接受已满足frozen root limits的prebuilt Chunk；仍需deep-copy split时在任何复制、发布或Store mutation前返回typed `DeepSplitUnavailable`，不使用无法证明的OOM probe。Capability-bound EntityDb add复用既有同步Store event/index/query-cache传播；真实fixture覆盖dispatch→registration→EntityDb latest-at E2E、same-start与unsorted timeline，native Store config不变。Dafee三轮最终0 High/0 Medium/0 Low且无设计偏离；deterministic6/6、dispatch3/3、residency16/16、manifest3/3、terminal3/3、full-chain E2E、EntityDb测试、re_chunk_store65/65、三crate Clippy `-D warnings`与default/all-features check、diff-check通过。裸wasm check受仓库getrandom wasm_js环境配置阻断，本机无pixi/taplo；production route继续disarmed。
 
 ### [~] MCAP-038 — 抽取 checked DataSourceMessage apply helper
 

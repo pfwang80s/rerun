@@ -238,6 +238,21 @@ pub(crate) fn prepare_temporal_terminal_registration_v1(
     }
 }
 
+#[cfg(test)]
+pub(crate) fn prepare_terminal_registration_for_test_v1(
+    terminal: &RemoteChunkTerminalV1,
+) -> Result<PreparedPartitionRegistrationV1, RootRegistrationErrorV1> {
+    match terminal {
+        RemoteChunkTerminalV1::Complete(handoff) => {
+            PreparedPartitionRegistrationV1::complete_roots_v1(handoff.partition_v1(), handoff)
+        }
+        RemoteChunkTerminalV1::CompleteEmpty => {
+            Err(RootRegistrationErrorV1::InvalidTerminalOutcome)
+        }
+        RemoteChunkTerminalV1::Failed(_) => Err(RootRegistrationErrorV1::InvalidTerminalOutcome),
+    }
+}
+
 pub(crate) struct RemoteOpeningStaticRootHandoffV1 {
     chunk: Chunk,
     root: ManifestRootDescriptorV1,
@@ -572,6 +587,13 @@ impl RefetchableRootIndexV1 {
 
     pub(crate) fn counters_v1(&self) -> RemoteRegistrationCountersV1 {
         self.counters
+    }
+
+    pub(crate) fn root_refetch_descriptor_v1(
+        &self,
+        root: ChunkId,
+    ) -> Option<ExternalRefetchableRootDescriptorV1> {
+        self.roots.get(&root).map(|root| root.external_descriptor)
     }
 
     pub(crate) fn partition_residency_v1(

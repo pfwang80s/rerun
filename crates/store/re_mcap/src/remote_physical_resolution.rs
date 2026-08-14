@@ -1923,7 +1923,7 @@ pub mod phase_a_measurement;
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU64;
+    use std::{num::NonZeroU64, sync::Arc};
 
     use static_assertions::assert_not_impl_any;
 
@@ -2475,6 +2475,124 @@ mod tests {
         };
         assert_eq!(chunk.entity_path().to_string(), "/beta");
         assert_eq!(chunk.num_rows(), 1);
+    }
+
+    #[test]
+    fn dispatched_roots_register_and_become_queryable_through_entity_db() {
+        let mut payload = vec![0, 1, 0, 0];
+        payload.extend_from_slice(&20_i32.to_le_bytes());
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_schemas([FixtureSchema::new(7, "pkg/Root", "ros2msg").with_data(b"int32 value")])
+            .with_channels([FixtureChannel::schema_less(1, "/int").with_schema(7, "cdr")])
+            .with_chunks([FixtureChunk::new([
+                FixtureMessage::new(1, 0, 1).with_data(payload)
+            ])])
+            .with_partition_fixture(PartitionFixture::default())
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+
+        let exact = retained_layout_bytes(1).unwrap();
+        let resolved = bound_pair(&fixture, layout_budget(1, exact))
+            .prepare()
+            .unwrap()
+            .finalize_v1()
+            .unwrap();
+        let metadata_source = resolved.source_v1();
+        let unit = metadata_source.source_unit_v1(0).unwrap();
+        let metadata = unit.metadata_v1().unwrap();
+        let physical = metadata.definitions_capability_for_full_chain_test_v1();
+        let record = fixture.layout.chunks[0].record;
+        let validated = install_exact_physical_chunk_record_for_test(
+            unit.issue_lease_v1().unwrap(),
+            fixture.bytes[record.start..record.end]
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .unwrap();
+        let compressed = install_header_validated_payload_for_test(validated).unwrap();
+        let decompressed = crate::remote_decompression::decompress_exact_chunk(compressed).unwrap();
+        let cache = crate::remote_chunk_scan::PhysicalChunkScanCacheEntry::new(
+            scan_decompressed_physical_chunk(decompressed).unwrap(),
+        )
+        .unwrap();
+        let terminal =
+            crate::remote_decoder_assignment::dispatch_group_from_finalized_source_for_test_v1(
+                resolved.source_v1(),
+                &physical,
+                cache.consumer().into_message_evidence_v1().unwrap(),
+                1,
+                crate::remote_decoder_assignment::RemoteDispatchTestMutationV1::None,
+            );
+        let crate::remote_chunk_dispatch::RemoteChunkTerminalV1::Complete(handoff) = &terminal
+        else {
+            panic!("the valid source must produce a complete typed handoff");
+        };
+        let partition = handoff.partition_v1();
+        let chunks = handoff.chunks_v1().cloned().collect::<Vec<_>>();
+        let registration =
+            crate::remote_partition_residency::prepare_terminal_registration_for_test_v1(&terminal)
+                .unwrap();
+        let root_count = u64::try_from(chunks.len()).unwrap();
+        let store_id = re_log_types::StoreId::random(
+            re_log_types::StoreKind::Recording,
+            "remote-dispatch-registration-db",
+        );
+        let (mut store, capability) =
+            re_chunk_store::WebRemoteMcapStoreConfigV1::for_test_v1().into_store_v1(store_id);
+        let mut index = crate::remote_partition_residency::RefetchableRootIndexV1::new_v1(
+            partition.key_v1().session_id_v1(),
+            crate::remote_manifest::RemoteRegistrationCapacityV1 {
+                max_registered_partitions: 1,
+                max_complete_empty_entries: 0,
+                max_root_descriptors: root_count,
+                max_external_origin_bytes: root_count
+                    * re_chunk_store::ExternalRefetchableRootOriginV1::ENCODED_BYTES_V1,
+            },
+            &store,
+            &capability,
+            crate::remote_loaded_coverage::RemoteTemporalCoveragePlanV1::for_test_v1(
+                &[Some((0, 0))],
+                1,
+            ),
+        )
+        .unwrap();
+        index
+            .register_commit_set_v1(&mut store, &capability, vec![registration])
+            .unwrap();
+        let descriptors = chunks
+            .iter()
+            .map(|chunk| index.root_refetch_descriptor_v1(chunk.id()).unwrap())
+            .collect::<Vec<_>>();
+        let mut db =
+            re_entity_db::EntityDb::from_web_remote_mcap_store_v1(store, &capability).unwrap();
+
+        for (chunk, descriptor) in chunks.iter().zip(descriptors) {
+            let chunk = Arc::new(chunk.clone());
+            let permit = capability
+                .issue_refetch_v1(db.storage_engine().store(), descriptor)
+                .unwrap();
+            let events = db.add_external_refetchable_root_v1(permit, &chunk).unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.diff.to_addition().is_some())
+                    .count(),
+                1
+            );
+            let timeline = *chunk.timelines().keys().next().unwrap();
+            let component = chunk.component_descriptors().next().unwrap().component;
+            let results = db.latest_at(
+                &re_chunk_store::LatestAtQuery::latest(timeline),
+                chunk.entity_path(),
+                [component],
+            );
+            assert!(
+                results.component_batch_raw(component).is_some(),
+                "the Store event must reach QueryCache before remote add returns"
+            );
+        }
+        assert_eq!(db.num_physical_chunks(), chunks.len());
     }
 
     #[test]

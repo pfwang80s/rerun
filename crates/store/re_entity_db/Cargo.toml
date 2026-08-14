@@ -25,6 +25,9 @@ default = []
 ## Enable some feature only used for tests
 testing = []
 
+## Enables the production-disarmed Web remote-MCAP Store boundary in native tests.
+remote_mcap_test = ["re_chunk_store/remote_mcap_test"]
+
 
 [dependencies]
 re_arrow_util.workspace = true
@@ -61,6 +64,7 @@ web-time.workspace = true
 
 [dev-dependencies]
 re_build_info.workspace = true
+re_chunk_store = { workspace = true, features = ["remote_mcap_test"] }
 re_log_encoding = { workspace = true, features = ["decoder", "encoder"] }
 
 anyhow.workspace = true

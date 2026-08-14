@@ -66,6 +66,7 @@ lz4_flex.workspace = true
 prost-reflect = { workspace = true, features = ["text-format"] }
 re_arrow_util.workspace = true
 re_chunk_store = { workspace = true, features = ["remote_mcap_test"] }
+re_entity_db = { workspace = true, features = ["remote_mcap_test"] }
 re_log = { workspace = true, features = ["setup"] }
 static_assertions.workspace = true
 xxhash-rust.workspace = true

@@ -371,21 +371,73 @@ mod tests {
     use super::*;
 
     fn temporal_chunk(root_chunk_id: ChunkId) -> Arc<Chunk> {
-        Arc::new(
-            Chunk::builder_with_id(root_chunk_id, "world/points")
-                .with_archetype(
-                    RowId::new(),
-                    [(Timeline::log_tick(), 1)],
-                    &archetypes::Points3D::new([[1.0, 2.0, 3.0]]),
-                )
-                .build()
-                .unwrap(),
-        )
+        temporal_chunk_with_times(root_chunk_id, [1])
+    }
+
+    fn temporal_chunk_with_times(
+        root_chunk_id: ChunkId,
+        times: impl IntoIterator<Item = i64>,
+    ) -> Arc<Chunk> {
+        let mut builder = Chunk::builder_with_id(root_chunk_id, "world/points");
+        for time in times {
+            builder = builder.with_archetype(
+                RowId::new(),
+                [(Timeline::log_tick(), time)],
+                &archetypes::Points3D::new([[time as f32, 2.0, 3.0]]),
+            );
+        }
+        Arc::new(builder.build().unwrap())
     }
 
     fn store_and_capability() -> (ChunkStore, WebRemoteMcapRootCapabilityV1) {
         WebRemoteMcapStoreConfigV1::for_test_v1()
             .into_store_v1(StoreId::random(StoreKind::Recording, "external-root-test"))
+    }
+
+    #[test]
+    fn web_remote_store_is_compaction_free_at_cap_state() {
+        let (mut store, capability) = store_and_capability();
+        assert_eq!(store.config(), &ChunkStoreConfig::COMPACTION_DISABLED);
+
+        const PREFILL_ROOTS: usize = 64;
+        for ordinal in 0..=PREFILL_ROOTS {
+            let root_chunk_id = ChunkId::new();
+            let descriptor = capability
+                .register_root_origin_v1(&mut store, root_chunk_id, false)
+                .unwrap();
+            let chunk = if ordinal == PREFILL_ROOTS {
+                temporal_chunk_with_times(root_chunk_id, [7, 5, 7])
+            } else {
+                temporal_chunk_with_times(root_chunk_id, [7])
+            };
+            let permit = capability.issue_refetch_v1(&store, descriptor).unwrap();
+            let events = store
+                .insert_external_refetchable_root_v1(permit, &chunk)
+                .unwrap();
+            let additions = events
+                .iter()
+                .filter_map(|event| event.diff.to_addition())
+                .collect::<Vec<_>>();
+            let [addition] = additions.as_slice() else {
+                panic!("one remote root insertion must emit exactly one physical addition");
+            };
+            assert_eq!(addition.chunk_before_processing.id(), root_chunk_id);
+            assert_eq!(addition.chunk_after_processing.id(), root_chunk_id);
+            assert!(matches!(
+                addition.direct_lineage,
+                ChunkDirectLineageReport::RootFromExternalSource(_)
+            ));
+            assert_eq!(
+                store.physical_chunk(&root_chunk_id).map(|chunk| chunk.id()),
+                Some(root_chunk_id),
+                "the synchronous Store indexes must expose the exact inserted root"
+            );
+        }
+
+        assert_eq!(store.num_physical_chunks(), PREFILL_ROOTS + 1);
+        assert!(store.leaky_compactions.is_empty());
+        assert!(store.split_on_ingest.is_empty());
+        assert!(store.dangling_splits.is_empty());
     }
 
     #[test]

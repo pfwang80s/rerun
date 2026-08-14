@@ -32,6 +32,7 @@ use arrow::array::{
     StructBuilder, UInt8Array, UInt16Array, UInt32Array, UInt32Builder, UInt64Array, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Fields};
+use re_byte_size::SizeBytes as _;
 use re_chunk::{Chunk, TimePoint, TimelineName};
 use re_log_types::TimeCell;
 
@@ -41,6 +42,7 @@ pub(crate) enum RemoteChunkDispatchFailureV1 {
     PlanMismatch,
     Decode(RemoteExecutableAdapterErrorV1),
     Validation(RemoteValidationCountErrorV1),
+    DerivedInsertion(crate::remote_deterministic_insertion::RemoteDerivedChunkResourceLimitV1),
 }
 
 pub(crate) enum RemoteChunkTerminalV1 {
@@ -52,11 +54,17 @@ pub(crate) enum RemoteChunkTerminalV1 {
 pub(crate) struct RemoteTypedChunkHandoffV1 {
     chunk: Chunk,
     root: crate::remote_manifest::ManifestRootDescriptorV1,
-    _reservation: crate::remote_chunk_validation_count::RemoteTypedOutputReservationV1,
 }
 
 pub(crate) struct RemoteTypedPartitionHandoffV1 {
+    partition: crate::remote_manifest::ManifestPartitionDescriptorV1,
     chunks: Box<[RemoteTypedChunkHandoffV1]>,
+    _reservations: Box<[crate::remote_chunk_validation_count::RemoteTypedOutputReservationV1]>,
+}
+
+struct RemoteBuiltChannelChunkV1 {
+    chunk: Chunk,
+    reservation: crate::remote_chunk_validation_count::RemoteTypedOutputReservationV1,
 }
 
 pub(crate) struct RemoteAdmittedChannelDispatchV1<'adapter> {
@@ -101,6 +109,12 @@ impl RemoteTypedChunkHandoffV1 {
 }
 
 impl RemoteTypedPartitionHandoffV1 {
+    pub(crate) const fn partition_v1(
+        &self,
+    ) -> crate::remote_manifest::ManifestPartitionDescriptorV1 {
+        self.partition
+    }
+
     pub(crate) fn chunks_v1(&self) -> impl ExactSizeIterator<Item = &Chunk> {
         self.chunks.iter().map(RemoteTypedChunkHandoffV1::chunk_v1)
     }
@@ -1023,12 +1037,12 @@ fn validate_descriptor_batch_plan_v1(
     Ok(())
 }
 
-pub(crate) fn build_ros_scalar_chunk_v1(
+fn build_ros_scalar_chunk_v1(
     descriptor: RemoteTypedOutputDescriptorV1,
     plan: &ValidatedChunkDispatchPlanV1<'_, '_, '_, '_, '_, '_>,
     batch: RemoteTypedDecodedBatchV1,
     output_ordinal: u32,
-) -> Result<RemoteTypedChunkHandoffV1, RemoteChunkDispatchFailureV1> {
+) -> Result<RemoteBuiltChannelChunkV1, RemoteChunkDispatchFailureV1> {
     validate_descriptor_batch_plan_v1(&descriptor, plan, &batch)?;
     let authority = plan.authority_v1();
     let output_reservation = plan
@@ -1168,10 +1182,9 @@ pub(crate) fn build_ros_scalar_chunk_v1(
     let chunk = builder
         .build()
         .map_err(|_| RemoteChunkDispatchFailureV1::PlanMismatch)?;
-    Ok(RemoteTypedChunkHandoffV1 {
+    Ok(RemoteBuiltChannelChunkV1 {
         chunk,
-        root,
-        _reservation: output_reservation,
+        reservation: output_reservation,
     })
 }
 
@@ -1180,7 +1193,7 @@ fn build_protobuf_chunk_v1(
     plan: &ValidatedChunkDispatchPlanV1<'_, '_, '_, '_, '_, '_>,
     batch: RemoteTypedDecodedBatchV1,
     output_ordinal: u32,
-) -> Result<RemoteTypedChunkHandoffV1, RemoteChunkDispatchFailureV1> {
+) -> Result<RemoteBuiltChannelChunkV1, RemoteChunkDispatchFailureV1> {
     validate_descriptor_batch_plan_v1(&descriptor, plan, &batch)?;
     if !descriptor.is_protobuf_v1() {
         return Err(RemoteChunkDispatchFailureV1::StaleSource);
@@ -1279,10 +1292,9 @@ fn build_protobuf_chunk_v1(
         );
         drop(allocation_guard);
     }
-    Ok(RemoteTypedChunkHandoffV1 {
+    Ok(RemoteBuiltChannelChunkV1 {
         chunk,
-        root,
-        _reservation: output_reservation,
+        reservation: output_reservation,
     })
 }
 
@@ -1315,10 +1327,23 @@ pub(crate) fn dispatch_admitted_v1(
     {
         return RemoteChunkTerminalV1::Failed(RemoteChunkDispatchFailureV1::PlanMismatch);
     }
+    let authority = plan.authority_v1();
+    let insertion_limits = plan.derived_chunk_limits_v1();
+    let root_capacity = match usize::try_from(insertion_limits.max_roots_per_partition_v1()) {
+        Ok(capacity) => capacity,
+        Err(_overflow) => {
+            return RemoteChunkTerminalV1::Failed(RemoteChunkDispatchFailureV1::PlanMismatch);
+        }
+    };
     let mut chunks = Vec::new();
-    if chunks.try_reserve_exact(dispatches.len()).is_err() {
+    if chunks.try_reserve_exact(root_capacity).is_err() {
         return RemoteChunkTerminalV1::Failed(RemoteChunkDispatchFailureV1::PlanMismatch);
     }
+    let mut reservations = Vec::new();
+    if reservations.try_reserve_exact(dispatches.len()).is_err() {
+        return RemoteChunkTerminalV1::Failed(RemoteChunkDispatchFailureV1::PlanMismatch);
+    }
+    let mut output_physical_bytes = 0_u64;
     for (ordinal, dispatch) in dispatches.into_vec().into_iter().enumerate() {
         let expected = plan.channels_v1()[ordinal];
         let batch = match dispatch.adapter.execute_batch_v1(evidence) {
@@ -1352,16 +1377,95 @@ pub(crate) fn dispatch_admitted_v1(
         } else {
             build_ros_scalar_chunk_v1(dispatch.descriptor, plan, batch, ordinal)
         };
-        match built {
-            Ok(chunk) => chunks.push(chunk),
+        let RemoteBuiltChannelChunkV1 { chunk, reservation } = match built {
+            Ok(chunk) => chunk,
             Err(error) => return RemoteChunkTerminalV1::Failed(error),
+        };
+        let remaining_roots = match root_capacity.checked_sub(chunks.len()) {
+            Some(remaining) => match u32::try_from(remaining) {
+                Ok(remaining) => remaining,
+                Err(_overflow) => {
+                    return RemoteChunkTerminalV1::Failed(
+                        RemoteChunkDispatchFailureV1::PlanMismatch,
+                    );
+                }
+            },
+            None => {
+                return RemoteChunkTerminalV1::Failed(RemoteChunkDispatchFailureV1::PlanMismatch);
+            }
+        };
+        let Some(remaining_output_bytes) = insertion_limits
+            .max_output_physical_bytes_per_partition_v1()
+            .checked_sub(output_physical_bytes)
+        else {
+            return RemoteChunkTerminalV1::Failed(RemoteChunkDispatchFailureV1::PlanMismatch);
+        };
+        let channel_limits =
+            insertion_limits.with_partition_remainder_v1(remaining_roots, remaining_output_bytes);
+        if remaining_roots == 0 {
+            return RemoteChunkTerminalV1::Failed(
+                RemoteChunkDispatchFailureV1::DerivedInsertion(
+                    crate::remote_deterministic_insertion::RemoteDerivedChunkResourceLimitV1::RootsPerPartition,
+                ),
+            );
         }
+        // `Chunk::row_sliced_deep` and Arrow's builders allocate infallibly. A probe allocation
+        // cannot transfer ownership to those later allocations, so the production path validates
+        // the already-built root and rejects before any candidate copy when deep splitting would
+        // be required. A later implementation needs a real fallible arena-backed builder.
+        if let Err(error) = channel_limits.validate_prebuilt_root_v1(&chunk) {
+            return RemoteChunkTerminalV1::Failed(RemoteChunkDispatchFailureV1::DerivedInsertion(
+                error,
+            ));
+        }
+        if chunk.total_size_bytes() > remaining_output_bytes {
+            return RemoteChunkTerminalV1::Failed(
+                RemoteChunkDispatchFailureV1::DerivedInsertion(
+                    crate::remote_deterministic_insertion::RemoteDerivedChunkResourceLimitV1::OutputPhysicalBytes,
+                ),
+            );
+        }
+        let derived_chunks = [chunk];
+        for chunk in derived_chunks {
+            output_physical_bytes =
+                match output_physical_bytes.checked_add(chunk.total_size_bytes()) {
+                    Some(bytes) => bytes,
+                    None => {
+                        return RemoteChunkTerminalV1::Failed(
+                            RemoteChunkDispatchFailureV1::PlanMismatch,
+                        );
+                    }
+                };
+            let output_ordinal = match u32::try_from(chunks.len()) {
+                Ok(ordinal) => ordinal,
+                Err(_overflow) => {
+                    return RemoteChunkTerminalV1::Failed(
+                        RemoteChunkDispatchFailureV1::PlanMismatch,
+                    );
+                }
+            };
+            let root = match authority.issue_root_v1(output_ordinal) {
+                Ok(root) => root,
+                Err(_error) => {
+                    return RemoteChunkTerminalV1::Failed(
+                        RemoteChunkDispatchFailureV1::PlanMismatch,
+                    );
+                }
+            };
+            chunks.push(RemoteTypedChunkHandoffV1 {
+                chunk: chunk.with_id(root.root_chunk_id_v1()),
+                root,
+            });
+        }
+        reservations.push(reservation);
     }
     if chunks.is_empty() {
         RemoteChunkTerminalV1::CompleteEmpty
     } else {
         RemoteChunkTerminalV1::Complete(RemoteTypedPartitionHandoffV1 {
+            partition: authority.partition_v1(),
             chunks: chunks.into_boxed_slice(),
+            _reservations: reservations.into_boxed_slice(),
         })
     }
 }

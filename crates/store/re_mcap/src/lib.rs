@@ -144,6 +144,9 @@ mod remote_protobuf_descriptor;
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
 mod remote_decoder_assignment;
 
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+mod remote_deterministic_insertion;
+
 // Immutable Channel groups consume the complete assignment owner and remain production-disarmed
 // until the full manifest and remote resource profile are sealed.
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]

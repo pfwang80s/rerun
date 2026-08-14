@@ -16,6 +16,10 @@ use re_chunk_store::{
     ChunkStore, ChunkStoreChunkStats, ChunkStoreConfig, ChunkStoreEvent, ChunkStoreHandle,
     ChunkStoreSubscriber as _, GarbageCollectionOptions, GarbageCollectionTarget,
 };
+#[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
+use re_chunk_store::{
+    ExternalRefetchableRootErrorV1, WebRemoteMcapRootCapabilityV1, WebRemoteMcapRootRefetchPermitV1,
+};
 use re_log::{debug_assert, debug_assert_eq};
 use re_log_channel::LogSource;
 use re_log_encoding::RrdManifest;
@@ -202,7 +206,25 @@ impl EntityDb {
         // If we don't care about inline indexes, we definitely don't care about remote subscribers either.
         store_config.enable_changelog = enable_viewer_indexes;
 
-        let store = ChunkStoreHandle::new(ChunkStore::new(store_id.clone(), store_config));
+        Self::from_chunk_store_v1(
+            ChunkStore::new(store_id, store_config),
+            enable_viewer_indexes,
+        )
+    }
+
+    /// Installs the capability-bound Store used exclusively by Web remote-MCAP sessions.
+    #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
+    pub fn from_web_remote_mcap_store_v1(
+        store: ChunkStore,
+        capability: &WebRemoteMcapRootCapabilityV1,
+    ) -> Result<Self, ExternalRefetchableRootErrorV1> {
+        capability.validate_store_v1(&store)?;
+        Ok(Self::from_chunk_store_v1(store, true))
+    }
+
+    fn from_chunk_store_v1(store: ChunkStore, enable_viewer_indexes: bool) -> Self {
+        let store_id = store.id().clone();
+        let store = ChunkStoreHandle::new(store);
         let cache = QueryCacheHandle::new(QueryCache::new(store.clone()));
 
         // Safety: these handles are never going to be leaked outside of the `EntityDb`.
@@ -824,6 +846,26 @@ impl EntityDb {
         self.add_chunk_with_timestamp_metadata(chunk, &Default::default())
     }
 
+    /// Inserts one exact refetchable root into a Web remote-MCAP Store.
+    ///
+    /// The one-shot permit prevents ordinary/native ingestion paths from using this mutation path.
+    #[cfg(any(target_arch = "wasm32", test, feature = "remote_mcap_test"))]
+    pub fn add_external_refetchable_root_v1(
+        &mut self,
+        permit: WebRemoteMcapRootRefetchPermitV1,
+        chunk: &Arc<Chunk>,
+    ) -> Result<Vec<ChunkStoreEvent>, ExternalRefetchableRootErrorV1> {
+        re_tracing::profile_function!();
+        self.last_modified_at = web_time::Instant::now();
+        let store_events = self
+            .storage_engine
+            .write()
+            .store()
+            .insert_external_refetchable_root_v1(permit, chunk)?;
+        self.apply_chunk_store_events_v1(chunk, &store_events, &Default::default());
+        Ok(store_events)
+    }
+
     fn add_chunk_with_timestamp_metadata(
         &mut self,
         chunk: &Arc<Chunk>,
@@ -831,6 +873,17 @@ impl EntityDb {
     ) -> Result<Vec<ChunkStoreEvent>, Error> {
         let store_events = self.storage_engine.write().store().insert_chunk(chunk)?;
 
+        self.apply_chunk_store_events_v1(chunk, &store_events, chunk_timestamps);
+
+        Ok(store_events)
+    }
+
+    fn apply_chunk_store_events_v1(
+        &mut self,
+        chunk: &Arc<Chunk>,
+        store_events: &[ChunkStoreEvent],
+        chunk_timestamps: &re_sorbet::TimestampMetadata,
+    ) {
         self.entity_paths.insert(chunk.entity_path().clone());
 
         self.entity_path_from_hash
@@ -841,15 +894,13 @@ impl EntityDb {
             self.latest_row_id = chunk.row_id_range().map(|(_, row_id_max)| row_id_max);
         }
 
-        self.on_store_events(&store_events);
+        self.on_store_events(store_events);
 
         // We inform the stats last, since it measures e2e latency.
         // We only care about latency metrics during ingestion (adding a chunk)
         // which is why we only call it here, and not inside of `on_store_events`
         // (we need the `chunk_timestamps`).
-        self.stats.on_events(chunk_timestamps, &store_events);
-
-        Ok(store_events)
+        self.stats.on_events(chunk_timestamps, store_events);
     }
 
     /// We call this on any changes, before returning the store events to the outsider caller.
@@ -1422,5 +1473,55 @@ mod tests {
         "###);
 
         Ok(())
+    }
+
+    #[test]
+    fn web_remote_root_add_updates_store_indexes_and_query_cache_synchronously() {
+        let store_id = StoreId::random(re_log_types::StoreKind::Recording, "remote-mcap-db");
+        let (mut store, capability) =
+            re_chunk_store::WebRemoteMcapStoreConfigV1::for_test_v1().into_store_v1(store_id);
+        let root_chunk_id = ChunkId::new();
+        let descriptor = capability
+            .register_root_origin_v1(&mut store, root_chunk_id, false)
+            .unwrap();
+        let mut db = EntityDb::from_web_remote_mcap_store_v1(store, &capability).unwrap();
+        let entity_path: EntityPath = "world/points".into();
+        let timeline = Timeline::new_sequence("frame");
+        let chunk = Arc::new(
+            Chunk::builder_with_id(root_chunk_id, entity_path.clone())
+                .with_component_batches(
+                    RowId::new(),
+                    TimePoint::from_iter([(timeline, 7)]),
+                    [(
+                        MyPoints::descriptor_points(),
+                        &[MyPoint::new(1.0, 2.0)] as _,
+                    )],
+                )
+                .build()
+                .unwrap(),
+        );
+        let permit = capability
+            .issue_refetch_v1(db.storage_engine().store(), descriptor)
+            .unwrap();
+        let events = db.add_external_refetchable_root_v1(permit, &chunk).unwrap();
+        let additions = events
+            .iter()
+            .filter_map(|event| event.diff.to_addition())
+            .collect::<Vec<_>>();
+        let [addition] = additions.as_slice() else {
+            panic!("one remote root add must emit exactly one physical addition");
+        };
+        assert_eq!(addition.chunk_before_processing.id(), root_chunk_id);
+        assert_eq!(addition.chunk_after_processing.id(), root_chunk_id);
+        assert_eq!(db.num_physical_chunks(), 1);
+        assert!(
+            db.latest_at_component::<MyPoint>(
+                &entity_path,
+                &re_chunk_store::LatestAtQuery::latest(*timeline.name()),
+                MyPoints::descriptor_points().component,
+            )
+            .is_some(),
+            "the QueryCache must observe the Store event before add returns"
+        );
     }
 }

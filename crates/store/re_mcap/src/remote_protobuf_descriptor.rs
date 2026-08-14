@@ -4071,8 +4071,7 @@ pub(crate) struct FrozenRemoteExecutableConfigV1 {
     kind: u8,
     schema_handle: u16,
     canonical_digest: [u8; 16],
-    max_roots_per_partition: u32,
-    max_external_origin_bytes_per_partition: u64,
+    derived_chunk_profile: crate::remote_deterministic_insertion::RemoteDerivedChunkProfileV1,
 }
 
 impl FrozenRemoteExecutableConfigV1 {
@@ -4080,10 +4079,13 @@ impl FrozenRemoteExecutableConfigV1 {
         self.canonical_digest
     }
     pub(crate) const fn registration_contract_v1(self) -> (u32, u64) {
-        (
-            self.max_roots_per_partition,
-            self.max_external_origin_bytes_per_partition,
-        )
+        self.derived_chunk_profile.registration_contract_v1()
+    }
+
+    pub(crate) const fn derived_chunk_profile_v1(
+        self,
+    ) -> crate::remote_deterministic_insertion::RemoteDerivedChunkProfileV1 {
+        self.derived_chunk_profile
     }
 
     #[cfg(test)]
@@ -4095,8 +4097,15 @@ impl FrozenRemoteExecutableConfigV1 {
             kind,
             schema_handle,
             canonical_digest: digest,
-            max_roots_per_partition: 1,
-            max_external_origin_bytes_per_partition: 128,
+            derived_chunk_profile:
+                crate::remote_deterministic_insertion::RemoteDerivedChunkProfileV1::for_test_v1(
+                    1,
+                    u64::MAX,
+                    u64::MAX,
+                    u32::MAX,
+                    u32::MAX,
+                    1,
+                ),
         }
     }
 }
@@ -5407,8 +5416,7 @@ impl<'definitions, 'input, 'source, 'wire>
                         .schema_id_v1()
                         .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?,
                     canonical_digest: digest,
-                    max_roots_per_partition: 1,
-                    max_external_origin_bytes_per_partition: 128,
+                    derived_chunk_profile: crate::remote_deterministic_insertion::RemoteDerivedChunkProfileV1::phase_a_candidate_v1(),
                 }
             }
             crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Raw => unreachable!(),
@@ -6342,10 +6350,9 @@ impl BoundedRemoteChannelRecognitionV1<'_, '_, '_, '_, '_, '_> {
             kind,
             schema_handle: schema_id,
             canonical_digest: digest,
-            // All three currently admitted remote-specific parsers finalize exactly one temporal
-            // Chunk. The external-origin descriptor is a fixed-width V1 encoding.
-            max_roots_per_partition: 1,
-            max_external_origin_bytes_per_partition: 128,
+            // Decoder output is deterministically pre-split before Store insertion. The sealed
+            // executable identity owns the complete insertion profile consumed by the manifest.
+            derived_chunk_profile: crate::remote_deterministic_insertion::RemoteDerivedChunkProfileV1::phase_a_candidate_v1(),
         })
     }
 
@@ -7459,8 +7466,7 @@ fn initialize_remote_protobuf_with_gate_v1<'definitions, 'input, 'source, 'wire>
                 kind: 2,
                 schema_handle: schema.schema_id,
                 canonical_digest: short,
-                max_roots_per_partition: 1,
-                max_external_origin_bytes_per_partition: 128,
+                derived_chunk_profile: crate::remote_deterministic_insertion::RemoteDerivedChunkProfileV1::phase_a_candidate_v1(),
             },
         ));
     }

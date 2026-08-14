@@ -9536,6 +9536,7 @@ dependencies = [
  "re_cdr",
  "re_chunk",
  "re_chunk_store",
+ "re_entity_db",
  "re_int",
  "re_log",
  "re_log_types",

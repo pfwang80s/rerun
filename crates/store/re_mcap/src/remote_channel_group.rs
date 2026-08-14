@@ -407,6 +407,12 @@ impl ImmutableChannelGroupV1 {
     pub(crate) const fn decoder_identifier_v1(&self) -> RemoteDecoderIdentifierV1 {
         self.decoder_identifier
     }
+
+    pub(crate) const fn derived_chunk_profile_v1(
+        &self,
+    ) -> crate::remote_deterministic_insertion::RemoteDerivedChunkProfileV1 {
+        self.executable_config.derived_chunk_profile_v1()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

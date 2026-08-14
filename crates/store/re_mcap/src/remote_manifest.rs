@@ -187,6 +187,8 @@ pub(crate) struct ManifestPartitionDescriptorV1 {
     key: DerivationPartitionKeyV1,
     registration_bound: u32,
     root_namespace: u16,
+    derived_chunk_limits: Option<crate::remote_deterministic_insertion::RemoteDerivedChunkLimitsV1>,
+    derived_profile_digest: [u8; 16],
 }
 
 impl ManifestPartitionDescriptorV1 {
@@ -204,8 +206,8 @@ impl ManifestPartitionDescriptorV1 {
         self.registration_bound
     }
 
-    pub(crate) fn identity_bytes_v1(self) -> [u8; 24] {
-        let mut bytes = [0_u8; 24];
+    pub(crate) fn identity_bytes_v1(self) -> [u8; 40] {
+        let mut bytes = [0_u8; 40];
         bytes[..8].copy_from_slice(&self.key.source_unit.source_generation.to_le_bytes());
         bytes[8..12].copy_from_slice(&self.key.source_unit.ordinal.to_le_bytes());
         bytes[12..20].copy_from_slice(&self.root_namespace.to_le_bytes().repeat(4));
@@ -214,6 +216,7 @@ impl ManifestPartitionDescriptorV1 {
             DerivationPartitionKindV1::OpeningStatic => u32::MAX,
         };
         bytes[20..24].copy_from_slice(&kind.to_le_bytes());
+        bytes[24..40].copy_from_slice(&self.derived_profile_digest);
         bytes
     }
 
@@ -232,16 +235,36 @@ impl ManifestPartitionDescriptorV1 {
             },
             kind,
         };
+        let profile =
+            crate::remote_deterministic_insertion::RemoteDerivedChunkProfileV1::for_test_v1(
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+                u32::MAX,
+                u32::MAX,
+                registration_bound,
+            );
+        let derived_chunk_limits =
+            matches!(kind, DerivationPartitionKindV1::TemporalChannelGroup(_))
+                .then(|| profile.partition_limits_v1(1).unwrap());
+        let derived_profile_digest = if derived_chunk_limits.is_some() {
+            profile.identity_digest_v1()
+        } else {
+            [0; 16]
+        };
         (
             Self {
                 key,
                 registration_bound,
                 root_namespace: 1,
+                derived_chunk_limits,
+                derived_profile_digest,
             },
             ManifestRootDescriptorIssuerV1 {
                 key,
                 registration_bound,
                 namespace: 1,
+                derived_profile_digest,
             },
         )
     }
@@ -259,6 +282,7 @@ pub(crate) struct ManifestRootDescriptorIssuerV1 {
     key: DerivationPartitionKeyV1,
     registration_bound: u32,
     namespace: u16,
+    derived_profile_digest: [u8; 16],
 }
 
 impl ManifestRootDescriptorIssuerV1 {
@@ -273,6 +297,7 @@ impl ManifestRootDescriptorIssuerV1 {
         hasher.update(b"rerun.remote-mcap.root.v1");
         hasher.update(&MANIFEST_VERSION_V1.to_le_bytes());
         hasher.update(&self.namespace.to_le_bytes());
+        hasher.update(&self.derived_profile_digest);
         hasher.update(&self.key.source_unit.session.0.as_bytes());
         hasher.update(&self.key.source_unit.source_generation.to_le_bytes());
         hasher.update(&self.key.source_unit.ordinal.to_le_bytes());
@@ -386,6 +411,21 @@ impl<'d, 'i, 's, 'w> ManifestTemporalPartitionAuthorityV1<'_, '_, 'd, 'i, 's, 'w
 
     pub(crate) const fn partition_v1(&self) -> ManifestPartitionDescriptorV1 {
         self.partition
+    }
+
+    pub(crate) const fn registration_bound_v1(&self) -> u32 {
+        self.partition.registration_bound_v1()
+    }
+
+    pub(crate) fn derived_chunk_limits_v1(
+        &self,
+    ) -> Result<
+        crate::remote_deterministic_insertion::RemoteDerivedChunkLimitsV1,
+        RemoteManifestErrorV1,
+    > {
+        self.partition
+            .derived_chunk_limits
+            .ok_or(RemoteManifestErrorV1::InvalidPartition)
     }
 
     pub(crate) fn issue_root_v1(
@@ -600,11 +640,14 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
             key: opening_key,
             registration_bound: 1,
             root_namespace: 1,
+            derived_chunk_limits: None,
+            derived_profile_digest: [0; 16],
         });
         issuers.push(ManifestRootDescriptorIssuerV1 {
             key: opening_key,
             registration_bound: 1,
             namespace: 1,
+            derived_profile_digest: [0; 16],
         });
         for ordinal in 0..units {
             let source_unit = SourceUnitIdV1 {
@@ -624,15 +667,31 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
                     })
                     .ok_or(RemoteManifestErrorV1::InvalidPartition)?;
                 let key = DerivationPartitionKeyV1 { source_unit, kind };
+                let resolved_group = groups
+                    .resolve_group(group.group_id())
+                    .ok_or(RemoteManifestErrorV1::InvalidPartition)?;
+                let channel_count = u32::try_from(resolved_group.channels().len())
+                    .map_err(|_error| RemoteManifestErrorV1::ArithmeticOverflow)?;
+                let profile = resolved_group.descriptor().derived_chunk_profile_v1();
+                let derived_chunk_limits = profile
+                    .partition_limits_v1(channel_count)
+                    .map_err(|_error| RemoteManifestErrorV1::ArithmeticOverflow)?;
+                if derived_chunk_limits.max_roots_per_partition_v1() != bound {
+                    return Err(RemoteManifestErrorV1::InvalidPartition);
+                }
+                let derived_profile_digest = profile.identity_digest_v1();
                 partitions.push(ManifestPartitionDescriptorV1 {
                     key,
                     registration_bound: bound,
                     root_namespace: 1,
+                    derived_chunk_limits: Some(derived_chunk_limits),
+                    derived_profile_digest,
                 });
                 issuers.push(ManifestRootDescriptorIssuerV1 {
                     key,
                     registration_bound: bound,
                     namespace: 1,
+                    derived_profile_digest,
                 });
             }
         }
@@ -792,6 +851,7 @@ mod tests {
             key,
             registration_bound: 2,
             namespace: 1,
+            derived_profile_digest: [0; 16],
         };
         let a = issuer.descriptor_v1(0).unwrap().root_chunk_id_v1();
         let b = issuer.descriptor_v1(0).unwrap().root_chunk_id_v1();
@@ -809,6 +869,7 @@ mod tests {
             },
             registration_bound: 2,
             namespace: 1,
+            derived_profile_digest: [0; 16],
         };
         assert_ne!(
             a,
@@ -829,6 +890,7 @@ mod tests {
             },
             registration_bound: 2,
             namespace: 1,
+            derived_profile_digest: [0; 16],
         };
         assert_ne!(
             a,
@@ -843,8 +905,25 @@ mod tests {
             },
             registration_bound: 2,
             namespace: 1,
+            derived_profile_digest:
+                crate::remote_deterministic_insertion::RemoteDerivedChunkProfileV1::for_test_v1(
+                    2, 3, 4, 5, 6, 2,
+                )
+                .identity_digest_v1(),
         };
         assert_ne!(a, temporal.descriptor_v1(0).unwrap().root_chunk_id_v1());
+        let changed_profile = ManifestRootDescriptorIssuerV1 {
+            derived_profile_digest:
+                crate::remote_deterministic_insertion::RemoteDerivedChunkProfileV1::for_test_v1(
+                    1, 3, 4, 5, 6, 2,
+                )
+                .identity_digest_v1(),
+            ..temporal
+        };
+        assert_ne!(
+            temporal.descriptor_v1(0).unwrap().root_chunk_id_v1(),
+            changed_profile.descriptor_v1(0).unwrap().root_chunk_id_v1()
+        );
         assert!(matches!(
             issuer.descriptor_v1(2),
             Err(RemoteManifestErrorV1::InvalidPartition)

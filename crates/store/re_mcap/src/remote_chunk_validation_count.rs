@@ -694,6 +694,7 @@ pub(crate) struct ValidatedChunkDispatchPlanV1<'manifest, 'a, 'definitions, 'inp
     selected_groups: Box<[StableDecoderGroupIdV1]>,
     resource_bounds: Box<[DecoderDispatchResourceBoundV1]>,
     extent: ValidatedPhysicalChunkExtent,
+    derived_chunk_limits: crate::remote_deterministic_insertion::RemoteDerivedChunkLimitsV1,
     _reservation: RemoteValidationCountReservationV1,
 }
 
@@ -747,6 +748,12 @@ impl ValidatedChunkDispatchPlanV1<'_, '_, '_, '_, '_, '_> {
         &self,
     ) -> &ManifestTemporalPartitionAuthorityV1<'_, '_, '_, '_, '_, '_> {
         self.authority
+    }
+
+    pub(crate) const fn derived_chunk_limits_v1(
+        &self,
+    ) -> crate::remote_deterministic_insertion::RemoteDerivedChunkLimitsV1 {
+        self.derived_chunk_limits
     }
 
     pub(crate) fn reserve_typed_output_v1(
@@ -884,7 +891,23 @@ pub(crate) fn validate_and_count_with_authority_v1<
             RemoteValidationCountResourceLimitV1::GroupCount,
         ));
     }
-    let retained_bytes = exact_retained_bytes(channel_len, group_count)?;
+    let derived_chunk_limits = authority
+        .derived_chunk_limits_v1()
+        .map_err(|_error| RemoteValidationCountErrorV1::ManifestMismatch)?;
+    let maximum_admitted_rows = derived_chunk_limits
+        .max_rows_per_root_v1()
+        .checked_mul(u64::from(authority.registration_bound_v1()))
+        .ok_or_else(arithmetic_error)?;
+    if exact_messages > maximum_admitted_rows {
+        return Err(RemoteValidationCountErrorV1::ResourceLimitExceeded(
+            RemoteValidationCountResourceLimitV1::MessageCount,
+        ));
+    }
+    let retained_bytes = exact_retained_bytes(
+        channel_len,
+        group_count,
+        usize::try_from(authority.registration_bound_v1()).map_err(|_| arithmetic_error())?,
+    )?;
     let combined_retained_bytes = checked_add(
         checked_add(
             retained_bytes,
@@ -945,6 +968,7 @@ pub(crate) fn validate_and_count_with_authority_v1<
         selected_groups: selected_groups.into_boxed_slice(),
         resource_bounds: resource_bounds.into_boxed_slice(),
         extent,
+        derived_chunk_limits,
         _reservation: reservation,
     })
 }
@@ -952,6 +976,7 @@ pub(crate) fn validate_and_count_with_authority_v1<
 fn exact_retained_bytes(
     channels: usize,
     groups: usize,
+    root_capacity: usize,
 ) -> Result<u64, RemoteValidationCountErrorV1> {
     let bytes = locked_footprint(
         Layout::array::<ExactChannelDispatchCountV1>(channels)
@@ -967,7 +992,16 @@ fn exact_retained_bytes(
     )?)
     .ok_or_else(arithmetic_error)?
     .checked_add(locked_footprint(
-        Layout::array::<crate::remote_chunk_dispatch::RemoteTypedChunkHandoffV1>(channels)
+        Layout::array::<crate::remote_chunk_dispatch::RemoteTypedChunkHandoffV1>(root_capacity)
+            .map_err(|_error| arithmetic_error())?,
+    )?)
+    .ok_or_else(arithmetic_error)?
+    .checked_add(locked_footprint(
+        Layout::array::<re_chunk::Chunk>(root_capacity).map_err(|_error| arithmetic_error())?,
+    )?)
+    .ok_or_else(arithmetic_error)?
+    .checked_add(locked_footprint(
+        Layout::array::<RemoteTypedOutputReservationV1>(channels)
             .map_err(|_error| arithmetic_error())?,
     )?)
     .ok_or_else(arithmetic_error)?;
@@ -1071,7 +1105,7 @@ mod tests {
     #[test]
     fn aggregate_terminal_handoff_reservation_is_exact_and_one_byte_short_fails_before_work() {
         let limits = UnfrozenRemoteValidationCountLimitsV1::generous_for_test_v1();
-        let retained = exact_retained_bytes(2, 1).unwrap();
+        let retained = exact_retained_bytes(2, 1, 2).unwrap();
         let expected = locked_footprint(Layout::array::<ExactChannelDispatchCountV1>(2).unwrap())
             .unwrap()
             .checked_add(
@@ -1090,6 +1124,17 @@ mod tests {
                             .unwrap(),
                     )
                     .unwrap(),
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    locked_footprint(Layout::array::<re_chunk::Chunk>(2).unwrap()).unwrap(),
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    locked_footprint(Layout::array::<RemoteTypedOutputReservationV1>(2).unwrap())
+                        .unwrap(),
                 )
             })
             .unwrap();
