@@ -505,11 +505,6 @@ pub(crate) fn build_immutable_remote_channel_groups_v1<'definitions, 'input, 'so
         .map_err(map_assignment_error)?;
     let rows = assignment_owner.assignments_for_manifest_v1();
     let row_count = u64::try_from(rows.len()).map_err(|_error| arithmetic_error())?;
-    if row_count > limits.max_groups {
-        return Err(RemoteChannelGroupErrorV1::ResourceLimitExceeded(
-            RemoteChannelGroupResourceLimitV1::GroupCount,
-        ));
-    }
     if row_count > limits.max_memberships {
         return Err(RemoteChannelGroupErrorV1::ResourceLimitExceeded(
             RemoteChannelGroupResourceLimitV1::MembershipCount,
@@ -576,7 +571,44 @@ fn canonicalize_groups_v1(
         }
     }
     proposals.sort_unstable();
-    proposals.dedup();
+    let mut merged = Vec::<CanonicalChannelGroupProposalV1>::new();
+    merged
+        .try_reserve_exact(proposals.len())
+        .map_err(|_error| RemoteChannelGroupErrorV1::FallibleAllocationFailed)?;
+    for proposal in proposals {
+        if let Some(existing) = merged.last_mut()
+            && existing.decoder_identifier == proposal.decoder_identifier
+            && existing.executable_config == proposal.executable_config
+            && existing.registration_bounds == proposal.registration_bounds
+        {
+            existing
+                .channels
+                .try_reserve_exact(proposal.channels.len())
+                .map_err(|_error| RemoteChannelGroupErrorV1::FallibleAllocationFailed)?;
+            existing.channels.extend(proposal.channels);
+        } else {
+            merged.push(proposal);
+        }
+    }
+    let mut proposals = merged;
+    for proposal in &mut proposals {
+        proposal.channels.sort_unstable();
+        proposal.channels.dedup();
+        let membership_count =
+            u32::try_from(proposal.channels.len()).map_err(|_overflow| arithmetic_error())?;
+        proposal.registration_bounds = RemotePartitionRegistrationBoundsV1 {
+            max_roots_per_partition: proposal
+                .registration_bounds
+                .max_roots_per_partition
+                .checked_mul(membership_count)
+                .ok_or_else(arithmetic_error)?,
+            max_external_origin_bytes_per_partition: proposal
+                .registration_bounds
+                .max_external_origin_bytes_per_partition
+                .checked_mul(u64::from(membership_count))
+                .ok_or_else(arithmetic_error)?,
+        };
+    }
     if proposals.len() as u64 > limits.max_groups {
         return Err(RemoteChannelGroupErrorV1::ResourceLimitExceeded(
             RemoteChannelGroupResourceLimitV1::GroupCount,
@@ -758,12 +790,17 @@ fn exact_peak_bytes_v1(
         ))?)
         .ok_or_else(arithmetic_error)?;
     let singleton_channel = array(Layout::array::<u16>(1))?;
-    let working = array(Layout::array::<CanonicalChannelGroupProposalV1>(groups))?
+    let proposal_array = array(Layout::array::<CanonicalChannelGroupProposalV1>(groups))?;
+    let working = proposal_array
+        .checked_add(proposal_array)
+        .ok_or_else(arithmetic_error)?
         .checked_add(
             singleton_channel
                 .checked_mul(u64::try_from(groups).map_err(|_overflow| arithmetic_error())?)
                 .ok_or_else(arithmetic_error)?,
         )
+        .ok_or_else(arithmetic_error)?
+        .checked_add(array(Layout::array::<u16>(memberships))?)
         .ok_or_else(arithmetic_error)?;
     Ok((working, retained))
 }
@@ -859,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_groups_deduplicate_and_assign_dense_ids() {
+    fn canonical_groups_merge_equal_decoder_config_and_bind_sorted_membership() {
         let sources = [
             source_assignment(2, RemoteDecoderOwnerV1::Raw, 0),
             source_assignment(7, RemoteDecoderOwnerV1::Raw, 0),
@@ -875,13 +912,24 @@ mod tests {
             UnfrozenRemoteChannelGroupLimitsV1::generous_for_test_v1(),
         )
         .unwrap();
-        assert_eq!(groups.len(), 2);
+        assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].group_id.as_u32(), 0);
-        assert_eq!(&memberships[groups[0].membership.clone()], &[2]);
-        assert_eq!(groups[1].group_id.as_u32(), 1);
-        assert_eq!(&memberships[groups[1].membership.clone()], &[7]);
+        assert_eq!(&memberships[groups[0].membership.clone()], &[2, 7]);
+        let per_channel = registration_bounds(config(RemoteDecoderOwnerV1::Raw, 0)).unwrap();
+        assert_eq!(
+            groups[0].registration_bounds.max_roots_per_partition,
+            per_channel.max_roots_per_partition * 2
+        );
+        assert_eq!(
+            groups[0]
+                .registration_bounds
+                .max_external_origin_bytes_per_partition,
+            per_channel.max_external_origin_bytes_per_partition * 2
+        );
         assert_eq!(projection[0].channel_id(), 2);
         assert_eq!(projection[1].channel_id(), 7);
+        assert_eq!(projection[0].group_id(), groups[0].group_id());
+        assert_eq!(projection[1].group_id(), groups[0].group_id());
     }
 
     #[test]

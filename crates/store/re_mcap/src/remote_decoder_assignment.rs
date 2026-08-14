@@ -903,16 +903,26 @@ fn assign_remote_decoders_with_gate_v1<'definitions, 'input, 'source, 'wire>(
 /// the same sealed projections consumed by production stages and does not mint replacement
 /// physical, partition, or root authority.
 #[cfg(test)]
-pub(crate) fn execute_ros_scalar_from_finalized_source_for_test_v1<'a, 'definitions, 'input>(
-    source: crate::remote_physical_resolution::ResolvedRemotePhysicalSourceRefV1<'a, 'input>,
-    physical: &crate::remote_chunk_scan::PhysicalChunkDefinitionsCapabilityV1<'definitions, 'input>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteDispatchTestMutationV1 {
+    None,
+    InvalidateSource,
+    CrossWireFirstDescriptor,
+}
+
+#[cfg(test)]
+pub(crate) fn dispatch_group_from_finalized_source_for_test_v1<'input>(
+    source: crate::remote_physical_resolution::ResolvedRemotePhysicalSourceRefV1<'_, 'input>,
+    physical: &crate::remote_chunk_scan::PhysicalChunkDefinitionsCapabilityV1<'_, 'input>,
     evidence: crate::remote_chunk_scan::PhysicalChunkMessageEvidenceV1<'input>,
     channel_id: u16,
-) -> re_chunk::Chunk {
+    mutation: RemoteDispatchTestMutationV1,
+) -> crate::remote_chunk_dispatch::RemoteChunkTerminalV1 {
     use crate::remote_protobuf_descriptor::{
-        RemoteExecutableAdapterBudgetV1, RemoteExecutableAdapterLimitsV1,
-        RemoteProtobufInitializationBudgetV1, UnfrozenRemoteProtobufLimitsV1,
-        initialize_remote_protobuf_v1, prepare_remote_protobuf_census_v1,
+        RemoteExecutableAdapterBudgetRootV1, RemoteExecutableAdapterBudgetV1,
+        RemoteExecutableAdapterLimitsV1, RemoteProtobufInitializationBudgetV1,
+        UnfrozenRemoteProtobufLimitsV1, initialize_remote_protobuf_v1,
+        prepare_remote_protobuf_census_v1,
     };
     use crate::remote_protobuf_projection_boundary::RemoteProtobufProfileScopeV1;
     use crate::remote_ros2_reflection::{
@@ -1010,64 +1020,119 @@ pub(crate) fn execute_ros_scalar_from_finalized_source_for_test_v1<'a, 'definiti
             u64::MAX,
             u64::MAX,
         );
-    let plan = crate::remote_chunk_validation_count::validate_and_count_with_authority_v1(
+    let plan = match crate::remote_chunk_validation_count::validate_and_count_with_authority_v1(
         evidence,
         &authority,
         &validation_budget,
-    )
-    .unwrap();
-    let factory = plan.bind_executable_factory_v1(channel_id).unwrap();
-    let descriptor = factory.typed_output_descriptor_v1().unwrap();
-    let rows = plan
-        .channels_v1()
-        .iter()
-        .find(|channel| channel.channel_id_v1() == channel_id)
-        .expect("the validation plan retains the selected channel")
-        .message_count_v1();
-    let payload_bytes = plan
-        .channels_v1()
-        .iter()
-        .find(|channel| channel.channel_id_v1() == channel_id)
-        .expect("the validation plan retains the selected channel")
-        .payload_bytes_v1();
-    let adapter_budget =
-        RemoteExecutableAdapterBudgetV1::new_disarmed_v1(RemoteExecutableAdapterLimitsV1 {
-            max_rows: rows,
-            max_payload_bytes: payload_bytes,
-            max_steps: 1_000_000,
-            max_scratch_bytes: 1_000_000,
-            max_builder_bytes: 1_000_000,
-            max_output_bytes: 1_000_000,
-            max_global_bytes: 8_000_000,
-        });
-    let adapter = factory
-        .prepare_adapter_v1(rows, payload_bytes, &adapter_budget)
-        .unwrap();
-    let batch = match crate::remote_chunk_dispatch::dispatch_admitted_v1(adapter, &plan) {
-        crate::remote_chunk_dispatch::RemoteChunkTerminalV1::Complete(batch) => batch,
-        crate::remote_chunk_dispatch::RemoteChunkTerminalV1::CompleteEmpty => {
-            panic!("the finalized scalar fixture is non-empty")
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return crate::remote_chunk_dispatch::RemoteChunkTerminalV1::Failed(
+                crate::remote_chunk_dispatch::RemoteChunkDispatchFailureV1::Validation(error),
+            );
         }
+    };
+    let rows = plan.expected_rows_v1();
+    let payload_bytes = plan.expected_payload_bytes_v1();
+    let adapter_limits = RemoteExecutableAdapterLimitsV1 {
+        max_rows: rows,
+        max_payload_bytes: payload_bytes,
+        max_steps: 1_000_000,
+        max_scratch_bytes: 1_000_000,
+        max_builder_bytes: 1_000_000,
+        max_output_bytes: 1_000_000,
+        max_global_bytes: 8_000_000,
+    };
+    let adapter_root = RemoteExecutableAdapterBudgetRootV1::new_disarmed_v1(8_000_000);
+    let adapter_budgets = plan
+        .channels_v1()
+        .iter()
+        .map(|_| {
+            RemoteExecutableAdapterBudgetV1::new_disarmed_with_root_v1(
+                adapter_limits,
+                &adapter_root,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let factories = plan
+        .channels_v1()
+        .iter()
+        .map(|channel| {
+            plan.bind_executable_factory_v1(channel.channel_id_v1())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let dispatches = factories
+        .iter()
+        .zip(plan.channels_v1())
+        .zip(&adapter_budgets)
+        .enumerate()
+        .map(|(ordinal, ((factory, channel), adapter_budget))| {
+            let descriptor = factory.typed_output_descriptor_v1().unwrap();
+            let descriptor = if mutation == RemoteDispatchTestMutationV1::CrossWireFirstDescriptor
+                && ordinal == 0
+            {
+                descriptor.cross_wired_source_and_config_for_dispatch_test_v1()
+            } else {
+                descriptor
+            };
+            let adapter = factory
+                .prepare_adapter_v1(
+                    channel.message_count_v1(),
+                    channel.payload_bytes_v1(),
+                    adapter_budget,
+                )
+                .unwrap();
+            crate::remote_chunk_dispatch::RemoteAdmittedChannelDispatchV1::new_v1(
+                descriptor, adapter,
+            )
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    if mutation == RemoteDispatchTestMutationV1::InvalidateSource {
+        source_state.invalidate_for_protobuf_test_v1();
+    }
+    crate::remote_chunk_dispatch::dispatch_admitted_v1(dispatches, &plan)
+}
+
+#[cfg(test)]
+pub(crate) fn execute_group_from_finalized_source_for_test_v1<'input>(
+    source: crate::remote_physical_resolution::ResolvedRemotePhysicalSourceRefV1<'_, 'input>,
+    physical: &crate::remote_chunk_scan::PhysicalChunkDefinitionsCapabilityV1<'_, 'input>,
+    evidence: crate::remote_chunk_scan::PhysicalChunkMessageEvidenceV1<'input>,
+    channel_id: u16,
+) -> Vec<re_chunk::Chunk> {
+    match dispatch_group_from_finalized_source_for_test_v1(
+        source,
+        physical,
+        evidence,
+        channel_id,
+        RemoteDispatchTestMutationV1::None,
+    ) {
+        crate::remote_chunk_dispatch::RemoteChunkTerminalV1::Complete(handoff) => {
+            handoff.chunks_v1().cloned().collect()
+        }
+        crate::remote_chunk_dispatch::RemoteChunkTerminalV1::CompleteEmpty => Vec::new(),
         crate::remote_chunk_dispatch::RemoteChunkTerminalV1::Failed(error) => {
             panic!("the finalized scalar fixture failed dispatch: {error:?}")
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn execute_ros_scalar_from_finalized_source_for_test_v1<'input>(
+    source: crate::remote_physical_resolution::ResolvedRemotePhysicalSourceRefV1<'_, 'input>,
+    physical: &crate::remote_chunk_scan::PhysicalChunkDefinitionsCapabilityV1<'_, 'input>,
+    evidence: crate::remote_chunk_scan::PhysicalChunkMessageEvidenceV1<'input>,
+    channel_id: u16,
+) -> re_chunk::Chunk {
+    let chunks =
+        execute_group_from_finalized_source_for_test_v1(source, physical, evidence, channel_id);
+    let [chunk] = chunks.as_slice() else {
+        panic!("the finalized single-channel fixture emits one chunk");
     };
-    let output_peak =
-        crate::remote_chunk_validation_count::typed_output_peak_for_descriptor_test_v1(
-            rows,
-            &descriptor,
-        )
-        .unwrap();
-    let allocation_guard = crate::remote_summary::tests::AllocationGuard::start();
-    let handoff =
-        crate::remote_chunk_dispatch::build_ros_scalar_chunk_v1(descriptor, &plan, batch).unwrap();
-    let measured_peak = crate::remote_summary::tests::AllocationGuard::high_water_locked_bytes();
-    assert!(
-        measured_peak <= output_peak,
-        "typed output build retained {measured_peak} bytes, above its {output_peak}-byte census"
-    );
-    drop(allocation_guard);
-    handoff.chunk_v1().clone()
+    chunk.clone()
 }
 
 fn checked_add(left: u64, right: u64) -> Result<u64, RemoteDecoderAssignmentErrorV1> {
@@ -1133,6 +1198,7 @@ fn locked_wasm_allocation_footprint_v1(
 #[cfg(test)]
 mod tests {
     use crate::TopicFilter;
+    use crate::decoders::resolve_decoder_owner;
     use crate::remote_chunk_scan::{
         PhysicalChunkAssignmentEvidenceHarnessV1, PhysicalChunkDefinitionsCapabilityV1,
         PhysicalChunkSourceBindingV1,
@@ -1429,8 +1495,6 @@ mod tests {
         FixtureChannel::schema_less(id, topic).with_schema(schema_id, encoding)
     }
 
-    #[cfg(any())]
-    #[cfg(any())]
     #[test]
     fn pure_priority_core_prefers_first_recognizer_and_uses_fallback_lazily() {
         let mut fallback_calls = 0;
@@ -1748,83 +1812,6 @@ mod tests {
         assert!(!physical.read_is_still_claimed_v1());
         assert!(ros_budget.is_idle_for_assignment_test_v1());
         assert!(protobuf_budget.is_idle_for_assignment_test_v1());
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn validation_count_uses_actual_message_headers_and_retains_all_owners() {
-        let fixture = fixture(
-            [],
-            [
-                FixtureChannel::schema_less(1, "/one"),
-                FixtureChannel::schema_less(2, "/two"),
-            ],
-            [1, 2, 1],
-        );
-        let physical = PhysicalChunkAssignmentEvidenceHarnessV1::new(&fixture, 0).unwrap();
-        let definitions = physical.definitions_capability_v1();
-        let context = StableContext::new_with_filter_and_physical(
-            TopicFilter::default(),
-            physical.source_binding_v1(),
-        );
-        let protobuf_budget = context.protobuf_budget();
-        let (initializers, ros_budget) =
-            combined_initializers_with_physical(&definitions, &context, &protobuf_budget);
-        let assignment_budget = assignment_budget();
-        let group_budget = crate::remote_channel_group::RemoteChannelGroupBudgetV1::new_for_assignment_test_v1(
-            crate::remote_channel_group::UnfrozenRemoteChannelGroupLimitsV1::generous_for_assignment_test_v1(),
-            1,
-            u64::MAX,
-        );
-        let manifest =
-            build_groups_for_test_v1(initializers, &assignment_budget, &group_budget).unwrap();
-        let evidence = physical.take_evidence_v1();
-        let combined =
-            crate::remote_chunk_validation_count::exact_combined_retained_bytes_for_test_v1(
-                &evidence, &manifest,
-            )
-            .unwrap();
-        let validation_budget = crate::remote_chunk_validation_count::RemoteValidationCountBudgetV1::new_for_test_v1(
-            crate::remote_chunk_validation_count::UnfrozenRemoteValidationCountLimitsV1::generous_for_test_v1(),
-            1,
-            u64::MAX,
-            combined,
-        );
-        let plan = crate::remote_chunk_validation_count::validate_and_count_with_authority_v1(
-            evidence,
-            &crate::remote_manifest::ImmutableRemoteMcapManifestV1::build_v1(
-                physical.authority.source_v1(),
-                manifest,
-                64,
-            )
-            .unwrap()
-            .temporal_partition_v1(
-                0,
-                crate::remote_channel_group::StableDecoderGroupIdV1::first_for_assignment_test_v1(),
-            )
-            .unwrap(),
-            &validation_budget,
-        )
-        .unwrap();
-        assert_eq!(
-            plan.channels_v1()
-                .iter()
-                .map(|row| row.values_for_test_v1())
-                .collect::<Vec<_>>(),
-            [(1, 2, 2, 0), (2, 1, 1, 1)],
-        );
-        assert_eq!(
-            plan.resource_bounds_for_test_v1()
-                .iter()
-                .map(|bound| bound.values_for_test_v1())
-                .collect::<Vec<_>>(),
-            [(1, 0, 2, 2), (1, 1, 1, 1)],
-        );
-        assert!(physical.read_is_still_claimed_v1());
-        drop(plan);
-        assert!(!physical.read_is_still_claimed_v1());
-        assert!(validation_budget.is_idle_for_test_v1());
-        assert!(ros_budget.is_idle_for_assignment_test_v1());
     }
 
     #[test]

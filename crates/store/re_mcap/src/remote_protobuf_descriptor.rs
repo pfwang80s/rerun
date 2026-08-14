@@ -6,6 +6,7 @@
 //! the opaque post-EOF source/policy authority in the combined result.
 
 #![allow(dead_code)]
+#![allow(clippy::type_complexity)]
 #![expect(
     clippy::map_err_ignore,
     reason = "remote request errors intentionally erase parser/allocation internals"
@@ -1528,6 +1529,13 @@ enum FieldKindV1 {
     SInt64,
 }
 
+fn is_packable_kind_v1(kind: FieldKindV1) -> bool {
+    !matches!(
+        kind,
+        FieldKindV1::String | FieldKindV1::Bytes | FieldKindV1::Message
+    )
+}
+
 impl FieldKindV1 {
     fn from_descriptor(value: u64) -> Result<Self, RemoteProtobufInitializationErrorV1> {
         Ok(match value {
@@ -1586,6 +1594,31 @@ struct FieldHeaderV1 {
     default: Option<ByteSpanV1>,
     oneof_index: Option<u32>,
     proto3_optional: bool,
+    packed: Option<bool>,
+}
+
+fn parse_field_options_packed_v1(
+    projection: &DescriptorProjectionV1<'_>,
+    body: ByteSpanV1,
+    steps: &mut RemoteProtobufStepOwnerV1,
+) -> Result<Option<bool>, RemoteProtobufInitializationErrorV1> {
+    let mut packed = None;
+    let mut reader = WireReaderV1::from_span(&projection.inputs, body)?;
+    while let Some(field) = reader.next(steps)? {
+        match field.number {
+            2 => {
+                let value = expected_varint(field.value)?;
+                let value = match value {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(RemoteProtobufInitializationErrorV1::InvalidRemoteSchema),
+                };
+                set_once(&mut packed, value)?;
+            }
+            _ => return Err(unsupported_option()),
+        }
+    }
+    Ok(packed)
 }
 
 fn parse_field_header_v1(
@@ -1604,6 +1637,7 @@ fn parse_field_header_v1(
     let mut default = None;
     let mut oneof_index = None;
     let mut proto3_optional = None;
+    let mut options = None;
     let mut reader = WireReaderV1::from_span(&projection.inputs, body)?;
     while let Some(field) = reader.next(steps)? {
         match field.number {
@@ -1613,9 +1647,10 @@ fn parse_field_header_v1(
             5 => set_once(&mut kind, expected_varint(field.value)?)?,
             6 => set_once(&mut type_name, expected_bytes(field.value)?)?,
             7 => set_once(&mut default, expected_bytes(field.value)?)?,
+            8 => set_once(&mut options, expected_bytes(field.value)?)?,
             9 => set_once(&mut oneof_index, expected_varint(field.value)?)?,
             17 => set_once(&mut proto3_optional, expected_varint(field.value)?)?,
-            2 | 8 | 10 => return Err(unsupported_feature()),
+            2 | 10 => return Err(unsupported_feature()),
             _ => return Err(unsupported_field()),
         }
     }
@@ -1669,6 +1704,10 @@ fn parse_field_header_v1(
         Some(1) => true,
         Some(_) => return Err(RemoteProtobufInitializationErrorV1::InvalidRemoteSchema),
     };
+    let packed = options
+        .map(|body| parse_field_options_packed_v1(projection, body, steps))
+        .transpose()?
+        .flatten();
     if account {
         increment_limited(
             &mut census.fields,
@@ -1686,6 +1725,7 @@ fn parse_field_header_v1(
         default,
         oneof_index,
         proto3_optional,
+        packed,
     })
 }
 
@@ -2447,15 +2487,149 @@ fn validate_default_value_v1(
         FieldKindV1::Message => {
             return Err(RemoteProtobufInitializationErrorV1::InvalidRemoteSchema);
         }
-        // Descriptor string/bytes defaults use protobuf's C-escape grammar. V1 deliberately
-        // rejects it until an allocation-free unescaper and exact decoded-size bound exist.
-        FieldKindV1::String | FieldKindV1::Bytes => return Err(unsupported_feature()),
+        FieldKindV1::String => validate_protobuf_c_escape_v1(value, true),
+        FieldKindV1::Bytes => validate_protobuf_c_escape_v1(value, false),
     };
     if valid {
         Ok(())
     } else {
         Err(RemoteProtobufInitializationErrorV1::InvalidRemoteSchema)
     }
+}
+
+fn for_each_protobuf_c_escape_byte_v1(
+    value: &[u8],
+    mut emit: impl FnMut(u8) -> Result<(), ()>,
+) -> Result<(), ()> {
+    let mut index = 0;
+    while index < value.len() {
+        let byte = value[index];
+        index += 1;
+        if byte != b'\\' {
+            emit(byte)?;
+            continue;
+        }
+        let escaped = *value.get(index).ok_or(())?;
+        index += 1;
+        let simple = match escaped {
+            b'a' => Some(0x07),
+            b'b' => Some(0x08),
+            b'f' => Some(0x0c),
+            b'n' => Some(b'\n'),
+            b'r' => Some(b'\r'),
+            b't' => Some(b'\t'),
+            b'v' => Some(0x0b),
+            b'\\' => Some(b'\\'),
+            b'\'' => Some(b'\''),
+            b'"' => Some(b'"'),
+            _ => None,
+        };
+        if let Some(byte) = simple {
+            emit(byte)?;
+            continue;
+        }
+        if (b'0'..=b'7').contains(&escaped) {
+            let mut decoded = u16::from(escaped - b'0');
+            for _ in 1..3 {
+                let Some(next) = value.get(index).copied() else {
+                    break;
+                };
+                if !(b'0'..=b'7').contains(&next) {
+                    break;
+                }
+                index += 1;
+                decoded = decoded * 8 + u16::from(next - b'0');
+            }
+            emit(u8::try_from(decoded).map_err(|_| ())?)?;
+            continue;
+        }
+        let hex = |byte: u8| match byte {
+            b'0'..=b'9' => Some(u32::from(byte - b'0')),
+            b'a'..=b'f' => Some(u32::from(byte - b'a') + 10),
+            b'A'..=b'F' => Some(u32::from(byte - b'A') + 10),
+            _ => None,
+        };
+        if matches!(escaped, b'x' | b'X') {
+            let mut decoded = 0_u32;
+            let mut digits = 0;
+            while digits < 2 {
+                let Some(next) = value.get(index).copied().and_then(hex) else {
+                    break;
+                };
+                index += 1;
+                digits += 1;
+                decoded = decoded * 16 + next;
+            }
+            if digits == 0 {
+                return Err(());
+            }
+            emit(u8::try_from(decoded).map_err(|_| ())?)?;
+            continue;
+        }
+        if matches!(escaped, b'u' | b'U') {
+            let digits = if escaped == b'u' { 4 } else { 8 };
+            let mut decoded = 0_u32;
+            for _ in 0..digits {
+                let next = value.get(index).copied().and_then(hex).ok_or(())?;
+                index += 1;
+                decoded = decoded
+                    .checked_mul(16)
+                    .and_then(|v| v.checked_add(next))
+                    .ok_or(())?;
+            }
+            let character = char::from_u32(decoded).ok_or(())?;
+            let mut encoded = [0_u8; 4];
+            for byte in character.encode_utf8(&mut encoded).bytes() {
+                emit(byte)?;
+            }
+            continue;
+        }
+        return Err(());
+    }
+    Ok(())
+}
+
+fn validate_protobuf_c_escape_v1(value: &str, require_utf8: bool) -> bool {
+    let mut utf8 = [0_u8; 4];
+    let mut utf8_len = 0_usize;
+    let result = for_each_protobuf_c_escape_byte_v1(value.as_bytes(), |byte| {
+        if !require_utf8 {
+            return Ok(());
+        }
+        if utf8_len == 0 && byte.is_ascii() {
+            return Ok(());
+        }
+        if utf8_len == 0 {
+            utf8[0] = byte;
+            utf8_len = 1;
+        } else {
+            let slot = utf8.get_mut(utf8_len).ok_or(())?;
+            *slot = byte;
+            utf8_len += 1;
+        }
+        let width = match utf8[0] {
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => return Err(()),
+        };
+        if utf8_len == width {
+            std::str::from_utf8(&utf8[..width]).map_err(|_| ())?;
+            utf8_len = 0;
+        }
+        Ok(())
+    });
+    result.is_ok() && (!require_utf8 || utf8_len == 0)
+}
+
+fn decode_protobuf_c_escape_v1(value: &[u8]) -> Result<Box<[u8]>, RemoteExecutableAdapterErrorV1> {
+    let mut decoded = Vec::with_capacity(value.len());
+    for_each_protobuf_c_escape_byte_v1(value, |byte| {
+        decoded.push(byte);
+        Ok(())
+    })
+    .map_err(|()| RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature)?;
+    Ok(decoded.into_boxed_slice())
 }
 
 fn validate_fields_and_resolve_types_v1(
@@ -2482,17 +2656,6 @@ fn validate_fields_and_resolve_types_v1(
             let body = direct_field_span_v1(projection, message_index, field_ordinal, steps)?;
             let field =
                 parse_field_header_v1(body, projection, &mut no_accounting, limits, steps, false)?;
-            // Executable V1 deliberately admits only singular, non-oneof fields with implicit
-            // defaults. Broader descriptor shapes remain valid protobuf, but cannot enter the
-            // remote executable table until their payload semantics and exact output bounds are
-            // implemented end-to-end.
-            if field.label != FieldLabelV1::Optional
-                || field.default.is_some()
-                || field.oneof_index.is_some()
-                || field.proto3_optional
-            {
-                return Err(unsupported_feature());
-            }
             if file.syntax == ProtobufSyntaxV1::Proto3
                 && (field.label == FieldLabelV1::Required || field.default.is_some())
             {
@@ -2552,9 +2715,6 @@ fn validate_fields_and_resolve_types_v1(
                 None
             };
             let kind = effective_field_kind_v1(projection, field, resolved_symbol)?;
-            if kind == FieldKindV1::Message {
-                return Err(unsupported_feature());
-            }
             validate_default_value_v1(projection, field, kind, resolved_symbol, steps)?;
         }
     }
@@ -3514,6 +3674,7 @@ struct BoundedProtobufFieldV1 {
     default: Option<ByteSpanV1>,
     oneof_index: Option<u32>,
     proto3_optional: bool,
+    packed: Option<bool>,
     resolved_symbol: Option<u32>,
 }
 
@@ -3621,6 +3782,7 @@ fn walk_materialization_v1<'definitions>(
                 default: field.default,
                 oneof_index: field.oneof_index,
                 proto3_optional: field.proto3_optional,
+                packed: field.packed,
                 resolved_symbol: resolved_symbol.map(checked_u32).transpose()?,
             };
             emit(MaterializationRecordV1::Field(bounded_field))?;
@@ -3957,7 +4119,10 @@ impl BoundedProtobufDescriptorGraphV1<'_> {
         max_steps: u64,
         max_output_bytes: u64,
         max_field_values: usize,
-    ) -> Result<(Vec<RemoteNormalizedFieldV1>, Vec<u8>, u64), RemoteExecutableAdapterErrorV1> {
+    ) -> Result<
+        (Vec<RemoteNormalizedFieldV1>, Vec<u8>, u64, u32, u32),
+        RemoteExecutableAdapterErrorV1,
+    > {
         let schema_position = self
             .schemas
             .as_slice()
@@ -3984,7 +4149,7 @@ impl BoundedProtobufDescriptorGraphV1<'_> {
             max_steps,
             RemoteProtobufResourceLimitV1::MaterializationSteps,
         );
-        self.decode_message_payload_v1(
+        let (root_first, root_count) = self.decode_message_payload_v1(
             root,
             payload,
             &mut steps,
@@ -3994,7 +4159,13 @@ impl BoundedProtobufDescriptorGraphV1<'_> {
             &mut bytes_out,
             0,
         )?;
-        Ok((fields_out, bytes_out, steps.consumed))
+        Ok((
+            fields_out,
+            bytes_out,
+            steps.consumed,
+            root_first,
+            root_count,
+        ))
     }
 
     fn decode_message_payload_v1(
@@ -4007,7 +4178,7 @@ impl BoundedProtobufDescriptorGraphV1<'_> {
         fields_out: &mut Vec<RemoteNormalizedFieldV1>,
         bytes_out: &mut Vec<u8>,
         depth: u32,
-    ) -> Result<(), RemoteExecutableAdapterErrorV1> {
+    ) -> Result<(u32, u32), RemoteExecutableAdapterErrorV1> {
         if depth > 32 {
             return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
         }
@@ -4022,7 +4193,7 @@ impl BoundedProtobufDescriptorGraphV1<'_> {
             .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
         let mut reader = WireReaderV1::root(0, payload)
             .map_err(|_| RemoteExecutableAdapterErrorV1::InvalidPayload)?;
-        let first_output = fields_out.len();
+        let mut observed = Vec::new();
         while let Some(wire) = reader
             .next(steps)
             .map_err(|_| RemoteExecutableAdapterErrorV1::InvalidPayload)?
@@ -4031,37 +4202,237 @@ impl BoundedProtobufDescriptorGraphV1<'_> {
                 field.message_index == message_index
                     && u32::try_from(field.number).ok() == Some(wire.number)
             }) else {
-                return Err(RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature);
+                // Application payload unknowns are consumed by the bounded wire reader but do
+                // not participate in the projected Arrow schema, matching `DynamicMessage`.
+                // Descriptor-set initializer unknowns remain strictly rejected during schema
+                // admission and never reach this path.
+                continue;
             };
-            if fields_out[first_output..]
-                .iter()
-                .any(|observed| observed.tag == wire.number)
+            if field.label == FieldLabelV1::Repeated
+                && matches!(wire.value, WireValueV1::Bytes(_))
+                && is_packable_kind_v1(field.kind)
             {
-                return Err(RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature);
+                self.decode_packed_field_values_v1(
+                    field,
+                    wire.value,
+                    &inputs,
+                    steps,
+                    max_output_bytes,
+                    max_field_values,
+                    fields_out,
+                    bytes_out,
+                    depth,
+                    &mut observed,
+                )?;
+            } else {
+                let value = self.decode_field_value_v1(
+                    field,
+                    wire.value,
+                    &inputs,
+                    steps,
+                    max_output_bytes,
+                    max_field_values,
+                    fields_out,
+                    bytes_out,
+                    depth,
+                )?;
+                if fields_out.len().saturating_add(observed.len()) >= max_field_values {
+                    return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+                }
+                observed.push(RemoteNormalizedFieldV1 {
+                    tag: wire.number,
+                    value,
+                });
             }
-            let value = self.decode_field_value_v1(
-                field,
-                wire.value,
-                &inputs,
-                steps,
-                max_output_bytes,
-                max_field_values,
-                fields_out,
-                bytes_out,
-                depth,
-            )?;
-            if fields_out.len() >= max_field_values {
-                return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
-            }
-            fields_out.push(RemoteNormalizedFieldV1 {
-                tag: wire.number,
-                value,
-            });
         }
-        // Missing singular fields keep implicit protobuf default/presence semantics. The
-        // downstream fixed builder plan owns default materialization; this IR records wire
-        // observations only.
-        Ok(())
+        self.finalize_observed_message_v1(
+            message_index,
+            &observed,
+            steps,
+            max_field_values,
+            fields_out,
+            depth,
+        )
+    }
+
+    fn finalize_observed_message_v1(
+        &self,
+        message_index: u32,
+        observed: &[RemoteNormalizedFieldV1],
+        steps: &mut RemoteProtobufStepOwnerV1,
+        max_field_values: usize,
+        fields_out: &mut Vec<RemoteNormalizedFieldV1>,
+        depth: u32,
+    ) -> Result<(u32, u32), RemoteExecutableAdapterErrorV1> {
+        if depth > 32 {
+            return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+        }
+        let mut direct = Vec::new();
+        let real_oneof_selection = |oneof_index: u32| {
+            let member_count = self
+                .fields
+                .as_slice()
+                .iter()
+                .filter(|field| {
+                    field.message_index == message_index && field.oneof_index == Some(oneof_index)
+                })
+                .count();
+            if member_count <= 1 {
+                return None;
+            }
+            let (last_index, last_tag) = observed
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, value)| {
+                    self.fields.as_slice().iter().any(|field| {
+                        field.message_index == message_index
+                            && field.oneof_index == Some(oneof_index)
+                            && u32::try_from(field.number).ok() == Some(value.tag)
+                    })
+                })
+                .map(|(index, value)| (index, value.tag))?;
+            let suffix_start = observed[..last_index]
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, value)| {
+                    value.tag != last_tag
+                        && self.fields.as_slice().iter().any(|field| {
+                            field.message_index == message_index
+                                && field.oneof_index == Some(oneof_index)
+                                && u32::try_from(field.number).ok() == Some(value.tag)
+                        })
+                })
+                .map_or(0, |(index, _)| index + 1);
+            Some((last_tag, suffix_start))
+        };
+        for field in self
+            .fields
+            .as_slice()
+            .iter()
+            .filter(|field| field.message_index == message_index)
+        {
+            let tag = u32::try_from(field.number)
+                .map_err(|_| RemoteExecutableAdapterErrorV1::ConfigMismatch)?;
+            let field_observed = if let Some(oneof_index) = field.oneof_index
+                && let Some((last_tag, suffix_start)) = real_oneof_selection(oneof_index)
+            {
+                if tag != last_tag {
+                    continue;
+                }
+                &observed[suffix_start..]
+            } else {
+                observed
+            };
+            if field.label == FieldLabelV1::Repeated {
+                let first_value = u32::try_from(fields_out.len())
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+                let mut value_count = 0_u32;
+                for value in field_observed.iter().filter(|value| value.tag == tag) {
+                    let expanded = match value.value {
+                        RemoteNormalizedValueV1::Array {
+                            first_value,
+                            value_count,
+                            ..
+                        } => {
+                            let start = usize::try_from(first_value).map_err(|_| {
+                                RemoteExecutableAdapterErrorV1::ResourceLimitExceeded
+                            })?;
+                            let count = usize::try_from(value_count).map_err(|_| {
+                                RemoteExecutableAdapterErrorV1::ResourceLimitExceeded
+                            })?;
+                            fields_out
+                                .get(start..start.saturating_add(count))
+                                .ok_or(RemoteExecutableAdapterErrorV1::ConfigMismatch)?
+                                .to_vec()
+                        }
+                        _ => vec![*value],
+                    };
+                    for value in expanded {
+                        steps
+                            .consume()
+                            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+                        if fields_out.len().saturating_add(direct.len()) >= max_field_values {
+                            return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+                        }
+                        fields_out.push(value);
+                        value_count = value_count
+                            .checked_add(1)
+                            .ok_or(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+                    }
+                }
+                if value_count > 0 {
+                    direct.push(RemoteNormalizedFieldV1 {
+                        tag,
+                        value: RemoteNormalizedValueV1::Array {
+                            first_value,
+                            value_count,
+                            fixed: false,
+                        },
+                    });
+                }
+            } else if field.kind == FieldKindV1::Message {
+                let occurrences = field_observed
+                    .iter()
+                    .filter(|value| value.tag == tag)
+                    .copied()
+                    .collect::<Vec<_>>();
+                if occurrences.is_empty() {
+                    continue;
+                }
+                let symbol = field
+                    .resolved_symbol
+                    .and_then(|index| usize::try_from(index).ok())
+                    .and_then(|index| self.symbols.as_slice().get(index))
+                    .ok_or(RemoteExecutableAdapterErrorV1::ConfigMismatch)?;
+                let mut nested_observed = Vec::new();
+                for occurrence in occurrences {
+                    let RemoteNormalizedValueV1::Message {
+                        first_value,
+                        value_count,
+                    } = occurrence.value
+                    else {
+                        return Err(RemoteExecutableAdapterErrorV1::ConfigMismatch);
+                    };
+                    let start = usize::try_from(first_value)
+                        .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+                    let count = usize::try_from(value_count)
+                        .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+                    nested_observed.extend_from_slice(
+                        fields_out
+                            .get(start..start.saturating_add(count))
+                            .ok_or(RemoteExecutableAdapterErrorV1::ConfigMismatch)?,
+                    );
+                }
+                let (first_value, value_count) = self.finalize_observed_message_v1(
+                    symbol.node_index,
+                    &nested_observed,
+                    steps,
+                    max_field_values,
+                    fields_out,
+                    depth + 1,
+                )?;
+                direct.push(RemoteNormalizedFieldV1 {
+                    tag,
+                    value: RemoteNormalizedValueV1::Message {
+                        first_value,
+                        value_count,
+                    },
+                });
+            } else if let Some(value) = field_observed.iter().rev().find(|value| value.tag == tag) {
+                direct.push(*value);
+            }
+        }
+        let first = u32::try_from(fields_out.len())
+            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        let count = u32::try_from(direct.len())
+            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        if fields_out.len().saturating_add(direct.len()) > max_field_values {
+            return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+        }
+        fields_out.extend(direct);
+        Ok((first, count))
     }
 
     fn decode_field_value_v1(
@@ -4196,9 +4567,7 @@ impl BoundedProtobufDescriptorGraphV1<'_> {
                 if resolved.kind != SymbolKindV1::Message {
                     return Err(RemoteExecutableAdapterErrorV1::ConfigMismatch);
                 }
-                let first = u32::try_from(fields_out.len())
-                    .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
-                self.decode_message_payload_v1(
+                let (first_value, value_count) = self.decode_message_payload_v1(
                     resolved.node_index,
                     data,
                     steps,
@@ -4209,13 +4578,90 @@ impl BoundedProtobufDescriptorGraphV1<'_> {
                     depth + 1,
                 )?;
                 RemoteNormalizedValueV1::Message {
-                    first_value: first,
-                    value_count: u32::try_from(fields_out.len())
-                        .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?
-                        - first,
+                    first_value,
+                    value_count,
                 }
             }
         })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the bounded decoder threads one sealed budget/output arena through recursion"
+    )]
+    fn decode_packed_field_values_v1(
+        &self,
+        field: &BoundedProtobufFieldV1,
+        wire: WireValueV1,
+        inputs: &InlineListV1<SchemaInputV1<'_>, MAX_INLINE_PROTOBUF_SCHEMAS_V1>,
+        steps: &mut RemoteProtobufStepOwnerV1,
+        max_output_bytes: u64,
+        max_field_values: usize,
+        fields_out: &mut Vec<RemoteNormalizedFieldV1>,
+        bytes_out: &mut Vec<u8>,
+        depth: u32,
+        observed: &mut Vec<RemoteNormalizedFieldV1>,
+    ) -> Result<(), RemoteExecutableAdapterErrorV1> {
+        let span =
+            expected_bytes(wire).map_err(|_| RemoteExecutableAdapterErrorV1::InvalidPayload)?;
+        let data =
+            span_bytes(inputs, span).map_err(|_| RemoteExecutableAdapterErrorV1::InvalidPayload)?;
+        let mut reader = WireReaderV1::root(0, data)
+            .map_err(|_| RemoteExecutableAdapterErrorV1::InvalidPayload)?;
+        while reader.position < reader.bytes.len() {
+            let value = match field.kind {
+                FieldKindV1::Double | FieldKindV1::Fixed64 | FieldKindV1::SFixed64 => {
+                    let start = reader.position;
+                    reader
+                        .take_exact(8, steps)
+                        .map_err(|_| RemoteExecutableAdapterErrorV1::InvalidPayload)?;
+                    WireValueV1::Fixed64(u64::from_le_bytes(
+                        reader.bytes[start..start + 8]
+                            .try_into()
+                            .map_err(|_| RemoteExecutableAdapterErrorV1::InvalidPayload)?,
+                    ))
+                }
+                FieldKindV1::Float | FieldKindV1::Fixed32 | FieldKindV1::SFixed32 => {
+                    let start = reader.position;
+                    reader
+                        .take_exact(4, steps)
+                        .map_err(|_| RemoteExecutableAdapterErrorV1::InvalidPayload)?;
+                    WireValueV1::Fixed32(u32::from_le_bytes(
+                        reader.bytes[start..start + 4]
+                            .try_into()
+                            .map_err(|_| RemoteExecutableAdapterErrorV1::InvalidPayload)?,
+                    ))
+                }
+                FieldKindV1::String | FieldKindV1::Bytes | FieldKindV1::Message => {
+                    return Err(RemoteExecutableAdapterErrorV1::InvalidPayload);
+                }
+                _ => WireValueV1::Varint(
+                    reader
+                        .read_varint(steps)
+                        .map_err(|_| RemoteExecutableAdapterErrorV1::InvalidPayload)?,
+                ),
+            };
+            let normalized = self.decode_field_value_v1(
+                field,
+                value,
+                inputs,
+                steps,
+                max_output_bytes,
+                max_field_values,
+                fields_out,
+                bytes_out,
+                depth,
+            )?;
+            if fields_out.len().saturating_add(observed.len()) >= max_field_values {
+                return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+            }
+            observed.push(RemoteNormalizedFieldV1 {
+                tag: u32::try_from(field.number)
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::ConfigMismatch)?,
+                value: normalized,
+            });
+        }
+        Ok(())
     }
 
     fn verify_lengths(
@@ -4296,6 +4742,11 @@ impl BoundedProtobufDescriptorGraphV1<'_> {
             self.hash_option_span_v1(&mut hasher, field.default)?;
             hash_option_u32(&mut hasher, field.oneof_index);
             hasher.update([field.proto3_optional as u8]);
+            hasher.update([match field.packed {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            }]);
             hash_option_u32(&mut hasher, field.resolved_symbol);
         }
         for root in self.output_roots.as_slice() {
@@ -5111,6 +5562,221 @@ pub(crate) struct RemoteExecutableFactoryV1<'a, 'definitions, 'input, 'source, '
 }
 
 impl RemoteExecutableFactoryV1<'_, '_, '_, '_, '_> {
+    fn protobuf_span_bytes_v1(
+        &self,
+        span: ByteSpanV1,
+    ) -> Result<&[u8], RemoteExecutableAdapterErrorV1> {
+        let input = self
+            .protobuf
+            .schemas
+            .as_slice()
+            .get(usize::from(span.schema_index))
+            .ok_or(RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature)?;
+        let start = usize::try_from(span.start)
+            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        input
+            .data
+            .get(
+                start
+                    ..span
+                        .end()
+                        .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?,
+            )
+            .ok_or(RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature)
+    }
+
+    fn protobuf_typed_fields_v1(
+        &self,
+    ) -> Result<
+        (
+            u32,
+            Box<[crate::remote_typed_output::RemoteTypedProtobufFieldV1]>,
+            Box<[crate::remote_typed_output::RemoteTypedProtobufOneofV1]>,
+            Box<[crate::remote_typed_output::RemoteTypedProtobufEnumV1]>,
+        ),
+        RemoteExecutableAdapterErrorV1,
+    > {
+        use crate::remote_typed_output::{
+            RemoteTypedProtobufEnumV1, RemoteTypedProtobufEnumValueV1, RemoteTypedProtobufFieldV1,
+            RemoteTypedProtobufKindV1, RemoteTypedProtobufOneofV1,
+        };
+        let root = self
+            .protobuf
+            .output_roots
+            .as_slice()
+            .iter()
+            .find(|root| root.schema_id == self.config.schema_handle)
+            .ok_or(RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature)?;
+        let mut projected = Vec::new();
+        for node in self.protobuf.output_nodes.as_slice() {
+            let field = self
+                .protobuf
+                .fields
+                .as_slice()
+                .iter()
+                .find(|field| {
+                    field.message_index == node.owner_message && field.ordinal == node.ordinal
+                })
+                .ok_or(RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature)?;
+            let kind = match node.kind {
+                RemoteOutputNodeKindV1::Scalar(kind) => match kind {
+                    FieldKindV1::Double => RemoteTypedProtobufKindV1::Double,
+                    FieldKindV1::Float => RemoteTypedProtobufKindV1::Float,
+                    FieldKindV1::Int64 => RemoteTypedProtobufKindV1::Int64,
+                    FieldKindV1::UInt64 => RemoteTypedProtobufKindV1::UInt64,
+                    FieldKindV1::Int32 => RemoteTypedProtobufKindV1::Int32,
+                    FieldKindV1::Fixed64 => RemoteTypedProtobufKindV1::Fixed64,
+                    FieldKindV1::Fixed32 => RemoteTypedProtobufKindV1::Fixed32,
+                    FieldKindV1::Bool => RemoteTypedProtobufKindV1::Bool,
+                    FieldKindV1::String => RemoteTypedProtobufKindV1::String,
+                    FieldKindV1::Bytes => RemoteTypedProtobufKindV1::Bytes,
+                    FieldKindV1::UInt32 => RemoteTypedProtobufKindV1::UInt32,
+                    FieldKindV1::SFixed32 => RemoteTypedProtobufKindV1::SFixed32,
+                    FieldKindV1::SFixed64 => RemoteTypedProtobufKindV1::SFixed64,
+                    FieldKindV1::SInt32 => RemoteTypedProtobufKindV1::SInt32,
+                    FieldKindV1::SInt64 => RemoteTypedProtobufKindV1::SInt64,
+                    FieldKindV1::Message | FieldKindV1::Enum => {
+                        return Err(RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature);
+                    }
+                },
+                RemoteOutputNodeKindV1::Message(index) => {
+                    let message =
+                        self.protobuf
+                            .messages
+                            .as_slice()
+                            .get(usize::try_from(index).map_err(|_| {
+                                RemoteExecutableAdapterErrorV1::ResourceLimitExceeded
+                            })?)
+                            .ok_or(RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature)?;
+                    if message.map_entry {
+                        RemoteTypedProtobufKindV1::Map(index)
+                    } else {
+                        RemoteTypedProtobufKindV1::Message(index)
+                    }
+                }
+                RemoteOutputNodeKindV1::Enum(index) => RemoteTypedProtobufKindV1::Enum(index),
+            };
+            let name = std::str::from_utf8(self.protobuf_span_bytes_v1(node.name)?)
+                .map_err(|_| RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature)?;
+            let default = field
+                .default
+                .map(|span| {
+                    let value = self.protobuf_span_bytes_v1(span)?;
+                    if matches!(field.kind, FieldKindV1::String | FieldKindV1::Bytes) {
+                        decode_protobuf_c_escape_v1(value)
+                    } else {
+                        Ok(value.to_vec().into_boxed_slice())
+                    }
+                })
+                .transpose()?;
+            let message = self
+                .protobuf
+                .messages
+                .as_slice()
+                .get(
+                    usize::try_from(node.owner_message)
+                        .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?,
+                )
+                .ok_or(RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature)?;
+            let file = self
+                .protobuf
+                .files
+                .as_slice()
+                .get(
+                    usize::try_from(message.file_index)
+                        .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?,
+                )
+                .ok_or(RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature)?;
+            let supports_presence = file.syntax == ProtobufSyntaxV1::Proto2
+                || matches!(
+                    kind,
+                    RemoteTypedProtobufKindV1::Message(_) | RemoteTypedProtobufKindV1::Map(_)
+                )
+                || field.oneof_index.is_some()
+                || field.proto3_optional;
+            projected.push(RemoteTypedProtobufFieldV1 {
+                owner_message: node.owner_message,
+                tag: node.tag,
+                name: name.to_owned().into_boxed_str(),
+                kind,
+                nullable: node.nullable,
+                supports_presence,
+                repeated: node.repeated,
+                oneof_index: field.oneof_index,
+                proto3_optional: field.proto3_optional,
+                packed: field.packed,
+                default,
+            });
+        }
+        let mut oneofs = Vec::new();
+        for oneof in self.protobuf.oneofs.as_slice() {
+            let name = std::str::from_utf8(self.protobuf_span_bytes_v1(oneof.name)?)
+                .map_err(|_| RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature)?;
+            let member_count = self
+                .protobuf
+                .fields
+                .as_slice()
+                .iter()
+                .filter(|field| {
+                    field.message_index == oneof.message_index
+                        && field.oneof_index == Some(oneof.ordinal)
+                })
+                .count();
+            let synthetic = member_count == 1
+                && self.protobuf.fields.as_slice().iter().any(|field| {
+                    field.message_index == oneof.message_index
+                        && field.oneof_index == Some(oneof.ordinal)
+                        && field.proto3_optional
+                });
+            oneofs.push(RemoteTypedProtobufOneofV1 {
+                owner_message: oneof.message_index,
+                index: oneof.ordinal,
+                name: name.to_owned().into_boxed_str(),
+                synthetic,
+            });
+        }
+        let mut enums = Vec::new();
+        for (index, _enumeration) in self.protobuf.enums.as_slice().iter().enumerate() {
+            let index = u32::try_from(index)
+                .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+            let values = self
+                .protobuf
+                .enum_values
+                .as_slice()
+                .iter()
+                .filter(|value| value.enum_index == index)
+                .map(|value| {
+                    let name = std::str::from_utf8(self.protobuf_span_bytes_v1(value.name)?)
+                        .map_err(|_| RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature)?;
+                    Ok(RemoteTypedProtobufEnumValueV1 {
+                        number: value.number,
+                        name: name.to_owned().into_boxed_str(),
+                    })
+                })
+                .collect::<Result<Vec<_>, RemoteExecutableAdapterErrorV1>>()?;
+            enums.push(RemoteTypedProtobufEnumV1 {
+                index,
+                values: values.into_boxed_slice(),
+            });
+        }
+        Ok((
+            root.root_message,
+            projected.into_boxed_slice(),
+            oneofs.into_boxed_slice(),
+            enums.into_boxed_slice(),
+        ))
+    }
+
+    fn protobuf_archetype_name_v1(&self) -> Result<&str, RemoteExecutableAdapterErrorV1> {
+        self.protobuf
+            .schemas
+            .as_slice()
+            .iter()
+            .find(|schema| schema.schema_id == self.config.schema_handle)
+            .map(|schema| schema.name)
+            .ok_or(RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature)
+    }
+
     pub(crate) fn channel_id_v1(&self) -> u16 {
         self.channel_id
     }
@@ -5158,19 +5824,36 @@ impl RemoteExecutableFactoryV1<'_, '_, '_, '_, '_> {
                 return Err(RemoteExecutableAdapterErrorV1::UnsupportedSemantic);
             }
         };
-        let fields = match self.owner {
-            RemoteDecoderOwnerV1::Ros2Reflection => self
-                .view
-                .typed_field_contract_v1()
-                .map_err(|_| RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature)?,
+        let (fields, protobuf_fields, protobuf_oneofs, protobuf_enums, protobuf_root_message): (
+            Box<[crate::remote_typed_output::RemoteTypedFieldContractV1]>,
+            Box<[crate::remote_typed_output::RemoteTypedProtobufFieldV1]>,
+            Box<[crate::remote_typed_output::RemoteTypedProtobufOneofV1]>,
+            Box<[crate::remote_typed_output::RemoteTypedProtobufEnumV1]>,
+            Option<u32>,
+        ) = match self.owner {
+            RemoteDecoderOwnerV1::Ros2Reflection => (
+                self.view
+                    .typed_field_contract_v1()
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature)?,
+                Box::new([]),
+                Box::new([]),
+                Box::new([]),
+                None,
+            ),
             RemoteDecoderOwnerV1::Protobuf => {
-                return Err(RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature);
+                let (root, fields, oneofs, enums) = self.protobuf_typed_fields_v1()?;
+                (Box::new([]), fields, oneofs, enums, Some(root))
             }
             RemoteDecoderOwnerV1::Raw => unreachable!(),
         };
-        if fields.len() != 1 {
+        if self.owner == RemoteDecoderOwnerV1::Ros2Reflection && fields.len() != 1 {
             return Err(RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature);
         }
+        let archetype_name = match self.owner {
+            RemoteDecoderOwnerV1::Ros2Reflection => self.typed_archetype_name_v1()?,
+            RemoteDecoderOwnerV1::Protobuf => self.protobuf_archetype_name_v1()?.to_owned(),
+            RemoteDecoderOwnerV1::Raw => unreachable!(),
+        };
         Ok(crate::remote_typed_output::issue_from_live_factory_v1(
             self.channel_id,
             kind,
@@ -5178,12 +5861,16 @@ impl RemoteExecutableFactoryV1<'_, '_, '_, '_, '_> {
             self.config.schema_handle,
             self.binding.clone(),
             fields,
+            protobuf_fields,
+            protobuf_oneofs,
+            protobuf_enums,
+            protobuf_root_message,
             self.view
                 .channel_topic_v1()
                 .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?
                 .to_owned(),
             re_sdk_types::ComponentDescriptor::partial("message").with_builtin_archetype(
-                re_sdk_types::ArchetypeName::try_new(self.typed_archetype_name_v1()?)
+                re_sdk_types::ArchetypeName::try_new(archetype_name)
                     .map_err(|_| RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature)?,
             ),
             self.view
@@ -5272,6 +5959,8 @@ pub(crate) struct RemoteNormalizedFieldV1 {
 pub(crate) struct RemoteNormalizedEnvelopeV1 {
     fields: Vec<RemoteNormalizedFieldV1>,
     bytes: Vec<u8>,
+    root_first_value: u32,
+    root_value_count: u32,
     rows: u64,
     config_digest: [u8; 16],
     _reservation: Option<RemoteExecutableAdapterReservationV1>,
@@ -5330,6 +6019,8 @@ impl std::fmt::Debug for RemoteNormalizedEnvelopeV1 {
         f.debug_struct("RemoteNormalizedEnvelopeV1")
             .field("fields", &self.fields)
             .field("bytes", &self.bytes)
+            .field("root_first_value", &self.root_first_value)
+            .field("root_value_count", &self.root_value_count)
             .field("rows", &self.rows)
             .field("config_digest", &self.config_digest)
             .finish_non_exhaustive()
@@ -5339,6 +6030,8 @@ impl PartialEq for RemoteNormalizedEnvelopeV1 {
     fn eq(&self, other: &Self) -> bool {
         self.fields == other.fields
             && self.bytes == other.bytes
+            && self.root_first_value == other.root_first_value
+            && self.root_value_count == other.root_value_count
             && self.rows == other.rows
             && self.config_digest == other.config_digest
     }
@@ -5350,7 +6043,17 @@ impl RemoteNormalizedEnvelopeV1 {
         self.rows
     }
     pub(crate) fn fields_v1(&self) -> &[RemoteNormalizedFieldV1] {
-        &self.fields
+        self.field_span_v1(self.root_first_value, self.root_value_count)
+            .unwrap_or_else(|| protobuf_fatal_invariant("normalized root span escaped its arena"))
+    }
+    pub(crate) fn field_span_v1(
+        &self,
+        first_value: u32,
+        value_count: u32,
+    ) -> Option<&[RemoteNormalizedFieldV1]> {
+        let start = usize::try_from(first_value).ok()?;
+        let end = start.checked_add(usize::try_from(value_count).ok()?)?;
+        self.fields.get(start..end)
     }
     pub(crate) fn bytes_v1(&self, start: u32, len: u32) -> Option<&[u8]> {
         let start = usize::try_from(start).ok()?;
@@ -5359,6 +6062,26 @@ impl RemoteNormalizedEnvelopeV1 {
     }
     pub(crate) fn config_digest_v1(&self) -> [u8; 16] {
         self.config_digest
+    }
+}
+
+#[cfg(test)]
+impl RemoteNormalizedEnvelopeV1 {
+    pub(crate) fn new_for_dispatch_test_v1(
+        fields: Vec<RemoteNormalizedFieldV1>,
+        bytes: Vec<u8>,
+        root_first_value: u32,
+        root_value_count: u32,
+    ) -> Self {
+        Self {
+            fields,
+            bytes,
+            root_first_value,
+            root_value_count,
+            rows: 1,
+            config_digest: [7; 16],
+            _reservation: None,
+        }
     }
 }
 
@@ -5463,6 +6186,17 @@ impl Drop for RemoteExecutableAdapterReservationV1 {
     }
 }
 
+type RemoteDecodedPayloadV1 = (Vec<RemoteNormalizedFieldV1>, Vec<u8>, u64, u32, u32);
+
+fn root_wrapped_payload_v1(
+    decoded: Result<(Vec<RemoteNormalizedFieldV1>, Vec<u8>, u64), RemoteExecutableAdapterErrorV1>,
+) -> Result<RemoteDecodedPayloadV1, RemoteExecutableAdapterErrorV1> {
+    let (fields, bytes, steps) = decoded?;
+    let count = u32::try_from(fields.len())
+        .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+    Ok((fields, bytes, steps, 0, count))
+}
+
 trait RemoteExecutableRecognitionAuthorityV1 {
     fn ensure_current_for_adapter_v1(&self) -> Result<(), RemoteExecutableAdapterErrorV1>;
     fn config_for_adapter_v1(
@@ -5480,7 +6214,7 @@ trait RemoteExecutableRecognitionAuthorityV1 {
         max_steps: u64,
         max_output_bytes: u64,
         max_field_values: usize,
-    ) -> Result<(Vec<RemoteNormalizedFieldV1>, Vec<u8>, u64), RemoteExecutableAdapterErrorV1>;
+    ) -> Result<RemoteDecodedPayloadV1, RemoteExecutableAdapterErrorV1>;
 }
 
 /// One-shot executable capability.  It retains only the bounded initializer owner and frozen
@@ -5750,7 +6484,7 @@ impl RemoteExecutableRecognitionAuthorityV1
         max_steps: u64,
         max_output_bytes: u64,
         max_field_values: usize,
-    ) -> Result<(Vec<RemoteNormalizedFieldV1>, Vec<u8>, u64), RemoteExecutableAdapterErrorV1> {
+    ) -> Result<RemoteDecodedPayloadV1, RemoteExecutableAdapterErrorV1> {
         match owner {
             crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Protobuf => {
                 self.protobuf.decode_schema_payload_v1(
@@ -5764,9 +6498,14 @@ impl RemoteExecutableRecognitionAuthorityV1
                     max_field_values,
                 )
             }
-            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Ros2Reflection => self
-                .ros2
-                .decode_ros2_payload_v1(payload, max_steps, max_output_bytes, max_field_values),
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Ros2Reflection => {
+                root_wrapped_payload_v1(self.ros2.decode_ros2_payload_v1(
+                    payload,
+                    max_steps,
+                    max_output_bytes,
+                    max_field_values,
+                ))
+            }
             crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Raw => {
                 Err(RemoteExecutableAdapterErrorV1::UnsupportedSemantic)
             }
@@ -5819,11 +6558,16 @@ impl RemoteExecutableRecognitionAuthorityV1 for RemoteExecutableFactoryV1<'_, '_
         max_steps: u64,
         max_output_bytes: u64,
         max_field_values: usize,
-    ) -> Result<(Vec<RemoteNormalizedFieldV1>, Vec<u8>, u64), RemoteExecutableAdapterErrorV1> {
+    ) -> Result<RemoteDecodedPayloadV1, RemoteExecutableAdapterErrorV1> {
         match owner {
-            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Ros2Reflection => self
-                .view
-                .decode_ros2_payload_v1(payload, max_steps, max_output_bytes, max_field_values),
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Ros2Reflection => {
+                root_wrapped_payload_v1(self.view.decode_ros2_payload_v1(
+                    payload,
+                    max_steps,
+                    max_output_bytes,
+                    max_field_values,
+                ))
+            }
             crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Protobuf => {
                 self.protobuf.decode_schema_payload_v1(
                     self.view
@@ -5948,7 +6692,7 @@ impl RemoteExecutableDecoderAdapterV1<'_> {
 
     fn validate_normalized_v1(
         &self,
-        normalized: &(Vec<RemoteNormalizedFieldV1>, Vec<u8>, u64),
+        normalized: &RemoteDecodedPayloadV1,
         offered_steps: u64,
         offered_output_bytes: u64,
     ) -> Result<(), RemoteExecutableAdapterErrorV1> {
@@ -5958,6 +6702,17 @@ impl RemoteExecutableDecoderAdapterV1<'_> {
                 .is_none_or(|len| len > offered_output_bytes)
             || normalized.0.len() > self.max_field_values_v1()?
         {
+            return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
+        }
+        let root_start = usize::try_from(normalized.3)
+            .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        let root_end = root_start
+            .checked_add(
+                usize::try_from(normalized.4)
+                    .map_err(|_| RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?,
+            )
+            .ok_or(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded)?;
+        if root_end > normalized.0.len() {
             return Err(RemoteExecutableAdapterErrorV1::ResourceLimitExceeded);
         }
         let field_layout = Layout::array::<RemoteNormalizedFieldV1>(normalized.0.capacity())
@@ -6126,6 +6881,8 @@ impl RemoteExecutableDecoderAdapterV1<'_> {
             envelopes.push(RemoteNormalizedEnvelopeV1 {
                 fields: normalized.0,
                 bytes: normalized.1,
+                root_first_value: normalized.3,
+                root_value_count: normalized.4,
                 rows: 1,
                 config_digest: self.config.canonical_digest_v1(),
                 _reservation: None,
@@ -6237,6 +6994,8 @@ impl RemoteExecutableDecoderAdapterV1<'_> {
         Ok(RemoteNormalizedEnvelopeV1 {
             fields: normalized.0,
             bytes: normalized.1,
+            root_first_value: normalized.3,
+            root_value_count: normalized.4,
             rows: 1,
             config_digest: self.config.canonical_digest_v1(),
             _reservation: self.reservation.take(),
@@ -6344,9 +7103,8 @@ mod executable_adapter_tests {
             max_steps: u64,
             max_output_bytes: u64,
             _max_field_values: usize,
-        ) -> Result<(Vec<RemoteNormalizedFieldV1>, Vec<u8>, u64), RemoteExecutableAdapterErrorV1>
-        {
-            decode_bounded_wire_v1(payload, max_steps, max_output_bytes)
+        ) -> Result<RemoteDecodedPayloadV1, RemoteExecutableAdapterErrorV1> {
+            root_wrapped_payload_v1(decode_bounded_wire_v1(payload, max_steps, max_output_bytes))
         }
     }
 
@@ -6883,6 +7641,13 @@ mod tests {
         ])
     }
 
+    fn packed_scalar_field(name: &str, number: u64, kind: u64) -> Vec<u8> {
+        concat([
+            scalar_field_with_label(name, number, kind, 3),
+            bytes_field(8, &varint_field(2, 1)),
+        ])
+    }
+
     fn named_field(name: &str, number: u64, kind: u64, type_name: &str) -> Vec<u8> {
         named_field_with_label(name, number, kind, type_name, 1)
     }
@@ -7224,6 +7989,75 @@ mod tests {
         assert!(channel.recognized_by_protobuf().unwrap());
         assert!(recognition.next_channel().unwrap().is_none());
         let _recognition_is_finished = recognition;
+        drop(result);
+        assert_eq!(
+            *budget.state.usage.lock(),
+            RemoteProtobufBudgetUsageV1::default()
+        );
+    }
+
+    #[test]
+    fn repeated_unpacked_and_packed_values_form_bounded_array_spans() {
+        let data = descriptor_set(
+            "pkg",
+            "repeated.proto",
+            [message(
+                "Message",
+                [
+                    scalar_field_with_label("unpacked", 1, 5, 3),
+                    packed_scalar_field("packed", 2, 13),
+                ],
+            )],
+            "proto3",
+        );
+        assert!(prost_reflect::DescriptorPool::decode(data.as_slice()).is_ok());
+        let fixture = fixture(data, "pkg.Message");
+        let definitions = validated_summary_definitions_for_test(&fixture);
+        let context = StableContext::new();
+        let budget = context.protobuf_budget();
+        let prepared = prepared(&definitions, &context, &budget).unwrap();
+        let result = initialize_remote_protobuf_v1(prepared).unwrap();
+
+        let payload = concat([
+            varint_field(1, 10),
+            varint_field(1, 20),
+            bytes_field(2, &[30, 40]),
+        ]);
+        let (fields, bytes, _steps, root_first, root_count) = result
+            .protobuf
+            .decode_schema_payload_v1(7, &payload, 1_000, 1_000, 64)
+            .unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!((root_first, root_count), (4, 2));
+        let [unpacked, packed] = &fields[4..6] else {
+            panic!("root direct fields must contain both repeated columns");
+        };
+        assert_eq!(
+            unpacked,
+            &RemoteNormalizedFieldV1 {
+                tag: 1,
+                value: RemoteNormalizedValueV1::Array {
+                    first_value: 0,
+                    value_count: 2,
+                    fixed: false,
+                },
+            }
+        );
+        assert_eq!(
+            packed,
+            &RemoteNormalizedFieldV1 {
+                tag: 2,
+                value: RemoteNormalizedValueV1::Array {
+                    first_value: 2,
+                    value_count: 2,
+                    fixed: false,
+                },
+            }
+        );
+        assert_eq!(fields[0].value, RemoteNormalizedValueV1::Signed(10));
+        assert_eq!(fields[1].value, RemoteNormalizedValueV1::Signed(20));
+        assert_eq!(fields[2].value, RemoteNormalizedValueV1::Unsigned(30));
+        assert_eq!(fields[3].value, RemoteNormalizedValueV1::Unsigned(40));
         drop(result);
         assert_eq!(
             *budget.state.usage.lock(),
@@ -7881,7 +8715,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_defaults_are_invalid_while_unescaped_string_defaults_are_unsupported() {
+    fn invalid_defaults_are_rejected_while_string_and_bytes_c_escapes_are_accepted() {
         let enumeration = enum_descriptor("State", &[("ZERO", 0)]);
         let cases = [
             descriptor_set(
@@ -7932,7 +8766,7 @@ mod tests {
             );
         }
 
-        for (kind, default) in [(9, "hello"), (12, "bytes")] {
+        for (kind, default) in [(9, "hello\\n\\u03bb"), (12, "\\000\\377\\x41")] {
             let data = descriptor_set(
                 "pkg",
                 "string_default.proto",
@@ -7943,12 +8777,31 @@ mod tests {
                 "proto2",
             );
             assert!(prost_reflect::DescriptorPool::decode(data.as_slice()).is_ok());
+            let fixture = fixture(data, "pkg.Message");
+            let definitions = validated_summary_definitions_for_test(&fixture);
+            let context = StableContext::new();
+            let budget = context.protobuf_budget();
+            drop(prepared(&definitions, &context, &budget).unwrap());
+            assert_eq!(
+                *budget.state.usage.lock(),
+                RemoteProtobufBudgetUsageV1::default()
+            );
+        }
+
+        for (kind, default) in [(9, "trailing\\"), (9, "\\xff"), (12, "\\x")] {
+            let data = descriptor_set(
+                "pkg",
+                "bad_escape.proto",
+                [message(
+                    "Message",
+                    [scalar_field_with_default("value", 1, kind, default)],
+                )],
+                "proto2",
+            );
             assert_prepare_error(
                 data,
                 "pkg.Message",
-                RemoteProtobufInitializationErrorV1::UnsupportedForRemote(
-                    UnsupportedRemoteProtobufV1::DescriptorFeature,
-                ),
+                RemoteProtobufInitializationErrorV1::InvalidRemoteSchema,
             );
         }
     }

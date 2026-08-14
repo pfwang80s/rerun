@@ -2259,6 +2259,399 @@ mod tests {
     }
 
     #[test]
+    fn terminal_dispatch_is_atomic_for_all_channels_in_one_frozen_group() {
+        let int32_payload = |value: i32| {
+            let mut payload = vec![0, 1, 0, 0];
+            payload.extend_from_slice(&value.to_le_bytes());
+            payload
+        };
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_schemas([FixtureSchema::new(7, "pkg/Root", "ros2msg").with_data(b"int32 value")])
+            .with_channels([
+                FixtureChannel::schema_less(1, "/alpha").with_schema(7, "cdr"),
+                FixtureChannel::schema_less(2, "/beta").with_schema(7, "cdr"),
+            ])
+            .with_chunks([FixtureChunk::new([
+                FixtureMessage::new(2, 0, 2).with_data(int32_payload(20)),
+                FixtureMessage::new(1, 0, 1).with_data(int32_payload(10)),
+            ])])
+            .with_partition_fixture(PartitionFixture::default())
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+
+        let exact = retained_layout_bytes(1).unwrap();
+        let resolved = bound_pair(&fixture, layout_budget(1, exact))
+            .prepare()
+            .unwrap()
+            .finalize_v1()
+            .unwrap();
+        let manifest_source = resolved.source_v1();
+        let metadata_source = resolved.source_v1();
+        let unit = metadata_source.source_unit_v1(0).unwrap();
+        let metadata = unit.metadata_v1().unwrap();
+        let physical = metadata.definitions_capability_for_full_chain_test_v1();
+        let record = fixture.layout.chunks[0].record;
+        let validated = install_exact_physical_chunk_record_for_test(
+            unit.issue_lease_v1().unwrap(),
+            fixture.bytes[record.start..record.end]
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .unwrap();
+        let compressed = install_header_validated_payload_for_test(validated).unwrap();
+        let decompressed = crate::remote_decompression::decompress_exact_chunk(compressed).unwrap();
+        let cache = crate::remote_chunk_scan::PhysicalChunkScanCacheEntry::new(
+            scan_decompressed_physical_chunk(decompressed).unwrap(),
+        )
+        .unwrap();
+        let chunks =
+            crate::remote_decoder_assignment::execute_group_from_finalized_source_for_test_v1(
+                manifest_source,
+                &physical,
+                cache.consumer().into_message_evidence_v1().unwrap(),
+                1,
+            );
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].entity_path().to_string(), "/alpha");
+        assert_eq!(chunks[1].entity_path().to_string(), "/beta");
+        assert_eq!(chunks[0].num_rows(), 1);
+        assert_eq!(chunks[1].num_rows(), 1);
+        assert_ne!(chunks[0].id(), chunks[1].id());
+    }
+
+    #[test]
+    fn terminal_dispatch_filters_mixed_groups_to_the_frozen_partition() {
+        let mut int32_payload = vec![0, 1, 0, 0];
+        int32_payload.extend_from_slice(&10_i32.to_le_bytes());
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_schemas([
+                FixtureSchema::new(7, "pkg/Int", "ros2msg").with_data(b"int32 value"),
+                FixtureSchema::new(8, "pkg/Bool", "ros2msg").with_data(b"bool value"),
+            ])
+            .with_channels([
+                FixtureChannel::schema_less(1, "/int").with_schema(7, "cdr"),
+                FixtureChannel::schema_less(2, "/bool").with_schema(8, "cdr"),
+            ])
+            .with_chunks([FixtureChunk::new([
+                FixtureMessage::new(1, 0, 1).with_data(int32_payload),
+                FixtureMessage::new(2, 0, 2).with_data(vec![0, 1, 0, 0, 1]),
+            ])])
+            .with_partition_fixture(PartitionFixture::default())
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+
+        let exact = retained_layout_bytes(1).unwrap();
+        let resolved = bound_pair(&fixture, layout_budget(1, exact))
+            .prepare()
+            .unwrap()
+            .finalize_v1()
+            .unwrap();
+        let manifest_source = resolved.source_v1();
+        let metadata_source = resolved.source_v1();
+        let unit = metadata_source.source_unit_v1(0).unwrap();
+        let metadata = unit.metadata_v1().unwrap();
+        let physical = metadata.definitions_capability_for_full_chain_test_v1();
+        let record = fixture.layout.chunks[0].record;
+        let validated = install_exact_physical_chunk_record_for_test(
+            unit.issue_lease_v1().unwrap(),
+            fixture.bytes[record.start..record.end]
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .unwrap();
+        let compressed = install_header_validated_payload_for_test(validated).unwrap();
+        let decompressed = crate::remote_decompression::decompress_exact_chunk(compressed).unwrap();
+        let cache = crate::remote_chunk_scan::PhysicalChunkScanCacheEntry::new(
+            scan_decompressed_physical_chunk(decompressed).unwrap(),
+        )
+        .unwrap();
+        let chunks =
+            crate::remote_decoder_assignment::execute_group_from_finalized_source_for_test_v1(
+                manifest_source,
+                &physical,
+                cache.consumer().into_message_evidence_v1().unwrap(),
+                1,
+            );
+        let [chunk] = chunks.as_slice() else {
+            panic!("the frozen int32 partition must emit exactly one chunk");
+        };
+        assert_eq!(chunk.entity_path().to_string(), "/int");
+        assert_eq!(chunk.num_rows(), 1);
+    }
+
+    #[test]
+    fn terminal_dispatch_validates_zero_row_members_without_emitting_empty_chunks() {
+        let mut payload = vec![0, 1, 0, 0];
+        payload.extend_from_slice(&20_i32.to_le_bytes());
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_schemas([FixtureSchema::new(7, "pkg/Root", "ros2msg").with_data(b"int32 value")])
+            .with_channels([
+                FixtureChannel::schema_less(1, "/alpha").with_schema(7, "cdr"),
+                FixtureChannel::schema_less(2, "/beta").with_schema(7, "cdr"),
+            ])
+            .with_chunks([FixtureChunk::new([
+                FixtureMessage::new(2, 0, 1).with_data(payload)
+            ])])
+            .with_partition_fixture(PartitionFixture::default())
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+
+        let exact = retained_layout_bytes(1).unwrap();
+        let resolved = bound_pair(&fixture, layout_budget(1, exact))
+            .prepare()
+            .unwrap()
+            .finalize_v1()
+            .unwrap();
+        let manifest_source = resolved.source_v1();
+        let metadata_source = resolved.source_v1();
+        let unit = metadata_source.source_unit_v1(0).unwrap();
+        let metadata = unit.metadata_v1().unwrap();
+        let physical = metadata.definitions_capability_for_full_chain_test_v1();
+        let record = fixture.layout.chunks[0].record;
+        let validated = install_exact_physical_chunk_record_for_test(
+            unit.issue_lease_v1().unwrap(),
+            fixture.bytes[record.start..record.end]
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .unwrap();
+        let compressed = install_header_validated_payload_for_test(validated).unwrap();
+        let decompressed = crate::remote_decompression::decompress_exact_chunk(compressed).unwrap();
+        let cache = crate::remote_chunk_scan::PhysicalChunkScanCacheEntry::new(
+            scan_decompressed_physical_chunk(decompressed).unwrap(),
+        )
+        .unwrap();
+        let chunks =
+            crate::remote_decoder_assignment::execute_group_from_finalized_source_for_test_v1(
+                manifest_source,
+                &physical,
+                cache.consumer().into_message_evidence_v1().unwrap(),
+                1,
+            );
+        let [chunk] = chunks.as_slice() else {
+            panic!("only the non-empty canonical member emits a chunk");
+        };
+        assert_eq!(chunk.entity_path().to_string(), "/beta");
+        assert_eq!(chunk.num_rows(), 1);
+    }
+
+    #[test]
+    fn all_zero_frozen_group_validates_every_owner_before_complete_empty() {
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_schemas([
+                FixtureSchema::new(7, "pkg/Int", "ros2msg").with_data(b"int32 value"),
+                FixtureSchema::new(8, "pkg/Bool", "ros2msg").with_data(b"bool value"),
+            ])
+            .with_channels([
+                FixtureChannel::schema_less(1, "/alpha").with_schema(7, "cdr"),
+                FixtureChannel::schema_less(2, "/beta").with_schema(7, "cdr"),
+                FixtureChannel::schema_less(3, "/other").with_schema(8, "cdr"),
+            ])
+            .with_chunks([FixtureChunk::new([
+                FixtureMessage::new(3, 0, 1).with_data(vec![0, 1, 0, 0, 1])
+            ])])
+            .with_partition_fixture(PartitionFixture::default())
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+
+        let exact = retained_layout_bytes(1).unwrap();
+        let resolved = bound_pair(&fixture, layout_budget(1, exact))
+            .prepare()
+            .unwrap()
+            .finalize_v1()
+            .unwrap();
+        let manifest_source = resolved.source_v1();
+        let metadata_source = resolved.source_v1();
+        let unit = metadata_source.source_unit_v1(0).unwrap();
+        let metadata = unit.metadata_v1().unwrap();
+        let physical = metadata.definitions_capability_for_full_chain_test_v1();
+        let record = fixture.layout.chunks[0].record;
+        let validated = install_exact_physical_chunk_record_for_test(
+            unit.issue_lease_v1().unwrap(),
+            fixture.bytes[record.start..record.end]
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .unwrap();
+        let compressed = install_header_validated_payload_for_test(validated).unwrap();
+        let decompressed = crate::remote_decompression::decompress_exact_chunk(compressed).unwrap();
+        let cache = crate::remote_chunk_scan::PhysicalChunkScanCacheEntry::new(
+            scan_decompressed_physical_chunk(decompressed).unwrap(),
+        )
+        .unwrap();
+        let evidence = cache.consumer().into_message_evidence_v1().unwrap();
+        let terminal =
+            crate::remote_decoder_assignment::dispatch_group_from_finalized_source_for_test_v1(
+                manifest_source,
+                &physical,
+                evidence,
+                1,
+                crate::remote_decoder_assignment::RemoteDispatchTestMutationV1::None,
+            );
+        assert!(matches!(
+            terminal,
+            crate::remote_chunk_dispatch::RemoteChunkTerminalV1::CompleteEmpty
+        ));
+
+        let cross_wired =
+            crate::remote_decoder_assignment::dispatch_group_from_finalized_source_for_test_v1(
+                resolved.source_v1(),
+                &physical,
+                cache.consumer().into_message_evidence_v1().unwrap(),
+                1,
+                crate::remote_decoder_assignment::RemoteDispatchTestMutationV1::CrossWireFirstDescriptor,
+            );
+        assert!(matches!(
+            cross_wired,
+            crate::remote_chunk_dispatch::RemoteChunkTerminalV1::Failed(
+                crate::remote_chunk_dispatch::RemoteChunkDispatchFailureV1::StaleSource
+            )
+        ));
+    }
+
+    #[test]
+    fn all_zero_frozen_group_revalidates_stale_source_before_complete_empty() {
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_schemas([
+                FixtureSchema::new(7, "pkg/Int", "ros2msg").with_data(b"int32 value"),
+                FixtureSchema::new(8, "pkg/Bool", "ros2msg").with_data(b"bool value"),
+            ])
+            .with_channels([
+                FixtureChannel::schema_less(1, "/alpha").with_schema(7, "cdr"),
+                FixtureChannel::schema_less(2, "/beta").with_schema(7, "cdr"),
+                FixtureChannel::schema_less(3, "/other").with_schema(8, "cdr"),
+            ])
+            .with_chunks([FixtureChunk::new([
+                FixtureMessage::new(3, 0, 1).with_data(vec![0, 1, 0, 0, 1])
+            ])])
+            .with_partition_fixture(PartitionFixture::default())
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+
+        let exact = retained_layout_bytes(1).unwrap();
+        let resolved = bound_pair(&fixture, layout_budget(1, exact))
+            .prepare()
+            .unwrap()
+            .finalize_v1()
+            .unwrap();
+        let manifest_source = resolved.source_v1();
+        let metadata_source = resolved.source_v1();
+        let unit = metadata_source.source_unit_v1(0).unwrap();
+        let metadata = unit.metadata_v1().unwrap();
+        let physical = metadata.definitions_capability_for_full_chain_test_v1();
+        let record = fixture.layout.chunks[0].record;
+        let validated = install_exact_physical_chunk_record_for_test(
+            unit.issue_lease_v1().unwrap(),
+            fixture.bytes[record.start..record.end]
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .unwrap();
+        let compressed = install_header_validated_payload_for_test(validated).unwrap();
+        let decompressed = crate::remote_decompression::decompress_exact_chunk(compressed).unwrap();
+        let cache = crate::remote_chunk_scan::PhysicalChunkScanCacheEntry::new(
+            scan_decompressed_physical_chunk(decompressed).unwrap(),
+        )
+        .unwrap();
+        let evidence = cache.consumer().into_message_evidence_v1().unwrap();
+        let terminal =
+            crate::remote_decoder_assignment::dispatch_group_from_finalized_source_for_test_v1(
+                manifest_source,
+                &physical,
+                evidence,
+                1,
+                crate::remote_decoder_assignment::RemoteDispatchTestMutationV1::InvalidateSource,
+            );
+        assert!(matches!(
+            terminal,
+            crate::remote_chunk_dispatch::RemoteChunkTerminalV1::Failed(_)
+        ));
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "host-only test verifies cross-source all-zero evidence uses the fatal control-plane path"
+    )]
+    fn all_zero_frozen_group_rejects_cross_source_evidence_before_complete_empty() {
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_schemas([
+                FixtureSchema::new(7, "pkg/Int", "ros2msg").with_data(b"int32 value"),
+                FixtureSchema::new(8, "pkg/Bool", "ros2msg").with_data(b"bool value"),
+            ])
+            .with_channels([
+                FixtureChannel::schema_less(1, "/empty").with_schema(7, "cdr"),
+                FixtureChannel::schema_less(2, "/other").with_schema(8, "cdr"),
+            ])
+            .with_chunks([FixtureChunk::new([
+                FixtureMessage::new(2, 0, 1).with_data(vec![0, 1, 0, 0, 1])
+            ])])
+            .with_partition_fixture(PartitionFixture::default())
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+        let other_fixture = fixture.clone();
+
+        let exact = retained_layout_bytes(1).unwrap();
+        let resolved = bound_pair(&fixture, layout_budget(1, exact))
+            .prepare()
+            .unwrap()
+            .finalize_v1()
+            .unwrap();
+        let manifest_source = resolved.source_v1();
+        let metadata_source = resolved.source_v1();
+        let unit = metadata_source.source_unit_v1(0).unwrap();
+        let metadata = unit.metadata_v1().unwrap();
+        let physical = metadata.definitions_capability_for_full_chain_test_v1();
+
+        let other_resolved = bound_pair(&other_fixture, layout_budget(1, exact))
+            .prepare()
+            .unwrap()
+            .finalize_v1()
+            .unwrap();
+        let other_source = other_resolved.source_v1();
+        let other_unit = other_source.source_unit_v1(0).unwrap();
+        let other_record = other_fixture.layout.chunks[0].record;
+        let other_validated = install_exact_physical_chunk_record_for_test(
+            other_unit.issue_lease_v1().unwrap(),
+            other_fixture.bytes[other_record.start..other_record.end]
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .unwrap();
+        let other_compressed = install_header_validated_payload_for_test(other_validated).unwrap();
+        let other_decompressed =
+            crate::remote_decompression::decompress_exact_chunk(other_compressed).unwrap();
+        let other_cache = crate::remote_chunk_scan::PhysicalChunkScanCacheEntry::new(
+            scan_decompressed_physical_chunk(other_decompressed).unwrap(),
+        )
+        .unwrap();
+        let other_evidence = other_cache.consumer().into_message_evidence_v1().unwrap();
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::remote_decoder_assignment::dispatch_group_from_finalized_source_for_test_v1(
+                manifest_source,
+                &physical,
+                other_evidence,
+                1,
+                crate::remote_decoder_assignment::RemoteDispatchTestMutationV1::None,
+            )
+        }));
+        match outcome {
+            Ok(crate::remote_chunk_dispatch::RemoteChunkTerminalV1::Failed(_)) | Err(_) => {}
+            Ok(
+                crate::remote_chunk_dispatch::RemoteChunkTerminalV1::Complete(_)
+                | crate::remote_chunk_dispatch::RemoteChunkTerminalV1::CompleteEmpty,
+            ) => panic!("cross-source all-zero evidence must fail before completion"),
+        }
+    }
+
+    #[test]
     fn typed_output_locked_peak_covers_multi_row_bool_and_u64_builds() {
         fn run_case(definition: &str, payloads: &[Vec<u8>]) {
             let messages = payloads.iter().enumerate().map(|(index, payload)| {
@@ -2338,6 +2731,571 @@ mod tests {
             })
             .collect::<Vec<_>>();
         run_case("uint64 value", &u64_payloads);
+    }
+
+    #[test]
+    fn finalized_owner_protobuf_nested_and_repeated_matches_local_decoder_chunk() {
+        use crate::decoders::{DecoderRegistry, McapProtobufDecoder, TestEmitter, TopicFilter};
+        use arrow::array::Array as _;
+        use prost_reflect::prost::Message as _;
+        use prost_reflect::prost_types::{
+            DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+            OneofDescriptorProto, field_descriptor_proto,
+        };
+
+        let field = |name: &str,
+                     number,
+                     label: field_descriptor_proto::Label,
+                     kind: field_descriptor_proto::Type,
+                     type_name: Option<&str>| FieldDescriptorProto {
+            name: Some(name.to_owned()),
+            number: Some(number),
+            label: Some(label as i32),
+            r#type: Some(kind as i32),
+            type_name: type_name.map(str::to_owned),
+            ..Default::default()
+        };
+        let child = DescriptorProto {
+            name: Some("Child".to_owned()),
+            field: vec![
+                field(
+                    "first",
+                    1,
+                    field_descriptor_proto::Label::Optional,
+                    field_descriptor_proto::Type::Int32,
+                    None,
+                ),
+                field(
+                    "second",
+                    2,
+                    field_descriptor_proto::Label::Optional,
+                    field_descriptor_proto::Type::Int32,
+                    None,
+                ),
+            ],
+            ..Default::default()
+        };
+        let root = DescriptorProto {
+            name: Some("Message".to_owned()),
+            field: vec![
+                field(
+                    "implicit",
+                    1,
+                    field_descriptor_proto::Label::Optional,
+                    field_descriptor_proto::Type::Int32,
+                    None,
+                ),
+                field(
+                    "nested",
+                    2,
+                    field_descriptor_proto::Label::Optional,
+                    field_descriptor_proto::Type::Message,
+                    Some(".pkg.Message.Child"),
+                ),
+                field(
+                    "values",
+                    3,
+                    field_descriptor_proto::Label::Repeated,
+                    field_descriptor_proto::Type::Int32,
+                    None,
+                ),
+                FieldDescriptorProto {
+                    oneof_index: Some(0),
+                    proto3_optional: Some(true),
+                    ..field(
+                        "optional_text",
+                        4,
+                        field_descriptor_proto::Label::Optional,
+                        field_descriptor_proto::Type::String,
+                        None,
+                    )
+                },
+            ],
+            nested_type: vec![child],
+            oneof_decl: vec![OneofDescriptorProto {
+                name: Some("_optional_text".to_owned()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let descriptor = FileDescriptorSet {
+            file: vec![FileDescriptorProto {
+                name: Some("remote.proto".to_owned()),
+                package: Some("pkg".to_owned()),
+                message_type: vec![root],
+                syntax: Some("proto3".to_owned()),
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec();
+        // Two singular nested occurrences must merge to {first:9, second:10}; values=[1]
+        // unpacked followed by packed [2,3]; implicit and proto3 optional are absent.
+        let payload = vec![
+            0x12, 0x02, 0x08, 0x09, 0x12, 0x02, 0x10, 0x0a, 0x18, 0x01, 0x1a, 0x02, 0x02, 0x03,
+        ];
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_schemas([FixtureSchema::new(7, "pkg.Message", "protobuf").with_data(descriptor)])
+            .with_channels([FixtureChannel::schema_less(1, "/protobuf").with_schema(7, "protobuf")])
+            .with_chunks([FixtureChunk::single(
+                FixtureMessage::new(1, 0, 1)
+                    .with_publish_time(3)
+                    .with_data(payload),
+            )])
+            .with_partition_fixture(PartitionFixture::default())
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+
+        let exact = retained_layout_bytes(1).unwrap();
+        let resolved = bound_pair(&fixture, layout_budget(1, exact))
+            .prepare()
+            .unwrap()
+            .finalize_v1()
+            .unwrap();
+        let manifest_source = resolved.source_v1();
+        let metadata_source = resolved.source_v1();
+        let unit = metadata_source.source_unit_v1(0).unwrap();
+        let metadata = unit.metadata_v1().unwrap();
+        let physical = metadata.definitions_capability_for_full_chain_test_v1();
+        let record = fixture.layout.chunks[0].record;
+        let validated = install_exact_physical_chunk_record_for_test(
+            unit.issue_lease_v1().unwrap(),
+            fixture.bytes[record.start..record.end]
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .unwrap();
+        let compressed = install_header_validated_payload_for_test(validated).unwrap();
+        let decompressed = crate::remote_decompression::decompress_exact_chunk(compressed).unwrap();
+        let scan = scan_decompressed_physical_chunk(decompressed).unwrap();
+        let cache = crate::remote_chunk_scan::PhysicalChunkScanCacheEntry::new(scan).unwrap();
+        let evidence = cache.consumer().into_message_evidence_v1().unwrap();
+        let remote =
+            crate::remote_decoder_assignment::execute_ros_scalar_from_finalized_source_for_test_v1(
+                manifest_source,
+                &physical,
+                evidence,
+                1,
+            );
+
+        let summary = fixture.read_upstream_summary().unwrap().unwrap();
+        let plan = DecoderRegistry::empty()
+            .register_message_decoder::<McapProtobufDecoder>()
+            .plan(&fixture.bytes, &summary, &TopicFilter::default())
+            .unwrap();
+        let emitter = TestEmitter::default();
+        plan.run(
+            &fixture.bytes,
+            &summary,
+            re_log_types::TimeType::TimestampNs,
+            &*emitter,
+        )
+        .unwrap();
+        let local = emitter.finish();
+        let [local] = local.as_slice() else {
+            panic!("the local protobuf oracle must emit exactly one chunk");
+        };
+        assert_eq!(remote.entity_path(), local.entity_path());
+        assert_eq!(remote.timelines(), local.timelines());
+        let remote_components = remote.components().iter().collect::<Vec<_>>();
+        let [(remote_component, remote_column)] = remote_components.as_slice() else {
+            panic!("the remote protobuf chunk must contain one component");
+        };
+        let local_components = local.components().iter().collect::<Vec<_>>();
+        let [(local_component, local_column)] = local_components.as_slice() else {
+            panic!("the local protobuf chunk must contain one component");
+        };
+        assert_eq!(remote_component, local_component);
+        assert_eq!(remote_column.descriptor, local_column.descriptor);
+        assert_eq!(
+            remote_column.list_array.to_data(),
+            local_column.list_array.to_data()
+        );
+    }
+
+    #[test]
+    fn finalized_owner_protobuf_oneof_and_enum_matches_local_decoder_chunk() {
+        use crate::decoders::{DecoderRegistry, McapProtobufDecoder, TestEmitter, TopicFilter};
+        use arrow::array::Array as _;
+        use prost_reflect::prost::Message as _;
+        use prost_reflect::prost_types::{
+            DescriptorProto, EnumDescriptorProto, EnumValueDescriptorProto, FieldDescriptorProto,
+            FileDescriptorProto, FileDescriptorSet, OneofDescriptorProto, field_descriptor_proto,
+        };
+
+        let field = |name: &str,
+                     number,
+                     kind: field_descriptor_proto::Type,
+                     type_name: Option<&str>,
+                     oneof_index: Option<i32>| FieldDescriptorProto {
+            name: Some(name.to_owned()),
+            number: Some(number),
+            label: Some(field_descriptor_proto::Label::Optional as i32),
+            r#type: Some(kind as i32),
+            type_name: type_name.map(str::to_owned),
+            oneof_index,
+            ..Default::default()
+        };
+        let root = DescriptorProto {
+            name: Some("Message".to_owned()),
+            field: vec![
+                field(
+                    "mode",
+                    1,
+                    field_descriptor_proto::Type::Enum,
+                    Some(".pkg.Mode"),
+                    None,
+                ),
+                field(
+                    "alpha",
+                    2,
+                    field_descriptor_proto::Type::Message,
+                    Some(".pkg.Message.Child"),
+                    Some(0),
+                ),
+                field(
+                    "beta",
+                    3,
+                    field_descriptor_proto::Type::Int32,
+                    None,
+                    Some(0),
+                ),
+                FieldDescriptorProto {
+                    default_value: Some("42".to_owned()),
+                    ..field(
+                        "threshold",
+                        4,
+                        field_descriptor_proto::Type::Int32,
+                        None,
+                        None,
+                    )
+                },
+                FieldDescriptorProto {
+                    label: Some(field_descriptor_proto::Label::Required as i32),
+                    ..field(
+                        "required_text",
+                        5,
+                        field_descriptor_proto::Type::String,
+                        None,
+                        None,
+                    )
+                },
+                FieldDescriptorProto {
+                    default_value: Some("line\\n\\u03bb".to_owned()),
+                    ..field(
+                        "escaped_default",
+                        6,
+                        field_descriptor_proto::Type::String,
+                        None,
+                        None,
+                    )
+                },
+                FieldDescriptorProto {
+                    default_value: Some("\\000\\377".to_owned()),
+                    ..field(
+                        "escaped_bytes_default",
+                        7,
+                        field_descriptor_proto::Type::Bytes,
+                        None,
+                        None,
+                    )
+                },
+            ],
+            oneof_decl: vec![OneofDescriptorProto {
+                name: Some("choice".to_owned()),
+                ..Default::default()
+            }],
+            nested_type: vec![DescriptorProto {
+                name: Some("Child".to_owned()),
+                field: vec![
+                    field("x", 1, field_descriptor_proto::Type::Int32, None, None),
+                    field("y", 2, field_descriptor_proto::Type::Int32, None, None),
+                    field("z", 3, field_descriptor_proto::Type::Int32, None, None),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mode = EnumDescriptorProto {
+            name: Some("Mode".to_owned()),
+            value: vec![
+                EnumValueDescriptorProto {
+                    name: Some("MODE_UNSPECIFIED".to_owned()),
+                    number: Some(0),
+                    ..Default::default()
+                },
+                EnumValueDescriptorProto {
+                    name: Some("MODE_ACTIVE".to_owned()),
+                    number: Some(1),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let descriptor = FileDescriptorSet {
+            file: vec![FileDescriptorProto {
+                name: Some("remote.proto".to_owned()),
+                package: Some("pkg".to_owned()),
+                message_type: vec![root],
+                enum_type: vec![mode],
+                syntax: Some("proto2".to_owned()),
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec();
+        // mode=MODE_ACTIVE; alpha{x=1}, beta=7, alpha{y=2}, alpha{z=3}. The final alpha suffix
+        // must merge to {x:null,y:2,z:3}; the pre-switch x=1 must not leak across beta.
+        let payload = vec![
+            0x08, 0x01, 0x12, 0x02, 0x08, 0x01, 0x18, 0x07, 0x12, 0x02, 0x10, 0x02, 0x12, 0x02,
+            0x18, 0x03, 0x2a, 0x02, b'o', b'k',
+        ];
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_schemas([FixtureSchema::new(7, "pkg.Message", "protobuf").with_data(descriptor)])
+            .with_channels([FixtureChannel::schema_less(1, "/protobuf").with_schema(7, "protobuf")])
+            .with_chunks([FixtureChunk::single(
+                FixtureMessage::new(1, 0, 1)
+                    .with_publish_time(3)
+                    .with_data(payload),
+            )])
+            .with_partition_fixture(PartitionFixture::default())
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+
+        let exact = retained_layout_bytes(1).unwrap();
+        let resolved = bound_pair(&fixture, layout_budget(1, exact))
+            .prepare()
+            .unwrap()
+            .finalize_v1()
+            .unwrap();
+        let manifest_source = resolved.source_v1();
+        let metadata_source = resolved.source_v1();
+        let unit = metadata_source.source_unit_v1(0).unwrap();
+        let metadata = unit.metadata_v1().unwrap();
+        let physical = metadata.definitions_capability_for_full_chain_test_v1();
+        let record = fixture.layout.chunks[0].record;
+        let validated = install_exact_physical_chunk_record_for_test(
+            unit.issue_lease_v1().unwrap(),
+            fixture.bytes[record.start..record.end]
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .unwrap();
+        let compressed = install_header_validated_payload_for_test(validated).unwrap();
+        let decompressed = crate::remote_decompression::decompress_exact_chunk(compressed).unwrap();
+        let scan = scan_decompressed_physical_chunk(decompressed).unwrap();
+        let cache = crate::remote_chunk_scan::PhysicalChunkScanCacheEntry::new(scan).unwrap();
+        let evidence = cache.consumer().into_message_evidence_v1().unwrap();
+        let remote =
+            crate::remote_decoder_assignment::execute_ros_scalar_from_finalized_source_for_test_v1(
+                manifest_source,
+                &physical,
+                evidence,
+                1,
+            );
+
+        let summary = fixture.read_upstream_summary().unwrap().unwrap();
+        let plan = DecoderRegistry::empty()
+            .register_message_decoder::<McapProtobufDecoder>()
+            .plan(&fixture.bytes, &summary, &TopicFilter::default())
+            .unwrap();
+        let emitter = TestEmitter::default();
+        plan.run(
+            &fixture.bytes,
+            &summary,
+            re_log_types::TimeType::TimestampNs,
+            &*emitter,
+        )
+        .unwrap();
+        let local = emitter.finish();
+        let [local] = local.as_slice() else {
+            panic!("the local protobuf oracle must emit exactly one chunk");
+        };
+        assert_eq!(remote.entity_path(), local.entity_path());
+        assert_eq!(remote.timelines(), local.timelines());
+        let remote_components = remote.components().iter().collect::<Vec<_>>();
+        let [(remote_component, remote_column)] = remote_components.as_slice() else {
+            panic!("the remote protobuf chunk must contain one component");
+        };
+        let local_components = local.components().iter().collect::<Vec<_>>();
+        let [(local_component, local_column)] = local_components.as_slice() else {
+            panic!("the local protobuf chunk must contain one component");
+        };
+        assert_eq!(remote_component, local_component);
+        assert_eq!(remote_column.descriptor, local_column.descriptor);
+        assert_eq!(
+            remote_column.list_array.to_data(),
+            local_column.list_array.to_data()
+        );
+    }
+
+    #[test]
+    fn finalized_owner_protobuf_map_and_unknown_field_matches_local_decoder_chunk() {
+        use crate::decoders::{DecoderRegistry, McapProtobufDecoder, TestEmitter, TopicFilter};
+        use arrow::array::Array as _;
+        use prost_reflect::prost::Message as _;
+        use prost_reflect::prost_types::{
+            DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+            MessageOptions, field_descriptor_proto,
+        };
+
+        let field = |name: &str,
+                     number,
+                     label: field_descriptor_proto::Label,
+                     kind: field_descriptor_proto::Type,
+                     type_name: Option<&str>| FieldDescriptorProto {
+            name: Some(name.to_owned()),
+            number: Some(number),
+            label: Some(label as i32),
+            r#type: Some(kind as i32),
+            type_name: type_name.map(str::to_owned),
+            ..Default::default()
+        };
+        let entry = DescriptorProto {
+            name: Some("LabelsEntry".to_owned()),
+            field: vec![
+                field(
+                    "key",
+                    1,
+                    field_descriptor_proto::Label::Optional,
+                    field_descriptor_proto::Type::String,
+                    None,
+                ),
+                field(
+                    "value",
+                    2,
+                    field_descriptor_proto::Label::Optional,
+                    field_descriptor_proto::Type::Message,
+                    Some(".pkg.Message.Value"),
+                ),
+            ],
+            options: Some(MessageOptions {
+                map_entry: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let root = DescriptorProto {
+            name: Some("Message".to_owned()),
+            field: vec![field(
+                "labels",
+                1,
+                field_descriptor_proto::Label::Repeated,
+                field_descriptor_proto::Type::Message,
+                Some(".pkg.Message.LabelsEntry"),
+            )],
+            nested_type: vec![
+                entry,
+                DescriptorProto {
+                    name: Some("Value".to_owned()),
+                    field: vec![field(
+                        "number",
+                        1,
+                        field_descriptor_proto::Label::Optional,
+                        field_descriptor_proto::Type::Int32,
+                        None,
+                    )],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let descriptor = FileDescriptorSet {
+            file: vec![FileDescriptorProto {
+                name: Some("remote.proto".to_owned()),
+                package: Some("pkg".to_owned()),
+                message_type: vec![root],
+                syntax: Some("proto3".to_owned()),
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec();
+        // labels={"b":<missing message>,"a":{1},"a":{5}} in reverse/duplicate key order,
+        // followed by unknown field 99=7. Both decoders must apply last-key-wins, sort the map,
+        // materialize the missing message value exactly like local reflection, and ignore the
+        // bounded unknown application field.
+        let payload = vec![
+            0x0a, 0x03, 0x0a, 0x01, b'b', 0x0a, 0x07, 0x0a, 0x01, b'a', 0x12, 0x02, 0x08, 0x01,
+            0x0a, 0x07, 0x0a, 0x01, b'a', 0x12, 0x02, 0x08, 0x05, 0x98, 0x06, 0x07,
+        ];
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_schemas([FixtureSchema::new(7, "pkg.Message", "protobuf").with_data(descriptor)])
+            .with_channels([FixtureChannel::schema_less(1, "/protobuf").with_schema(7, "protobuf")])
+            .with_chunks([FixtureChunk::single(
+                FixtureMessage::new(1, 0, 1)
+                    .with_publish_time(3)
+                    .with_data(payload),
+            )])
+            .with_partition_fixture(PartitionFixture::default())
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+
+        let exact = retained_layout_bytes(1).unwrap();
+        let resolved = bound_pair(&fixture, layout_budget(1, exact))
+            .prepare()
+            .unwrap()
+            .finalize_v1()
+            .unwrap();
+        let manifest_source = resolved.source_v1();
+        let metadata_source = resolved.source_v1();
+        let unit = metadata_source.source_unit_v1(0).unwrap();
+        let metadata = unit.metadata_v1().unwrap();
+        let physical = metadata.definitions_capability_for_full_chain_test_v1();
+        let record = fixture.layout.chunks[0].record;
+        let validated = install_exact_physical_chunk_record_for_test(
+            unit.issue_lease_v1().unwrap(),
+            fixture.bytes[record.start..record.end]
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .unwrap();
+        let compressed = install_header_validated_payload_for_test(validated).unwrap();
+        let decompressed = crate::remote_decompression::decompress_exact_chunk(compressed).unwrap();
+        let scan = scan_decompressed_physical_chunk(decompressed).unwrap();
+        let cache = crate::remote_chunk_scan::PhysicalChunkScanCacheEntry::new(scan).unwrap();
+        let evidence = cache.consumer().into_message_evidence_v1().unwrap();
+        let remote =
+            crate::remote_decoder_assignment::execute_ros_scalar_from_finalized_source_for_test_v1(
+                manifest_source,
+                &physical,
+                evidence,
+                1,
+            );
+
+        let summary = fixture.read_upstream_summary().unwrap().unwrap();
+        let plan = DecoderRegistry::empty()
+            .register_message_decoder::<McapProtobufDecoder>()
+            .plan(&fixture.bytes, &summary, &TopicFilter::default())
+            .unwrap();
+        let emitter = TestEmitter::default();
+        plan.run(
+            &fixture.bytes,
+            &summary,
+            re_log_types::TimeType::TimestampNs,
+            &*emitter,
+        )
+        .unwrap();
+        let local = emitter.finish();
+        let [local] = local.as_slice() else {
+            panic!("the local protobuf oracle must emit exactly one chunk");
+        };
+        assert_eq!(remote.entity_path(), local.entity_path());
+        assert_eq!(remote.timelines(), local.timelines());
+        let remote_components = remote.components().iter().collect::<Vec<_>>();
+        let [(remote_component, remote_column)] = remote_components.as_slice() else {
+            panic!("the remote protobuf chunk must contain one component");
+        };
+        let local_components = local.components().iter().collect::<Vec<_>>();
+        let [(local_component, local_column)] = local_components.as_slice() else {
+            panic!("the local protobuf chunk must contain one component");
+        };
+        assert_eq!(remote_component, local_component);
+        assert_eq!(remote_column.descriptor, local_column.descriptor);
+        assert_eq!(
+            remote_column.list_array.to_data(),
+            local_column.list_array.to_data()
+        );
     }
 
     #[test]

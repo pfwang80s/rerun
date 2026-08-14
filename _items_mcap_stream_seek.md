@@ -422,7 +422,7 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 复审修复：validation plan在任何reservation前强制比较physical evidence canonical ordinal与MCAP-032 temporal partition authority source-unit ordinal，cross-ordinal与ordinal conversion overflow均返回`ManifestMismatch`。
 - 复审修复：typed output peak删除固定magic byte allowance，改为versioned `Layout` census并逐项应用locked Wasm allocator footprint，覆盖同时存活的`ChunkBuilder`/`Chunk` owners、map slots、row IDs、两条timeline staging与final buffers、per-row scalar/Struct owners、list offsets/validity和sealed descriptor metadata双owner overlap；plan既有combined reservation继续同时保留physical evidence/lease与manifest owner。exact/one-byte-short、metadata growth、overflow和完整full-chain测试通过。
 
-### [ ] MCAP-031 — 实现 PhysicalChunkDispatchDecode 与 terminal partition contract
+### [x] MCAP-031 — 实现 PhysicalChunkDispatchDecode 与 terminal partition contract
 
 - 建议提交：`Add admitted remote chunk dispatch and decode`。
 - 依赖：MCAP-026、MCAP-027、MCAP-030、MCAP-030A、MCAP-032。
@@ -432,8 +432,8 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 变更：protobuf必须实现profile内完整bounded Arrow语义，包括proto2/proto3 default/null、explicit/implicit presence、oneof、enum、singular/repeated、packed/unpacked、map-entry、nested message和unknown application field policy；不得因依赖重排缩窄产品语义。
 - 验收：actual append/dispatch与plan不一致失败；`OpeningStatic`只含static，temporal partition必须含canonical log timeline且不能产生static，消息派生static decoder不在allowlist；stale/cross-source/cross-policy initializer result不能decode，合法admitted ROS 2 reflection/protobuf subset与local normalized output差分一致，semantic fixtures继续结构化拒绝。
 - 验收：protobuf default/null、presence、oneof、enum、repeated、packed和map fixtures逐项与local normalized output差分，全部builder/temporary/output allocations受首次allocation前reservation约束；同一manifest partition+ordinal重复签发稳定identity，不同identity domain严格分离，任一失败零partial terminal publication。
-- 当前中间态：工作树中的A/B normalized output descriptor/executable factory属于031的未提交实现输入；它们不得签发partition/root identity、不得被计为032完成，也不得在032之前提交为独立产品能力。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 当前中间态：已由MCAP-030B与本项闭合并提交，不再存在normalized terminal或临时禁用测试。
+- 负责人：kola；提交：本提交；备注：2026-08-14 完成production-disarmed的原子partition dispatch：validation plan只冻结matching 032 temporal group，terminal按canonical group membership一次消费所有channel descriptor/adapter，逐channel exact rows/payload并以canonical membership ordinal签发唯一root；所有Chunk/reservation先进入sealed partition staging，任一失败Drop全部且零partial，zero-row member仍验证/消费但不emit并保留ordinal hole，全部zero仅在所有owner source/config/policy校验后`CompleteEmpty`。029修复为按decoder/config/registration合并canonical membership并checked聚合registration/external-origin bounds。protobuf recursive typed path直接消费027 sealed graph与030A bounded spans，覆盖proto2/proto3 implicit/explicit presence与defaults、nested singular merge、repeated packed/unpacked、real oneof跨variantlast-one-wins、enum name/value、map排序与duplicate-key last-wins、string/bytes C-escape、unknown application field ignore；不重解schema。真实full-chain local differentials覆盖nested/repeated/presence、proto2 oneof/enum/default、map/unknown/duplicate及同组/混组terminal；recursive output census按descriptor shape/payload与locked allocator高水位验证，exact/minus-one和aggregate handoff capacity通过。所有临时`cfg(any())`已清理。Dafee多轮复审最终0个中级及以上问题且无设计偏离；focused 33/33及后续terminal/zero-row/assignment/group门限通过，all-features library check、fmt、diff-check及增量Clippy `-D warnings`通过。production route继续disarmed，native/local API、Viewer行为和Rerun服务端不变。
 
 ### [x] MCAP-032 — 构建 immutable manifest 与全 session metadata preflight
 

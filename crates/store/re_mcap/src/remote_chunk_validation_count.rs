@@ -4,13 +4,14 @@
 //! It never constructs a parser, Arrow builder, or local decoder initializer.
 
 #![allow(dead_code)]
+#![allow(clippy::map_err_ignore)]
 
 use std::alloc::Layout;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::remote_channel_group::{ImmutableRemoteChannelGroupsV1, StableDecoderGroupIdV1};
+use crate::remote_channel_group::StableDecoderGroupIdV1;
 use crate::remote_chunk_scan::{
     PhysicalChunkMessageEvidenceV1, PhysicalChunkValidationError, ValidatedPhysicalChunkExtent,
 };
@@ -38,6 +39,8 @@ impl RemoteTypedOutputPeakCensusV1 {
     fn from_layouts_v1(
         rows: u64,
         retained_metadata_bytes: u64,
+        payload_bytes: u64,
+        protobuf: Option<crate::remote_typed_output::RemoteTypedProtobufCensusV1>,
     ) -> Result<Self, RemoteValidationCountErrorV1> {
         let rows = usize::try_from(rows).map_err(|_| arithmetic_error())?;
         let rows_plus_one = rows.checked_add(1).ok_or_else(arithmetic_error)?;
@@ -169,6 +172,69 @@ impl RemoteTypedOutputPeakCensusV1 {
             2,
         )?)?;
 
+        if let Some(protobuf) = protobuf {
+            let payload = usize::try_from(payload_bytes).map_err(|_| arithmetic_error())?;
+            let field_count = usize::try_from(protobuf.fields).map_err(|_| arithmetic_error())?;
+            let wrapper_count =
+                usize::try_from(protobuf.real_oneofs).map_err(|_| arithmetic_error())?;
+            let nodes = field_count
+                .checked_add(wrapper_count)
+                .ok_or_else(arithmetic_error)?;
+            let row_nodes = rows.checked_mul(nodes).ok_or_else(arithmetic_error)?;
+            let value_occurrences = rows.checked_add(payload).ok_or_else(arithmetic_error)?;
+            let recursive_visits = nodes
+                .checked_mul(value_occurrences)
+                .ok_or_else(arithmetic_error)?;
+
+            // Recursive protobuf builders create one Arrow field/builder owner for every direct
+            // field and real-oneof wrapper on every row. Nested message/list/map traversal also
+            // materializes bounded grouped-field and entry-order scratch. A wire byte can begin
+            // at most one nested value or collection element, so `rows + payload_bytes` is the
+            // closed occurrence bound used for those transient pointer arenas.
+            for layout in [
+                Layout::new::<arrow::datatypes::Field>(),
+                Layout::new::<arrow::array::ArrayData>(),
+                Layout::new::<std::sync::Arc<arrow::array::ArrayData>>(),
+                Layout::new::<arrow::buffer::Buffer>(),
+                Layout::new::<Box<dyn arrow::array::ArrayBuilder>>(),
+            ] {
+                charge(repeated(layout, row_nodes)?)?;
+            }
+            charge(repeated(
+                Layout::new::<&crate::remote_typed_output::RemoteTypedProtobufFieldV1>(),
+                recursive_visits,
+            )?)?;
+            charge(repeated(
+                Layout::new::<crate::remote_protobuf_descriptor::RemoteNormalizedFieldV1>(),
+                value_occurrences,
+            )?)?;
+
+            // Variable-width string/bytes, list offsets, map entry scratch, and final concat may
+            // overlap. Charge four payload-sized byte buffers and two offset buffers; payload is
+            // a strict upper bound for all decoded variable data and element cardinality.
+            charge(repeated(
+                Layout::array::<u8>(payload).map_err(|_| arithmetic_error())?,
+                4,
+            )?)?;
+            let offsets = payload
+                .checked_add(rows)
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(arithmetic_error)?;
+            charge(repeated(
+                Layout::array::<i32>(offsets).map_err(|_| arithmetic_error())?,
+                2,
+            )?)?;
+
+            let metadata_owners = rows
+                .checked_mul(2)
+                .and_then(|count| count.checked_add(1))
+                .ok_or_else(arithmetic_error)?;
+            charge(repeated(
+                Layout::array::<u8>(metadata).map_err(|_| arithmetic_error())?,
+                metadata_owners,
+            )?)?;
+        }
+
         Ok(Self {
             profile_version: REMOTE_TYPED_OUTPUT_CENSUS_VERSION_V1,
             simultaneous_bytes: total,
@@ -179,8 +245,15 @@ impl RemoteTypedOutputPeakCensusV1 {
 fn typed_output_peak_bytes_v1(
     rows: u64,
     retained_metadata_bytes: u64,
+    payload_bytes: u64,
+    protobuf: Option<crate::remote_typed_output::RemoteTypedProtobufCensusV1>,
 ) -> Result<u64, RemoteValidationCountErrorV1> {
-    let census = RemoteTypedOutputPeakCensusV1::from_layouts_v1(rows, retained_metadata_bytes)?;
+    let census = RemoteTypedOutputPeakCensusV1::from_layouts_v1(
+        rows,
+        retained_metadata_bytes,
+        payload_bytes,
+        protobuf,
+    )?;
     if census.profile_version != REMOTE_TYPED_OUTPUT_CENSUS_VERSION_V1 {
         return Err(arithmetic_error());
     }
@@ -190,12 +263,18 @@ fn typed_output_peak_bytes_v1(
 #[cfg(test)]
 pub(crate) fn typed_output_peak_for_descriptor_test_v1(
     rows: u64,
+    payload_bytes: u64,
     descriptor: &crate::remote_typed_output::RemoteTypedOutputDescriptorV1,
 ) -> Result<u64, RemoteValidationCountErrorV1> {
     let retained_metadata_bytes = descriptor
         .retained_metadata_bytes_v1()
         .ok_or_else(arithmetic_error)?;
-    typed_output_peak_bytes_v1(rows, retained_metadata_bytes)
+    typed_output_peak_bytes_v1(
+        rows,
+        retained_metadata_bytes,
+        payload_bytes,
+        descriptor.protobuf_census_v1(),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -312,8 +391,10 @@ fn reserve_typed_output_state_v1(
     state: &Arc<RemoteValidationCountBudgetStateV1>,
     rows: u64,
     retained_metadata_bytes: u64,
+    payload_bytes: u64,
+    protobuf: Option<crate::remote_typed_output::RemoteTypedProtobufCensusV1>,
 ) -> Result<RemoteTypedOutputReservationV1, RemoteValidationCountErrorV1> {
-    let bytes = typed_output_peak_bytes_v1(rows, retained_metadata_bytes)?;
+    let bytes = typed_output_peak_bytes_v1(rows, retained_metadata_bytes, payload_bytes, protobuf)?;
     let mut usage = state.usage.lock();
     let next = usage
         .output_bytes
@@ -406,7 +487,7 @@ impl RemoteValidationCountBudgetV1 {
         &self,
         rows: u64,
     ) -> Result<RemoteTypedOutputReservationV1, RemoteValidationCountErrorV1> {
-        reserve_typed_output_state_v1(&self.state, rows, 0)
+        reserve_typed_output_state_v1(&self.state, rows, 0, 0, None)
     }
 
     #[cfg(test)]
@@ -441,20 +522,20 @@ mod typed_output_peak_tests {
 
     #[test]
     fn locked_census_is_explicit_and_overflow_closed() {
-        let empty = RemoteTypedOutputPeakCensusV1::from_layouts_v1(0, 0).unwrap();
-        let one = RemoteTypedOutputPeakCensusV1::from_layouts_v1(1, 0).unwrap();
-        let with_metadata = RemoteTypedOutputPeakCensusV1::from_layouts_v1(1, 17).unwrap();
+        let empty = RemoteTypedOutputPeakCensusV1::from_layouts_v1(0, 0, 0, None).unwrap();
+        let one = RemoteTypedOutputPeakCensusV1::from_layouts_v1(1, 0, 0, None).unwrap();
+        let with_metadata = RemoteTypedOutputPeakCensusV1::from_layouts_v1(1, 17, 0, None).unwrap();
         assert_eq!(empty.profile_version, REMOTE_TYPED_OUTPUT_CENSUS_VERSION_V1);
         assert!(empty.simultaneous_bytes > 0);
         assert!(one.simultaneous_bytes > empty.simultaneous_bytes);
         assert!(with_metadata.simultaneous_bytes > one.simultaneous_bytes);
-        assert!(typed_output_peak_bytes_v1(u64::MAX, 0).is_err());
+        assert!(typed_output_peak_bytes_v1(u64::MAX, 0, 0, None).is_err());
     }
 
     #[test]
     fn exact_output_limit_accepts_and_one_byte_short_rejects() {
         let limits = UnfrozenRemoteValidationCountLimitsV1::generous_for_test_v1();
-        let retained = typed_output_peak_bytes_v1(2, 0).unwrap();
+        let retained = typed_output_peak_bytes_v1(2, 0, 0, None).unwrap();
         let exact = RemoteValidationCountBudgetV1::new_for_test_v1(
             limits.with_combined_limit_for_test_v1(retained),
             1,
@@ -477,6 +558,45 @@ mod typed_output_peak_tests {
                 RemoteValidationCountResourceLimitV1::ReservationCapacity
             ))
         ));
+    }
+
+    #[test]
+    fn recursive_protobuf_exact_output_limit_accepts_and_one_byte_short_rejects() {
+        let limits = UnfrozenRemoteValidationCountLimitsV1::generous_for_test_v1();
+        let protobuf = crate::remote_typed_output::RemoteTypedProtobufCensusV1 {
+            fields: 9,
+            repeated_fields: 2,
+            message_fields: 2,
+            map_fields: 1,
+            real_oneofs: 1,
+            enum_fields: 1,
+            enum_values: 3,
+        };
+        let retained = typed_output_peak_bytes_v1(3, 97, 64, Some(protobuf)).unwrap();
+        let exact = RemoteValidationCountBudgetV1::new_for_test_v1(
+            limits.with_combined_limit_for_test_v1(retained),
+            1,
+            0,
+            retained,
+        );
+        let reservation =
+            reserve_typed_output_state_v1(&exact.state, 3, 97, 64, Some(protobuf)).unwrap();
+        drop(reservation);
+        assert!(exact.is_idle_for_test_v1());
+
+        let short = RemoteValidationCountBudgetV1::new_for_test_v1(
+            limits.with_combined_limit_for_test_v1(retained - 1),
+            1,
+            0,
+            retained - 1,
+        );
+        assert!(matches!(
+            reserve_typed_output_state_v1(&short.state, 3, 97, 64, Some(protobuf)),
+            Err(RemoteValidationCountErrorV1::ResourceLimitExceeded(
+                RemoteValidationCountResourceLimitV1::ReservationCapacity
+            ))
+        ));
+        assert!(short.is_idle_for_test_v1());
     }
 }
 
@@ -611,6 +731,7 @@ impl ValidatedChunkDispatchPlanV1<'_, '_, '_, '_, '_, '_> {
     pub(crate) fn reserve_typed_output_v1(
         &self,
         rows: u64,
+        payload_bytes: u64,
         descriptor: &crate::remote_typed_output::RemoteTypedOutputDescriptorV1,
     ) -> Result<RemoteTypedOutputReservationV1, RemoteValidationCountErrorV1> {
         // V1 only admits one scalar component per row. This bound intentionally includes the
@@ -620,7 +741,13 @@ impl ValidatedChunkDispatchPlanV1<'_, '_, '_, '_, '_, '_> {
         let retained_metadata_bytes = descriptor
             .retained_metadata_bytes_v1()
             .ok_or_else(arithmetic_error)?;
-        reserve_typed_output_state_v1(&self._reservation.state, rows, retained_metadata_bytes)
+        reserve_typed_output_state_v1(
+            &self._reservation.state,
+            rows,
+            retained_metadata_bytes,
+            payload_bytes,
+            descriptor.protobuf_census_v1(),
+        )
     }
 
     #[cfg(test)]
@@ -651,35 +778,6 @@ impl DecoderDispatchResourceBoundV1 {
             self.exact_payload_bytes,
         )
     }
-}
-
-#[cfg(test)]
-pub(crate) fn exact_combined_retained_bytes_for_test_v1(
-    evidence: &PhysicalChunkMessageEvidenceV1<'_>,
-    manifest: &ImmutableRemoteChannelGroupsV1<'_, '_, '_, '_>,
-) -> Result<u64, RemoteValidationCountErrorV1> {
-    let channels = evidence
-        .channel_census_v1()
-        .map_err(map_physical_error)?
-        .len();
-    let mut groups = 0_usize;
-    for (index, assignment) in manifest.assignments_v1().iter().enumerate() {
-        if manifest.assignments_v1()[..index]
-            .iter()
-            .all(|candidate| candidate.group_id() != assignment.group_id())
-        {
-            groups = groups.checked_add(1).ok_or_else(arithmetic_error)?;
-        }
-    }
-    checked_add(
-        checked_add(
-            exact_retained_bytes(channels, groups)?,
-            evidence
-                .retained_physical_bytes_v1()
-                .map_err(map_physical_error)?,
-        )?,
-        manifest.retained_bytes_for_validation_v1(),
-    )
 }
 
 pub(crate) fn validate_and_count_with_authority_v1<
@@ -722,9 +820,24 @@ pub(crate) fn validate_and_count_with_authority_v1<
         .ensure_matches_physical_evidence_v1(&evidence)
         .map_err(|_error| RemoteValidationCountErrorV1::ManifestMismatch)?;
     let census = evidence.channel_census_v1().map_err(map_physical_error)?;
-    let channel_len = census.len();
     let assignments = manifest.assignments_v1();
     if census.len() != assignments.len() {
+        return Err(RemoteValidationCountErrorV1::ManifestMismatch);
+    }
+    let mut channel_len = 0_usize;
+    let mut exact_messages = 0_u64;
+    let mut exact_payload = 0_u64;
+    for (channel, assignment) in census.zip(assignments) {
+        if channel.channel_id() != assignment.channel_id() {
+            return Err(RemoteValidationCountErrorV1::ManifestMismatch);
+        }
+        if authority.matches_group_v1(assignment.group_id()) {
+            channel_len = channel_len.checked_add(1).ok_or_else(arithmetic_error)?;
+            exact_messages = checked_add(exact_messages, channel.message_count())?;
+            exact_payload = checked_add(exact_payload, channel.payload_bytes())?;
+        }
+    }
+    if channel_len != authority.channels_v1().len() {
         return Err(RemoteValidationCountErrorV1::ManifestMismatch);
     }
     let channel_count = u64::try_from(channel_len).map_err(|_error| arithmetic_error())?;
@@ -732,24 +845,6 @@ pub(crate) fn validate_and_count_with_authority_v1<
         return Err(RemoteValidationCountErrorV1::ResourceLimitExceeded(
             RemoteValidationCountResourceLimitV1::ChannelCount,
         ));
-    }
-
-    let mut exact_messages = 0_u64;
-    let mut exact_payload = 0_u64;
-    let mut group_count = 0_usize;
-    for (channel, assignment) in census.zip(assignments) {
-        if channel.channel_id() != assignment.channel_id() {
-            return Err(RemoteValidationCountErrorV1::ManifestMismatch);
-        }
-        exact_messages = checked_add(exact_messages, channel.message_count())?;
-        exact_payload = checked_add(exact_payload, channel.payload_bytes())?;
-        let first_group = assignments
-            .iter()
-            .take_while(|candidate| candidate.channel_id() != assignment.channel_id())
-            .all(|candidate| candidate.group_id() != assignment.group_id());
-        if first_group {
-            group_count = group_count.checked_add(1).ok_or_else(arithmetic_error)?;
-        }
     }
     if exact_messages > budget.state.limits.max_messages {
         return Err(RemoteValidationCountErrorV1::ResourceLimitExceeded(
@@ -761,7 +856,8 @@ pub(crate) fn validate_and_count_with_authority_v1<
             RemoteValidationCountResourceLimitV1::PayloadBytes,
         ));
     }
-    let group_count_u64 = u64::try_from(group_count).map_err(|_error| arithmetic_error())?;
+    let group_count = 1_usize;
+    let group_count_u64 = 1_u64;
     if group_count_u64 > budget.state.limits.max_groups {
         return Err(RemoteValidationCountErrorV1::ResourceLimitExceeded(
             RemoteValidationCountResourceLimitV1::GroupCount,
@@ -791,37 +887,31 @@ pub(crate) fn validate_and_count_with_authority_v1<
     resource_bounds
         .try_reserve_exact(group_count)
         .map_err(|_error| RemoteValidationCountErrorV1::FallibleAllocationFailed)?;
-    for (channel, assignment) in evidence
-        .channel_census_v1()
-        .map_err(map_physical_error)?
-        .zip(assignments)
-    {
+    for channel_id in authority.channels_v1() {
+        let (channel, assignment) = evidence
+            .channel_census_v1()
+            .map_err(map_physical_error)?
+            .zip(assignments)
+            .find(|(channel, assignment)| {
+                channel.channel_id() == *channel_id
+                    && assignment.channel_id() == *channel_id
+                    && authority.matches_group_v1(assignment.group_id())
+            })
+            .ok_or(RemoteValidationCountErrorV1::ManifestMismatch)?;
         channels.push(ExactChannelDispatchCountV1 {
             channel_id: channel.channel_id(),
             message_count: channel.message_count(),
             payload_bytes: channel.payload_bytes(),
             selected_group: assignment.group_id(),
         });
-        if !selected_groups.contains(&assignment.group_id()) {
-            selected_groups.push(assignment.group_id());
-            resource_bounds.push(DecoderDispatchResourceBoundV1 {
-                version: REMOTE_DECODER_RESOURCE_BOUND_VERSION_V1,
-                group_id: assignment.group_id(),
-                exact_num_rows: 0,
-                exact_payload_bytes: 0,
-            });
-        }
-        let bound_index = selected_groups
-            .iter()
-            .position(|group| *group == assignment.group_id())
-            .expect("selected group owns one resource bound");
-        let bound = resource_bounds
-            .get_mut(bound_index)
-            .expect("selected group owns one resource bound");
-        bound.exact_num_rows = checked_add(bound.exact_num_rows, channel.message_count())?;
-        bound.exact_payload_bytes =
-            checked_add(bound.exact_payload_bytes, channel.payload_bytes())?;
     }
+    selected_groups.push(authority.group_id_v1());
+    resource_bounds.push(DecoderDispatchResourceBoundV1 {
+        version: REMOTE_DECODER_RESOURCE_BOUND_VERSION_V1,
+        group_id: authority.group_id_v1(),
+        exact_num_rows: exact_messages,
+        exact_payload_bytes: exact_payload,
+    });
     evidence.ensure_current_v1().map_err(map_physical_error)?;
     manifest
         .ensure_current_for_validation_v1()
@@ -852,6 +942,11 @@ fn exact_retained_bytes(
     .ok_or_else(arithmetic_error)?
     .checked_add(locked_footprint(
         Layout::array::<DecoderDispatchResourceBoundV1>(groups)
+            .map_err(|_error| arithmetic_error())?,
+    )?)
+    .ok_or_else(arithmetic_error)?
+    .checked_add(locked_footprint(
+        Layout::array::<crate::remote_chunk_dispatch::RemoteTypedChunkHandoffV1>(channels)
             .map_err(|_error| arithmetic_error())?,
     )?)
     .ok_or_else(arithmetic_error)?;
@@ -953,9 +1048,31 @@ mod tests {
     }
 
     #[test]
-    fn exact_peak_budget_rejects_one_byte_short_and_restores_on_drop() {
+    fn aggregate_terminal_handoff_reservation_is_exact_and_one_byte_short_fails_before_work() {
         let limits = UnfrozenRemoteValidationCountLimitsV1::generous_for_test_v1();
         let retained = exact_retained_bytes(2, 1).unwrap();
+        let expected = locked_footprint(Layout::array::<ExactChannelDispatchCountV1>(2).unwrap())
+            .unwrap()
+            .checked_add(
+                locked_footprint(Layout::array::<StableDecoderGroupIdV1>(1).unwrap()).unwrap(),
+            )
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    locked_footprint(Layout::array::<DecoderDispatchResourceBoundV1>(1).unwrap())
+                        .unwrap(),
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    locked_footprint(
+                        Layout::array::<crate::remote_chunk_dispatch::RemoteTypedChunkHandoffV1>(2)
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .unwrap();
+        assert_eq!(retained, expected);
         let budget = RemoteValidationCountBudgetV1::new_for_test_v1(limits, 1, retained, retained);
         let reservation = budget.reserve(retained, retained).unwrap();
         assert_eq!(budget.state.usage.lock().active_plans, 1);
@@ -972,6 +1089,15 @@ mod tests {
                 RemoteValidationCountResourceLimitV1::ReservationCapacity
             ))
         ));
+
+        let source = include_str!("remote_chunk_validation_count.rs");
+        let reservation = source
+            .find("let reservation = budget.reserve")
+            .expect("validation reserves the aggregate terminal handoff peak");
+        let first_result_allocation = source
+            .find("let mut channels = Vec::new()")
+            .expect("validation materializes the per-channel result after reservation");
+        assert!(reservation < first_result_allocation);
     }
 
     #[test]
@@ -996,7 +1122,7 @@ mod tests {
             );
         }
         assert!(production.contains("PhysicalChunkMessageEvidenceV1"));
-        assert!(production.contains("ImmutableRemoteChannelGroupsV1"));
+        assert!(production.contains("ManifestTemporalPartitionAuthorityV1"));
         assert!(production.contains("REMOTE_DECODER_RESOURCE_BOUND_VERSION_V1"));
     }
 }
