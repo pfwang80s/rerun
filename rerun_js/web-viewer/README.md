@@ -46,6 +46,25 @@ viewer.stop();
 Compatibility URLs passed to `start` or `open` are attempted independently in input order.
 If one item fails, the Viewer emits a warning and continues with later items without throwing, stopping the Viewer, or rolling back earlier successful items.
 
+The additive `openRequest` and `openBatch` APIs provide strict HTTP(S) remote-MCAP admission, typed options, structured request-local errors, and stable opaque operation handles.
+`openBatch` is all-or-nothing and preserves input order.
+Explicit `.mcap` URLs are accepted directly, while extensionless URLs require `allow_extensionless_sniff: true` and use a bounded format sniff when the remote transport capability is installed.
+Non-HTTP routes, gRPC/message proxy URLs, Redap URLs, RRD files, and other formats are rejected by the strict APIs and are never handed to the compatibility importer.
+Until the measured release-Wasm remote-MCAP capability is installed, valid strict requests reject with `StrictOpenError` code `CapabilityUnavailable` before creating handles or scheduling work.
+
+```ts
+const handles = await viewer.openBatch([
+  { url: "https://example.test/first.mcap" },
+  {
+    url: "https://example.test/extensionless",
+    options: { allow_extensionless_sniff: true },
+  },
+]);
+```
+
+The existing `open` and `start` APIs remain the compatibility lane.
+In particular, extensionless compatibility URLs still use the existing dispatcher and do not perform the strict format sniff.
+
 The `rrd` in the snippet above should be a URL pointing to either:
 - A hosted `.rrd` file, such as <https://app.rerun.io/version/0.35.0/examples/dna.rrd>
 - A gRPC connection to the SDK opened via the [`serve`](https://www.rerun.io/docs/reference/sdk/operating-modes#serve) API

@@ -78,6 +78,9 @@ function resetState() {
     handles: [],
     addReceiverCalls: 0,
     addReceiverErrorAt: -1,
+    strictAdmitCalls: [],
+    strictAdmitErrorAt: -1,
+    strictCapabilityInstalled: false,
     startError: null,
     activeRecordingId: null,
     activeTimeline: null,
@@ -107,7 +110,7 @@ globalThis.setTimeout = (callback, delay, ...args) => {
 };
 
 resetState();
-const { LogChannel, WebViewer } = await import("../index.js");
+const { LogChannel, StrictOpenError, WebViewer } = await import("../index.js");
 
 beforeEach(() => {
   resetState();
@@ -366,6 +369,208 @@ test("LogChannel is synchronous while ready and becomes inert after close or sto
   stoppedChannel.close();
   assert.equal(callsNamed("send_rrd_to_channel").length, 1);
   assert.equal(callsNamed("close_channel").length, 1);
+});
+
+test("strict openBatch returns input-ordered opaque handles only after complete admission", async () => {
+  const viewer = await startViewer();
+  globalThis.__rerun_web_viewer_test_state.strictCapabilityInstalled = true;
+  const urls = [
+    "https://example.test/first.mcap?credential=do-not-expose",
+    "https://example.test/extensionless?credential=also-secret",
+  ];
+
+  const handles = await viewer.openBatch([
+    {
+      url: urls[0],
+      options: {
+        topic_filter: ["/z", "/a", "/z"],
+        recording_open_behavior: "open",
+      },
+    },
+    {
+      url: urls[1],
+      options: {
+        allow_extensionless_sniff: true,
+        recording_open_behavior: "background",
+      },
+    },
+  ]);
+
+  assert.equal(handles.length, 2);
+  assert.notEqual(handles[0].requestId, handles[1].requestId);
+  assert.notEqual(handles[0].operationId, handles[1].operationId);
+  assert.equal(handles[0].recordings.length, 1);
+  assert.equal(handles[1].recordings.length, 1);
+  assert.equal(handles[0].phase, "accepted");
+  assert.equal(handles[1].phase, "accepted");
+  assert.equal(handles[0].recordingOpenBehavior, "open");
+  assert.equal(handles[1].recordingOpenBehavior, "background");
+  assert.equal(viewer._strict_open_cache.operation_count, 2);
+  assert.deepEqual(globalThis.__rerun_web_viewer_test_state.strictAdmitCalls, []);
+  assert.equal(callsNamed("add_receiver").length, 0);
+
+  const publicPayload = JSON.stringify(handles);
+  assert.doesNotMatch(publicPayload, /credential|do-not-expose|also-secret|example\.test/);
+  viewer.stop();
+});
+
+test("strict singleton and startup aliases share request-local admission", async () => {
+  const viewer = await startViewer();
+  globalThis.__rerun_web_viewer_test_state.strictCapabilityInstalled = true;
+  const accepted = [];
+
+  const singleton = await viewer.openRequest({
+    url: "https://example.test/singleton.mcap",
+  });
+  singleton.on("accepted", (handle) => accepted.push(handle.requestId));
+
+  const startup = await viewer.startWithRequests([{
+    url: "https://example.test/startup.mcap",
+  }]);
+  startup[0].on("accepted", (handle) => accepted.push(handle.requestId));
+
+  assert.deepEqual(accepted, []);
+  await new Promise((resolve) => original.setTimeout(resolve, 0));
+  assert.deepEqual(accepted, [singleton.requestId, startup[0].requestId]);
+  assert.equal(viewer.ready, true);
+  viewer.stop();
+});
+
+test("strict invalid later item rolls back before capability admission", async () => {
+  const viewer = await startViewer();
+  const state = globalThis.__rerun_web_viewer_test_state;
+
+  await assert.rejects(
+    viewer.openBatch([
+      { url: "https://example.test/valid.mcap" },
+      { url: "https://example.test/not-mcap.rrd" },
+    ]),
+    (error) => {
+      assert.ok(error instanceof StrictOpenError);
+      assert.equal(error.code, "UnsupportedFormat");
+      assert.equal(error.index, 1);
+      assert.doesNotMatch(String(error), /example|not-mcap|rrd/);
+      return true;
+    },
+  );
+  assert.equal(viewer._strict_open_cache.operation_count, 0);
+  assert.deepEqual(state.strictAdmitCalls, []);
+
+  await assert.rejects(
+    viewer.openBatch([
+      { url: "https://example.test/first.mcap" },
+      { url: "https://example.test/second.mcap" },
+    ]),
+    (error) => {
+      assert.ok(error instanceof StrictOpenError);
+      assert.equal(error.code, "CapabilityUnavailable");
+      assert.equal(error.index, null);
+      return true;
+    },
+  );
+  assert.equal(viewer._strict_open_cache.operation_count, 0);
+  assert.deepEqual(state.strictAdmitCalls, []);
+  assert.equal(callsNamed("add_receiver").length, 0);
+  assert.equal(viewer.ready, true);
+  viewer.stop();
+});
+
+test("strict route matrix rejects non-HTTP and requires opt-in extensionless sniff", async () => {
+  const viewer = await startViewer();
+
+  for (const [spec, code] of [
+    [{ url: "rerun+http://127.0.0.1:9876/proxy" }, "UnsupportedStrictOpenRoute"],
+    [{ url: "rerun://host/dataset/opaque" }, "UnsupportedStrictOpenRoute"],
+    [{ url: "https://example.test/no-extension" }, "UnsupportedFormat"],
+  ]) {
+    await assert.rejects(viewer.openRequest(spec), (error) => {
+      assert.ok(error instanceof StrictOpenError);
+      assert.equal(error.code, code);
+      assert.equal(error.index, 0);
+      return true;
+    });
+  }
+
+  assert.equal(viewer._strict_open_cache.operation_count, 0);
+  assert.equal(callsNamed("add_receiver").length, 0);
+  viewer.stop();
+});
+
+test("capability-off strict singleton, batch, and startup reject before every public effect", async () => {
+  const viewer = await startViewer();
+  const state = globalThis.__rerun_web_viewer_test_state;
+  for (const call of [
+    () => viewer.openRequest({ url: "https://example.test/a.mcap?token=secret" }),
+    () => viewer.openBatch([{ url: "https://example.test/b.mcap" }]),
+    () => viewer.startWithRequests([{ url: "https://example.test/c.mcap" }]),
+  ]) {
+    await assert.rejects(call(), (error) => {
+      assert.ok(error instanceof StrictOpenError);
+      assert.equal(error.code, "CapabilityUnavailable");
+      assert.equal(error.phase, "admission");
+      assert.doesNotMatch(String(error), /example|token|secret/);
+      return true;
+    });
+  }
+  assert.equal(viewer.ready, true);
+  assert.equal(viewer._strict_open_cache.operation_count, 0);
+  assert.equal(viewer._strict_dispatcher.queued_count, 0);
+  assert.equal(state.strictAdmitCalls.length, 0);
+  assert.equal(callsNamed("add_receiver").length, 0);
+  assert.equal(callsNamed("remove_receiver").length, 0);
+  viewer.stop();
+});
+
+test("strict request shape errors are request-local and never stop the Viewer", async () => {
+  const stopped = new WebViewer();
+  await assert.rejects(stopped.openRequest({ url: "https://example.test/secret.mcap" }), (error) => {
+    assert.ok(error instanceof StrictOpenError);
+    assert.equal(error.code, "ViewerStopped");
+    assert.doesNotMatch(String(error), /secret|example\.test/);
+    return true;
+  });
+
+  const viewer = await startViewer();
+  for (const invalid of [
+    null,
+    [],
+    [{ url: "https://example.test/shape.mcap", options: { unknown: true } }],
+  ]) {
+    await assert.rejects(viewer.openBatch(invalid), (error) => {
+      assert.ok(error instanceof StrictOpenError);
+      assert.equal(error.code, "InvalidRequestShape");
+      return true;
+    });
+  }
+  assert.equal(viewer.ready, true);
+  assert.equal(viewer._strict_open_cache.operation_count, 0);
+  viewer.stop();
+});
+
+test("strict semantic aliases canonicalize topic order and keep behavior operation-local", async () => {
+  const viewer = await startViewer();
+  globalThis.__rerun_web_viewer_test_state.strictCapabilityInstalled = true;
+  const handles = await viewer.openBatch([
+    {
+      url: "HTTPS://EXAMPLE.TEST/a.mcap",
+      options: {
+        topic_filter: ["/b", "/a", "/a"],
+        recording_open_behavior: "open",
+      },
+    },
+    {
+      url: "https://example.test/a.mcap",
+      options: {
+        topic_filter: ["/a", "/b"],
+        recording_open_behavior: "background",
+      },
+    },
+  ]);
+
+  assert.equal(handles.length, 2);
+  assert.notEqual(handles[0].operationId, handles[1].operationId);
+  assert.equal(viewer._strict_open_cache.operation_count, 2);
+  viewer.stop();
 });
 
 test("strict wrapper cache reuses recording wrappers and cached snapshots", () => {

@@ -7,6 +7,12 @@
 `WebViewer.start` and `WebViewer.open` attempt compatibility URL items independently in input order.
 An item failure emits a warning and does not throw, stop the Viewer, or roll back earlier or later items.
 
+### Web Viewer strict remote-MCAP API
+
+Added additive `WebViewer.openRequest`, `openBatch`, and `startWithRequests` contracts with typed HTTP remote-MCAP options, opaque lifecycle handles, and redacted request-local errors.
+The strict lane rejects non-MCAP and non-HTTP routes without falling back to the compatibility dispatcher.
+The release-Wasm remote-MCAP capability is not installed yet, so valid strict requests return `CapabilityUnavailable` before allocating wrappers or scheduling work.
+
 ## [0.35.0](https://github.com/rerun-io/rerun/compare/0.34.1...0.35.0) - 2026-07-23
 
 🧳 Migration guide: https://rerun.io/docs/reference/migration/migration-0-35

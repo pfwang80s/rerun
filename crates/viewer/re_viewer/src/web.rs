@@ -26,7 +26,7 @@ use re_web::compatibility_open::{
 use crate::web_history::install_popstate_listener;
 use crate::web_startup::{
     CompatibilityRemoteMcapControlV1, CompatibilityUrlDispatchOutcomeV1,
-    dispatch_compatibility_url_v1,
+    classify_strict_http_remote_mcap_route_v1, dispatch_compatibility_url_v1,
 };
 use crate::web_tools::{Callback, JsResultExt as _, StringOrStringArray};
 
@@ -328,6 +328,39 @@ impl WebHandle {
                 re_log::warn!(?url_raw, "Failed to open URL: {err}");
             }
         }
+    }
+
+    /// Performs the production-disarmed strict HTTP route admission check.
+    ///
+    /// This is deliberately narrower than `add_receiver`: it never constructs a legacy receiver,
+    /// opens a connection, starts Fetch, or mutates a Store.  The measured remote capability will
+    /// replace this seam with the Rust `StrictOpenBatchPrepareContextV1` transaction once the
+    /// release-Wasm profile is installed.  The TypeScript API does not call this route-only seam
+    /// while the capability gate is false; it remains available for the future Rust handoff.
+    #[wasm_bindgen]
+    pub fn strict_open_admit_v1(
+        &self,
+        url_raw: &str,
+        allow_extensionless_sniff: bool,
+    ) -> Result<(), JsValue> {
+        classify_strict_http_remote_mcap_route_v1(url_raw, allow_extensionless_sniff).map_or_else(
+            |error| {
+                let code = error.wire_code_v1();
+                Err(JsValue::from_str(code))
+            },
+            |_route| Ok(()),
+        )
+    }
+
+    /// Reports whether the sealed release-Wasm remote-MCAP capability is installed.
+    ///
+    /// MCAP-055 publishes the typed JavaScript boundary while the MCAP-088 measured profile is
+    /// still unavailable, so this remains a production-off seam.  Once the capability is sealed,
+    /// this method will be the only gate before Rust `StrictOpenBatchPrepareContextV1` and the
+    /// disarmed handoff registry are entered.
+    #[wasm_bindgen]
+    pub fn strict_open_capability_available_v1(&self) -> bool {
+        false
     }
 
     #[wasm_bindgen]
