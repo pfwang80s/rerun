@@ -24,6 +24,12 @@
 //! use re_web::strict_open_wire;
 //! ```
 //!
+//! Open-source terminal ownership and one-shot capability issuance are likewise Web-only:
+//!
+//! ```compile_fail,ignore-wasm32
+//! use re_web::open_source_terminal;
+//! ```
+//!
 //! Generation-aware Store publication identities are likewise Web-only:
 //!
 //! ```compile_fail,ignore-wasm32
@@ -56,6 +62,8 @@ pub mod chrome_byob;
 pub mod chrome_range;
 #[cfg(target_arch = "wasm32")]
 mod format_sniffer;
+#[cfg(target_arch = "wasm32")]
+pub mod open_source_terminal;
 #[cfg(target_arch = "wasm32")]
 #[cfg_attr(
     not(test),
@@ -118,6 +126,14 @@ mod remote_validator;
     reason = "native tests exercise the Web-only strict-open codec without publishing its API"
 )]
 mod strict_open_wire;
+
+// Host builds compile the module only for its unit tests and do not publish it to consumers.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[expect(
+    dead_code,
+    reason = "native tests exercise the Web-only open-source terminal schema without publishing its API"
+)]
+mod open_source_terminal;
 
 // Host builds compile the module only for its unit tests and do not publish it to consumers.
 #[cfg(all(test, not(target_arch = "wasm32")))]
