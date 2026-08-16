@@ -42,6 +42,12 @@
 //! use re_web::open_lifecycle_registry;
 //! ```
 //!
+//! Strict-open public lifecycle sequencing is likewise Web-only:
+//!
+//! ```compile_fail,ignore-wasm32
+//! use re_web::open_lifecycle_sequencer;
+//! ```
+//!
 //! Generation-aware Store publication identities are likewise Web-only:
 //!
 //! ```compile_fail,ignore-wasm32
@@ -82,6 +88,8 @@ pub mod chrome_range;
 mod format_sniffer;
 #[cfg(target_arch = "wasm32")]
 pub mod open_lifecycle_registry;
+#[cfg(target_arch = "wasm32")]
+pub mod open_lifecycle_sequencer;
 #[cfg(target_arch = "wasm32")]
 pub mod open_source_client_registry;
 #[cfg(target_arch = "wasm32")]
@@ -178,6 +186,10 @@ mod secret_url;
 // Host builds compile the module only for its unit tests and do not publish it to consumers.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod open_lifecycle_registry;
+
+// Host builds compile the module only for its unit tests and do not publish it to consumers.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod open_lifecycle_sequencer;
 
 // Host builds compile the module only for its unit tests and do not publish it to consumers.
 #[cfg(all(test, not(target_arch = "wasm32")))]

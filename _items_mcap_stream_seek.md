@@ -59,7 +59,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M1 | MCAP-006…012 | 7/7 | 已完成 | URL、validator、时间、wire、Store generation 和 remote runtime interner 边界冻结 |
 | M2 | MCAP-013…033（含 MCAP-025A、MCAP-030A、MCAP-030B） | 24/24 | 已完成 | 不接 TimeControl 即可安全完成 metadata opening、bounded decoder initialization、局部 Chunk 验证和 terminal batch 派生 |
 | M3 | MCAP-034…042 | 5/6 | 进行中 | Web remote-MCAP partition、root、coverage、reclaim 和 existing-identifier 能力可用 |
-| M4 | MCAP-043…057 | 5/15 | 进行中 | compatibility 和 strict lane 的身份、状态、回放、dispose 与 teardown 闭合 |
+| M4 | MCAP-043…057 | 6/15 | 进行中 | compatibility 和 strict lane 的身份、状态、回放、dispose 与 teardown 闭合 |
 | M5 | MCAP-058…066 | 0/0 | 已移出 | legacy HTTP adapter 保留现有 Web 路径，不进入 remote-MCAP 项目 |
 | M6 | MCAP-067…080 | 0/5 | 未开始 | remote-MCAP page execution、hidden suspension、安全字符串和 teardown 闭合 |
 | M7 | MCAP-081…087 | 0/2 | 未开始 | remote-MCAP identifier census 与 module-lifetime intern admission 闭合 |
@@ -67,7 +67,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M8 | MCAP-089…105 | 0/17 | 未开始 | foreground-only window playback、seek、query isolation、mutation arbitration 和 reload 闭合 |
 | M9 | MCAP-106…114 | 0/9 | 未开始 | two-phase runner、strict startup、UI/API 文档和桌面 Chrome E2E 全部通过 |
 
-有效工作项总数为 91，当前进度为 46/91；26 个 `[~]` 项不计入分母且不产生提交。
+有效工作项总数为 91，当前进度为 47/91；26 个 `[~]` 项不计入分母且不产生提交。
 关键路径为 `M0 → M1 → M2/M3 → M4/M6/M7 → GA → M8 → M9`。
 M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前保持 feature-disabled。
 
@@ -584,13 +584,13 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 验收：每次 open 都有独立 operation；compatible alias只共享 source；相同 RecordingId 的 Stores得到不同 public identity；最后一个显式 subscriber dispose 后确定删除 tombstone，不依赖 GC。
 - 负责人：William；提交：本地已提交；备注：Web-only registry foundation 已落地，未接入 native viewer 或现有 compatibility open 行为。
 
-### [ ] MCAP-048 — 实现唯一 public lifecycle sequencer
+### [x] MCAP-048 — 实现唯一 public lifecycle sequencer
 
 - 建议提交：`Implement normative public open lifecycle sequencing`。
 - 依赖：MCAP-047。
 - 变更：按设计唯一表实现 accepted、recording_activated、behavior effect、request_ready、presentation_ready、terminal 和 recording_removed 的有序 transition及 typed reason。
 - 验收：remote new/Active/terminal alias replay、pre-Store failure、post-activation failure、各种 close、pressure/background 和 stop-no-removed 都只有唯一合法 trace；wrapper installation 先于 ready；既有 non-MCAP `recording_open` trace 不变。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：本地已提交；备注：Web-only sequencer foundation 已落地，未接入 TypeScript dispatcher 或现有 non-MCAP `recording_open` 路径。
 
 ### [ ] MCAP-049 — 实现 Rust lifecycle delivery permits
 
