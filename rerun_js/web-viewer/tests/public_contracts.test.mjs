@@ -453,6 +453,16 @@ test("strict request preflight seals fields, indexes sparse batches, and rejects
   });
 
   await assert.rejects(viewer.openRequest({
+    url: "https://example.test/topics.mcap",
+    options: { topic_filter: Array.from({ length: 17 }, () => "x".repeat(4_096)) },
+  }), (error) => {
+    assert.ok(error instanceof StrictOpenError);
+    assert.equal(error.code, "ResourceLimitExceeded");
+    assert.equal(error.index, 0);
+    return true;
+  });
+
+  await assert.rejects(viewer.openRequest({
     url: "https://example.test/unknown.mcap",
     extra: "field",
   }), (error) => {

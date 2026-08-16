@@ -646,6 +646,7 @@ function normalize_strict_open_spec(
       if (topic_value.length > STRICT_OPEN_MAX_TOPIC_FILTERS) {
         throw new StrictOpenError("InvalidRequestShape", "admission", { index });
       }
+      let topic_filter_bytes = 0;
       for (let topic_index = 0; topic_index < topic_value.length; topic_index++) {
         const topic_descriptor = Object.getOwnPropertyDescriptor(topic_value, String(topic_index));
         if (!topic_descriptor || !("value" in topic_descriptor)
@@ -653,6 +654,11 @@ function normalize_strict_open_spec(
           || strict_utf8_byte_length(topic_descriptor.value) > 4_096) {
           throw new StrictOpenError("InvalidRequestShape", "admission", { index });
         }
+        const topic_bytes = strict_utf8_byte_length(topic_descriptor.value);
+        if (topic_bytes > STRICT_OPEN_MAX_FIELD_BYTES - topic_filter_bytes) {
+          throw new StrictOpenError("ResourceLimitExceeded", "admission", { index });
+        }
+        topic_filter_bytes += topic_bytes;
       }
     } else {
       throw new StrictOpenError("InvalidRequestShape", "admission", { index });
