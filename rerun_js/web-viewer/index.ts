@@ -469,6 +469,8 @@ export class WebViewer {
   // NOTE: Using the handle requires wrapping all calls to its methods in try/catch.
   //       On failure, call `this.stop` to prevent a memory leak, then re-throw the error.
   #handle: WebHandle | null = null;
+  private _strict_open_cache = new StrictOpenWrapperCache();
+  private _strict_dispatcher = new BoundedSingleTaskDispatcher();
   #canvas: HTMLCanvasElement | null = null;
   #loader: HTMLDivElement | null = null;
   #state: "ready" | "starting" | "stopped" = "stopped";
@@ -1285,6 +1287,324 @@ export class LogChannel {
     if (!this.ready) return;
     this.#on_close();
     this.#closed = true;
+  }
+}
+
+type StrictOpenRecordingPhase = "preexisting" | "active" | "completed";
+
+class StrictOpenRecordingWrapper {
+  readonly operation_id: string;
+  readonly recording_id: string;
+  readonly alias_kind: StrictOpenRecordingPhase;
+  #phase: StrictOpenRecordingPhase;
+
+  constructor(
+    operation_id: string,
+    recording_id: string,
+    alias_kind: StrictOpenRecordingPhase,
+  ) {
+    this.operation_id = operation_id;
+    this.recording_id = recording_id;
+    this.alias_kind = alias_kind;
+    this.#phase = alias_kind;
+  }
+
+  get phase() {
+    return this.#phase;
+  }
+
+  mark_active() {
+    this.#phase = StrictOpenRecordingWrapper.#merge_phase(this.#phase, "active");
+  }
+
+  mark_completed() {
+    this.#phase = StrictOpenRecordingWrapper.#merge_phase(this.#phase, "completed");
+  }
+
+  static #merge_phase(
+    current: StrictOpenRecordingPhase,
+    next: StrictOpenRecordingPhase,
+  ): StrictOpenRecordingPhase {
+    if (current === "completed" || current === next) {
+      return current;
+    }
+    if (current === "active") {
+      return next === "completed" ? "completed" : current;
+    }
+    return next;
+  }
+}
+
+class StrictOpenOperationWrapper {
+  readonly operation_id: string;
+  #recordings = new Map<string, StrictOpenRecordingWrapper>();
+  #recordings_cache: readonly StrictOpenRecordingWrapper[] | null = null;
+  #installation_ack_complete = false;
+  #activation_bridge_armed = false;
+
+  constructor(operation_id: string) {
+    this.operation_id = operation_id;
+  }
+
+  get recording_count() {
+    return this.#recordings.size;
+  }
+
+  get wrapper_count() {
+    return this.#recordings.size;
+  }
+
+  get installation_ack_complete() {
+    return this.#installation_ack_complete;
+  }
+
+  get activation_bridge_armed() {
+    return this.#activation_bridge_armed;
+  }
+
+  get recordings() {
+    if (!this.#recordings_cache) {
+      this.#recordings_cache = Object.freeze([...this.#recordings.values()]);
+    }
+    return this.#recordings_cache;
+  }
+
+  attach_preexisting_recording(recording_id: string) {
+    return this.#attach_recording(recording_id, "preexisting");
+  }
+
+  replay_active_recording(recording_id: string) {
+    return this.#attach_recording(recording_id, "active");
+  }
+
+  replay_completed_recording(recording_id: string) {
+    return this.#attach_recording(recording_id, "completed");
+  }
+
+  complete_installation_ack() {
+    this.#installation_ack_complete = true;
+  }
+
+  arm_internal_activation_bridge() {
+    this.#activation_bridge_armed = true;
+  }
+
+  dispose() {
+    this.#recordings.clear();
+    this.#recordings_cache = null;
+    this.#installation_ack_complete = false;
+    this.#activation_bridge_armed = false;
+  }
+
+  #attach_recording(
+    recording_id: string,
+    alias_kind: StrictOpenRecordingPhase,
+  ) {
+    const existing = this.#recordings.get(recording_id);
+    if (existing) {
+      if (alias_kind === "active") {
+        existing.mark_active();
+      } else if (alias_kind === "completed") {
+        existing.mark_completed();
+      }
+      return existing;
+    }
+
+    const wrapper = new StrictOpenRecordingWrapper(
+      this.operation_id,
+      recording_id,
+      alias_kind,
+    );
+    this.#recordings.set(recording_id, wrapper);
+    this.#recordings_cache = null;
+    return wrapper;
+  }
+}
+
+class StrictOpenWrapperCache {
+  #operations = new Map<string, StrictOpenOperationWrapper>();
+
+  get operation_count() {
+    return this.#operations.size;
+  }
+
+  get_operation(operation_id: string) {
+    return this.#operations.get(operation_id) ?? null;
+  }
+
+  install_operation(operation_id: string) {
+    const existing = this.#operations.get(operation_id);
+    if (existing) {
+      return existing;
+    }
+
+    const operation = new StrictOpenOperationWrapper(operation_id);
+    this.#operations.set(operation_id, operation);
+    return operation;
+  }
+
+  install_operation_with_abort(
+    operation_id: string,
+    build: (operation: StrictOpenOperationWrapper) => void,
+    on_abort: () => void,
+  ) {
+    const operation = new StrictOpenOperationWrapper(operation_id);
+    this.#operations.set(operation_id, operation);
+    try {
+      build(operation);
+      return operation;
+    } catch (error) {
+      try {
+        on_abort();
+      } finally {
+        operation.dispose();
+        this.#operations.delete(operation_id);
+      }
+      throw error;
+    }
+  }
+
+  dispose_operation(operation_id: string) {
+    const operation = this.#operations.get(operation_id);
+    if (!operation) {
+      return false;
+    }
+
+    operation.dispose();
+    this.#operations.delete(operation_id);
+    return true;
+  }
+}
+
+type StrictDispatcherTask = () => void;
+
+class BoundedSingleTaskDispatcher {
+  #queue: StrictDispatcherTask[] = [];
+  #scheduled = false;
+  #draining = false;
+  #stopped = false;
+  #schedule_count = 0;
+  #delivered_count = 0;
+  #error_notification_count = 0;
+  #report_error_count = 0;
+  #error_hook: ((error: unknown) => void) | null = null;
+  readonly max_queue_length: number;
+
+  constructor(max_queue_length = 64) {
+    this.max_queue_length = max_queue_length;
+  }
+
+  get queued_count() {
+    return this.#queue.length;
+  }
+
+  get scheduled_task_count() {
+    return this.#schedule_count;
+  }
+
+  get delivered_count() {
+    return this.#delivered_count;
+  }
+
+  get error_notification_count() {
+    return this.#error_notification_count;
+  }
+
+  get report_error_count() {
+    return this.#report_error_count;
+  }
+
+  get stopped() {
+    return this.#stopped;
+  }
+
+  set_error_hook(hook: ((error: unknown) => void) | null) {
+    this.#error_hook = hook;
+  }
+
+  enqueue(task: StrictDispatcherTask) {
+    if (this.#stopped || this.#queue.length >= this.max_queue_length) {
+      return false;
+    }
+
+    this.#queue.push(task);
+    if (!this.#scheduled && !this.#draining) {
+      this.#scheduled = true;
+      this.#schedule_count += 1;
+      setTimeout(() => this.#drain(), 0);
+    }
+
+    return true;
+  }
+
+  drain_now() {
+    this.#drain();
+  }
+
+  cancel() {
+    this.#stopped = true;
+    this.#scheduled = false;
+    this.#queue.length = 0;
+  }
+
+  #drain() {
+    if (this.#stopped) {
+      this.#scheduled = false;
+      this.#queue.length = 0;
+      return;
+    }
+
+    this.#scheduled = false;
+    this.#draining = true;
+    try {
+      while (this.#queue.length > 0) {
+        if (this.#stopped) {
+          this.#queue.length = 0;
+          return;
+        }
+
+        const task = this.#queue.shift();
+        if (!task) {
+          continue;
+        }
+
+        try {
+          task();
+          this.#delivered_count += 1;
+        } catch (error) {
+          this.#report_task_error(error);
+        }
+      }
+    } finally {
+      this.#draining = false;
+    }
+  }
+
+  #report_task_error(error: unknown) {
+    this.#error_notification_count += 1;
+    if (!this.#error_hook) {
+      this.#report_sink(error);
+      return;
+    }
+
+    try {
+      this.#error_hook(error);
+    } catch (hook_error) {
+      this.#report_error_count += 1;
+      this.#report_sink(hook_error);
+    }
+  }
+
+  #report_sink(error: unknown) {
+    if (typeof globalThis.reportError === "function") {
+      try {
+        globalThis.reportError(error);
+        return;
+      } catch {
+        // Fall through to console.error.
+      }
+    }
+    console.error(error);
   }
 }
 

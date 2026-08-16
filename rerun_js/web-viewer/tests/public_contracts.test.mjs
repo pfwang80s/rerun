@@ -349,6 +349,130 @@ test("LogChannel is synchronous while ready and becomes inert after close or sto
   assert.equal(callsNamed("close_channel").length, 1);
 });
 
+test("strict wrapper cache reuses recording wrappers and cached snapshots", () => {
+  const viewer = new WebViewer();
+  const cache = viewer._strict_open_cache;
+
+  assert.equal(cache.operation_count, 0);
+
+  const operation = cache.install_operation("operation-1");
+  assert.equal(cache.operation_count, 1);
+  assert.equal(operation.recording_count, 0);
+  assert.equal(operation.wrapper_count, 0);
+
+  const first = operation.attach_preexisting_recording("recording-a");
+  const second = operation.attach_preexisting_recording("recording-b");
+  const duplicate = operation.attach_preexisting_recording("recording-a");
+
+  assert.strictEqual(first, duplicate);
+  assert.strictEqual(operation.recordings, operation.recordings);
+  assert.strictEqual(operation.recordings[0], first);
+  assert.strictEqual(operation.recordings[1], second);
+  assert.equal(operation.recording_count, 2);
+  assert.equal(operation.wrapper_count, 2);
+  assert.equal(first.phase, "preexisting");
+
+  operation.replay_active_recording("recording-a");
+  operation.replay_completed_recording("recording-b");
+  assert.strictEqual(operation.recordings[0], first);
+  assert.strictEqual(operation.recordings[1], second);
+  assert.equal(first.phase, "active");
+  assert.equal(second.phase, "completed");
+  assert.equal(operation.recording_count, 2);
+
+  operation.complete_installation_ack();
+  operation.arm_internal_activation_bridge();
+  assert.equal(operation.installation_ack_complete, true);
+  assert.equal(operation.activation_bridge_armed, true);
+});
+
+test("strict wrapper cache aborts before disposing temporary operations", () => {
+  const viewer = new WebViewer();
+  const cache = viewer._strict_open_cache;
+  const order = [];
+
+  assert.throws(
+    () =>
+      cache.install_operation_with_abort(
+        "operation-throw",
+        (operation) => {
+          order.push(["build", operation.operation_id, operation.recording_count]);
+          operation.attach_preexisting_recording("recording-a");
+          throw new Error("constructor failed");
+        },
+        () => order.push(["abort", "operation-throw"]),
+      ),
+    /constructor failed/,
+  );
+
+  order.push(["post"]);
+  assert.deepEqual(order, [
+    ["build", "operation-throw", 0],
+    ["abort", "operation-throw"],
+    ["post"],
+  ]);
+  assert.equal(cache.get_operation("operation-throw"), null);
+  assert.equal(cache.operation_count, 0);
+});
+
+test("strict dispatcher batches into one task, preserves FIFO, and cancels cleanly", () => {
+  const viewer = new WebViewer();
+  const dispatcher = viewer._strict_dispatcher;
+  const seen = [];
+
+  assert.equal(dispatcher.enqueue(() => seen.push("a")), true);
+  assert.equal(dispatcher.enqueue(() => seen.push("b")), true);
+  assert.equal(dispatcher.enqueue(() => {
+    seen.push("c");
+    assert.equal(dispatcher.enqueue(() => seen.push("d")), true);
+  }), true);
+
+  assert.equal(dispatcher.scheduled_task_count, 1);
+  assert.equal(dispatcher.queued_count, 3);
+
+  dispatcher.drain_now();
+
+  assert.deepEqual(seen, ["a", "b", "c", "d"]);
+  assert.equal(dispatcher.queued_count, 0);
+  assert.equal(dispatcher.delivered_count, 4);
+  assert.equal(dispatcher.scheduled_task_count, 1);
+
+  dispatcher.cancel();
+  assert.equal(dispatcher.stopped, true);
+  assert.equal(dispatcher.enqueue(() => seen.push("e")), false);
+});
+
+test("strict dispatcher reports task errors once and does not recurse through the hook", () => {
+  const viewer = new WebViewer();
+  const dispatcher = viewer._strict_dispatcher;
+  const hookErrors = [];
+  const reportedErrors = [];
+  const originalReportError = globalThis.reportError;
+
+  globalThis.reportError = (error) => {
+    reportedErrors.push(String(error));
+  };
+
+  try {
+    dispatcher.set_error_hook((error) => {
+      hookErrors.push(String(error));
+      throw new Error("hook failed");
+    });
+
+    dispatcher.enqueue(() => {
+      throw new Error("task failed");
+    });
+    dispatcher.drain_now();
+  } finally {
+    globalThis.reportError = originalReportError;
+  }
+
+  assert.deepEqual(hookErrors, ["Error: task failed"]);
+  assert.equal(dispatcher.error_notification_count, 1);
+  assert.equal(dispatcher.report_error_count, 1);
+  assert.deepEqual(reportedErrors, ["Error: hook failed"]);
+});
+
 test("raw recording-ID controls forward exact IDs and retain fallback values", async () => {
   const viewer = await startViewer();
   const state = globalThis.__rerun_web_viewer_test_state;

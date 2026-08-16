@@ -616,21 +616,21 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 验收：wrapper throw、invalid/duplicate/missing ack、wrong/repeated token、release前stop和state change保持历史registry逐位不变；release前零 event/replay/work；abort绝不关闭共享 source。
 - 负责人：William；提交：本地已提交；备注：Web-only disarmed handoff foundation 已落地，未接入 TypeScript release handshake 或现有 compatibility path。
 
-### [ ] MCAP-052 — 实现 TypeScript operation/recording wrapper cache
+### [x] MCAP-052 — 实现 TypeScript operation/recording wrapper cache
 
 - 建议提交：`Add strict open operation and recording wrappers`。
 - 依赖：MCAP-010、MCAP-047、MCAP-051。
 - 变更：实现 wrapper construction、preexisting recording attachment、complete installation ack、internal activation bridge和operation-local稳定对象 cache，不执行用户 callback。
 - 验收：重复读取 `recordings` 不增加 wrapper/subscriber/Promise且 object identity 稳定；constructor throw先 matching abort并dispose临时对象；Active/completed alias replay在public dispatch前已装好wrapper。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`7d06923ad81ade355986c91357191546982a710f`；备注：已实现内部 strict open operation/recording wrapper cache、preexisting attachment、installation ack标记、activation replay bridge和constructor失败abort→dispose顺序；保持现有compatibility open/close/event语义不变。
 
-### [ ] MCAP-053 — 实现 instance-owned TypeScript dispatcher
+### [x] MCAP-053 — 实现 instance-owned TypeScript dispatcher
 
 - 建议提交：`Add bounded single-task Web Viewer event dispatcher`。
 - 依赖：MCAP-049、MCAP-052。
 - 变更：为新 strict remote-MCAP lifecycle/Promise/event-error 建立最多挂一个 browser task 的 bounded FIFO dispatcher；不迁移 existing `recording_open`、notebook/Gradio raw event 或其他 compatibility event bridge。
 - 验收：public method return/start resolve前不执行 remote host callback；不让出event loop的open/dispose循环仍有界；普通listener错误最多一个预留通知；error hook抛错只reportError不递归；stop取消新队列，既有raw-event同步时序不变。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`7d06923ad81ade355986c91357191546982a710f`；备注：已实现 instance-owned bounded single-task dispatcher 基础设施与测试；仅用于 strict future path，未迁移既有 `recording_open`、notebook/Gradio raw event 或其他 compatibility bridge。
 
 ### [ ] MCAP-054 — 在 compatibility open/start 中接入 remote-MCAP 分支
 
