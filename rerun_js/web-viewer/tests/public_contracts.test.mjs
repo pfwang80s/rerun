@@ -196,7 +196,8 @@ test("an exception in the second array item warns and continues without stopping
   state.addReceiverErrorAt = 1;
 
   const originalConsoleWarn = console.warn;
-  console.warn = () => {};
+  const warnings = [];
+  console.warn = (...args) => warnings.push(args);
   try {
     assert.doesNotThrow(() =>
       viewer.open([
@@ -218,6 +219,8 @@ test("an exception in the second array item warns and continues without stopping
   assert.equal(viewer.ready, true);
   assert.equal(callsNamed("destroy").length, 0);
   assert.equal(callsNamed("free").length, 0);
+  assert.equal(warnings.length, 1);
+  assert.match(String(warnings[0][0]), /continuing with the next item/);
   viewer.stop();
 });
 

@@ -1,6 +1,76 @@
 use re_log_channel::RecordingOpenBehavior;
 use re_viewer_context::{CommandSender, open_url};
 
+use re_viewer_context::open_url::ViewerOpenUrl;
+
+/// Decision returned by the production-disarmed remote-MCAP singleton seam.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompatibilityRemoteMcapControlV1 {
+    ExistingDispatcher,
+    RemoteAccepted,
+    RemoteSessionLimitReached,
+}
+
+/// Outcome of one compatibility URL dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompatibilityUrlDispatchOutcomeV1 {
+    ExistingDispatcher,
+    RemoteAccepted,
+    RemoteSessionLimitReached,
+}
+
+/// Parses and dispatches one compatibility URL through the exact production `WebHandle` path.
+///
+/// The callback is invoked only for an explicit HTTP(S) `.mcap` URL.  Returning
+/// `ExistingDispatcher` from the callback immediately uses the existing `ViewerOpenUrl::open`
+/// command path, which is the production-disarmed fallback.
+pub(crate) fn dispatch_compatibility_url_v1(
+    raw_url: &str,
+    egui_ctx: &egui::Context,
+    command_sender: &CommandSender,
+    remote_dispatch: impl FnOnce() -> CompatibilityRemoteMcapControlV1,
+) -> anyhow::Result<CompatibilityUrlDispatchOutcomeV1> {
+    let parsed = raw_url.parse::<ViewerOpenUrl>()?;
+    let is_explicit_remote_mcap = match &parsed {
+        ViewerOpenUrl::HttpUrl(url) => url
+            .path()
+            .rsplit('/')
+            .next()
+            .and_then(|segment| segment.rsplit_once('.').map(|(_, extension)| extension))
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("mcap")),
+        _ => false,
+    };
+
+    let open_existing = |parsed: ViewerOpenUrl| {
+        parsed.open(
+            egui_ctx,
+            &open_url::OpenUrlOptions {
+                recording_open_behavior: RecordingOpenBehavior::OpenAndSelect,
+                show_loader: true,
+            },
+            command_sender,
+        );
+    };
+
+    if !is_explicit_remote_mcap {
+        open_existing(parsed);
+        return Ok(CompatibilityUrlDispatchOutcomeV1::ExistingDispatcher);
+    }
+
+    match remote_dispatch() {
+        CompatibilityRemoteMcapControlV1::ExistingDispatcher => {
+            open_existing(parsed);
+            Ok(CompatibilityUrlDispatchOutcomeV1::ExistingDispatcher)
+        }
+        CompatibilityRemoteMcapControlV1::RemoteAccepted => {
+            Ok(CompatibilityUrlDispatchOutcomeV1::RemoteAccepted)
+        }
+        CompatibilityRemoteMcapControlV1::RemoteSessionLimitReached => {
+            Ok(CompatibilityUrlDispatchOutcomeV1::RemoteSessionLimitReached)
+        }
+    }
+}
+
 /// A `JavaScript` string or array of strings, preserving caller order.
 #[derive(Clone, Debug)]
 pub(crate) struct StringOrStringArray(Vec<String>);
@@ -85,7 +155,130 @@ mod tests {
     use re_log_channel::LogSource;
     use re_viewer_context::{Item, Route, SystemCommand, command_channel};
 
-    use super::{StringOrStringArray, dispatch_hidden_startup_urls};
+    use super::{
+        CompatibilityRemoteMcapControlV1, CompatibilityUrlDispatchOutcomeV1, StringOrStringArray,
+        dispatch_compatibility_url_v1, dispatch_hidden_startup_urls,
+    };
+
+    fn command_debug_trace(receiver: &re_viewer_context::CommandReceiver) -> Vec<String> {
+        std::iter::from_fn(|| {
+            receiver
+                .recv_system()
+                .map(|(_, command)| format!("{command:?}"))
+        })
+        .collect()
+    }
+
+    #[test]
+    fn compatibility_add_receiver_path_diffs_to_existing_dispatcher() {
+        let cases = [
+            ("https://example.test/data.mcap", true),
+            ("HTTP://example.test/data.MCAP?token=opaque#fragment", true),
+            ("https://example.test/data.mcap?url=opaque", true),
+            ("https://example.test/data.rrd", false),
+            ("rerun+http://127.0.0.1:9876/proxy", false),
+            (
+                "rerun://127.0.0.1:1234/dataset/abc/data.mcap?segment_id=pid",
+                false,
+            ),
+            (
+                "https://viewer.example.test/?url=https%3A%2F%2Fexample.test%2Fdata.mcap",
+                false,
+            ),
+        ];
+
+        for (raw_url, is_remote) in cases {
+            let (sender, receiver) = command_channel();
+            let mut remote_calls = 0;
+            let result =
+                dispatch_compatibility_url_v1(raw_url, &egui::Context::default(), &sender, || {
+                    remote_calls += 1;
+                    CompatibilityRemoteMcapControlV1::ExistingDispatcher
+                });
+            assert!(
+                result.is_ok(),
+                "expected existing parser to accept {raw_url}"
+            );
+            assert_eq!(
+                remote_calls,
+                usize::from(is_remote),
+                "remote route for {raw_url}"
+            );
+
+            let actual_trace = command_debug_trace(&receiver);
+            let (expected_sender, expected_receiver) = command_channel();
+            raw_url
+                .parse::<super::ViewerOpenUrl>()
+                .expect("baseline parser accepts route")
+                .open(
+                    &egui::Context::default(),
+                    &re_viewer_context::open_url::OpenUrlOptions {
+                        recording_open_behavior:
+                            re_log_channel::RecordingOpenBehavior::OpenAndSelect,
+                        show_loader: true,
+                    },
+                    &expected_sender,
+                );
+            let expected_trace = command_debug_trace(&expected_receiver);
+            assert_eq!(
+                actual_trace, expected_trace,
+                "dispatcher trace for {raw_url}"
+            );
+        }
+
+        let (sender, receiver) = command_channel();
+        let mut remote_calls = 0;
+        let outcome = dispatch_compatibility_url_v1(
+            "https://example.test/data.mcap",
+            &egui::Context::default(),
+            &sender,
+            || {
+                remote_calls += 1;
+                CompatibilityRemoteMcapControlV1::RemoteAccepted
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, CompatibilityUrlDispatchOutcomeV1::RemoteAccepted);
+        assert_eq!(remote_calls, 1);
+        assert!(command_debug_trace(&receiver).is_empty());
+
+        let (sender, receiver) = command_channel();
+        let outcome = dispatch_compatibility_url_v1(
+            "https://example.test/data.mcap",
+            &egui::Context::default(),
+            &sender,
+            || CompatibilityRemoteMcapControlV1::RemoteSessionLimitReached,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            CompatibilityUrlDispatchOutcomeV1::RemoteSessionLimitReached
+        );
+        assert!(command_debug_trace(&receiver).is_empty());
+    }
+
+    #[test]
+    fn compatibility_extensionless_and_malformed_inputs_have_zero_remote_side_effects() {
+        for raw_url in [
+            "https://example.test/no-extension",
+            "not a URL",
+            "https://example.test/data.mcap/child",
+        ] {
+            let (sender, receiver) = command_channel();
+            let mut remote_calls = 0;
+            let result =
+                dispatch_compatibility_url_v1(raw_url, &egui::Context::default(), &sender, || {
+                    remote_calls += 1;
+                    CompatibilityRemoteMcapControlV1::RemoteAccepted
+                });
+            assert!(
+                result.is_err(),
+                "expected existing parser rejection for {raw_url}"
+            );
+            assert_eq!(remote_calls, 0);
+            assert!(command_debug_trace(&receiver).is_empty());
+        }
+    }
 
     #[test]
     fn hidden_startup_urls_use_web_parser_and_continue_in_order() {

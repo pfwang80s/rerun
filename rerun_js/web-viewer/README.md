@@ -43,6 +43,9 @@ await viewer.start(rrd, parentElement, { width: "800px", height: "600px" });
 viewer.stop();
 ```
 
+Compatibility URLs passed to `start` or `open` are attempted independently in input order.
+If one item fails, the Viewer emits a warning and continues with later items without throwing, stopping the Viewer, or rolling back earlier successful items.
+
 The `rrd` in the snippet above should be a URL pointing to either:
 - A hosted `.rrd` file, such as <https://app.rerun.io/version/0.35.0/examples/dna.rrd>
 - A gRPC connection to the SDK opened via the [`serve`](https://www.rerun.io/docs/reference/sdk/operating-modes#serve) API

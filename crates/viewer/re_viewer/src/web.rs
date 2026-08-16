@@ -11,7 +11,7 @@ use arrow::array::RecordBatch;
 use itertools::Itertools as _;
 use re_async::AsyncRuntimeHandle;
 use re_log::ResultExt as _;
-use re_log_channel::{LogSender, RecordingOpenBehavior};
+use re_log_channel::LogSender;
 use re_log_types::{TableId, TableMsg, TimelineName};
 use re_memory::AccountingAllocator;
 use re_sdk_types::blueprint::components::PlayState;
@@ -20,11 +20,14 @@ use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
 use re_web::compatibility_open::{
-    CompatibilityRemoteMcapDispatchV1, CompatibilityRemoteMcapRouteV1,
-    CompatibilityRemoteMcapSingletonV1, classify_compatibility_url_v1,
+    CompatibilityRemoteMcapDispatchV1, CompatibilityRemoteMcapSingletonV1,
 };
 
 use crate::web_history::install_popstate_listener;
+use crate::web_startup::{
+    CompatibilityRemoteMcapControlV1, CompatibilityUrlDispatchOutcomeV1,
+    dispatch_compatibility_url_v1,
+};
 use crate::web_tools::{Callback, JsResultExt as _, StringOrStringArray};
 
 #[global_allocator]
@@ -299,37 +302,27 @@ impl WebHandle {
             return;
         };
 
-        match url_raw.parse::<open_url::ViewerOpenUrl>() {
-            Ok(url) => {
-                if matches!(&url, open_url::ViewerOpenUrl::HttpUrl(_))
-                    && classify_compatibility_url_v1(url_raw)
-                        == CompatibilityRemoteMcapRouteV1::ExplicitRemoteMcap
-                {
-                    match self.compatibility_remote_mcap.borrow_mut().dispatch_v1() {
-                        CompatibilityRemoteMcapDispatchV1::ExistingDispatcher => {}
-                        CompatibilityRemoteMcapDispatchV1::RemoteAccepted { .. } => {
-                            // The production remote capability is installed by a later, measured
-                            // bridge.  Keep this branch side-effect free until then.
-                            re_log::debug!("Remote MCAP compatibility capability accepted input");
-                            return;
-                        }
-                        CompatibilityRemoteMcapDispatchV1::RemoteSessionLimitReached => {
-                            re_log::warn!(
-                                "Remote MCAP compatibility session limit reached; continuing"
-                            );
-                            return;
-                        }
-                    }
+        match dispatch_compatibility_url_v1(url_raw, &app.egui_ctx, &app.command_sender, || {
+            match self.compatibility_remote_mcap.borrow_mut().dispatch_v1() {
+                CompatibilityRemoteMcapDispatchV1::ExistingDispatcher => {
+                    CompatibilityRemoteMcapControlV1::ExistingDispatcher
                 }
-
-                url.open(
-                    &app.egui_ctx,
-                    &open_url::OpenUrlOptions {
-                        recording_open_behavior: RecordingOpenBehavior::OpenAndSelect,
-                        show_loader: true,
-                    },
-                    &app.command_sender,
-                );
+                CompatibilityRemoteMcapDispatchV1::RemoteAccepted { .. } => {
+                    CompatibilityRemoteMcapControlV1::RemoteAccepted
+                }
+                CompatibilityRemoteMcapDispatchV1::RemoteSessionLimitReached => {
+                    CompatibilityRemoteMcapControlV1::RemoteSessionLimitReached
+                }
+            }
+        }) {
+            Ok(CompatibilityUrlDispatchOutcomeV1::ExistingDispatcher) => {}
+            Ok(CompatibilityUrlDispatchOutcomeV1::RemoteAccepted) => {
+                // The production remote capability is installed by a later, measured bridge.
+                // Keep this branch side-effect free until then.
+                re_log::debug!("Remote MCAP compatibility capability accepted input");
+            }
+            Ok(CompatibilityUrlDispatchOutcomeV1::RemoteSessionLimitReached) => {
+                re_log::warn!("Remote MCAP compatibility session limit reached; continuing");
             }
             Err(err) => {
                 re_log::warn!(?url_raw, "Failed to open URL: {err}");

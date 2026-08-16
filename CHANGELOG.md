@@ -1,5 +1,12 @@
 # Rerun changelog
 
+## Unreleased
+
+### Web Viewer compatibility open behavior
+
+`WebViewer.start` and `WebViewer.open` attempt compatibility URL items independently in input order.
+An item failure emits a warning and does not throw, stop the Viewer, or roll back earlier or later items.
+
 ## [0.35.0](https://github.com/rerun-io/rerun/compare/0.34.1...0.35.0) - 2026-07-23
 
 🧳 Migration guide: https://rerun.io/docs/reference/migration/migration-0-35

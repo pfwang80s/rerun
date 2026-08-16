@@ -486,6 +486,8 @@ export class WebViewer {
    * Start the viewer.
    *
    * @param rrd URLs to `.rrd` files or gRPC connections to our SDK.
+   * Compatibility startup URLs are dispatched in input order; a failed item emits a warning and
+   * does not stop the viewer or prevent later items from being attempted.
    * @param parent The element to attach the canvas onto.
    * @param options Web Viewer configuration.
    */
@@ -766,6 +768,8 @@ export class WebViewer {
    * The viewer must have been started via {@link WebViewer.start}.
    *
    * @param rrd URLs to `.rrd` files or gRPC connections to our SDK.
+   * Each compatibility URL is attempted independently in input order.  Item failures emit a
+   * warning and do not throw, stop the viewer, or roll back earlier or later items.
    */
   open(rrd: string | string[]) {
     if (!this.#handle) {

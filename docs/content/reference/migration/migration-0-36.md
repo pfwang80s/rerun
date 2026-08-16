@@ -3,6 +3,13 @@ title: Migrating from 0.35 to 0.36
 order: 974
 ---
 
+## Web Viewer compatibility `open` and `start`
+
+Compatibility URL arrays passed to `WebViewer.start` or `WebViewer.open` are now attempted independently in input order.
+An item failure emits a warning and does not throw, stop the Viewer, or roll back earlier or later items.
+Callers that relied on catching an individual URL dispatch exception should instead treat the warning as request-local and let later items continue.
+This does not change errors for starting the Viewer itself or calling `open` after the Viewer has stopped.
+
 ## `ParquetReader` loading options moved to `stream()`
 
 The experimental `ParquetReader`'s constructor now takes only the file path.

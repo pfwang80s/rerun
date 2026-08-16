@@ -12,40 +12,6 @@ use crate::open_source_client_registry::{
 };
 use crate::open_source_terminal::{OpenSourceStatusOwnerV1, OpenSourceToken};
 
-/// Result of compatibility URL classification before any remote ownership or probe work.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CompatibilityRemoteMcapRouteV1 {
-    ExplicitRemoteMcap,
-    ExistingDispatcher,
-}
-
-/// Classifies only explicit HTTP(S) `.mcap` URLs.
-///
-/// This parser is deliberately a route predicate: it does not retain the URL, perform a Range
-/// request, or register a pending sniff.  Nested Web Viewer URLs are delegated by the
-/// `ViewerOpenUrl` parser before this predicate is consulted.
-pub fn classify_compatibility_url_v1(raw_url: &str) -> CompatibilityRemoteMcapRouteV1 {
-    let Ok(url) = url::Url::parse(raw_url) else {
-        return CompatibilityRemoteMcapRouteV1::ExistingDispatcher;
-    };
-    if !matches!(url.scheme(), "http" | "https") {
-        return CompatibilityRemoteMcapRouteV1::ExistingDispatcher;
-    }
-    let Some(extension) = url.path().rsplit('/').next().and_then(|segment| {
-        segment
-            .rsplit_once('.')
-            .map(|(_, extension)| extension)
-            .filter(|extension| !extension.is_empty())
-    }) else {
-        return CompatibilityRemoteMcapRouteV1::ExistingDispatcher;
-    };
-    if extension.eq_ignore_ascii_case("mcap") {
-        CompatibilityRemoteMcapRouteV1::ExplicitRemoteMcap
-    } else {
-        CompatibilityRemoteMcapRouteV1::ExistingDispatcher
-    }
-}
-
 /// The compatibility ingress route decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompatibilityRemoteMcapDispatchV1 {
@@ -135,53 +101,6 @@ impl fmt::Debug for CompatibilityRemoteMcapSingletonV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn classifier_only_accepts_direct_http_mcap_paths() {
-        let accepted = [
-            "https://example.invalid/data.mcap",
-            "HTTP://example.invalid/data.MCAP?token=opaque",
-            "https://example.invalid/data.mcap#fragment",
-            "https://example.invalid/data.mcap?url=opaque",
-        ];
-        for url in accepted {
-            assert_eq!(
-                classify_compatibility_url_v1(url),
-                CompatibilityRemoteMcapRouteV1::ExplicitRemoteMcap
-            );
-        }
-
-        let delegated = [
-            "https://example.invalid/no-extension",
-            "https://example.invalid/data.rrd",
-            "https://example.invalid/data.mcap/child",
-            "rerun+http://127.0.0.1:9876/proxy",
-            "rerun://127.0.0.1:1234/dataset/abc/data.mcap?segment_id=pid",
-            "https://viewer.invalid/?url=https%3A%2F%2Fexample.invalid%2Fdata.mcap",
-            "not a URL",
-        ];
-        for url in delegated {
-            assert_eq!(
-                classify_compatibility_url_v1(url),
-                CompatibilityRemoteMcapRouteV1::ExistingDispatcher
-            );
-        }
-    }
-
-    #[test]
-    fn classifier_never_performs_probe_or_pending_registration() {
-        // Classification is pure and must not alter the disarmed singleton state.
-        let mut singleton = CompatibilityRemoteMcapSingletonV1::new_disarmed_v1();
-        assert_eq!(
-            classify_compatibility_url_v1("https://example.invalid/no-extension"),
-            CompatibilityRemoteMcapRouteV1::ExistingDispatcher
-        );
-        assert_eq!(
-            singleton.dispatch_v1(),
-            CompatibilityRemoteMcapDispatchV1::ExistingDispatcher
-        );
-        assert!(!singleton.cancel_opening_v1());
-    }
 
     #[test]
     fn disarmed_path_is_an_exact_noop_for_existing_dispatcher() {
