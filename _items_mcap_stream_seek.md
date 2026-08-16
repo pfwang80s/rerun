@@ -59,7 +59,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M1 | MCAP-006…012 | 7/7 | 已完成 | URL、validator、时间、wire、Store generation 和 remote runtime interner 边界冻结 |
 | M2 | MCAP-013…033（含 MCAP-025A、MCAP-030A、MCAP-030B） | 24/24 | 已完成 | 不接 TimeControl 即可安全完成 metadata opening、bounded decoder initialization、局部 Chunk 验证和 terminal batch 派生 |
 | M3 | MCAP-034…042 | 5/6 | 进行中 | Web remote-MCAP partition、root、coverage、reclaim 和 existing-identifier 能力可用 |
-| M4 | MCAP-043…057 | 8/15 | 进行中 | compatibility 和 strict lane 的身份、状态、回放、dispose 与 teardown 闭合 |
+| M4 | MCAP-043…057 | 9/15 | 进行中 | compatibility 和 strict lane 的身份、状态、回放、dispose 与 teardown 闭合 |
 | M5 | MCAP-058…066 | 0/0 | 已移出 | legacy HTTP adapter 保留现有 Web 路径，不进入 remote-MCAP 项目 |
 | M6 | MCAP-067…080 | 0/5 | 未开始 | remote-MCAP page execution、hidden suspension、安全字符串和 teardown 闭合 |
 | M7 | MCAP-081…087 | 0/2 | 未开始 | remote-MCAP identifier census 与 module-lifetime intern admission 闭合 |
@@ -67,7 +67,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M8 | MCAP-089…105 | 0/17 | 未开始 | foreground-only window playback、seek、query isolation、mutation arbitration 和 reload 闭合 |
 | M9 | MCAP-106…114 | 0/9 | 未开始 | two-phase runner、strict startup、UI/API 文档和桌面 Chrome E2E 全部通过 |
 
-有效工作项总数为 91，当前进度为 49/91；26 个 `[~]` 项不计入分母且不产生提交。
+有效工作项总数为 91，当前进度为 50/91；26 个 `[~]` 项不计入分母且不产生提交。
 关键路径为 `M0 → M1 → M2/M3 → M4/M6/M7 → GA → M8 → M9`。
 M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前保持 feature-disabled。
 
@@ -608,13 +608,13 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 验收：任一 invalid shape/options/format/route/cap/slot/setup failure 整批零 owner、零 Fetch、零 connection且 terminal registry snapshot不变；non-HTTP、gRPC、Redap 或确认非 MCAP 的 strict 输入返回 typed unsupported error，不转交现有 route。
 - 负责人：William；提交：本地已提交；备注：Web-only strict batch prepare foundation 已落地，未接入 TypeScript bootstrap 或现有 compatibility open() 路径。
 
-### [ ] MCAP-051 — 实现 ordinary strict disarmed handoff release/abort
+### [x] MCAP-051 — 实现 ordinary strict disarmed handoff release/abort
 
 - 建议提交：`Commit and release disarmed strict open handoffs`。
 - 依赖：MCAP-010、MCAP-049、MCAP-050。
 - 变更：infallible commit只安装 disarmed ownership；matching release验证完整 installation acks、registry revision/victims和page idle后，同一 mutation执行terminal eviction、claim conversion、accepted publish和route arm；abort撤销新 owner或只detach existing alias。
 - 验收：wrapper throw、invalid/duplicate/missing ack、wrong/repeated token、release前stop和state change保持历史registry逐位不变；release前零 event/replay/work；abort绝不关闭共享 source。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：本地已提交；备注：Web-only disarmed handoff foundation 已落地，未接入 TypeScript release handshake 或现有 compatibility path。
 
 ### [ ] MCAP-052 — 实现 TypeScript operation/recording wrapper cache
 

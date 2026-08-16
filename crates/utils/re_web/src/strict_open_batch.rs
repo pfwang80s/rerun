@@ -11,8 +11,8 @@ use crate::open_source_terminal::{OpenSourceStatusOwnerV1, OpenSourceToken};
 use crate::secret_url::{HttpUrlIngress, SecretUrl, SecretUrlParserLimits};
 use crate::source_reuse::RemoteMcapSemanticConfigV1;
 use crate::strict_open_wire::{
-    OpenOperationIdentity, PublicOpenRequestIdentity, StrictOpenAdmissionCodeV1,
-    StrictOpenWireErrorV1,
+    OpenOperationIdentity, PublicOpenRequestIdentity, PublicRecordingIdentity,
+    StrictOpenAdmissionCodeV1, StrictOpenWireErrorV1,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +33,7 @@ pub enum StrictOpenRequestSpecV1 {
 pub struct PreparedStrictOpenOperationV1 {
     pub operation_id: OpenOperationIdentity,
     pub public_request_id: PublicOpenRequestIdentity,
+    pub public_recording_id: PublicRecordingIdentity,
     pub source_token: OpenSourceToken,
     pub status_owner: OpenSourceStatusOwnerV1,
     pub route: PreparedStrictOpenRouteV1,
@@ -46,6 +47,7 @@ impl fmt::Debug for PreparedStrictOpenOperationV1 {
             .debug_struct("PreparedStrictOpenOperationV1")
             .field("operation_id", &self.operation_id)
             .field("public_request_id", &self.public_request_id)
+            .field("public_recording_id", &self.public_recording_id)
             .field("source_token", &self.source_token)
             .field("route", &self.route)
             .field("url", &"<redacted>")
@@ -129,11 +131,13 @@ impl StrictOpenBatchPrepareContextV1 {
         for staged_operation in staged {
             let operation_id = self.allocate_identity_v1()?;
             let public_request_id = self.allocate_identity_v1()?;
+            let public_recording_id = self.allocate_identity_v1()?;
             let status_owner = OpenSourceStatusOwnerV1::new_fresh_v1();
             let source_token = status_owner.source_token();
             operations.push(PreparedStrictOpenOperationV1 {
                 operation_id: OpenOperationIdentity::new(operation_id),
                 public_request_id: PublicOpenRequestIdentity::new(public_request_id),
+                public_recording_id: PublicRecordingIdentity::new(public_recording_id),
                 source_token,
                 status_owner,
                 route: staged_operation.route,
@@ -283,6 +287,10 @@ mod tests {
             prepared.operations_v1()[0].public_request_id,
             prepared.operations_v1()[1].public_request_id
         );
+        assert_ne!(
+            prepared.operations_v1()[0].public_recording_id,
+            prepared.operations_v1()[1].public_recording_id
+        );
     }
 
     #[test]
@@ -362,5 +370,6 @@ mod tests {
             semantic().retained_bytes_v1()
         );
         assert_eq!(first.url.scheme().to_string(), "https");
+        assert_eq!(first.public_recording_id, PublicRecordingIdentity::new(3));
     }
 }
