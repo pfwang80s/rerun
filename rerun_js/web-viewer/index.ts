@@ -777,8 +777,9 @@ export class WebViewer {
       try {
         this.#handle.add_receiver(url);
       } catch (e) {
-        this.#fail("Failed to open recording", String(e));
-        throw e;
+        // Compatibility open/start are deliberately per-item and non-throwing.  A failed item
+        // reports a warning and leaves preceding and following inputs untouched.
+        console.warn("Failed to open recording; continuing with the next item", e);
       }
     }
   }

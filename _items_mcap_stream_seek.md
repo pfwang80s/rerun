@@ -59,7 +59,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M1 | MCAP-006…012 | 7/7 | 已完成 | URL、validator、时间、wire、Store generation 和 remote runtime interner 边界冻结 |
 | M2 | MCAP-013…033（含 MCAP-025A、MCAP-030A、MCAP-030B） | 24/24 | 已完成 | 不接 TimeControl 即可安全完成 metadata opening、bounded decoder initialization、局部 Chunk 验证和 terminal batch 派生 |
 | M3 | MCAP-034…042 | 5/6 | 进行中 | Web remote-MCAP partition、root、coverage、reclaim 和 existing-identifier 能力可用 |
-| M4 | MCAP-043…057 | 9/15 | 进行中 | compatibility 和 strict lane 的身份、状态、回放、dispose 与 teardown 闭合 |
+| M4 | MCAP-043…057 | 10/15 | 进行中 | compatibility 和 strict lane 的身份、状态、回放、dispose 与 teardown 闭合 |
 | M5 | MCAP-058…066 | 0/0 | 已移出 | legacy HTTP adapter 保留现有 Web 路径，不进入 remote-MCAP 项目 |
 | M6 | MCAP-067…080 | 0/5 | 未开始 | remote-MCAP page execution、hidden suspension、安全字符串和 teardown 闭合 |
 | M7 | MCAP-081…087 | 0/2 | 未开始 | remote-MCAP identifier census 与 module-lifetime intern admission 闭合 |
@@ -67,7 +67,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M8 | MCAP-089…105 | 0/17 | 未开始 | foreground-only window playback、seek、query isolation、mutation arbitration 和 reload 闭合 |
 | M9 | MCAP-106…114 | 0/9 | 未开始 | two-phase runner、strict startup、UI/API 文档和桌面 Chrome E2E 全部通过 |
 
-有效工作项总数为 91，当前进度为 50/91；26 个 `[~]` 项不计入分母且不产生提交。
+有效工作项总数为 91，当前进度为 51/91；26 个 `[~]` 项不计入分母且不产生提交。
 关键路径为 `M0 → M1 → M2/M3 → M4/M6/M7 → GA → M8 → M9`。
 M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前保持 feature-disabled。
 
@@ -632,13 +632,13 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 验收：public method return/start resolve前不执行 remote host callback；不让出event loop的open/dispose循环仍有界；普通listener错误最多一个预留通知；error hook抛错只reportError不递归；stop取消新队列，既有raw-event同步时序不变。
 - 负责人：William；提交：`7d06923ad81ade355986c91357191546982a710f`；备注：已实现 instance-owned bounded single-task dispatcher 基础设施与测试；仅用于 strict future path，未迁移既有 `recording_open`、notebook/Gradio raw event 或其他 compatibility bridge。
 
-### [ ] MCAP-054 — 在 compatibility open/start 中接入 remote-MCAP 分支
+### [x] MCAP-054 — 在 compatibility open/start 中接入 remote-MCAP 分支
 
 - 建议提交：`Preserve compatibility open route semantics`。
 - 依赖：MCAP-007、MCAP-044、MCAP-046、MCAP-048。
 - 变更：`open/start(string|string[])`继续逐项、non-throwing warning/continue；只有由明确受支持的 `.mcap` URL route 识别的 remote MCAP HTTP item 进入 remote singleton helper；无扩展名URL和其余HTTP、RRD、gRPC、Redap不经过新registry并继续原 `ViewerOpenUrl` dispatcher。
 - 验收：第二项malformed不回滚第一项也不stop；明确 `.mcap` URL竞争按逐项slot语义；无扩展名和其他non-MCAP routes的request/receiver/connection/selection/error side effects与MCAP-001完全一致；不存在compatibility format probe或统一全局ingress queue。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：本提交；备注：已接入 production-disarmed compatibility remote-MCAP seam：`ViewerOpenUrl` 解析后仅显式 HTTP(S) `.mcap` 进入 singleton 分类，未安装 measured capability 时逐项回落既有 dispatcher；无扩展名、RRD、legacy HTTP、gRPC、Redap、nested Web URL 和其他 route 不执行 probe、不登记 pending sniff、不占 remote slot。`open/start(string|string[])` 对每项 warning/continue，第二项异常不回滚前项或 stop。待 Dafee review；re_web 定向 4/4、Node compatibility 16/16通过；Wasm check 受既有 `web_remote_mcap_cpu.rs` 未使用 lifetime 参数错误阻塞，全 re_web 套件另有 2 个既有并发 snapshot 失败。
 
 ### [ ] MCAP-055 — 发布 strict openRequest/openBatch API
 

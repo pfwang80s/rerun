@@ -190,36 +190,52 @@ test("malformed array items do not stop compatibility dispatch", async () => {
   viewer.stop();
 });
 
-test("an exception in the second array item keeps the first call but stops the wrapper", async () => {
+test("an exception in the second array item warns and continues without stopping the wrapper", async () => {
   const viewer = await startViewer();
   const state = globalThis.__rerun_web_viewer_test_state;
   state.addReceiverErrorAt = 1;
 
-  const originalConsoleError = console.error;
-  console.error = () => {};
+  const originalConsoleWarn = console.warn;
+  console.warn = () => {};
   try {
-    assert.throws(
-      () =>
-        viewer.open([
-          "https://example.test/accepted.rrd",
-          "https://example.test/fails.rrd",
-          "https://example.test/not-attempted.rrd",
-        ]),
-      /injected add_receiver failure/,
-    );
+    assert.doesNotThrow(() =>
+      viewer.open([
+        "https://example.test/accepted.rrd",
+        "https://example.test/fails.rrd",
+        "https://example.test/not-attempted.rrd",
+      ]));
   } finally {
-    console.error = originalConsoleError;
+    console.warn = originalConsoleWarn;
   }
   assert.deepEqual(
     callsNamed("add_receiver").map((call) => call[1]),
     [
       "https://example.test/accepted.rrd",
       "https://example.test/fails.rrd",
+      "https://example.test/not-attempted.rrd",
     ],
   );
-  assert.equal(viewer.ready, false);
-  assert.equal(callsNamed("destroy").length, 1);
-  assert.equal(callsNamed("free").length, 1);
+  assert.equal(viewer.ready, true);
+  assert.equal(callsNamed("destroy").length, 0);
+  assert.equal(callsNamed("free").length, 0);
+  viewer.stop();
+});
+
+test("compatibility explicit mcap and extensionless inputs remain ordered dispatcher items", async () => {
+  const viewer = await startViewer();
+  const urls = [
+    "https://example.test/first.mcap?token=opaque",
+    "https://example.test/no-extension?token=opaque",
+    "https://example.test/last.rrd",
+  ];
+
+  assert.doesNotThrow(() => viewer.open(urls));
+  assert.deepEqual(
+    callsNamed("add_receiver").map((call) => call[1]),
+    urls,
+  );
+  assert.equal(viewer.ready, true);
+  viewer.stop();
 });
 
 test("recording_open follows completion order and raw delivery is synchronous", async () => {

@@ -2,6 +2,7 @@
 
 #![allow(clippy::allow_attributes, clippy::mem_forget)] // False positives from #[wasm_bindgen] macro
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::str::FromStr as _;
 
@@ -17,6 +18,11 @@ use re_sdk_types::blueprint::components::PlayState;
 use re_viewer_context::{SystemCommand, SystemCommandSender as _, TimeControlCommand, open_url};
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
+
+use re_web::compatibility_open::{
+    CompatibilityRemoteMcapDispatchV1, CompatibilityRemoteMcapRouteV1,
+    CompatibilityRemoteMcapSingletonV1, classify_compatibility_url_v1,
+};
 
 use crate::web_history::install_popstate_listener;
 use crate::web_tools::{Callback, JsResultExt as _, StringOrStringArray};
@@ -115,6 +121,10 @@ pub extern "C" fn rerun_remote_protobuf_initializer_artifact_probe_v1() -> u32 {
 pub struct WebHandle {
     runner: eframe::WebRunner,
 
+    /// Compatibility `.mcap` ingress seam.  The remote capability remains disarmed until its
+    /// measured production profile is installed; disarmed dispatch falls back to `ViewerOpenUrl`.
+    compatibility_remote_mcap: RefCell<CompatibilityRemoteMcapSingletonV1>,
+
     /// A dedicated smart channel used by the [`WebHandle::add_rrd_from_bytes`] API.
     ///
     /// This exists because the direct bytes API is expected to submit many small RRD chunks
@@ -145,6 +155,9 @@ impl WebHandle {
 
         Ok(Self {
             runner: eframe::WebRunner::new(),
+            compatibility_remote_mcap: RefCell::new(
+                CompatibilityRemoteMcapSingletonV1::new_disarmed_v1(),
+            ),
             log_senders: Default::default(),
             connection_registry,
             app_options: app_options.unwrap_or_default(),
@@ -281,13 +294,34 @@ impl WebHandle {
     ///
     /// It is an error to open a channel twice with the same id.
     #[wasm_bindgen]
-    pub fn add_receiver(&self, url: &str) {
+    pub fn add_receiver(&self, url_raw: &str) {
         let Some(app) = self.runner.app_mut::<crate::App>() else {
             return;
         };
 
-        match url.parse::<open_url::ViewerOpenUrl>() {
+        match url_raw.parse::<open_url::ViewerOpenUrl>() {
             Ok(url) => {
+                if matches!(&url, open_url::ViewerOpenUrl::HttpUrl(_))
+                    && classify_compatibility_url_v1(url_raw)
+                        == CompatibilityRemoteMcapRouteV1::ExplicitRemoteMcap
+                {
+                    match self.compatibility_remote_mcap.borrow_mut().dispatch_v1() {
+                        CompatibilityRemoteMcapDispatchV1::ExistingDispatcher => {}
+                        CompatibilityRemoteMcapDispatchV1::RemoteAccepted { .. } => {
+                            // The production remote capability is installed by a later, measured
+                            // bridge.  Keep this branch side-effect free until then.
+                            re_log::debug!("Remote MCAP compatibility capability accepted input");
+                            return;
+                        }
+                        CompatibilityRemoteMcapDispatchV1::RemoteSessionLimitReached => {
+                            re_log::warn!(
+                                "Remote MCAP compatibility session limit reached; continuing"
+                            );
+                            return;
+                        }
+                    }
+                }
+
                 url.open(
                     &app.egui_ctx,
                     &open_url::OpenUrlOptions {
@@ -298,7 +332,7 @@ impl WebHandle {
                 );
             }
             Err(err) => {
-                re_log::warn!(?url, "Failed to open URL: {err}");
+                re_log::warn!(?url_raw, "Failed to open URL: {err}");
             }
         }
     }

@@ -59,6 +59,12 @@
 //! ```compile_fail,ignore-wasm32
 //! use re_web::open_lifecycle_delivery;
 //! ```
+
+//! Compatibility remote-MCAP ingress is Web-only and production-disarmed:
+//!
+//! ```compile_fail,ignore-wasm32
+//! use re_web::compatibility_open;
+//! ```
 //!
 //! Strict-open public lifecycle sequencing is likewise Web-only:
 //!
@@ -102,6 +108,8 @@ pub mod browser;
 pub mod chrome_byob;
 #[cfg(target_arch = "wasm32")]
 pub mod chrome_range;
+#[cfg(target_arch = "wasm32")]
+pub mod compatibility_open;
 #[cfg(target_arch = "wasm32")]
 mod format_sniffer;
 #[cfg(target_arch = "wasm32")]
@@ -162,6 +170,11 @@ mod chrome_byob;
 // Host builds compile only the pure Range/header state machine for differential unit tests.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod chrome_range;
+
+// Host builds compile the compatibility ingress seam only for its unit tests and do not publish
+// it to consumers.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod compatibility_open;
 
 // Host builds compile only the pure metadata retry state machine for differential unit tests.
 #[cfg(all(test, not(target_arch = "wasm32")))]
