@@ -15,7 +15,7 @@ use re_log_channel::LogSender;
 use re_log_types::{TableId, TableMsg, TimelineName};
 use re_memory::AccountingAllocator;
 use re_sdk_types::blueprint::components::PlayState;
-use re_viewer_context::{SystemCommand, SystemCommandSender as _, TimeControlCommand, open_url};
+use re_viewer_context::{SystemCommand, SystemCommandSender as _, TimeControlCommand};
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
