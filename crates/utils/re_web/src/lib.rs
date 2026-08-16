@@ -30,6 +30,12 @@
 //! use re_web::open_source_terminal;
 //! ```
 //!
+//! Open-source client registry and close-once guards are likewise Web-only:
+//!
+//! ```compile_fail,ignore-wasm32
+//! use re_web::open_source_client_registry;
+//! ```
+//!
 //! Generation-aware Store publication identities are likewise Web-only:
 //!
 //! ```compile_fail,ignore-wasm32
@@ -62,6 +68,8 @@ pub mod chrome_byob;
 pub mod chrome_range;
 #[cfg(target_arch = "wasm32")]
 mod format_sniffer;
+#[cfg(target_arch = "wasm32")]
+pub mod open_source_client_registry;
 #[cfg(target_arch = "wasm32")]
 pub mod open_source_terminal;
 #[cfg(target_arch = "wasm32")]
@@ -134,6 +142,14 @@ mod strict_open_wire;
     reason = "native tests exercise the Web-only open-source terminal schema without publishing its API"
 )]
 mod open_source_terminal;
+
+// Host builds compile the module only for its unit tests and do not publish it to consumers.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[expect(
+    dead_code,
+    reason = "native tests exercise the Web-only client registry without publishing its API"
+)]
+mod open_source_client_registry;
 
 // Host builds compile the module only for its unit tests and do not publish it to consumers.
 #[cfg(all(test, not(target_arch = "wasm32")))]

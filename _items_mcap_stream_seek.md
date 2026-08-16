@@ -59,7 +59,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M1 | MCAP-006…012 | 7/7 | 已完成 | URL、validator、时间、wire、Store generation 和 remote runtime interner 边界冻结 |
 | M2 | MCAP-013…033（含 MCAP-025A、MCAP-030A、MCAP-030B） | 24/24 | 已完成 | 不接 TimeControl 即可安全完成 metadata opening、bounded decoder initialization、局部 Chunk 验证和 terminal batch 派生 |
 | M3 | MCAP-034…042 | 5/6 | 进行中 | Web remote-MCAP partition、root、coverage、reclaim 和 existing-identifier 能力可用 |
-| M4 | MCAP-043…057 | 1/15 | 进行中 | compatibility 和 strict lane 的身份、状态、回放、dispose 与 teardown 闭合 |
+| M4 | MCAP-043…057 | 2/15 | 进行中 | compatibility 和 strict lane 的身份、状态、回放、dispose 与 teardown 闭合 |
 | M5 | MCAP-058…066 | 0/0 | 已移出 | legacy HTTP adapter 保留现有 Web 路径，不进入 remote-MCAP 项目 |
 | M6 | MCAP-067…080 | 0/5 | 未开始 | remote-MCAP page execution、hidden suspension、安全字符串和 teardown 闭合 |
 | M7 | MCAP-081…087 | 0/2 | 未开始 | remote-MCAP identifier census 与 module-lifetime intern admission 闭合 |
@@ -67,7 +67,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M8 | MCAP-089…105 | 0/17 | 未开始 | foreground-only window playback、seek、query isolation、mutation arbitration 和 reload 闭合 |
 | M9 | MCAP-106…114 | 0/9 | 未开始 | two-phase runner、strict startup、UI/API 文档和桌面 Chrome E2E 全部通过 |
 
-有效工作项总数为 91，当前进度为 42/91；26 个 `[~]` 项不计入分母且不产生提交。
+有效工作项总数为 91，当前进度为 43/91；26 个 `[~]` 项不计入分母且不产生提交。
 关键路径为 `M0 → M1 → M2/M3 → M4/M6/M7 → GA → M8 → M9`。
 M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前保持 feature-disabled。
 
@@ -550,15 +550,15 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 变更：为matching remote opening token增加one-shot sealed object-capability issuer authority；它只能在后续probe产生完整typed `BoundRemoteObject`后签发MCAP-025A capability，不能接受分离的session/content-length/consistency/validator scalars，也不能由native、nonremote route或Rerun服务端取得。
 - 验收：pre-claim、opening、active failure 和 administrative cleanup 都恰好终态化一次；fatal cause 不被 explicit/pressure/background close 覆盖；高水位和 eviction 可观测且脱敏。
 - 验收：wrong/stale/reused opening token、重复签发、字段拆分重组和status owner终态化后签发均失败；025A仍不反向依赖043，dependency/API测试证明不存在cycle且production-disarmed issuer在本项接通前不可达。
-- 负责人：William；提交：本地待提交；备注：Web-only foundation 已落地，未改 native viewer 和现有 compatibility open/close。
+- 负责人：William；提交：`0f69654e9c`；备注：Web-only foundation 已落地，未改 native viewer 和现有 compatibility open/close。
 
-### [ ] MCAP-044 — 实现 remote slot、client registry 与 close-once
+### [x] MCAP-044 — 实现 remote slot、client registry 与 close-once
 
 - 建议提交：`Add token-checked remote MCAP client registry`。
 - 依赖：MCAP-043。
 - 变更：实现 `Vacant → Opening → Active → Closing → Vacant`、opening handle、client guard、registry owner token、owned client entry 和 `RemoteCloseOnce`，Active 不自持 guard。
 - 验收：claim 不跨 await，stale activation/close 不影响新 token，guard Drop 可触发 close，registry-driven cleanup 在 `Vacant` 前终结 owner并删除 client entry，stop 不依赖 frame-driven Closing。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：本地已提交；备注：Web-only registry foundation 已落地，未改 native viewer 和现有 compatibility open/close。
 
 ### [ ] MCAP-045 — 实现 secret fingerprint multimap 与 semantic reuse
 
