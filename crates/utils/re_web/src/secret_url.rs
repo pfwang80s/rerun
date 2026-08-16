@@ -136,7 +136,7 @@ pub struct SecretUrlParserLimits {
 
 impl SecretUrlParserLimits {
     #[cfg(test)]
-    const fn explicit_for_test(
+    pub(crate) const fn explicit_for_internal_v1(
         max_input_bytes: usize,
         max_canonical_bytes: usize,
         max_fragment_bytes: usize,
@@ -154,6 +154,27 @@ impl SecretUrlParserLimits {
             max_retained_bytes,
             max_peak_bytes,
         }
+    }
+
+    #[cfg(test)]
+    const fn explicit_for_test(
+        max_input_bytes: usize,
+        max_canonical_bytes: usize,
+        max_fragment_bytes: usize,
+        max_fragment_fields: usize,
+        max_fragment_field_bytes: usize,
+        max_retained_bytes: usize,
+        max_peak_bytes: usize,
+    ) -> Self {
+        Self::explicit_for_internal_v1(
+            max_input_bytes,
+            max_canonical_bytes,
+            max_fragment_bytes,
+            max_fragment_fields,
+            max_fragment_field_bytes,
+            max_retained_bytes,
+            max_peak_bytes,
+        )
     }
 }
 

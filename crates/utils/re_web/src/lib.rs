@@ -24,6 +24,12 @@
 //! use re_web::strict_open_wire;
 //! ```
 //!
+//! Strict-open HTTP batch preparation is likewise Web-only:
+//!
+//! ```compile_fail,ignore-wasm32
+//! use re_web::strict_open_batch;
+//! ```
+//!
 //! Open-source terminal ownership and one-shot capability issuance are likewise Web-only:
 //!
 //! ```compile_fail,ignore-wasm32
@@ -122,6 +128,8 @@ pub mod source_reuse;
 #[cfg(target_arch = "wasm32")]
 pub mod store_publication;
 #[cfg(target_arch = "wasm32")]
+pub mod strict_open_batch;
+#[cfg(target_arch = "wasm32")]
 #[cfg_attr(
     not(test),
     expect(
@@ -166,6 +174,10 @@ mod remote_validator;
     reason = "native tests exercise the Web-only strict-open codec without publishing its API"
 )]
 mod strict_open_wire;
+
+// Host builds compile the module only for its unit tests and do not publish it to consumers.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod strict_open_batch;
 
 // Host builds compile the module only for its unit tests and do not publish it to consumers.
 #[cfg(all(test, not(target_arch = "wasm32")))]
