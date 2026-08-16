@@ -42,6 +42,12 @@
 //! use re_web::open_lifecycle_registry;
 //! ```
 //!
+//! Strict-open lifecycle delivery permits are likewise Web-only:
+//!
+//! ```compile_fail,ignore-wasm32
+//! use re_web::open_lifecycle_delivery;
+//! ```
+//!
 //! Strict-open public lifecycle sequencing is likewise Web-only:
 //!
 //! ```compile_fail,ignore-wasm32
@@ -86,6 +92,8 @@ pub mod chrome_byob;
 pub mod chrome_range;
 #[cfg(target_arch = "wasm32")]
 mod format_sniffer;
+#[cfg(target_arch = "wasm32")]
+pub mod open_lifecycle_delivery;
 #[cfg(target_arch = "wasm32")]
 pub mod open_lifecycle_registry;
 #[cfg(target_arch = "wasm32")]
@@ -182,6 +190,10 @@ mod open_source_client_registry;
     reason = "native tests exercise Web-only URL normalization without publishing its API"
 )]
 mod secret_url;
+
+// Host builds compile the module only for its unit tests and do not publish it to consumers.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod open_lifecycle_delivery;
 
 // Host builds compile the module only for its unit tests and do not publish it to consumers.
 #[cfg(all(test, not(target_arch = "wasm32")))]
