@@ -504,13 +504,13 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 验收：成功路径对 Store、UI、route、cache 和 recording behavior 与旧路径差分一致；任一失败不再 log-and-continue，也不会在调用方确认 outcome 前构造后续 query context。
 - 负责人：TBD；提交：TBD；备注：TBD。
 
-### [ ] MCAP-039 — 引入 PurgeOutcome 与 pending remote reclaim
+### [x] MCAP-039 — 引入 PurgeOutcome 与 pending remote reclaim
 
 - 建议提交：`Represent asynchronous remote Store reclaim`。
 - 依赖：MCAP-004、MCAP-006。
 - 变更：在 Wasm remote-MCAP memory controller 增加 `freed_now` 与 `PendingRemoteReclaim::{Gc,Close}`、request ID、去重、GC-to-Close supersede 和完成后重采样；不改变 native StoreHub purge 签名或运行时语义。
 - 验收：pending GC/close 预计量不计入同步释放，pending 期间 remote growth 暂停，重复提交不创建新 work，只有 matching completion 和新采样可以恢复 admission。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：本提交；备注：2026-08-16 完成production-disarmed的Wasm remote-MCAP memory-pressure reclaim controller：增加`PurgeOutcomeV1`、`PendingRemoteReclaimV1::{Gc,Close}`、单调request ID、同ticket去重、GC-to-Close supersede、stale/duplicate/mismatch completion过滤、完成后必须等待更新的全进程memory sample才恢复remote growth admission。App仅在Wasm memory purge采样点更新disarmed controller，不改变native `StoreHub::purge_fraction_of_ram`签名或运行时语义，也不拦截现有Redap/普通Web prefetch。Dafee增量review未发现中级及以上问题或设计偏离；focused `web_remote_mcap_memory` 8/8通过，rustfmt通过；本机无pixi/cargo-nextest，使用`cargo test`兜底。裸wasm check仍被已提交`web_remote_mcap_cpu.rs`未使用lifetime错误阻断，非本项增量；production route继续disarmed，native Viewer/API/runtime、既有Web compatibility行为和Rerun服务端行为不变。
 
 ### [~] MCAP-040 — 实现真正 detached ChunkStore/EntityDb
 

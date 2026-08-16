@@ -105,6 +105,12 @@ pub struct App {
     #[cfg(target_arch = "wasm32")]
     open_files_promise: Option<PendingFilePromise>,
 
+    #[cfg(target_arch = "wasm32")]
+    remote_mcap_memory: crate::web_remote_mcap_memory::WebRemoteMcapMemoryControllerV1,
+
+    #[cfg(target_arch = "wasm32")]
+    remote_mcap_memory_revision: u64,
+
     /// What is serialized
     pub(crate) state: AppState,
 
@@ -475,6 +481,15 @@ impl App {
 
             #[cfg(target_arch = "wasm32")]
             open_files_promise: Default::default(),
+
+            #[cfg(target_arch = "wasm32")]
+            remote_mcap_memory:
+                crate::web_remote_mcap_memory::WebRemoteMcapMemoryControllerV1::new_disarmed_v1(
+                    crate::web_remote_mcap_memory::RemoteProcessMemorySampleV1::new_v1(1, 0, true),
+                ),
+
+            #[cfg(target_arch = "wasm32")]
+            remote_mcap_memory_revision: 1,
 
             state,
             background_tasks: Default::default(),

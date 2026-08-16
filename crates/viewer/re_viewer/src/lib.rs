@@ -48,6 +48,8 @@ mod ui;
 #[cfg(any(target_arch = "wasm32", test))]
 mod web_remote_mcap_cpu;
 #[cfg(any(target_arch = "wasm32", test))]
+mod web_remote_mcap_memory;
+#[cfg(any(target_arch = "wasm32", test))]
 mod web_startup;
 
 #[cfg(feature = "analytics")]

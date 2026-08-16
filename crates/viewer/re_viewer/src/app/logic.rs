@@ -941,6 +941,26 @@ impl App {
             external_mem
         };
 
+        #[cfg(target_arch = "wasm32")]
+        {
+            let current_bytes = mem_use_before
+                .counted
+                .or(mem_use_before.resident)
+                .unwrap_or(0);
+            let has_remote_headroom = limit.is_exceeded_by(&mem_use_before).is_none();
+            self.remote_mcap_memory_revision = self
+                .remote_mcap_memory_revision
+                .checked_add(1)
+                .expect("remote memory sample revision overflowed");
+            self.remote_mcap_memory.observe_process_memory_sample_v1(
+                crate::web_remote_mcap_memory::RemoteProcessMemorySampleV1::new_v1(
+                    self.remote_mcap_memory_revision,
+                    current_bytes,
+                    has_remote_headroom,
+                ),
+            );
+        }
+
         if let Some(minimum_fraction_to_purge) = limit.is_exceeded_by(&mem_use_before) {
             re_log::info_once!("Reached memory limit of {limit}. Freeing up data…");
 
@@ -974,6 +994,26 @@ impl App {
             self.state.app_caches.purge_memory();
 
             let mem_use_after = MemoryUse::capture();
+
+            #[cfg(target_arch = "wasm32")]
+            {
+                let current_bytes = mem_use_after
+                    .counted
+                    .or(mem_use_after.resident)
+                    .unwrap_or(0);
+                let has_remote_headroom = limit.is_exceeded_by(&mem_use_after).is_none();
+                self.remote_mcap_memory_revision = self
+                    .remote_mcap_memory_revision
+                    .checked_add(1)
+                    .expect("remote memory sample revision overflowed");
+                self.remote_mcap_memory.observe_process_memory_sample_v1(
+                    crate::web_remote_mcap_memory::RemoteProcessMemorySampleV1::new_v1(
+                        self.remote_mcap_memory_revision,
+                        current_bytes,
+                        has_remote_headroom,
+                    ),
+                );
+            }
 
             let freed_memory = mem_use_before - mem_use_after;
 
