@@ -58,7 +58,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M0 | MCAP-001…005 | 5/5 | 已完成 | 既有公开行为、fixture、Chrome origin、确定性调度和脱敏断言可复用 |
 | M1 | MCAP-006…012 | 7/7 | 已完成 | URL、validator、时间、wire、Store generation 和 remote runtime interner 边界冻结 |
 | M2 | MCAP-013…033（含 MCAP-025A、MCAP-030A、MCAP-030B） | 24/24 | 已完成 | 不接 TimeControl 即可安全完成 metadata opening、bounded decoder initialization、局部 Chunk 验证和 terminal batch 派生 |
-| M3 | MCAP-034…042 | 4/6 | 进行中 | Web remote-MCAP partition、root、coverage、reclaim 和 existing-identifier 能力可用 |
+| M3 | MCAP-034…042 | 5/6 | 进行中 | Web remote-MCAP partition、root、coverage、reclaim 和 existing-identifier 能力可用 |
 | M4 | MCAP-043…057 | 0/15 | 未开始 | compatibility 和 strict lane 的身份、状态、回放、dispose 与 teardown 闭合 |
 | M5 | MCAP-058…066 | 0/0 | 已移出 | legacy HTTP adapter 保留现有 Web 路径，不进入 remote-MCAP 项目 |
 | M6 | MCAP-067…080 | 0/5 | 未开始 | remote-MCAP page execution、hidden suspension、安全字符串和 teardown 闭合 |
@@ -67,7 +67,7 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M8 | MCAP-089…105 | 0/17 | 未开始 | foreground-only window playback、seek、query isolation、mutation arbitration 和 reload 闭合 |
 | M9 | MCAP-106…114 | 0/9 | 未开始 | two-phase runner、strict startup、UI/API 文档和桌面 Chrome E2E 全部通过 |
 
-有效工作项总数为 91，当前进度为 40/91；26 个 `[~]` 项不计入分母且不产生提交。
+有效工作项总数为 91，当前进度为 41/91；26 个 `[~]` 项不计入分母且不产生提交。
 关键路径为 `M0 → M1 → M2/M3 → M4/M6/M7 → GA → M8 → M9`。
 M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前保持 feature-disabled。
 
@@ -532,13 +532,13 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 验收：same-StoreId 新 generation attach 前无 public effect，swap 后旧 query/cache/subscriber result stale-drop，普通 attached Store 的 mutation/Drop 行为由差分测试保持不变。
 - 负责人：TBD；提交：TBD；备注：TBD。
 
-### [ ] MCAP-042 — 建立 Web existing-identifier lookup index
+### [x] MCAP-042 — 建立 Web existing-identifier lookup index
 
 - 建议提交：`Add bounded Web existing identifier catalogs`。
 - 依赖：MCAP-006、MCAP-011。
-- 变更：为 Web remote-MCAP Store 增加 revisioned timeline/entity-path/component lookup，key 只引用已 intern string或拥有明确计费的 canonical bytes，并仅向 strict exact-recording control 提供 privileged borrowed resolution。
-- 验收：raw external input 不在 lookup 中 intern；add/remove/remote generation 变更后 revision 正确；cap failure 不 fallback 扫 Store；native query API 和 compatibility raw-ID control 不变。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 变更：为 Web `recording_id` 兼容控制增加 bounded lookup index，key 只引用已存在的 recording identity，并在 store add/remove/close 时同步维护；native query API 和兼容 raw-ID control 不变。
+- 验收：相同 `recording_id` 的多 Store 仍有稳定且可回收的兼容查找；删除后回落到仍存活的同名 Store；native query API 和 compatibility raw-ID control 不变。
+- 负责人：William；提交：`Add web remote MCAP reclaim controller` 之后的增量；备注：根据产品选择 1，MCAP-042 以 recording_id compatibility MVP 收口，timeline/entity-path/component catalog 留待后续设计/取舍。
 
 ## 8. M4 — Open ownership、strict handoff 与 public lifecycle
 

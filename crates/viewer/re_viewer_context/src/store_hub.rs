@@ -143,6 +143,9 @@ pub struct StoreHub {
 
     /// Per-frame usage tracking for each store, and whether the user opened it.
     store_usages: HashMap<StoreId, EntityDbUsages>,
+
+    /// Web compatibility lookup for legacy `recording_id`-based controls.
+    recording_id_lookup: HashMap<String, Vec<StoreId>>,
 }
 
 #[derive(Default)]
@@ -277,6 +280,7 @@ impl StoreHub {
             blueprint_last_gc: Default::default(),
 
             store_usages: Default::default(),
+            recording_id_lookup: Default::default(),
 
             table_stores: TableStores::default(),
             table_blueprints: Default::default(),
@@ -501,7 +505,16 @@ impl StoreHub {
     /// Note that the recording is not automatically made active. Use [`StoreHub::load_blueprint_and_caches`]
     /// if needed.
     pub fn insert_entity_db(&mut self, entity_db: EntityDb) {
+        let store_id = entity_db.store_id().clone();
+        let is_recording = entity_db.store_kind() == StoreKind::Recording;
+        let is_new_store = !self.store_bundle.contains(&store_id);
         self.store_bundle.insert(entity_db);
+        if is_recording && is_new_store {
+            self.recording_id_lookup
+                .entry(store_id.recording_id().as_str().to_owned())
+                .or_default()
+                .push(store_id);
+        }
     }
 
     /// Add a chunk to a store and forward events to the store's [`StoreCache`] (if one exists).
@@ -575,6 +588,10 @@ impl StoreHub {
         let Some(removed_store) = removed_store else {
             return;
         };
+
+        if removed_store.store_kind() == StoreKind::Recording {
+            self.remove_recording_id_lookup(store_id);
+        }
 
         match removed_store.store_kind() {
             StoreKind::Recording => {
@@ -714,8 +731,12 @@ impl StoreHub {
         }
 
         let mut store_ids_removed = HashSet::default();
+        let mut recording_ids_removed = Vec::new();
         self.store_bundle.retain(|db| {
             if db.application_id() == app_id {
+                if db.store_kind() == StoreKind::Recording {
+                    recording_ids_removed.push(db.store_id().clone());
+                }
                 store_ids_removed.insert(db.store_id().clone());
                 false
             } else {
@@ -724,9 +745,32 @@ impl StoreHub {
         });
         self.store_caches
             .retain(|store_id, _| !store_ids_removed.contains(store_id));
+        for store_id in &recording_ids_removed {
+            self.remove_recording_id_lookup(store_id);
+        }
 
         self.default_blueprint_by_app_id.remove(app_id);
         self.active_blueprint_by_app_id.remove(app_id);
+    }
+
+    /// Web compatibility lookup for legacy `recording_id`-based controls.
+    pub fn recording_store_id_from_recording_id(&self, recording_id: &str) -> Option<StoreId> {
+        self.recording_id_lookup
+            .get(recording_id)
+            .and_then(|store_ids| store_ids.first())
+            .cloned()
+    }
+
+    fn remove_recording_id_lookup(&mut self, store_id: &StoreId) {
+        let recording_id = store_id.recording_id().as_str().to_owned();
+        let Some(store_ids) = self.recording_id_lookup.get_mut(recording_id.as_str()) else {
+            return;
+        };
+
+        store_ids.retain(|candidate| candidate != store_id);
+        if store_ids.is_empty() {
+            self.recording_id_lookup.remove(recording_id.as_str());
+        }
     }
 
     // ---------------------
@@ -1401,6 +1445,7 @@ impl StoreHub {
             blueprint_last_save: _,
             blueprint_last_gc: _,
             store_usages: _,
+            recording_id_lookup: _,
         } = self;
 
         let mut store_stats = BTreeMap::new();
@@ -1460,6 +1505,7 @@ impl MemUsageTreeCapture for StoreHub {
             blueprint_last_save: _,
             blueprint_last_gc: _,
             store_usages: _,
+            recording_id_lookup: _,
         } = self;
 
         let mut node = MemUsageNode::new();

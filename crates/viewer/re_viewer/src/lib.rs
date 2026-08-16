@@ -93,12 +93,7 @@ fn store_id_from_recording_id(
     store_hub: &re_viewer_context::StoreHub,
     recording_id: &str,
 ) -> Option<re_log_types::StoreId> {
-    store_hub
-        .store_bundle()
-        .recordings()
-        .map(|entity_db| entity_db.store_id())
-        .find(|store_id| store_id.recording_id().as_str() == recording_id)
-        .cloned()
+    store_hub.recording_store_id_from_recording_id(recording_id)
 }
 
 #[cfg(test)]
@@ -127,6 +122,24 @@ mod web_recording_id_tests {
 
         assert_eq!(hub.store_bundle().recordings().count(), stores_before);
         assert!(hub.entity_db(&first).is_some());
+        assert!(hub.entity_db(&second).is_some());
+    }
+
+    #[test]
+    fn compatibility_recording_id_lookup_follows_store_removal() {
+        let first = StoreId::recording("z-first-app", "duplicate");
+        let second = StoreId::recording("a-second-app", "duplicate");
+        let mut hub = StoreHub::test_hub();
+        hub.insert_entity_db(EntityDb::new(first.clone()));
+        hub.insert_entity_db(EntityDb::new(second.clone()));
+
+        hub.retain_recordings(|db| db.store_id() != &first);
+
+        assert_eq!(
+            store_id_from_recording_id(&hub, "duplicate"),
+            Some(second.clone())
+        );
+        assert!(hub.entity_db(&first).is_none());
         assert!(hub.entity_db(&second).is_some());
     }
 }
