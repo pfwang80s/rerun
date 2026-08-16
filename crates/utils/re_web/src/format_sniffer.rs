@@ -9,10 +9,12 @@
     reason = "MCAP-016 remains production-disarmed until strict admission wiring lands"
 )]
 
+use std::cell::Cell;
 use std::fmt;
 use std::future::Future;
 use std::num::NonZeroU64;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
@@ -1025,6 +1027,80 @@ impl<Owner> fmt::Debug for RejectedHandoff<Owner> {
     }
 }
 
+/// Production-disarmed bounded registry for strict-only pending format-sniff work.
+///
+/// This keeps the pending slot accounting separate from the sniff state machine itself.
+/// It does not hook into compatibility `open()` or any native viewer path.
+pub(crate) struct PendingFormatSniffRegistryV1 {
+    max_pending: usize,
+    pending_count: Rc<Cell<usize>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingFormatSniffRegistryErrorV1 {
+    CapacityReached,
+}
+
+pub(crate) struct PendingFormatSniffReservationV1 {
+    sniffer: Option<ChromeFormatSniffer>,
+    pending_count: Rc<Cell<usize>>,
+    released: bool,
+}
+
+impl PendingFormatSniffRegistryV1 {
+    pub(crate) fn new_v1(max_pending: usize) -> Self {
+        Self {
+            max_pending,
+            pending_count: Rc::new(Cell::new(0)),
+        }
+    }
+
+    pub(crate) fn pending_count_v1(&self) -> usize {
+        self.pending_count.get()
+    }
+
+    pub(crate) fn reserve_v1(
+        &self,
+        sniffer: ChromeFormatSniffer,
+    ) -> Result<PendingFormatSniffReservationV1, PendingFormatSniffRegistryErrorV1> {
+        if self.pending_count.get() >= self.max_pending {
+            return Err(PendingFormatSniffRegistryErrorV1::CapacityReached);
+        }
+        self.pending_count.set(self.pending_count.get() + 1);
+        Ok(PendingFormatSniffReservationV1 {
+            sniffer: Some(sniffer),
+            pending_count: Rc::clone(&self.pending_count),
+            released: false,
+        })
+    }
+}
+
+impl PendingFormatSniffReservationV1 {
+    pub(crate) fn sniffer_mut_v1(&mut self) -> &mut ChromeFormatSniffer {
+        self.sniffer
+            .as_mut()
+            .expect("pending format-sniff reservation still owns a sniffer")
+    }
+
+    pub(crate) fn into_sniffer_v1(mut self) -> ChromeFormatSniffer {
+        self.released = true;
+        self.pending_count
+            .set(self.pending_count.get().saturating_sub(1));
+        self.sniffer
+            .take()
+            .expect("pending format-sniff reservation still owns a sniffer")
+    }
+}
+
+impl Drop for PendingFormatSniffReservationV1 {
+    fn drop(&mut self) {
+        if !self.released {
+            self.pending_count
+                .set(self.pending_count.get().saturating_sub(1));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use futures::future;
@@ -1322,6 +1398,43 @@ mod tests {
         )
         .expect("disarmed sniffer prepares");
         (sniffer, issuer)
+    }
+
+    #[wasm_bindgen_test]
+    async fn pending_registry_caps_pending_sniffs_and_releases_on_drop() {
+        if !is_chrome_format_sniff_runtime() {
+            return;
+        }
+        let registry = PendingFormatSniffRegistryV1::new_v1(1);
+        let (sniffer, _issuer) = prepared_sniffer(1, 2);
+        let reservation = registry
+            .reserve_v1(sniffer)
+            .expect("first pending sniff reserves");
+        assert_eq!(registry.pending_count_v1(), 1);
+        assert_eq!(
+            registry.reserve_v1(prepared_sniffer(1, 2).0),
+            Err(PendingFormatSniffRegistryErrorV1::CapacityReached)
+        );
+        drop(reservation);
+        assert_eq!(registry.pending_count_v1(), 0);
+        assert!(registry.reserve_v1(prepared_sniffer(1, 2).0).is_ok());
+    }
+
+    #[wasm_bindgen_test]
+    async fn pending_registry_releases_capacity_when_sniffer_is_moved_out() {
+        if !is_chrome_format_sniff_runtime() {
+            return;
+        }
+        let registry = PendingFormatSniffRegistryV1::new_v1(1);
+        let (sniffer, _issuer) = prepared_sniffer(1, 2);
+        let reservation = registry
+            .reserve_v1(sniffer)
+            .expect("first pending sniff reserves");
+        assert_eq!(registry.pending_count_v1(), 1);
+        let sniffer = reservation.into_sniffer_v1();
+        assert_eq!(registry.pending_count_v1(), 0);
+        drop(sniffer);
+        assert!(registry.reserve_v1(prepared_sniffer(1, 2).0).is_ok());
     }
 
     async fn settle_started<Payload>(
