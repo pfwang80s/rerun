@@ -19,60 +19,6 @@ pub(crate) enum CompatibilityUrlDispatchOutcomeV1 {
     RemoteSessionLimitReached,
 }
 
-/// Strict HTTP-only route accepted by the production-disarmed Wasm boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StrictHttpRemoteMcapRouteV1 {
-    ExplicitMcap,
-    ExtensionlessSniff,
-}
-
-/// Fixed, secret-free strict route validation failure.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StrictHttpRemoteMcapRouteErrorV1 {
-    InvalidUrl,
-    UnsupportedStrictOpenRoute,
-    UnsupportedFormat,
-}
-
-impl StrictHttpRemoteMcapRouteErrorV1 {
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) const fn wire_code_v1(self) -> &'static str {
-        match self {
-            Self::InvalidUrl => "invalid_url",
-            Self::UnsupportedStrictOpenRoute => "unsupported_strict_open_route",
-            Self::UnsupportedFormat => "unsupported_format",
-        }
-    }
-}
-
-/// Classifies one strict URL without creating any receiver, connection, Fetch, or Store effect.
-pub(crate) fn classify_strict_http_remote_mcap_route_v1(
-    raw_url: &str,
-    allow_extensionless_sniff: bool,
-) -> Result<StrictHttpRemoteMcapRouteV1, StrictHttpRemoteMcapRouteErrorV1> {
-    let url = raw_url
-        .parse::<url::Url>()
-        .map_err(|_error| StrictHttpRemoteMcapRouteErrorV1::InvalidUrl)?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(StrictHttpRemoteMcapRouteErrorV1::UnsupportedStrictOpenRoute);
-    }
-    if url.username() != "" || url.password().is_some() {
-        return Err(StrictHttpRemoteMcapRouteErrorV1::UnsupportedStrictOpenRoute);
-    }
-
-    let last_segment = url.path().rsplit('/').next().unwrap_or_default();
-    let extension = last_segment
-        .rsplit_once('.')
-        .map(|(_stem, extension)| extension);
-    if extension.is_some_and(|extension| extension.eq_ignore_ascii_case("mcap")) {
-        return Ok(StrictHttpRemoteMcapRouteV1::ExplicitMcap);
-    }
-    if extension.is_some() || !allow_extensionless_sniff {
-        return Err(StrictHttpRemoteMcapRouteErrorV1::UnsupportedFormat);
-    }
-    Ok(StrictHttpRemoteMcapRouteV1::ExtensionlessSniff)
-}
-
 /// Parses and dispatches one compatibility URL through the exact production `WebHandle` path.
 ///
 /// The callback is invoked only for an explicit HTTP(S) `.mcap` URL.  Returning
@@ -210,42 +156,9 @@ mod tests {
     use re_viewer_context::{Item, Route, SystemCommand, command_channel};
 
     use super::{
-        CompatibilityRemoteMcapControlV1, CompatibilityUrlDispatchOutcomeV1,
-        StrictHttpRemoteMcapRouteErrorV1, StrictHttpRemoteMcapRouteV1, StringOrStringArray,
-        classify_strict_http_remote_mcap_route_v1, dispatch_compatibility_url_v1,
-        dispatch_hidden_startup_urls,
+        CompatibilityRemoteMcapControlV1, CompatibilityUrlDispatchOutcomeV1, StringOrStringArray,
+        dispatch_compatibility_url_v1, dispatch_hidden_startup_urls,
     };
-
-    #[test]
-    fn strict_route_classifier_is_http_mcap_only_and_side_effect_free() {
-        assert_eq!(
-            classify_strict_http_remote_mcap_route_v1(
-                "https://example.test/a.MCAP?secret=x",
-                false
-            ),
-            Ok(StrictHttpRemoteMcapRouteV1::ExplicitMcap)
-        );
-        assert_eq!(
-            classify_strict_http_remote_mcap_route_v1("https://example.test/no-extension", true),
-            Ok(StrictHttpRemoteMcapRouteV1::ExtensionlessSniff)
-        );
-        assert_eq!(
-            classify_strict_http_remote_mcap_route_v1("https://example.test/no-extension", false),
-            Err(StrictHttpRemoteMcapRouteErrorV1::UnsupportedFormat)
-        );
-        assert_eq!(
-            classify_strict_http_remote_mcap_route_v1("https://example.test/data.rrd", true),
-            Err(StrictHttpRemoteMcapRouteErrorV1::UnsupportedFormat)
-        );
-        assert_eq!(
-            classify_strict_http_remote_mcap_route_v1("rerun+http://127.0.0.1:9876/proxy", true),
-            Err(StrictHttpRemoteMcapRouteErrorV1::UnsupportedStrictOpenRoute)
-        );
-        assert_eq!(
-            classify_strict_http_remote_mcap_route_v1("not a URL", true),
-            Err(StrictHttpRemoteMcapRouteErrorV1::InvalidUrl)
-        );
-    }
 
     fn command_debug_trace(receiver: &re_viewer_context::CommandReceiver) -> Vec<String> {
         std::iter::from_fn(|| {

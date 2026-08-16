@@ -9,7 +9,7 @@ An item failure emits a warning and does not throw, stop the Viewer, or roll bac
 
 ### Web Viewer strict remote-MCAP API
 
-Added additive `WebViewer.openRequest`, `openBatch`, and `startWithRequests` contracts with typed HTTP remote-MCAP options, opaque lifecycle handles, and redacted request-local errors.
+Added additive `WebViewer.openRequest` and `openBatch` contracts with typed HTTP remote-MCAP options, opaque lifecycle handles, and redacted request-local errors.
 The strict lane rejects non-MCAP and non-HTTP routes without falling back to the compatibility dispatcher.
 The release-Wasm remote-MCAP capability is not installed yet, so valid strict requests return `CapabilityUnavailable` before allocating wrappers or scheduling work.
 

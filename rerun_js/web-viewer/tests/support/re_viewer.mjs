@@ -22,17 +22,6 @@ class FakeWebHandle {
     }
   }
 
-  strict_open_admit_v1(url, allowExtensionlessSniff) {
-    state.strictAdmitCalls.push([url, allowExtensionlessSniff]);
-    if (state.strictAdmitErrorAt === state.strictAdmitCalls.length - 1) {
-      throw new Error("strict admission rejected");
-    }
-  }
-
-  strict_open_capability_available_v1() {
-    return state.strictCapabilityInstalled;
-  }
-
   remove_receiver(url) {
     state.calls.push(["remove_receiver", url]);
   }

@@ -444,7 +444,7 @@ function resolveAbsoluteUrl(url: string): string {
 }
 
 /** The timeline used when decoding a remote MCAP recording. */
-export type RemoteMcapTimeType = "sequence" | "timestamp_ns" | "duration_ns";
+export type RemoteMcapTimeType = "timestamp_ns" | "duration_ns";
 
 /** The validator policy used when admitting a remote MCAP object. */
 export type RemoteMcapRepresentationConsistency =
@@ -462,7 +462,7 @@ export interface HttpOpenRequestOptions {
   decoder_allowlist_version?: string;
   /** Version of the bounded assignment policy, encoded as a decimal string. */
   assignment_policy_version?: string;
-  /** MCAP timeline type. Defaults to `sequence`. */
+  /** MCAP timeline type. Defaults to `timestamp_ns`; sequence timelines are unsupported. */
   mcap_time_type?: RemoteMcapTimeType;
   /** Representation validator policy. Defaults to `require_strong_validator`. */
   representation_consistency?: RemoteMcapRepresentationConsistency;
@@ -537,11 +537,7 @@ const STRICT_OPEN_MAX_TOPIC_FILTERS = 128;
 const STRICT_OPEN_MAX_FIELD_BYTES = 65_536;
 
 type NormalizedStrictOpenSpec = {
-  /** Used only while validating one transaction; never retained by a public handle. */
-  canonical_url: string;
-  semantic_key: string;
-  operation_behavior: RemoteMcapOpenBehavior;
-  allow_extensionless_sniff: boolean;
+  route: "explicit_mcap" | "extensionless_sniff";
 };
 
 function strict_utf8_byte_length(value: string): number {
@@ -550,7 +546,7 @@ function strict_utf8_byte_length(value: string): number {
   return typeof TextEncoder === "function" ? new TextEncoder().encode(value).byteLength : value.length;
 }
 
-function strict_decimal_option(value: unknown, field: string, index: number): string {
+function strict_decimal_option(value: unknown, index: number): string {
   if (typeof value !== "string" || !/^(?:0|[1-9][0-9]{0,19})$/.test(value)) {
     throw new StrictOpenError("InvalidRequestShape", "admission", { index });
   }
@@ -558,7 +554,6 @@ function strict_decimal_option(value: unknown, field: string, index: number): st
   if (value.length === 20 && value > "18446744073709551615") {
     throw new StrictOpenError("ResourceLimitExceeded", "admission", { index });
   }
-  void field;
   return value;
 }
 
@@ -577,122 +572,133 @@ function normalize_strict_open_spec(
   spec: unknown,
   index: number,
 ): NormalizedStrictOpenSpec {
-  if (spec === null || typeof spec !== "object" || Array.isArray(spec)) {
-    throw new StrictOpenError("InvalidRequestShape", "admission", { index });
-  }
-  const request = spec as Record<string, unknown>;
-  if (typeof request.url !== "string" || strict_utf8_byte_length(request.url) === 0) {
-    throw new StrictOpenError("InvalidRequestShape", "admission", { index });
-  }
-  if (strict_utf8_byte_length(request.url) > STRICT_OPEN_MAX_FIELD_BYTES) {
-    throw new StrictOpenError("ResourceLimitExceeded", "admission", { index });
-  }
-
-  let parsed: URL;
   try {
-    parsed = new URL(request.url);
-  } catch {
-    throw new StrictOpenError("InvalidUrl", "admission", { index });
-  }
-  if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || parsed.username || parsed.password) {
-    throw new StrictOpenError("UnsupportedStrictOpenRoute", "admission", { index });
-  }
-
-  const options_value = request.options;
-  if (options_value !== undefined &&
-      (options_value === null || typeof options_value !== "object" || Array.isArray(options_value))) {
-    throw new StrictOpenError("InvalidRequestShape", "admission", { index });
-  }
-  const options = (options_value ?? {}) as Record<string, unknown>;
-  const known_options = new Set([
-    "topic_filter",
-    "decoder_allowlist_version",
-    "assignment_policy_version",
-    "mcap_time_type",
-    "representation_consistency",
-    "recording_open_behavior",
-    "allow_extensionless_sniff",
-  ]);
-  for (const key of Object.keys(options)) {
-    if (!known_options.has(key)) {
+    if (spec === null || typeof spec !== "object" || Array.isArray(spec)) {
       throw new StrictOpenError("InvalidRequestShape", "admission", { index });
     }
-  }
+    const request = spec as Record<string, unknown>;
+    if (Object.getPrototypeOf(request) !== Object.prototype && Object.getPrototypeOf(request) !== null) {
+      throw new StrictOpenError("InvalidRequestShape", "admission", { index });
+    }
+    const request_keys = Reflect.ownKeys(request);
+    if (request_keys.some((key) => typeof key !== "string" || !["url", "options"].includes(key))) {
+      throw new StrictOpenError("InvalidRequestShape", "admission", { index });
+    }
+    const url_descriptor = Object.getOwnPropertyDescriptor(request, "url");
+    if (!url_descriptor || !("value" in url_descriptor)
+      || typeof url_descriptor.value !== "string" || strict_utf8_byte_length(url_descriptor.value) === 0) {
+      throw new StrictOpenError("InvalidRequestShape", "admission", { index });
+    }
+    const raw_url = url_descriptor.value;
+    if (strict_utf8_byte_length(raw_url) > STRICT_OPEN_MAX_FIELD_BYTES) {
+      throw new StrictOpenError("ResourceLimitExceeded", "admission", { index });
+    }
 
-  const topic_value = options.topic_filter ?? [];
-  const topics = typeof topic_value === "string"
-    ? [topic_value]
-    : Array.isArray(topic_value) ? [...topic_value] : null;
-  if (!topics || topics.length > STRICT_OPEN_MAX_TOPIC_FILTERS || topics.some(
-    (topic) => typeof topic !== "string" || strict_utf8_byte_length(topic) > 4_096,
-  )) {
+    let parsed: URL;
+    try {
+      parsed = new URL(raw_url);
+    } catch {
+      throw new StrictOpenError("InvalidUrl", "admission", { index });
+    }
+    if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || parsed.username || parsed.password) {
+      throw new StrictOpenError("UnsupportedStrictOpenRoute", "admission", { index });
+    }
+
+    const options_descriptor = Object.getOwnPropertyDescriptor(request, "options");
+    const options_value = options_descriptor?.value;
+    if (options_descriptor && !("value" in options_descriptor)) {
+      throw new StrictOpenError("InvalidRequestShape", "admission", { index });
+    }
+    if (options_value !== undefined &&
+        (options_value === null || typeof options_value !== "object" || Array.isArray(options_value))) {
+      throw new StrictOpenError("InvalidRequestShape", "admission", { index });
+    }
+    const options = (options_value ?? {}) as Record<string, unknown>;
+    if (Object.getPrototypeOf(options) !== Object.prototype && Object.getPrototypeOf(options) !== null) {
+      throw new StrictOpenError("InvalidRequestShape", "admission", { index });
+    }
+    const known_options = new Set([
+      "topic_filter",
+      "decoder_allowlist_version",
+      "assignment_policy_version",
+      "mcap_time_type",
+      "representation_consistency",
+      "recording_open_behavior",
+      "allow_extensionless_sniff",
+    ]);
+    if (Reflect.ownKeys(options).some((key) => typeof key !== "string" || !known_options.has(key))) {
+      throw new StrictOpenError("InvalidRequestShape", "admission", { index });
+    }
+    const option = (name: string, fallback: unknown) => {
+      const descriptor = Object.getOwnPropertyDescriptor(options, name);
+      if (descriptor && !("value" in descriptor)) {
+        throw new StrictOpenError("InvalidRequestShape", "admission", { index });
+      }
+      return descriptor?.value ?? fallback;
+    };
+
+    const topic_value = option("topic_filter", []);
+    if (typeof topic_value === "string") {
+      if (strict_utf8_byte_length(topic_value) > 4_096) {
+        throw new StrictOpenError("InvalidRequestShape", "admission", { index });
+      }
+    } else if (Array.isArray(topic_value)) {
+      if (topic_value.length > STRICT_OPEN_MAX_TOPIC_FILTERS) {
+        throw new StrictOpenError("InvalidRequestShape", "admission", { index });
+      }
+      for (let topic_index = 0; topic_index < topic_value.length; topic_index++) {
+        const topic_descriptor = Object.getOwnPropertyDescriptor(topic_value, String(topic_index));
+        if (!topic_descriptor || !("value" in topic_descriptor)
+          || typeof topic_descriptor.value !== "string"
+          || strict_utf8_byte_length(topic_descriptor.value) > 4_096) {
+          throw new StrictOpenError("InvalidRequestShape", "admission", { index });
+        }
+      }
+    } else {
+      throw new StrictOpenError("InvalidRequestShape", "admission", { index });
+    }
+
+    strict_decimal_option(
+      option("decoder_allowlist_version", "1"),
+      index,
+    );
+    strict_decimal_option(
+      option("assignment_policy_version", "1"),
+      index,
+    );
+    strict_option_value(
+      option("mcap_time_type", "timestamp_ns"),
+      ["timestamp_ns", "duration_ns"] as const,
+      index,
+    );
+    strict_option_value(
+      option("representation_consistency", "require_strong_validator"),
+      ["require_strong_validator", "allow_deployment_assumed"] as const,
+      index,
+    );
+    strict_option_value(
+      option("recording_open_behavior", "open_and_select"),
+      ["open", "open_and_select", "background"] as const,
+      index,
+    );
+    const allow_extensionless = option("allow_extensionless_sniff", false);
+    if (typeof allow_extensionless !== "boolean") {
+      throw new StrictOpenError("InvalidRequestShape", "admission", { index });
+    }
+
+    const explicit_mcap = parsed.pathname.toLowerCase().endsWith(".mcap");
+    const last_segment = parsed.pathname.slice(parsed.pathname.lastIndexOf("/") + 1);
+    if (!explicit_mcap && last_segment.includes(".")) {
+      throw new StrictOpenError("UnsupportedFormat", "admission", { index });
+    }
+    if (!explicit_mcap && !allow_extensionless) {
+      throw new StrictOpenError("UnsupportedFormat", "admission", { index });
+    }
+    return { route: explicit_mcap ? "explicit_mcap" : "extensionless_sniff" };
+  } catch (error) {
+    if (error instanceof StrictOpenError) throw error;
     throw new StrictOpenError("InvalidRequestShape", "admission", { index });
   }
-  const canonical_topics = [...new Set(topics)].sort();
-  const topic_bytes = canonical_topics.reduce(
-    (total, topic) => total + strict_utf8_byte_length(topic),
-    0,
-  );
-  if (topic_bytes > STRICT_OPEN_MAX_FIELD_BYTES) {
-    throw new StrictOpenError("ResourceLimitExceeded", "admission", { index });
-  }
-
-  const decoder_version = strict_decimal_option(
-    options.decoder_allowlist_version ?? "1",
-    "decoder_allowlist_version",
-    index,
-  );
-  const assignment_version = strict_decimal_option(
-    options.assignment_policy_version ?? "1",
-    "assignment_policy_version",
-    index,
-  );
-  const time_type = strict_option_value(
-    options.mcap_time_type ?? "sequence",
-    ["sequence", "timestamp_ns", "duration_ns"] as const,
-    index,
-  );
-  const consistency = strict_option_value(
-    options.representation_consistency ?? "require_strong_validator",
-    ["require_strong_validator", "allow_deployment_assumed"] as const,
-    index,
-  );
-  const operation_behavior = strict_option_value(
-    options.recording_open_behavior ?? "open_and_select",
-    ["open", "open_and_select", "background"] as const,
-    index,
-  );
-  const allow_extensionless = options.allow_extensionless_sniff ?? false;
-  if (typeof allow_extensionless !== "boolean") {
-    throw new StrictOpenError("InvalidRequestShape", "admission", { index });
-  }
-
-  const path = parsed.pathname;
-  const explicit_mcap = path.toLowerCase().endsWith(".mcap");
-  const last_segment = path.slice(path.lastIndexOf("/") + 1);
-  if (!explicit_mcap && last_segment.includes(".")) {
-    throw new StrictOpenError("UnsupportedFormat", "admission", { index });
-  }
-  if (!explicit_mcap && !allow_extensionless) {
-    throw new StrictOpenError("UnsupportedFormat", "admission", { index });
-  }
-
-  // URL#hash is not sent over HTTP and is intentionally absent from the source identity.
-  const canonical_url = `${parsed.origin}${parsed.pathname}${parsed.search}`;
-  const semantic_key = JSON.stringify([
-    canonical_topics,
-    decoder_version,
-    assignment_version,
-    time_type,
-    consistency,
-    allow_extensionless,
-  ]);
-  return {
-    canonical_url,
-    semantic_key,
-    operation_behavior,
-    allow_extensionless_sniff: allow_extensionless,
-  };
 }
 
 /**
@@ -1043,145 +1049,48 @@ export class WebViewer {
   /**
    * Open one strict HTTP remote-MCAP request.
    *
-   * This additive API is intentionally production-disarmed until the measured remote capability
-   * is installed.  It still performs the complete strict admission and wrapper/release handshake,
-   * so callers can safely integrate against the typed lifecycle without entering the compatibility
-   * dispatcher.  It never calls {@link WebViewer.stop} or the instance failure UI for a request
-   * local error.
+   * This additive API validates the strict request and currently rejects with
+   * `CapabilityUnavailable` until the measured Rust remote-MCAP capability is installed.
+   * It never creates a wrapper, schedules work, enters the compatibility dispatcher, calls
+   * {@link WebViewer.stop}, or invokes the instance failure UI for a request-local error.
    */
   async openRequest(spec: HttpOpenRequestSpec): Promise<OpenRequestHandle> {
-    const handles = await this._open_strict_batch([spec]);
-    return handles[0];
+    this._validate_strict_batch([spec]);
+    throw new StrictOpenError("CapabilityUnavailable", "admission");
   }
 
   /**
    * Atomically prepare and release a batch of strict HTTP remote-MCAP requests.
    *
-   * Every input is validated before a wrapper, lifecycle entry, or public event is created.  The
-   * returned handles preserve input order.  A failure rejects the operation with a redacted
-   * {@link StrictOpenError} and leaves the cache and compatibility routes untouched.
+   * Every input is validated before the capability gate.  Until that gate is installed, the
+   * operation rejects with a redacted {@link StrictOpenError} and leaves the cache, dispatcher,
+   * and compatibility routes untouched.
    */
   async openBatch(specs: readonly HttpOpenRequestSpec[]): Promise<readonly OpenRequestHandle[]> {
-    return this._open_strict_batch(specs);
+    this._validate_strict_batch(specs);
+    throw new StrictOpenError("CapabilityUnavailable", "admission");
   }
 
-  /**
-   * Strict startup using the same atomic handoff as {@link WebViewer.openBatch}.
-   *
-   * Viewer startup itself remains owned by {@link WebViewer.start}; this method only admits
-   * remote-MCAP operations once that startup has reached `ready`.
-   */
-  async startWithRequests(
-    specs: readonly HttpOpenRequestSpec[],
-  ): Promise<readonly OpenRequestHandle[]> {
-    return this._open_strict_batch(specs);
-  }
-
-  private _open_strict_batch(
-    specs: readonly HttpOpenRequestSpec[],
-  ): readonly OpenRequestHandle[] {
+  private _validate_strict_batch(specs: unknown): void {
     if (this.#state !== "ready" || !this.#handle) {
       throw new StrictOpenError("ViewerStopped", "admission");
     }
-    if (!Array.isArray(specs) || specs.length === 0) {
-      throw new StrictOpenError("InvalidRequestShape", "admission");
-    }
-    if (specs.length > STRICT_OPEN_MAX_BATCH_ITEMS) {
-      throw new StrictOpenError("BatchTooLarge", "admission");
-    }
-
-    // Validate and freeze all semantic identity before mutating the wrapper cache.  This is the
-    // strict all-or-nothing boundary: no remote owner, Fetch, legacy receiver, connection, Store,
-    // interner, terminal eviction, or public lifecycle effect exists on failure.
-    const normalized = specs.map((spec, index) => normalize_strict_open_spec(spec, index));
-    const seen = new Map<string, string>();
-    for (const [index, item] of normalized.entries()) {
-      const previous = seen.get(item.canonical_url);
-      if (previous !== undefined && previous !== item.semantic_key) {
-        throw new StrictOpenError("ExistingSourceOptionsConflict", "admission", { index });
-      }
-      seen.set(item.canonical_url, item.semantic_key);
-    }
-
-    // The actual Rust prepare/disarmed-handoff capability is intentionally sealed until the
-    // measured release-Wasm profile is installed.  Gate before touching wrapper/cache/lifecycle
-    // state; compatibility open/start never observes this gate.
-    const capability_probe = (this.#handle as unknown as {
-      strict_open_capability_available_v1?: () => boolean;
-    }).strict_open_capability_available_v1;
-    const capability_available = typeof capability_probe === "function"
-      && capability_probe.call(this.#handle) === true;
-    if (!capability_available) {
-      throw new StrictOpenError("CapabilityUnavailable", "admission");
-    }
-
-    if (this._strict_dispatcher.queued_count + normalized.length > this._strict_dispatcher.max_queue_length) {
-      throw new StrictOpenError("ResourceLimitExceeded", "admission");
-    }
-
-    const staged: Array<{
-      operation_id: string;
-      request_id: string;
-      recording_id: string;
-      behavior: RemoteMcapOpenBehavior;
-    }> = normalized.map((item) => ({
-      operation_id: `operation_${randomId()}`,
-      request_id: `request_${randomId()}`,
-      recording_id: `recording_${randomId()}`,
-      behavior: item.operation_behavior,
-    }));
-
-    const installed: string[] = [];
-    const handles: OpenRequestHandle[] = [];
     try {
-      for (const item of staged) {
-        const recording = RecordingHandle._create(item.request_id, item.recording_id);
-        const operation = this._strict_open_cache.install_operation_with_abort(
-          item.operation_id,
-          (wrapper) => {
-            // The existing wrapper cache is the TypeScript half of the disarmed handoff.  The
-            // matching installation ack is completed before release; no callback is run here.
-            wrapper.attach_preexisting_recording(recording.recordingId);
-            wrapper.complete_installation_ack();
-            wrapper.arm_internal_activation_bridge();
-          },
-          () => {
-            // Tokenized abort is represented by removing only this new operation.  Existing
-            // source aliases and compatibility state are not touched.
-          },
-        );
-        if (!operation.installation_ack_complete || !operation.activation_bridge_armed) {
-          throw new StrictOpenError("ProtocolViolation", "handoff");
-        }
-        installed.push(item.operation_id);
-        handles.push(OpenRequestHandle._create(
-          item.operation_id,
-          item.request_id,
-          [recording],
-          item.behavior,
-        ));
+      if (!Array.isArray(specs) || specs.length === 0) {
+        throw new StrictOpenError("InvalidRequestShape", "admission");
       }
-
-      // Matching release is deliberately the last synchronous operation.  The public accepted
-      // event is queued only after every wrapper/ack has been installed, and therefore cannot
-      // expose a partial batch.
-      for (const handle of handles) {
-        if (!this._strict_dispatcher.enqueue(() => {
-          for (const listener of handle._listenersFor("accepted")) listener(handle);
-        })) {
-          throw new StrictOpenError("ResourceLimitExceeded", "handoff");
-        }
+      if (specs.length > STRICT_OPEN_MAX_BATCH_ITEMS) {
+        throw new StrictOpenError("BatchTooLarge", "admission");
       }
-      return Object.freeze(handles);
+      for (let index = 0; index < specs.length; index++) {
+        if (!Object.prototype.hasOwnProperty.call(specs, index)) {
+          throw new StrictOpenError("InvalidRequestShape", "admission", { index });
+        }
+        normalize_strict_open_spec(specs[index], index);
+      }
     } catch (error) {
-      // Roll back every operation from this transaction, including wrappers created before the
-      // failing item.  The dispatcher capacity preflight above makes partial event publication
-      // impossible in ordinary operation.
-      for (const operation_id of installed) {
-        this._strict_open_cache.dispose_operation(operation_id);
-      }
       if (error instanceof StrictOpenError) throw error;
-      throw new StrictOpenError("ProtocolViolation", "handoff");
+      throw new StrictOpenError("InvalidRequestShape", "admission");
     }
   }
 
@@ -1692,7 +1601,7 @@ export class LogChannel {
   }
 }
 
-export type StrictOpenRecordingPhase = "preexisting" | "active" | "completed";
+type StrictOpenRecordingPhase = "preexisting" | "active" | "completed";
 
 class StrictOpenRecordingWrapper {
   readonly operation_id: string;
@@ -1888,142 +1797,25 @@ export type StrictOpenLifecycleEvent =
 
 export type StrictOpenLifecycleListener = (handle: OpenRequestHandle) => void;
 
-/** A stable opaque handle for one recording attached to a strict open request. */
-export class RecordingHandle {
-  readonly recordingId: string;
-  readonly requestId: string;
-  #phase: StrictOpenRecordingPhase = "preexisting";
-  #disposed = false;
+declare const strict_recording_handle_brand: unique symbol;
 
-  private constructor(requestId: string, recordingId: string) {
-    this.requestId = requestId;
-    this.recordingId = recordingId;
-  }
-
-  /** @internal */
-  static _create(requestId: string, recordingId = `recording_${randomId()}`) {
-    return new RecordingHandle(requestId, recordingId);
-  }
-
-  /** @deprecated Use {@link RecordingHandle.recordingId}. */
-  get recording_id() {
-    return this.recordingId;
-  }
-
-  /** @deprecated Use {@link RecordingHandle.requestId}. */
-  get request_id() {
-    return this.requestId;
-  }
-
-  get phase() {
-    return this.#phase;
-  }
-
-  get disposed() {
-    return this.#disposed;
-  }
-
-  /** Internal lifecycle transition; public controls are added in MCAP-056. */
-  _markActive() {
-    if (!this.#disposed && this.#phase !== "completed") this.#phase = "active";
-  }
-
-  /** Internal lifecycle transition; public controls are added in MCAP-056. */
-  _markCompleted() {
-    if (!this.#disposed) this.#phase = "completed";
-  }
-
-  /** Internal disposal used by a matching operation abort. */
-  _dispose() {
-    this.#disposed = true;
-  }
+/** Opaque recording handle type reserved for the installed remote-MCAP capability. */
+export interface RecordingHandle {
+  readonly [strict_recording_handle_brand]: true;
+  readonly phase: "preexisting" | "active" | "completed";
+  readonly disposed: boolean;
 }
 
-/**
- * A stable opaque handle for one strict HTTP open operation.
- *
- * The handle exposes lifecycle observation only.  Recording controls are deliberately added in
- * MCAP-056 so that opening cannot accidentally acquire a compatibility recording ID.
- */
-export class OpenRequestHandle {
-  readonly operationId: string;
-  readonly requestId: string;
+declare const strict_open_request_handle_brand: unique symbol;
+
+/** Opaque operation handle type reserved for the installed remote-MCAP capability. */
+export interface OpenRequestHandle {
+  readonly [strict_open_request_handle_brand]: true;
   readonly recordings: readonly RecordingHandle[];
+  readonly phase: StrictOpenLifecycleEvent;
+  readonly disposed: boolean;
   readonly recordingOpenBehavior: RemoteMcapOpenBehavior;
-  #phase: StrictOpenLifecycleEvent = "accepted";
-  #listeners = new Map<StrictOpenLifecycleEvent, Set<StrictOpenLifecycleListener>>();
-  #disposed = false;
-
-  private constructor(
-    operationId: string,
-    requestId: string,
-    recordings: readonly RecordingHandle[],
-    recordingOpenBehavior: RemoteMcapOpenBehavior = "open_and_select",
-  ) {
-    this.operationId = operationId;
-    this.requestId = requestId;
-    this.recordings = Object.freeze([...recordings]);
-    this.recordingOpenBehavior = recordingOpenBehavior;
-  }
-
-  /** @internal */
-  static _create(
-    operationId: string,
-    requestId: string,
-    recordings: readonly RecordingHandle[],
-    recordingOpenBehavior: RemoteMcapOpenBehavior = "open_and_select",
-  ) {
-    return new OpenRequestHandle(
-      operationId,
-      requestId,
-      recordings,
-      recordingOpenBehavior,
-    );
-  }
-
-  /** @deprecated Use {@link OpenRequestHandle.operationId}. */
-  get operation_id() {
-    return this.operationId;
-  }
-
-  /** @deprecated Use {@link OpenRequestHandle.requestId}. */
-  get request_id() {
-    return this.requestId;
-  }
-
-  get phase() {
-    return this.#phase;
-  }
-
-  get disposed() {
-    return this.#disposed;
-  }
-
-  /** Subscribe to a lifecycle event. Callbacks are always delivered by the bounded dispatcher. */
-  on(event: StrictOpenLifecycleEvent, listener: StrictOpenLifecycleListener): () => void {
-    const listeners = this.#listeners.get(event) ?? new Set();
-    listeners.add(listener);
-    this.#listeners.set(event, listeners);
-    return () => listeners.delete(listener);
-  }
-
-  /** Internal state transition used by the strict handoff bridge. */
-  _transition(event: StrictOpenLifecycleEvent) {
-    if (this.#disposed || this.#phase === "removed") return;
-    this.#phase = event;
-  }
-
-  /** Internal event snapshot used by the instance-owned dispatcher. */
-  _listenersFor(event: StrictOpenLifecycleEvent) {
-    return [...(this.#listeners.get(event) ?? [])];
-  }
-
-  /** Internal disposal used by a matching operation abort or viewer teardown. */
-  _dispose() {
-    this.#disposed = true;
-    this.#listeners.clear();
-    for (const recording of this.recordings) recording._dispose();
-  }
+  on(event: StrictOpenLifecycleEvent, listener: StrictOpenLifecycleListener): () => void;
 }
 
 type StrictDispatcherTask = () => void;
