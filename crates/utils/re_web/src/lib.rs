@@ -42,6 +42,12 @@
 //! use re_web::store_publication;
 //! ```
 //!
+//! Secret URL reuse classification is likewise Web-only:
+//!
+//! ```compile_fail,ignore-wasm32
+//! use re_web::source_reuse;
+//! ```
+//!
 //! Exact-length Chrome BYOB body pumping is likewise Web-only:
 //!
 //! ```compile_fail,ignore-wasm32
@@ -87,6 +93,8 @@ pub mod remote_limits;
 pub mod remote_validator;
 #[cfg(target_arch = "wasm32")]
 pub mod secret_url;
+#[cfg(target_arch = "wasm32")]
+pub mod source_reuse;
 #[cfg(target_arch = "wasm32")]
 pub mod store_publication;
 #[cfg(target_arch = "wasm32")]
@@ -166,6 +174,10 @@ mod secret_url;
     reason = "native tests exercise Web-only Store publication identities without publishing them"
 )]
 mod store_publication;
+
+// Host builds compile the module only for their unit tests and do not publish it to consumers.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod source_reuse;
 
 #[cfg(target_arch = "wasm32")]
 mod error;

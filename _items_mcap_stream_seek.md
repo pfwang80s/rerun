@@ -560,13 +560,13 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 验收：claim 不跨 await，stale activation/close 不影响新 token，guard Drop 可触发 close，registry-driven cleanup 在 `Vacant` 前终结 owner并删除 client entry，stop 不依赖 frame-driven Closing。
 - 负责人：William；提交：本地已提交；备注：Web-only registry foundation 已落地，未改 native viewer 和现有 compatibility open/close。
 
-### [ ] MCAP-045 — 实现 secret fingerprint multimap 与 semantic reuse
+### [x] MCAP-045 — 实现 secret fingerprint multimap 与 semantic reuse
 
 - 建议提交：`Add secret-safe source reuse classification`。
 - 依赖：MCAP-007、MCAP-008、MCAP-043。
 - 变更：用 instance-keyed HMAC fingerprint加 exact canonical match建立 bounded multimap，并为 remote 比较 Topic filter、decoder/assignment versions、time type、requested policy 和 actual consistency。
 - 验收：相同 URL兼容配置 alias，字段任一不同返回 `ExistingSourceOptionsConflict`，different URL 走 slot limit，规范化等价、不同 query、extensionless pending、strong-versus-assumed 和注入 digest collision 均有确定结果；canonical secret removal 后 zeroize。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：本地已提交；备注：Web-only 分类与复用基础件已落地，未改 native viewer 或现有 compatibility open 行为。
 
 ### [ ] MCAP-046 — 把 extensionless sniff 接入 bounded pending registry
 
