@@ -168,6 +168,8 @@ impl WebHandle {
     }
 
     #[wasm_bindgen]
+    /// Forwards a browser hidden transition with its resulting execution epoch.
+    /// Stale or non-sequential signals are ignored by the Rust remote page manager.
     pub fn remote_page_hidden_v1(&self, epoch: u32) {
         self.compatibility_remote_mcap
             .borrow_mut()
@@ -175,6 +177,8 @@ impl WebHandle {
     }
 
     #[wasm_bindgen]
+    /// Rebinds remote owners after visibility resume using a matching epoch and nonce.
+    /// Mismatched or repeated transitions are rejected without reviving terminated work.
     pub fn remote_page_resume_v1(&self, from_epoch: u32, to_epoch: u32, resume_nonce: u32) {
         let _ = self.compatibility_remote_mcap.borrow_mut().page_resume_v1(
             from_epoch,
@@ -184,7 +188,14 @@ impl WebHandle {
     }
 
     #[wasm_bindgen]
+    /// Updates the visible deadline for the supplied execution epoch.
+    /// `None` explicitly clears it; malformed numeric values are ignored at the JS boundary.
     pub fn remote_page_deadline_v1(&self, epoch: u32, deadline_ms: Option<f64>) {
+        if let Some(value) = deadline_ms {
+            if !value.is_finite() || value < 0.0 || value > u64::MAX as f64 {
+                return;
+            }
+        }
         let deadline_ms = deadline_ms.and_then(|value| {
             if value.is_finite() && value >= 0.0 && value <= u64::MAX as f64 {
                 Some(value as u64)
@@ -199,6 +210,8 @@ impl WebHandle {
     }
 
     #[wasm_bindgen]
+    /// Terminates remote owners for a resulting page epoch.
+    /// Stale, duplicate, and non-sequential signals are ignored.
     pub fn remote_page_terminate_v1(&self, epoch: u32) {
         self.compatibility_remote_mcap
             .borrow_mut()

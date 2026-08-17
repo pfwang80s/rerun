@@ -219,6 +219,19 @@ test("deadline suspension cannot overwrite reentrant page termination", () => {
   assert.equal(controller.state.reason, "freeze");
 });
 
+test("deadline fanout stops after a reentrant lifecycle transition", () => {
+  const listeners = new Map();
+  const target = { addEventListener: (n, f) => listeners.set(n, f), removeEventListener: () => {} };
+  const page = { visibilityState: "visible" };
+  const controller = new ChromePageExecutionController({ target, document: page });
+  let second = 0;
+  controller.register_remote_owner({ on_visible_deadline: () => listeners.get("pagehide")() });
+  controller.register_remote_owner({ on_visible_deadline: () => second++ });
+  controller.set_visible_deadline(1);
+  assert.equal(second, 0);
+  assert.equal(controller.state.kind, "RemoteTerminating");
+});
+
 function callsNamed(name) {
   return globalThis.__rerun_web_viewer_test_state.calls.filter(
     (call) => call[0] === name,

@@ -793,8 +793,13 @@ export class ChromePageExecutionController {
       this.#visible_deadline_ms = null;
       return;
     }
+    const captured_epoch = this.#epoch;
+    const captured_generation = this.#generation;
     this.#visible_deadline_ms = deadline_ms;
-    for (const owner of this.#owners) { try { owner.on_visible_deadline?.(deadline_ms); } catch {} }
+    for (const owner of this.#owners) {
+      if (this.#disposed || this.#epoch !== captured_epoch || this.#generation !== captured_generation || this.#state.kind !== "VisibleRunning") break;
+      try { owner.on_visible_deadline?.(deadline_ms); } catch {}
+    }
   }
 
   get visible_deadline(): number | null { return this.#visible_deadline_ms; }
