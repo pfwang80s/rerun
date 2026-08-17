@@ -194,6 +194,16 @@ test("WebViewer start bridges an initially hidden page into the Rust owner seam"
   viewer.stop();
 });
 
+test("outer start guard cleans an append failure and permits restart", async () => {
+  const viewer = new WebViewer();
+  const append = document.body.append.bind(document.body);
+  document.body.append = () => { throw new Error("append failure"); };
+  await assert.rejects(() => viewer.start(null, document.body, null), /append failure/);
+  document.body.append = append;
+  await viewer.start(null, document.body, null);
+  viewer.stop();
+});
+
 test("deadline suspension cannot overwrite reentrant page termination", () => {
   const listeners = new Map();
   const target = { addEventListener: (n, f) => listeners.set(n, f), removeEventListener: () => {} };

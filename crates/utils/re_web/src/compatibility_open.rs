@@ -28,6 +28,32 @@ pub struct CompatibilityRemoteMcapSingletonV1 {
     capability_installed: bool,
     registry: OpenSourceClientRegistryV1,
     opening: Option<OpenSourceClientOpeningHandleV1>,
+    page: RemotePageManagerV1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemotePageStateV1 {
+    Visible { epoch: u32, resume_nonce: u32 },
+    Hidden { epoch: u32 },
+    Terminated { epoch: u32 },
+}
+
+#[derive(Debug)]
+struct RemotePageManagerV1 {
+    state: RemotePageStateV1,
+    visible_deadline_ms: Option<u64>,
+}
+
+impl Default for RemotePageManagerV1 {
+    fn default() -> Self {
+        Self {
+            state: RemotePageStateV1::Visible {
+                epoch: 0,
+                resume_nonce: 0,
+            },
+            visible_deadline_ms: None,
+        }
+    }
 }
 
 impl CompatibilityRemoteMcapSingletonV1 {
@@ -37,6 +63,7 @@ impl CompatibilityRemoteMcapSingletonV1 {
             capability_installed: false,
             registry: OpenSourceClientRegistryV1::new_v1(),
             opening: None,
+            page: RemotePageManagerV1::default(),
         }
     }
 
@@ -48,6 +75,10 @@ impl CompatibilityRemoteMcapSingletonV1 {
     pub fn dispatch_v1(&mut self) -> CompatibilityRemoteMcapDispatchV1 {
         if !self.capability_installed {
             return CompatibilityRemoteMcapDispatchV1::ExistingDispatcher;
+        }
+
+        if !matches!(self.page.state, RemotePageStateV1::Visible { .. }) {
+            return CompatibilityRemoteMcapDispatchV1::RemoteSessionLimitReached;
         }
 
         if self.opening.is_some() {
@@ -67,6 +98,41 @@ impl CompatibilityRemoteMcapSingletonV1 {
                 | OpenSourceClientRegistryErrorV1::OwnerAlreadyTerminal,
             ) => CompatibilityRemoteMcapDispatchV1::RemoteSessionLimitReached,
         }
+    }
+
+    pub fn page_hidden_v1(&mut self, epoch: u32) {
+        if matches!(self.page.state, RemotePageStateV1::Terminated { .. }) {
+            return;
+        }
+        self.page.state = RemotePageStateV1::Hidden { epoch };
+        self.page.visible_deadline_ms = None;
+    }
+
+    pub fn page_resume_v1(&mut self, from_epoch: u32, to_epoch: u32, resume_nonce: u32) -> bool {
+        if self.page.state != (RemotePageStateV1::Hidden { epoch: from_epoch }) {
+            return false;
+        }
+        self.page.state = RemotePageStateV1::Visible {
+            epoch: to_epoch,
+            resume_nonce,
+        };
+        self.page.visible_deadline_ms = None;
+        true
+    }
+
+    pub fn page_visible_deadline_v1(&mut self, epoch: u32, deadline_ms: Option<u64>) -> bool {
+        if !matches!(self.page.state, RemotePageStateV1::Visible { epoch: current, .. } if current == epoch)
+        {
+            return false;
+        }
+        self.page.visible_deadline_ms = deadline_ms;
+        true
+    }
+
+    pub fn page_terminate_v1(&mut self, epoch: u32) {
+        self.page.state = RemotePageStateV1::Terminated { epoch };
+        self.page.visible_deadline_ms = None;
+        let _ = self.cancel_opening_v1();
     }
 
     /// Arms the future remote capability after its measured profile is installed.
@@ -110,6 +176,45 @@ mod tests {
             CompatibilityRemoteMcapDispatchV1::ExistingDispatcher
         );
         assert!(!singleton.cancel_opening_v1());
+    }
+
+    #[test]
+    fn page_lifecycle_gates_armed_admission_and_requires_matching_resume() {
+        let mut singleton = CompatibilityRemoteMcapSingletonV1::new_disarmed_v1();
+        singleton.page_hidden_v1(1);
+        singleton.arm_for_test_v1();
+        assert_eq!(
+            singleton.dispatch_v1(),
+            CompatibilityRemoteMcapDispatchV1::RemoteSessionLimitReached
+        );
+        assert!(!singleton.page_resume_v1(0, 2, 1));
+        assert!(singleton.page_resume_v1(1, 2, 1));
+        assert!(singleton.page_visible_deadline_v1(2, Some(10)));
+        assert!(!singleton.page_visible_deadline_v1(1, Some(10)));
+        assert!(matches!(
+            singleton.dispatch_v1(),
+            CompatibilityRemoteMcapDispatchV1::RemoteAccepted { .. }
+        ));
+        singleton.page_terminate_v1(3);
+        assert_eq!(
+            singleton.dispatch_v1(),
+            CompatibilityRemoteMcapDispatchV1::RemoteSessionLimitReached
+        );
+    }
+
+    #[test]
+    fn disarmed_compatibility_fallback_is_unchanged_in_every_page_state() {
+        let mut singleton = CompatibilityRemoteMcapSingletonV1::new_disarmed_v1();
+        singleton.page_hidden_v1(1);
+        assert_eq!(
+            singleton.dispatch_v1(),
+            CompatibilityRemoteMcapDispatchV1::ExistingDispatcher
+        );
+        singleton.page_terminate_v1(2);
+        assert_eq!(
+            singleton.dispatch_v1(),
+            CompatibilityRemoteMcapDispatchV1::ExistingDispatcher
+        );
     }
 
     #[test]

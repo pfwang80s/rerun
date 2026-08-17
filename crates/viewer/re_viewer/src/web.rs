@@ -120,59 +120,6 @@ pub extern "C" fn rerun_remote_protobuf_initializer_artifact_probe_v1() -> u32 {
     unsafe { rerun_remote_protobuf_initializer_artifact_probe_v1_impl() }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum RemotePageExecutionBridgeStateV1 {
-    Visible { epoch: u32, resume_nonce: u32 },
-    Hidden { epoch: u32 },
-    Terminated { epoch: u32 },
-}
-
-struct RemotePageExecutionBridgeV1 {
-    state: RemotePageExecutionBridgeStateV1,
-    deadline_ms: Option<f64>,
-}
-
-impl Default for RemotePageExecutionBridgeV1 {
-    fn default() -> Self {
-        Self {
-            state: RemotePageExecutionBridgeStateV1::Visible {
-                epoch: 0,
-                resume_nonce: 0,
-            },
-            deadline_ms: None,
-        }
-    }
-}
-
-impl RemotePageExecutionBridgeV1 {
-    fn hidden(&mut self, epoch: u32) {
-        if matches!(
-            self.state,
-            RemotePageExecutionBridgeStateV1::Terminated { .. }
-        ) {
-            return;
-        }
-        self.state = RemotePageExecutionBridgeStateV1::Hidden { epoch };
-        self.deadline_ms = None;
-    }
-
-    fn resume(&mut self, from_epoch: u32, to_epoch: u32, resume_nonce: u32) {
-        if self.state != (RemotePageExecutionBridgeStateV1::Hidden { epoch: from_epoch }) {
-            return;
-        }
-        self.state = RemotePageExecutionBridgeStateV1::Visible {
-            epoch: to_epoch,
-            resume_nonce,
-        };
-        self.deadline_ms = None;
-    }
-
-    fn terminate(&mut self, epoch: u32) {
-        self.state = RemotePageExecutionBridgeStateV1::Terminated { epoch };
-        self.deadline_ms = None;
-    }
-}
-
 #[wasm_bindgen]
 pub struct WebHandle {
     runner: eframe::WebRunner,
@@ -180,9 +127,6 @@ pub struct WebHandle {
     /// Compatibility `.mcap` ingress seam.  The remote capability remains disarmed until its
     /// measured production profile is installed; disarmed dispatch falls back to `ViewerOpenUrl`.
     compatibility_remote_mcap: RefCell<CompatibilityRemoteMcapSingletonV1>,
-
-    /// Rust-owned, production-disarmed page lifecycle seam for future remote Range owners.
-    remote_page_execution: RefCell<RemotePageExecutionBridgeV1>,
 
     /// A dedicated smart channel used by the [`WebHandle::add_rrd_from_bytes`] API.
     ///
@@ -217,7 +161,6 @@ impl WebHandle {
             compatibility_remote_mcap: RefCell::new(
                 CompatibilityRemoteMcapSingletonV1::new_disarmed_v1(),
             ),
-            remote_page_execution: RefCell::new(RemotePageExecutionBridgeV1::default()),
             log_senders: Default::default(),
             connection_registry,
             app_options: app_options.unwrap_or_default(),
@@ -226,24 +169,40 @@ impl WebHandle {
 
     #[wasm_bindgen]
     pub fn remote_page_hidden_v1(&self, epoch: u32) {
-        self.remote_page_execution.borrow_mut().hidden(epoch);
+        self.compatibility_remote_mcap
+            .borrow_mut()
+            .page_hidden_v1(epoch);
     }
 
     #[wasm_bindgen]
     pub fn remote_page_resume_v1(&self, from_epoch: u32, to_epoch: u32, resume_nonce: u32) {
-        self.remote_page_execution
-            .borrow_mut()
-            .resume(from_epoch, to_epoch, resume_nonce);
+        let _ = self.compatibility_remote_mcap.borrow_mut().page_resume_v1(
+            from_epoch,
+            to_epoch,
+            resume_nonce,
+        );
     }
 
     #[wasm_bindgen]
-    pub fn remote_page_deadline_v1(&self, deadline_ms: Option<f64>) {
-        self.remote_page_execution.borrow_mut().deadline_ms = deadline_ms;
+    pub fn remote_page_deadline_v1(&self, epoch: u32, deadline_ms: Option<f64>) {
+        let deadline_ms = deadline_ms.and_then(|value| {
+            if value.is_finite() && value >= 0.0 && value <= u64::MAX as f64 {
+                Some(value as u64)
+            } else {
+                None
+            }
+        });
+        let _ = self
+            .compatibility_remote_mcap
+            .borrow_mut()
+            .page_visible_deadline_v1(epoch, deadline_ms);
     }
 
     #[wasm_bindgen]
     pub fn remote_page_terminate_v1(&self, epoch: u32) {
-        self.remote_page_execution.borrow_mut().terminate(epoch);
+        self.compatibility_remote_mcap
+            .borrow_mut()
+            .page_terminate_v1(epoch);
     }
 
     #[wasm_bindgen]
