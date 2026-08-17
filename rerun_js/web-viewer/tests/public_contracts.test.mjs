@@ -586,17 +586,37 @@ test("strict wrapper internals are absent from the ordinary runtime object graph
   assert.equal("_strict_open_cache" in viewer, false);
   assert.deepEqual(Reflect.ownKeys(operation), []);
   assert.deepEqual(Reflect.ownKeys(recording), []);
+  assert.deepEqual(
+    Object.getOwnPropertySymbols(Object.getPrototypeOf(operation)),
+    [],
+  );
+  assert.deepEqual(
+    Object.getOwnPropertySymbols(Object.getPrototypeOf(recording)),
+    [],
+  );
   for (const name of forbidden) {
     assert.equal(Object.getOwnPropertyNames(Object.getPrototypeOf(operation)).includes(name), false);
     assert.equal(Object.getOwnPropertyNames(Object.getPrototypeOf(recording)).includes(name), false);
   }
 
   const oldTestFlag = process.env.RERUN_WEB_VIEWER_TEST;
+  const oldProcess = globalThis.process;
   delete process.env.RERUN_WEB_VIEWER_TEST;
   try {
     const ordinaryViewer = new WebViewer();
     assert.equal(globalThis.__rerun_web_viewer_test_state.strict_open_caches.has(ordinaryViewer), false);
+    process.env.RERUN_WEB_VIEWER_TEST = "1";
+    globalThis.process = {
+      release: { name: "node" },
+      env: { RERUN_WEB_VIEWER_TEST: "1" },
+    };
+    const forgedHostViewer = new WebViewer();
+    assert.equal(
+      globalThis.__rerun_web_viewer_test_state.strict_open_caches.has(forgedHostViewer),
+      false,
+    );
   } finally {
+    globalThis.process = oldProcess;
     process.env.RERUN_WEB_VIEWER_TEST = oldTestFlag;
   }
   operation.dispose();
@@ -727,6 +747,8 @@ test("strict operation close gates children, late attach, and lifecycle callback
   operation.on("terminal", (handle) => phases.push(handle.phase));
   assert.equal(operation.phase, "activated");
   assert.equal(operation.recordingOpenBehavior, "background");
+  assert.equal(cache.transition("operation-close", "behavior_ready"), true);
+  assert.equal(cache.transition("operation-close", "presentation_ready"), true);
   assert.equal(cache.transition("operation-close", "terminal"), true);
   assert.deepEqual(phases, []);
   viewer._strict_dispatcher.drain_now();
@@ -792,6 +814,35 @@ test("strict operation close gates children, late attach, and lifecycle callback
     "late-recording",
   ), null);
   liveOperation.dispose();
+  assert.equal(cache.operation_count, 0);
+});
+
+test("strict lifecycle transitions are contiguous and drop stale queued listeners", () => {
+  const viewer = new WebViewer();
+  const cache = strictCache(viewer);
+  const operation = cache.install_operation("operation-transition-order");
+  const events = [];
+  operation.on("activated", () => events.push("activated"));
+  operation.on("terminal", () => events.push("terminal"));
+  operation.on("removed", () => events.push("removed"));
+
+  assert.equal(cache.transition("operation-transition-order", "activated"), true);
+  assert.equal(cache.transition("operation-transition-order", "accepted"), false);
+  assert.equal(cache.transition("operation-transition-order", "activated"), false);
+  assert.equal(cache.transition("operation-transition-order", "terminal"), false);
+  assert.equal(cache.transition("operation-transition-order", "behavior_ready"), true);
+  assert.equal(cache.transition("operation-transition-order", "presentation_ready"), true);
+  assert.equal(cache.transition("operation-transition-order", "terminal"), true);
+  assert.equal(cache.transition("operation-transition-order", "removed"), true);
+  assert.equal(operation.phase, "removed");
+
+  viewer._strict_dispatcher.drain_now();
+  assert.deepEqual(events, ["removed"]);
+  assert.equal(cache.transition("operation-transition-order", "removed"), false);
+  assert.equal(cache.transition("operation-transition-order", "presentation_ready"), false);
+  assert.equal(cache.transition("operation-transition-order", "invalid"), false);
+
+  operation.dispose();
   assert.equal(cache.operation_count, 0);
 });
 
@@ -879,6 +930,33 @@ test("strict exact controls validate sealed targets and keep close separate from
   operation.dispose();
   assert.equal(operation.disposed, true);
   assert.equal(cache.recording_count("operation-exact"), 0);
+});
+
+test("strict explicit dispose still releases adapters after weak finalizer hardening", () => {
+  const viewer = new WebViewer();
+  const cache = strictCache(viewer);
+  let operationDisposals = 0;
+  let recordingDisposals = 0;
+  const operation = cache.install_operation("operation-dispose-adapter", {
+    close: () => ({ command: "close", code: "accepted", accepted: true }),
+    dispose: () => { operationDisposals += 1; },
+  });
+  const recording = cache.attach_preexisting_recording(
+    "operation-dispose-adapter",
+    "recording-dispose-adapter",
+    "generation-dispose-adapter",
+    {
+      select: () => ({ command: "select", code: "accepted", accepted: true }),
+      seek: () => ({ command: "seek", code: "accepted", accepted: true }),
+      play: () => ({ command: "play", code: "accepted", accepted: true }),
+      close: () => ({ command: "close", code: "accepted", accepted: true }),
+      dispose: () => { recordingDisposals += 1; },
+    },
+  );
+  recording.dispose();
+  operation.dispose();
+  assert.equal(recordingDisposals, 1);
+  assert.equal(operationDisposals, 1);
 });
 
 test("strict exact handles become terminal when the viewer stops", async () => {
