@@ -1355,7 +1355,7 @@ export class WebViewer {
    * The same viewer instance may be started multiple times.
    */
   #cleanup_failed_start() {
-    this.#clearLoader();
+    try { this.#clearLoader(); } catch {}
     try { this.#page_execution?.dispose(); } catch {} finally { this.#page_execution = null; }
     try { this.#page_owner_release?.(); } catch {} finally { this.#page_owner_release = null; }
     const handle = this.#handle;
