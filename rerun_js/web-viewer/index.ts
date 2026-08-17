@@ -1683,6 +1683,7 @@ type StrictOpenOperationInternals = {
     identity: StrictPublicRecordingHandleId,
     alias_kind: StrictOpenRecordingPhase,
     adapter: StrictRecordingControlAdapter | null,
+    on_dispose?: (() => void) | null,
   ) => StrictOpenRecordingWrapper | null;
   readonly install_ack: () => boolean;
   readonly arm_bridge: () => boolean;
@@ -1738,12 +1739,14 @@ function strict_operation_attach_recording(
   identity: StrictPublicRecordingHandleId,
   alias_kind: StrictOpenRecordingPhase,
   adapter: StrictRecordingControlAdapter | null,
+  on_dispose: (() => void) | null = null,
 ) {
   if (!operation) return null;
   return strict_open_operation_internals.get(operation)?.attach_recording(
     identity,
     alias_kind,
     adapter,
+    on_dispose,
   ) ?? null;
 }
 
@@ -2104,8 +2107,8 @@ class StrictOpenOperationWrapper {
     strict_open_finalization_registry?.register(this, this.#finalization_token, this.#finalization_token);
     strict_open_operation_internals.set(this, {
       viewer_stopped: () => this.#internal_viewer_stopped(),
-      attach_recording: (identity, alias_kind, adapter) =>
-        this.#internal_attach_recording(identity, alias_kind, adapter),
+      attach_recording: (identity, alias_kind, adapter, on_dispose) =>
+        this.#internal_attach_recording(identity, alias_kind, adapter, on_dispose),
       install_ack: () => this.#internal_install_ack(),
       arm_bridge: () => this.#internal_arm_bridge(),
       operation_state: () => this.#internal_operation_state(),
@@ -2157,9 +2160,10 @@ class StrictOpenOperationWrapper {
     identity: StrictPublicRecordingHandleId,
     alias_kind: StrictOpenRecordingPhase,
     adapter: StrictRecordingControlAdapter | null,
+    on_dispose: (() => void) | null = null,
   ) {
     if (this.#disposed || this.#closed || this.#viewer_stopped) return null;
-    return this.#attach_recording(identity, alias_kind, adapter);
+    return this.#attach_recording(identity, alias_kind, adapter, on_dispose);
   }
 
   #internal_install_ack() {
@@ -2277,6 +2281,7 @@ class StrictOpenOperationWrapper {
     identity: StrictPublicRecordingHandleId,
     alias_kind: StrictOpenRecordingPhase,
     adapter: StrictRecordingControlAdapter | null,
+    on_dispose: (() => void) | null = null,
   ) {
     const identity_key = strict_recording_identity_key(identity);
     const existing_entry = this.#recordings.get(identity_key);
@@ -2302,6 +2307,7 @@ class StrictOpenOperationWrapper {
       () => {
         const operation = operation_ref.deref();
         if (operation) operation.#delete_recording(identity_key, cache_token);
+        on_dispose?.();
       },
     );
     this.#recordings.set(identity_key, {
@@ -2333,6 +2339,7 @@ class StrictOpenWrapperCache {
   #recording_owners = new Set<StrictOpenRecordingWrapper>();
   #accepting = true;
   #instance_epoch = 1;
+  #has_started_instance = false;
   #schedule: (task: StrictDispatcherTask) => boolean;
 
   constructor(schedule: (task: StrictDispatcherTask) => boolean = () => false) {
@@ -2362,19 +2369,27 @@ class StrictOpenWrapperCache {
   begin_viewer_instance() {
     this.#instance_epoch += 1;
     this.#accepting = true;
+    // The previous instance namespace is never reused. Existing caller-held wrappers remain
+    // viewer-stopped, while a same-id open in this epoch gets a fresh operation object.
+    if (this.#has_started_instance) {
+      this.#operations.clear();
+      this.#recording_owners.clear();
+    }
+    this.#has_started_instance = true;
   }
 
   register_remote_owner(owner: { cancel: () => void }, epoch = this.#instance_epoch) {
     if (!this.#accepting || epoch !== this.#instance_epoch) return false;
-    this.#remote_owners.add({ owner, epoch });
+    if (this.#remote_owners.has(owner)) return true;
+    this.#remote_owners.set(owner, epoch);
     return true;
   }
 
-  #remote_owners = new Set<{ owner: { cancel: () => void }; epoch: number }>();
+  #remote_owners = new Map<{ cancel: () => void }, number>();
 
   cancel_remote_owners() {
-    for (const entry of this.#remote_owners) {
-      try { entry.owner.cancel(); } catch { /* continue cancelling independent owners */ }
+    for (const owner of this.#remote_owners.keys()) {
+      try { owner.cancel(); } catch { /* continue cancelling independent owners */ }
     }
     this.#remote_owners.clear();
   }
@@ -2443,11 +2458,13 @@ class StrictOpenWrapperCache {
   ) {
     if (!this.#accepting || epoch !== this.#instance_epoch) return null;
     const operation = this.#get_operation(operation_id);
-    const recording = strict_operation_attach_recording(
+    let recording: StrictOpenRecordingWrapper | null = null;
+    recording = strict_operation_attach_recording(
       operation,
       new StrictPublicRecordingHandleId(recording_key, generation),
       "preexisting",
       adapter,
+      () => { if (recording) this.#recording_owners.delete(recording); },
     );
     if (recording) this.#recording_owners.add(recording);
     return recording;
@@ -2462,11 +2479,13 @@ class StrictOpenWrapperCache {
   ) {
     if (!this.#accepting || epoch !== this.#instance_epoch) return null;
     const operation = this.#get_operation(operation_id);
-    const recording = strict_operation_attach_recording(
+    let recording: StrictOpenRecordingWrapper | null = null;
+    recording = strict_operation_attach_recording(
       operation,
       new StrictPublicRecordingHandleId(recording_key, generation),
       "active",
       adapter,
+      () => { if (recording) this.#recording_owners.delete(recording); },
     );
     if (recording) this.#recording_owners.add(recording);
     return recording;
@@ -2481,11 +2500,13 @@ class StrictOpenWrapperCache {
   ) {
     if (!this.#accepting || epoch !== this.#instance_epoch) return null;
     const operation = this.#get_operation(operation_id);
-    const recording = strict_operation_attach_recording(
+    let recording: StrictOpenRecordingWrapper | null = null;
+    recording = strict_operation_attach_recording(
       operation,
       new StrictPublicRecordingHandleId(recording_key, generation),
       "completed",
       adapter,
+      () => { if (recording) this.#recording_owners.delete(recording); },
     );
     if (recording) this.#recording_owners.add(recording);
     return recording;
@@ -2756,7 +2777,11 @@ class BoundedSingleTaskDispatcher {
   }
 
   #drain(epoch: number) {
-    if (this.#stopped || epoch !== this.#epoch) {
+    if (epoch !== this.#epoch) {
+      // A timer from an older Viewer epoch has no authority over current scheduling state.
+      return;
+    }
+    if (this.#stopped) {
       this.#scheduled = false;
       this.#queue.length = 0;
       return;

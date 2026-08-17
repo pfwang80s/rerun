@@ -1166,11 +1166,15 @@ test("viewer stop synchronously tears down remote owners and drops stale work", 
   await viewer.start(null, document.body, null);
   assert.equal(viewer._strict_dispatcher.stopped, false);
   assert.equal(cache.install_operation("late-stale", null, "accepted", "open_and_select", old_epoch), null);
+  const fresh_operation = cache.install_operation("operation-teardown");
+  assert.notStrictEqual(fresh_operation, operation);
+  assert.equal(fresh_operation.phase, "accepted");
   assert.equal(viewer._strict_dispatcher.enqueue(() => calls.push("fresh")), true);
   viewer._strict_dispatcher.drain_now();
   assert.deepEqual(calls, ["recording", "operation", "fresh"]);
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepEqual(calls, ["recording", "operation", "fresh"]);
+  fresh_operation.dispose();
   viewer.stop();
 });
 
