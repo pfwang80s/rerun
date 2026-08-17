@@ -15,6 +15,11 @@ class FakeWebHandle {
     }
   }
 
+  remote_page_hidden_v1(epoch) { state.calls.push(["remote_page_hidden_v1", epoch]); }
+  remote_page_resume_v1(from, to, nonce) { state.calls.push(["remote_page_resume_v1", from, to, nonce]); }
+  remote_page_deadline_v1(deadline) { state.calls.push(["remote_page_deadline_v1", deadline]); }
+  remote_page_terminate_v1(epoch) { state.calls.push(["remote_page_terminate_v1", epoch]); }
+
   add_receiver(url) {
     state.calls.push(["add_receiver", url]);
     if (state.addReceiverErrorAt === state.addReceiverCalls++) {

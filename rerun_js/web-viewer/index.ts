@@ -852,9 +852,13 @@ export class ChromePageExecutionController {
     if (this.#disposed || this.#state.kind === "RemoteTerminating" || this.#state.kind === "HiddenSuspended") return;
     this.#epoch++;
     this.#generation++;
+    const hidden_epoch = this.#epoch;
+    const hidden_generation = this.#generation;
     this.#visible_deadline_ms = null;
     for (const owner of this.#owners) { try { owner.on_visible_deadline?.(null); } catch {} }
+    if (this.#disposed || this.#epoch !== hidden_epoch || this.#generation !== hidden_generation) return;
     this.#publish({ kind: "HiddenSuspended", epoch: this.#epoch, remote_wake_pending: false });
+    if (this.#disposed || this.#epoch !== hidden_epoch || this.#generation !== hidden_generation) return;
     for (const owner of this.#owners) { try { owner.on_hidden?.(this.#epoch); } catch {} }
   }
 
@@ -930,6 +934,7 @@ export class WebViewer {
   #allow_fullscreen = false;
   #page_execution: ChromePageExecutionController | null = null;
   #page_owner_release: (() => void) | null = null;
+  #wasm_page_owner_release: (() => void) | null = null;
 
   constructor() {
     injectStyle();
@@ -1046,8 +1051,7 @@ export class WebViewer {
     try {
       WebHandle_class = await load(base_url, on_progress);
     } catch (e) {
-      this.#cleanup_failed_start();
-      this.#fail("Failed to load rerun", String(e));
+      try { this.#fail("Failed to load rerun", String(e)); } catch {} finally { this.#cleanup_failed_start(); }
       throw e;
     }
     if (this.#state !== "starting") {
@@ -1090,10 +1094,16 @@ export class WebViewer {
         fullscreen,
         on_viewer_event,
       });
+      const remote_handle = this.#handle as any;
+      this.#wasm_page_owner_release = this.#page_execution?.register_remote_owner({
+        on_hidden: (epoch) => remote_handle.remote_page_hidden_v1?.(epoch),
+        on_resume: (from, to, nonce) => remote_handle.remote_page_resume_v1?.(from, to, nonce),
+        on_visible_deadline: (deadline) => remote_handle.remote_page_deadline_v1?.(deadline),
+        on_terminate: (_reason, epoch) => remote_handle.remote_page_terminate_v1?.(epoch),
+      }) ?? null;
       await this.#handle.start(this.#canvas);
     } catch (e) {
-      this.#cleanup_failed_start();
-      this.#fail("Failed to start", String(e));
+      try { this.#fail("Failed to start", String(e)); } catch {} finally { this.#cleanup_failed_start(); }
       throw e;
     }
     if (this.#state !== "starting") {
@@ -1358,6 +1368,7 @@ export class WebViewer {
     try { this.#clearLoader(); } catch {}
     try { this.#page_execution?.dispose(); } catch {} finally { this.#page_execution = null; }
     try { this.#page_owner_release?.(); } catch {} finally { this.#page_owner_release = null; }
+    try { this.#wasm_page_owner_release?.(); } catch {} finally { this.#wasm_page_owner_release = null; }
     const handle = this.#handle;
     try { handle?.destroy(); } catch {} finally {
       try { handle?.free(); } catch {} finally { this.#handle = null; }
@@ -1380,6 +1391,7 @@ export class WebViewer {
     this.#strict_open_cache.mark_viewer_stopped();
     try { this.#page_execution?.dispose(); } catch {} finally { this.#page_execution = null; }
     try { this.#page_owner_release?.(); } catch {} finally { this.#page_owner_release = null; }
+    try { this.#wasm_page_owner_release?.(); } catch {} finally { this.#wasm_page_owner_release = null; }
     // Remote-MCAP work is instance-owned and must be synchronously cancelled before the
     // underlying wasm handle is destroyed.  Compatibility receivers and their existing
     // teardown remain owned by WebHandle.
@@ -1435,8 +1447,7 @@ export class WebViewer {
   }
 
   #clearLoader() {
-    this.#loader?.remove();
-    this.#loader = null;
+    try { this.#loader?.remove(); } finally { this.#loader = null; }
   }
 
   /**

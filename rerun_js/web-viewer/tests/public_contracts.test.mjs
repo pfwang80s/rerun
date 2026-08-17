@@ -186,6 +186,29 @@ test("remote page callbacks isolate throws and hidden deadlines stay cleared", (
   assert.equal(later, 2);
 });
 
+test("WebViewer start bridges an initially hidden page into the Rust owner seam", async () => {
+  globalThis.document.visibilityState = "hidden";
+  const viewer = new WebViewer();
+  await viewer.start(null, document.body, null);
+  assert.equal(globalThis.__rerun_web_viewer_test_state.calls.some((call) => call[0] === "remote_page_hidden_v1"), true);
+  viewer.stop();
+});
+
+test("deadline suspension cannot overwrite reentrant page termination", () => {
+  const listeners = new Map();
+  const target = { addEventListener: (n, f) => listeners.set(n, f), removeEventListener: () => {} };
+  const page = { visibilityState: "visible" };
+  const controller = new ChromePageExecutionController({ target, document: page });
+  controller.register_remote_owner({ on_visible_deadline: (deadline) => {
+    if (deadline === null) listeners.get("freeze")();
+  }});
+  controller.set_visible_deadline(1);
+  page.visibilityState = "hidden";
+  listeners.get("visibilitychange")();
+  assert.equal(controller.state.kind, "RemoteTerminating");
+  assert.equal(controller.state.reason, "freeze");
+});
+
 function callsNamed(name) {
   return globalThis.__rerun_web_viewer_test_state.calls.filter(
     (call) => call[0] === name,
