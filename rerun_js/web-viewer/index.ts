@@ -2571,8 +2571,8 @@ class StrictOpenWrapperCache {
     }
     for (const recording of this.#recording_owners) {
       strict_recording_viewer_stopped(recording);
-      if (recording.disposed) this.#recording_owners.delete(recording);
     }
+    this.#recording_owners.clear();
     this.cancel_remote_owners();
     this.#drop_dead_operations();
   }
