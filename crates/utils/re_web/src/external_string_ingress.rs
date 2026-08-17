@@ -42,7 +42,6 @@ impl<'a> OpaqueJsString<'a> {
             return Err(ExternalStringIngressError::FieldLimit);
         }
         let owned = js_string.as_string().ok_or(ExternalStringIngressError::InvalidUtf8)?;
-        let units = owned.encode_utf16().count() as u64;
         let bytes = owned.len() as u64;
         if bytes > MAX_FIELD_UTF8 {
             return Err(ExternalStringIngressError::FieldLimit);
@@ -76,10 +75,17 @@ impl<'a> OpaqueJsString<'a> {
 /// Request-local permit covering all copied strings and the retained Rust object graph.
 #[derive(Debug, PartialEq, Eq)]
 pub struct CombinedCopyPermit {
-    pub fields: u32,
-    pub utf16_code_units: u64,
-    pub utf8_bytes: u64,
-    pub object_graph_bytes: NonZeroU64,
+    fields: u32,
+    utf16_code_units: u64,
+    utf8_bytes: u64,
+    object_graph_bytes: NonZeroU64,
+}
+
+impl CombinedCopyPermit {
+    pub const fn fields(&self) -> u32 { self.fields }
+    pub const fn utf16_code_units(&self) -> u64 { self.utf16_code_units }
+    pub const fn utf8_bytes(&self) -> u64 { self.utf8_bytes }
+    pub const fn object_graph_bytes(&self) -> NonZeroU64 { self.object_graph_bytes }
 }
 
 impl CombinedCopyPermit {
@@ -128,8 +134,8 @@ mod tests {
         let value = OpaqueJsString::from_utf8(b"timeline").unwrap();
         assert!(format!("{value:?}").contains("<redacted>"));
         let permit = CombinedCopyPermit::prepare([value], 8).unwrap();
-        assert_eq!(permit.utf16_code_units, 8);
-        assert_eq!(permit.utf8_bytes, 8);
+        assert_eq!(permit.utf16_code_units(), 8);
+        assert_eq!(permit.utf8_bytes(), 8);
         let value = OpaqueJsString::from_utf8(b"timeline").unwrap();
         assert_eq!(CombinedCopyPermit::prepare([value], MAX_OBJECT_GRAPH_BYTES + 1).unwrap_err(), ExternalStringIngressError::FieldLimit);
     }
