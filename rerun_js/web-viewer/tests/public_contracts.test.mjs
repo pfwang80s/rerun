@@ -147,6 +147,27 @@ test("remote page execution lifecycle is epoch-checked and idempotent", () => {
   assert.equal(listeners.size, 0);
 });
 
+test("remote owner teardown and reentrant resume are guarded", () => {
+  const listeners = new Map();
+  const target = { addEventListener: (n, f) => listeners.set(n, f), removeEventListener: () => {} };
+  const page = { visibilityState: "hidden" };
+  let terminated = 0;
+  let resumed = 0;
+  let controller;
+  controller = new ChromePageExecutionController({ target, document: page, on_state: (state) => {
+    if (state.kind === "VisibleRevalidating") listeners.get("pagehide")();
+  }});
+  assert.equal(controller.state.kind, "HiddenSuspended");
+  const owner = controller.register_remote_owner({ on_resume: () => resumed++, on_terminate: () => terminated++ });
+  page.visibilityState = "visible";
+  listeners.get("pageshow")();
+  assert.equal(resumed, 0);
+  listeners.get("freeze")();
+  assert.equal(terminated, 1); // reentrant pagehide synchronously cancelled the owner
+  owner();
+  controller.dispose();
+});
+
 function callsNamed(name) {
   return globalThis.__rerun_web_viewer_test_state.calls.filter(
     (call) => call[0] === name,

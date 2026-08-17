@@ -724,6 +724,14 @@ export type ChromePageExecutionOwner = {
   readonly is_current: () => boolean;
 };
 
+/** Remote-MCAP owner callbacks; compatibility and non-remote work never register here. */
+export type ChromePageExecutionRemoteOwner = {
+  readonly on_hidden?: (epoch: number) => void;
+  readonly on_resume?: (from_epoch: number, to_epoch: number, resume_nonce: number) => void;
+  readonly on_terminate?: (reason: "pagehide" | "freeze", epoch: number) => void;
+  readonly on_visible_deadline?: (deadline_ms: number | null) => void;
+};
+
 export type ChromePageExecutionListenerOptions = {
   readonly target?: EventTarget;
   readonly document?: { readonly visibilityState?: string; addEventListener?: EventTarget["addEventListener"]; removeEventListener?: EventTarget["removeEventListener"] };
@@ -745,15 +753,17 @@ export class ChromePageExecutionController {
   #resume_nonce = 0;
   #disposed = false;
   #listeners: Array<[EventTarget, string, EventListener]> = [];
+  #owners = new Set<ChromePageExecutionRemoteOwner>();
+  #visible_deadline_ms: number | null = null;
 
   constructor(options: ChromePageExecutionListenerOptions = {}) {
     this.#target = options.target ?? (typeof window !== "undefined" ? window : null);
     this.#document = options.document ?? (typeof document !== "undefined" ? document : null);
     this.#on_state = options.on_state ?? null;
-    const visible = this.#document?.visibilityState !== "hidden";
-    this.#state = visible
-      ? { kind: "VisibleRunning", epoch: this.#epoch, clock_baseline: this.#now() }
-      : { kind: "HiddenSuspended", epoch: this.#epoch, remote_wake_pending: false };
+    // Start from a checked visible baseline, then reconcile the actual page state after
+    // listeners are installed. This makes an initially-hidden page advance its epoch and
+    // reject owners captured before the reconciliation.
+    this.#state = { kind: "VisibleRunning", epoch: this.#epoch, clock_baseline: this.#now() };
     this.#install();
     // Reconcile after listener installation to cover an already-hidden initial page.
     if (this.#document?.visibilityState === "hidden") this.#hidden();
@@ -761,6 +771,18 @@ export class ChromePageExecutionController {
 
   get state(): ChromePageExecutionState { return this.#state; }
   get epoch(): number { return this.#epoch; }
+
+  register_remote_owner(owner: ChromePageExecutionRemoteOwner): () => void {
+    if (this.#disposed) return () => {};
+    this.#owners.add(owner);
+    return () => this.#owners.delete(owner);
+  }
+
+  set_visible_deadline(deadline_ms: number | null): void {
+    if (this.#disposed) return;
+    this.#visible_deadline_ms = deadline_ms;
+    for (const owner of this.#owners) owner.on_visible_deadline?.(deadline_ms);
+  }
 
   acquire_owner(): ChromePageExecutionOwner {
     const epoch = this.#epoch;
@@ -781,6 +803,8 @@ export class ChromePageExecutionController {
     }
     this.#listeners = [];
     this.#on_state = null;
+    this.#cancel_owners("pagehide");
+    this.#owners.clear();
     this.#generation++;
   }
 
@@ -814,6 +838,7 @@ export class ChromePageExecutionController {
     this.#epoch++;
     this.#generation++;
     this.#publish({ kind: "HiddenSuspended", epoch: this.#epoch, remote_wake_pending: false });
+    for (const owner of this.#owners) owner.on_hidden?.(this.#epoch);
   }
 
   #visible(): void {
@@ -822,8 +847,12 @@ export class ChromePageExecutionController {
     const from = this.#epoch;
     this.#epoch++;
     this.#generation++;
+    const resume_generation = this.#generation;
     this.#resume_nonce++;
     this.#publish({ kind: "VisibleRevalidating", from_epoch: from, to_epoch: this.#epoch, resume_nonce: this.#resume_nonce });
+    if (this.#disposed || this.#epoch !== from + 1 || this.#generation !== resume_generation) return;
+    for (const owner of this.#owners) owner.on_resume?.(from, this.#epoch, this.#resume_nonce);
+    if (this.#disposed || this.#epoch !== from + 1 || this.#generation !== resume_generation) return;
     this.#publish({ kind: "VisibleRunning", epoch: this.#epoch, clock_baseline: this.#now() });
   }
 
@@ -832,6 +861,13 @@ export class ChromePageExecutionController {
     this.#epoch++;
     this.#generation++;
     this.#publish({ kind: "RemoteTerminating", epoch: this.#epoch, reason });
+    this.#cancel_owners(reason);
+  }
+
+  #cancel_owners(reason: "pagehide" | "freeze"): void {
+    const epoch = this.#epoch;
+    for (const owner of this.#owners) owner.on_terminate?.(reason, epoch);
+    this.#owners.clear();
   }
 }
 
@@ -981,6 +1017,9 @@ export class WebViewer {
       WebHandle_class = await load(base_url, on_progress);
     } catch (e) {
       this.#clearLoader();
+      this.#page_execution?.dispose();
+      this.#page_execution = null;
+      this.#state = "stopped";
       this.#fail("Failed to load rerun", String(e));
       throw e;
     }
@@ -1027,6 +1066,9 @@ export class WebViewer {
       await this.#handle.start(this.#canvas);
     } catch (e) {
       this.#clearLoader();
+      this.#page_execution?.dispose();
+      this.#page_execution = null;
+      this.#state = "stopped";
       this.#fail("Failed to start", String(e));
       throw e;
     }
