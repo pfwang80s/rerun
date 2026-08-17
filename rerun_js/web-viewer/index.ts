@@ -774,6 +774,14 @@ export class ChromePageExecutionController {
 
   register_remote_owner(owner: ChromePageExecutionRemoteOwner): () => void {
     if (this.#disposed) return () => {};
+    if (this.#state.kind === "RemoteTerminating") {
+      owner.on_terminate?.(this.#state.reason, this.#state.epoch);
+      return () => {};
+    }
+    if (this.#state.kind === "HiddenSuspended") {
+      owner.on_hidden?.(this.#state.epoch);
+      return () => {};
+    }
     this.#owners.add(owner);
     return () => this.#owners.delete(owner);
   }
@@ -784,6 +792,8 @@ export class ChromePageExecutionController {
     for (const owner of this.#owners) owner.on_visible_deadline?.(deadline_ms);
   }
 
+  get visible_deadline(): number | null { return this.#visible_deadline_ms; }
+
   acquire_owner(): ChromePageExecutionOwner {
     const epoch = this.#epoch;
     const generation = this.#generation;
@@ -791,7 +801,7 @@ export class ChromePageExecutionController {
       epoch,
       generation,
       is_current: () => !this.#disposed && epoch === this.#epoch && generation === this.#generation
-        && this.#state.kind !== "RemoteTerminating",
+        && this.#state.kind === "VisibleRunning",
     });
   }
 
@@ -837,6 +847,8 @@ export class ChromePageExecutionController {
     if (this.#disposed || this.#state.kind === "RemoteTerminating" || this.#state.kind === "HiddenSuspended") return;
     this.#epoch++;
     this.#generation++;
+    this.#visible_deadline_ms = null;
+    for (const owner of this.#owners) owner.on_visible_deadline?.(null);
     this.#publish({ kind: "HiddenSuspended", epoch: this.#epoch, remote_wake_pending: false });
     for (const owner of this.#owners) owner.on_hidden?.(this.#epoch);
   }
@@ -866,8 +878,13 @@ export class ChromePageExecutionController {
 
   #cancel_owners(reason: "pagehide" | "freeze"): void {
     const epoch = this.#epoch;
-    for (const owner of this.#owners) owner.on_terminate?.(reason, epoch);
-    this.#owners.clear();
+    try {
+      for (const owner of this.#owners) {
+        try { owner.on_terminate?.(reason, epoch); } catch { /* isolate remote owner teardown */ }
+      }
+    } finally {
+      this.#owners.clear();
+    }
   }
 }
 

@@ -163,7 +163,7 @@ test("remote owner teardown and reentrant resume are guarded", () => {
   listeners.get("pageshow")();
   assert.equal(resumed, 0);
   listeners.get("freeze")();
-  assert.equal(terminated, 1); // reentrant pagehide synchronously cancelled the owner
+  assert.equal(terminated, 0); // hidden registration is rejected and never retained
   owner();
   controller.dispose();
 });
