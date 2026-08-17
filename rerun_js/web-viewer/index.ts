@@ -2360,6 +2360,10 @@ class StrictOpenWrapperCache {
     return this.#instance_epoch;
   }
 
+  current_epoch() {
+    return this.#instance_epoch;
+  }
+
   get recording_owner_count() {
     this.#prune_recording_owners();
     return this.#recording_owners.size;
