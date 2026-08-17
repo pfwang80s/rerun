@@ -1123,6 +1123,50 @@ test("strict exact handles become terminal when the viewer stops", async () => {
   operation.dispose();
 });
 
+test("viewer stop synchronously tears down remote owners and drops stale work", async () => {
+  const viewer = await startViewer();
+  const cache = strictCache(viewer);
+  const calls = [];
+  const operation = cache.install_operation("operation-teardown", {
+    close: () => ({ command: "close", code: "accepted", accepted: true }),
+    dispose: () => calls.push("operation"),
+  });
+  const recording = cache.attach_preexisting_recording(
+    "operation-teardown",
+    "recording-teardown",
+    "generation-teardown",
+    {
+      select: () => ({ command: "select", code: "accepted", accepted: true }),
+      seek: () => ({ command: "seek", code: "accepted", accepted: true }),
+      play: () => ({ command: "play", code: "accepted", accepted: true }),
+      close: () => ({ command: "close", code: "accepted", accepted: true }),
+      dispose: () => calls.push("recording"),
+    },
+  );
+  let listener_calls = 0;
+  operation.on("activated", () => listener_calls++);
+  viewer._strict_dispatcher.enqueue(() => calls.push("stale"));
+
+  viewer.stop();
+
+  assert.deepEqual(calls, ["recording", "operation"]);
+  assert.equal(listener_calls, 0);
+  assert.equal(viewer._strict_dispatcher.stopped, true);
+  assert.deepEqual(recording.select(), {
+    command: "select",
+    code: "viewer_stopped",
+    accepted: false,
+  });
+
+  // A restarted Viewer instance gets a fresh dispatcher epoch; old queued work cannot run.
+  await viewer.start(null, document.body, null);
+  assert.equal(viewer._strict_dispatcher.stopped, false);
+  assert.equal(viewer._strict_dispatcher.enqueue(() => calls.push("fresh")), true);
+  viewer._strict_dispatcher.drain_now();
+  assert.deepEqual(calls, ["recording", "operation", "fresh"]);
+  viewer.stop();
+});
+
 test("strict dispatcher batches into one task, preserves FIFO, and cancels cleanly", () => {
   const viewer = new WebViewer();
   const dispatcher = viewer._strict_dispatcher;

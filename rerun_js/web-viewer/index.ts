@@ -796,6 +796,9 @@ export class WebViewer {
     this.#allow_fullscreen = options.allow_fullscreen || false;
 
     if (this.#state !== "stopped") return;
+    // A restart creates a fresh remote-MCAP dispatcher epoch.  Work queued by the previous
+    // Viewer instance was synchronously discarded by stop().
+    this._strict_dispatcher.reset();
     this.#state = "starting";
     this.#clearLoader();
 
@@ -1167,6 +1170,10 @@ export class WebViewer {
     // Strict remote handles retain their opaque identity across a Viewer restart, but all
     // controls become terminally stopped and can never redirect to a later publication.
     this.#strict_open_cache.mark_viewer_stopped();
+    // Remote-MCAP work is instance-owned and must be synchronously cancelled before the
+    // underlying wasm handle is destroyed.  Compatibility receivers and their existing
+    // teardown remain owned by WebHandle.
+    this._strict_dispatcher.cancel();
 
     this.#canvas?.remove();
     this.#clearLoader();
@@ -1917,6 +1924,7 @@ class StrictOpenRecordingWrapper {
   #operation_closed = false;
   #recording_removed = false;
   #viewer_stopped = false;
+  #remote_torn_down = false;
   #adapter: StrictRecordingControlAdapter | null;
   #finalization_token: StrictFinalizationToken;
 
@@ -1950,6 +1958,16 @@ class StrictOpenRecordingWrapper {
 
   #internal_viewer_stopped() {
     this.#viewer_stopped = true;
+    if (this.#remote_torn_down) return;
+    this.#remote_torn_down = true;
+    const adapter = this.#adapter;
+    this.#adapter = null;
+    try {
+      adapter?.dispose();
+    } catch {
+      // Viewer teardown is best-effort across independent remote owners. A stale completion
+      // must never prevent the remaining owners from being invalidated synchronously.
+    }
   }
 
   #internal_operation_closed() {
@@ -2060,6 +2078,7 @@ class StrictOpenOperationWrapper {
   #disposed = false;
   #closed = false;
   #viewer_stopped = false;
+  #remote_torn_down = false;
   #adapter: StrictOperationControlAdapter | null;
   #listeners = new Map<StrictOpenLifecycleEvent, Set<StrictOpenLifecycleListener>>();
   #finalization_token: StrictFinalizationToken;
@@ -2108,8 +2127,19 @@ class StrictOpenOperationWrapper {
   #internal_viewer_stopped() {
     this.#viewer_stopped = true;
     this.#transition_revision += 1;
+    this.#listeners.clear();
     for (const entry of this.#recordings.values()) {
       strict_recording_viewer_stopped(entry.wrapper);
+    }
+    if (this.#remote_torn_down) return;
+    this.#remote_torn_down = true;
+    const adapter = this.#adapter;
+    this.#adapter = null;
+    try {
+      adapter?.dispose();
+    } catch {
+      // See recording teardown above: cleanup of one remote owner cannot block invalidation of
+      // the rest of the instance.
     }
   }
 
@@ -2640,6 +2670,13 @@ class BoundedSingleTaskDispatcher {
   cancel() {
     this.#stopped = true;
     this.#scheduled = false;
+    this.#queue.length = 0;
+  }
+
+  reset() {
+    this.#stopped = false;
+    this.#scheduled = false;
+    this.#draining = false;
     this.#queue.length = 0;
   }
 
