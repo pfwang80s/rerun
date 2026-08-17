@@ -1964,7 +1964,7 @@ class StrictOpenRecordingWrapper {
     this.#viewer_stopped = true;
     if (this.#remote_torn_down) return;
     this.#remote_torn_down = true;
-    this.#adapter = null;
+    const adapter = this.#adapter;
     try {
       // Consume the same once-only finalization token used by explicit dispose, so a caller
       // retaining this handle cannot release the adapter twice after Viewer.stop().
@@ -1973,6 +1973,9 @@ class StrictOpenRecordingWrapper {
       // Viewer teardown is best-effort across independent remote owners. A stale completion
       // must never prevent the remaining owners from being invalidated synchronously.
     }
+    // Keep a strong local reference until the once-token has consumed its WeakRef.
+    void adapter;
+    this.#adapter = null;
   }
 
   #internal_operation_closed() {
@@ -2138,13 +2141,15 @@ class StrictOpenOperationWrapper {
     }
     if (this.#remote_torn_down) return;
     this.#remote_torn_down = true;
-    this.#adapter = null;
+    const adapter = this.#adapter;
     try {
       this.#finalization_token.run();
     } catch {
       // See recording teardown above: cleanup of one remote owner cannot block invalidation of
       // the rest of the instance.
     }
+    void adapter;
+    this.#adapter = null;
   }
 
   get recordings() {
