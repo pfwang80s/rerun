@@ -4,11 +4,12 @@
 //! This module is the second gate: it accepts only an opaque, already-copied UTF-8 value and
 //! reserves the complete retained object graph before constructing semantic identifiers.
 
-use std::num::NonZeroU64;
+use std::{borrow::Cow, fmt, num::NonZeroU64};
 
 pub const MAX_FIELD_UTF16: u64 = 65_536;
 pub const MAX_FIELD_UTF8: u64 = 65_536;
 pub const MAX_COMBINED_UTF8: u64 = 65_536;
+pub const MAX_OBJECT_GRAPH_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExternalStringIngressError {
@@ -19,12 +20,36 @@ pub enum ExternalStringIngressError {
 }
 
 /// Opaque proof that the JS adapter observed a primitive string and copied it exactly once.
-#[derive(Debug)]
 pub struct OpaqueJsString<'a> {
-    value: &'a str,
+    value: Cow<'a, str>,
+}
+
+impl fmt::Debug for OpaqueJsString<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OpaqueJsString(<redacted>)")
+    }
 }
 
 impl<'a> OpaqueJsString<'a> {
+    #[cfg(target_arch = "wasm32")]
+    pub fn from_js(value: &wasm_bindgen::JsValue) -> Result<OpaqueJsString<'static>, ExternalStringIngressError> {
+        if !value.is_string() {
+            return Err(ExternalStringIngressError::InvalidUtf8);
+        }
+        let js_string = js_sys::JsString::from(value.clone());
+        let units = js_string.length() as u64;
+        if units > MAX_FIELD_UTF16 {
+            return Err(ExternalStringIngressError::FieldLimit);
+        }
+        let owned = js_string.as_string().ok_or(ExternalStringIngressError::InvalidUtf8)?;
+        let units = owned.encode_utf16().count() as u64;
+        let bytes = owned.len() as u64;
+        if bytes > MAX_FIELD_UTF8 {
+            return Err(ExternalStringIngressError::FieldLimit);
+        }
+        Ok(OpaqueJsString { value: Cow::Owned(owned) })
+    }
+
     pub fn from_utf8(bytes: &'a [u8]) -> Result<Self, ExternalStringIngressError> {
         let value = std::str::from_utf8(bytes).map_err(|_| ExternalStringIngressError::InvalidUtf8)?;
         let units = value.encode_utf16().count() as u64;
@@ -32,14 +57,14 @@ impl<'a> OpaqueJsString<'a> {
         if units > MAX_FIELD_UTF16 || bytes_len > MAX_FIELD_UTF8 {
             return Err(ExternalStringIngressError::FieldLimit);
         }
-        Ok(Self { value })
+        Ok(Self { value: Cow::Borrowed(value) })
     }
 
     pub fn as_str(&self) -> &str {
-        self.value
+        self.value.as_ref()
     }
 
-    pub const fn utf8_len(&self) -> u64 {
+    pub fn utf8_len(&self) -> u64 {
         self.value.len() as u64
     }
 
@@ -49,7 +74,7 @@ impl<'a> OpaqueJsString<'a> {
 }
 
 /// Request-local permit covering all copied strings and the retained Rust object graph.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct CombinedCopyPermit {
     pub fields: u32,
     pub utf16_code_units: u64,
@@ -75,6 +100,13 @@ impl CombinedCopyPermit {
         }
         let object_graph_bytes = NonZeroU64::new(object_graph_bytes)
             .ok_or(ExternalStringIngressError::FieldLimit)?;
+        if object_graph_bytes.get() > MAX_OBJECT_GRAPH_BYTES {
+            return Err(ExternalStringIngressError::FieldLimit);
+        }
+        object_graph_bytes
+            .get()
+            .checked_add(utf8)
+            .ok_or(ExternalStringIngressError::ArithmeticOverflow)?;
         Ok(Self { fields, utf16_code_units: utf16, utf8_bytes: utf8, object_graph_bytes })
     }
 }
@@ -94,8 +126,11 @@ mod tests {
     #[test]
     fn reserves_nonempty_object_graph() {
         let value = OpaqueJsString::from_utf8(b"timeline").unwrap();
+        assert!(format!("{value:?}").contains("<redacted>"));
         let permit = CombinedCopyPermit::prepare([value], 8).unwrap();
         assert_eq!(permit.utf16_code_units, 8);
         assert_eq!(permit.utf8_bytes, 8);
+        let value = OpaqueJsString::from_utf8(b"timeline").unwrap();
+        assert_eq!(CombinedCopyPermit::prepare([value], MAX_OBJECT_GRAPH_BYTES + 1).unwrap_err(), ExternalStringIngressError::FieldLimit);
     }
 }

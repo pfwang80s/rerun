@@ -550,7 +550,10 @@ type NormalizedStrictOpenSpec = {
 function strict_utf8_byte_length(value: string): number {
   // TextEncoder is available in every supported browser and avoids treating UTF-16 code units
   // as wire bytes.  The fallback keeps contract tests usable in minimal JS hosts.
-  return typeof TextEncoder === "function" ? new TextEncoder().encode(value).byteLength : value.length;
+  if (typeof TextEncoder === "function") return new TextEncoder().encode(value).byteLength;
+  // Minimal hosts may omit TextEncoder; fail closed for non-ASCII rather than treating UTF-16
+  // code units as wire bytes and allowing an oversized Wasm copy.
+  return /^[\x00-\x7f]*$/.test(value) ? value.length : Number.POSITIVE_INFINITY;
 }
 
 function strict_decimal_option(value: unknown, index: number): string {
