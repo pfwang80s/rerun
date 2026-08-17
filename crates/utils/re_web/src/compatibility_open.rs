@@ -110,9 +110,8 @@ impl CompatibilityRemoteMcapSingletonV1 {
         let RemotePageStateV1::Visible { epoch: current, .. } = self.page.state else {
             return;
         };
-        // Browser signals carry the resulting epoch. Accept the initial 0→1
-        // transition as well as an explicit current-epoch signal; later jumps are stale.
-        if epoch != current && epoch != current.saturating_add(1) {
+        // Browser signals carry only the resulting epoch.
+        if epoch != current.saturating_add(1) {
             return;
         }
         self.page.state = RemotePageStateV1::Hidden { epoch };
@@ -155,8 +154,8 @@ impl CompatibilityRemoteMcapSingletonV1 {
             | RemotePageStateV1::Hidden { epoch: current } => current,
             RemotePageStateV1::Terminated { .. } => return,
         };
-        // Browser termination carries the resulting epoch, just like hidden.
-        if epoch != current && epoch != current.saturating_add(1) {
+        // Browser termination carries only the resulting epoch, just like hidden.
+        if epoch != current.saturating_add(1) {
             return;
         }
         self.page.state = RemotePageStateV1::Terminated { epoch };
@@ -223,6 +222,7 @@ mod tests {
         assert!(singleton.page_resume_v1(1, 2, 1));
         assert!(!singleton.opening_suspended);
         singleton.page_hidden_v1(1); // stale hidden must not suspend epoch 2
+        singleton.page_hidden_v1(2); // duplicate/current hidden is also stale
         assert!(matches!(
             singleton.page.state,
             RemotePageStateV1::Visible { epoch: 2, .. }
@@ -252,6 +252,8 @@ mod tests {
             CompatibilityRemoteMcapDispatchV1::RemoteAccepted { .. }
         ));
         singleton.page_terminate_v1(1);
+        assert!(singleton.opening.is_some());
+        singleton.page_terminate_v1(2); // current epoch is not a resulting signal
         assert!(singleton.opening.is_some());
         singleton.page_terminate_v1(3);
         assert!(singleton.opening.is_none());
