@@ -2399,25 +2399,25 @@ class StrictOpenWrapperCache {
     this.#remote_owners.clear();
   }
 
-  get_operation(operation_id: string, epoch = this.#instance_epoch) {
+  get_operation(operation_id: string, epoch: number) {
     if (!this.#accepting || epoch !== this.#instance_epoch) return null;
     return this.#get_operation(operation_id);
   }
 
-  recording_count(operation_id: string, epoch = this.#instance_epoch) {
+  recording_count(operation_id: string, epoch: number) {
     return this.get_operation(operation_id, epoch)?.recordings.length ?? 0;
   }
 
-  wrapper_count(operation_id: string, epoch = this.#instance_epoch) {
+  wrapper_count(operation_id: string, epoch: number) {
     return this.recording_count(operation_id, epoch);
   }
 
-  installation_ack_complete(operation_id: string, epoch = this.#instance_epoch) {
+  installation_ack_complete(operation_id: string, epoch: number) {
     return strict_operation_state(this.get_operation(operation_id, epoch) ?? undefined)
       .installation_ack_complete;
   }
 
-  activation_bridge_armed(operation_id: string, epoch = this.#instance_epoch) {
+  activation_bridge_armed(operation_id: string, epoch: number) {
     return strict_operation_state(this.get_operation(operation_id, epoch) ?? undefined)
       .activation_bridge_armed;
   }
@@ -2427,7 +2427,7 @@ class StrictOpenWrapperCache {
     adapter: StrictOperationControlAdapter | null = null,
     phase: StrictOpenLifecycleEvent = "accepted",
     recording_open_behavior: RemoteMcapOpenBehavior = "open_and_select",
-    epoch = this.#instance_epoch,
+    epoch: number,
   ) {
     if (!this.#accepting || epoch !== this.#instance_epoch) return null;
     const existing = this.#get_operation(operation_id);
@@ -2460,7 +2460,7 @@ class StrictOpenWrapperCache {
     recording_key: string,
     generation = "test-generation",
     adapter: StrictRecordingControlAdapter | null = null,
-    epoch = this.#instance_epoch,
+    epoch: number,
   ) {
     if (!this.#accepting || epoch !== this.#instance_epoch) return null;
     const operation = this.#get_operation(operation_id);
@@ -2481,7 +2481,7 @@ class StrictOpenWrapperCache {
     recording_key: string,
     generation = "test-generation",
     adapter: StrictRecordingControlAdapter | null = null,
-    epoch = this.#instance_epoch,
+    epoch: number,
   ) {
     if (!this.#accepting || epoch !== this.#instance_epoch) return null;
     const operation = this.#get_operation(operation_id);
@@ -2502,7 +2502,7 @@ class StrictOpenWrapperCache {
     recording_key: string,
     generation = "test-generation",
     adapter: StrictRecordingControlAdapter | null = null,
-    epoch = this.#instance_epoch,
+    epoch: number,
   ) {
     if (!this.#accepting || epoch !== this.#instance_epoch) return null;
     const operation = this.#get_operation(operation_id);
@@ -2518,14 +2518,14 @@ class StrictOpenWrapperCache {
     return recording;
   }
 
-  complete_installation_ack(operation_id: string, epoch = this.#instance_epoch) {
+  complete_installation_ack(operation_id: string, epoch: number) {
     if (!this.#accepting || epoch !== this.#instance_epoch) return false;
     const operation = this.#get_operation(operation_id);
     if (operation) strict_operation_install_ack(operation);
     return Boolean(operation);
   }
 
-  arm_internal_activation_bridge(operation_id: string, epoch = this.#instance_epoch) {
+  arm_internal_activation_bridge(operation_id: string, epoch: number) {
     if (!this.#accepting || epoch !== this.#instance_epoch) return false;
     const operation = this.#get_operation(operation_id);
     if (operation) strict_operation_arm_bridge(operation);
@@ -2535,7 +2535,7 @@ class StrictOpenWrapperCache {
   transition(
     operation_id: string,
     phase: StrictOpenLifecycleEvent,
-    epoch = this.#instance_epoch,
+    epoch: number,
   ) {
     if (!this.#accepting || epoch !== this.#instance_epoch) return false;
     const operation = this.#get_operation(operation_id);
@@ -2546,7 +2546,7 @@ class StrictOpenWrapperCache {
     operation_id: string,
     build: (operation: StrictOpenOperationWrapper) => void,
     on_abort: () => void,
-    epoch = this.#instance_epoch,
+    epoch: number,
   ) {
     if (!this.#accepting || epoch !== this.#instance_epoch) return null;
     const existing = this.#get_operation(operation_id);
@@ -2582,7 +2582,7 @@ class StrictOpenWrapperCache {
     }
   }
 
-  dispose_operation(operation_id: string, epoch = this.#instance_epoch) {
+  dispose_operation(operation_id: string, epoch: number) {
     if (!this.#accepting || epoch !== this.#instance_epoch) return false;
     const operation = this.#get_operation(operation_id);
     if (!operation) {

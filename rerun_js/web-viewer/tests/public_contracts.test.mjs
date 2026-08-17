@@ -128,7 +128,20 @@ function callsNamed(name) {
 }
 
 function strictCache(viewer) {
-  return globalThis.__rerun_web_viewer_test_state.strict_open_caches.get(viewer);
+  const cache = globalThis.__rerun_web_viewer_test_state.strict_open_caches.get(viewer);
+  return new Proxy(cache, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (typeof value !== "function") return value;
+      if (property === "register_remote_owner") return value.bind(target);
+      return (...args) => {
+        const epoch = target.instance_epoch;
+        if (property === "install_operation") while (args.length < 4) args.push(args.length === 1 ? null : args.length === 2 ? "accepted" : "open_and_select");
+        if (["attach_preexisting_recording", "replay_active_recording", "replay_completed_recording"].includes(property)) while (args.length < 4) args.push(args.length === 2 ? "test-generation" : null);
+        return value.apply(target, [...args, epoch]);
+      };
+    },
+  });
 }
 
 async function startViewer(rrd = null, options = null) {
