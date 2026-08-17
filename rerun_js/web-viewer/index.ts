@@ -733,8 +733,10 @@ export class WebViewer {
   // NOTE: Using the handle requires wrapping all calls to its methods in try/catch.
   //       On failure, call `this.stop` to prevent a memory leak, then re-throw the error.
   #handle: WebHandle | null = null;
-  private _strict_open_cache = new StrictOpenWrapperCache();
   private _strict_dispatcher = new BoundedSingleTaskDispatcher();
+  #strict_open_cache = new StrictOpenWrapperCache(
+    (task) => this._strict_dispatcher.enqueue(task),
+  );
   #canvas: HTMLCanvasElement | null = null;
   #loader: HTMLDivElement | null = null;
   #state: "ready" | "starting" | "stopped" = "stopped";
@@ -744,6 +746,18 @@ export class WebViewer {
   constructor() {
     injectStyle();
     setupGlobalEventListeners();
+    const node_process = (globalThis as any).process;
+    const test_state = (globalThis as any).__rerun_web_viewer_test_state;
+    if (
+      node_process?.release?.name === "node"
+      && node_process?.env?.RERUN_WEB_VIEWER_TEST === "1"
+      && test_state
+      && typeof test_state === "object"
+    ) {
+      const caches = test_state.strict_open_caches ?? new WeakMap();
+      test_state.strict_open_caches = caches;
+      caches.set(this, this.#strict_open_cache);
+    }
   }
 
   /**
@@ -1137,7 +1151,7 @@ export class WebViewer {
     this.#state = "stopped";
     // Strict remote handles retain their opaque identity across a Viewer restart, but all
     // controls become terminally stopped and can never redirect to a later publication.
-    this._strict_open_cache.mark_viewer_stopped();
+    this.#strict_open_cache.mark_viewer_stopped();
 
     this.#canvas?.remove();
     this.#clearLoader();
@@ -1613,10 +1627,10 @@ export class LogChannel {
 type StrictOpenRecordingPhase = "preexisting" | "active" | "completed";
 
 type StrictRecordingControlAdapter = {
-  select: () => StrictRecordingControlResult;
-  seek: (target: StrictRecordingSeekTarget) => StrictRecordingControlResult;
-  play: (value: "paused" | "playing") => StrictRecordingControlResult;
-  close: () => StrictRecordingControlResult;
+  select: (identity: StrictPublicRecordingHandleId) => StrictRecordingControlResult;
+  seek: (identity: StrictPublicRecordingHandleId, target: StrictRecordingSeekTarget) => StrictRecordingControlResult;
+  play: (identity: StrictPublicRecordingHandleId, value: "paused" | "playing") => StrictRecordingControlResult;
+  close: (identity: StrictPublicRecordingHandleId) => StrictRecordingControlResult;
   dispose: () => void;
 };
 
@@ -1632,6 +1646,42 @@ type StrictFinalizationToken = {
 // Internal lifecycle transitions are symbol-keyed so an opaque public handle does not expose
 // string-named constructors, identity mutators, or Viewer-stop hooks.
 const strict_internal_viewer_stopped = Symbol("strict_internal_viewer_stopped");
+const strict_internal_attach_recording = Symbol("strict_internal_attach_recording");
+const strict_internal_recording_phase = Symbol("strict_internal_recording_phase");
+const strict_internal_install_ack = Symbol("strict_internal_install_ack");
+const strict_internal_arm_bridge = Symbol("strict_internal_arm_bridge");
+const strict_internal_operation_closed = Symbol("strict_internal_operation_closed");
+const strict_internal_recording_removed = Symbol("strict_internal_recording_removed");
+const strict_internal_operation_state = Symbol("strict_internal_operation_state");
+const strict_internal_transition = Symbol("strict_internal_transition");
+
+const strict_recording_identity_keys = new WeakMap<StrictPublicRecordingHandleId, string>();
+
+class StrictStorePublicationIdentity {
+  #generation: string;
+
+  constructor(generation: string) {
+    this.#generation = generation;
+  }
+}
+
+class StrictPublicRecordingHandleId {
+  #recording_key: string;
+  #publication: StrictStorePublicationIdentity;
+
+  constructor(recording_key: string, generation: string) {
+    this.#recording_key = recording_key;
+    this.#publication = new StrictStorePublicationIdentity(generation);
+    strict_recording_identity_keys.set(
+      this,
+      `${generation.length}:${generation}${recording_key.length}:${recording_key}`,
+    );
+  }
+}
+
+function strict_recording_identity_key(identity: StrictPublicRecordingHandleId): string {
+  return strict_recording_identity_keys.get(identity)!;
+}
 
 const strict_open_finalization_registry: FinalizationRegistry<StrictFinalizationToken> | null =
   typeof FinalizationRegistry === "function"
@@ -1692,30 +1742,42 @@ function normalize_strict_seek_target(target: unknown): StrictRecordingSeekTarge
 }
 
 class StrictOpenRecordingWrapper {
+  #identity: StrictPublicRecordingHandleId;
   #phase: StrictOpenRecordingPhase;
   #disposed = false;
   #closed = false;
+  #operation_closed = false;
+  #recording_removed = false;
   #viewer_stopped = false;
   #adapter: StrictRecordingControlAdapter | null;
   #finalization_token: StrictFinalizationToken;
 
   constructor(
-    _operation: StrictOpenOperationWrapper,
-    _recording_key: string,
+    identity: StrictPublicRecordingHandleId,
     alias_kind: StrictOpenRecordingPhase,
     adapter: StrictRecordingControlAdapter | null = null,
+    on_dispose: (() => void) | null = null,
   ) {
+    this.#identity = identity;
     this.#phase = alias_kind;
     this.#adapter = adapter;
     const cleanup_state = {
       disposed: false,
       adapter,
+      on_dispose,
     };
     const cleanup = () => {
       if (cleanup_state.disposed) return;
       cleanup_state.disposed = true;
-      cleanup_state.adapter?.dispose();
+      const cleanup_adapter = cleanup_state.adapter;
+      const cleanup_parent = cleanup_state.on_dispose;
       cleanup_state.adapter = null;
+      cleanup_state.on_dispose = null;
+      try {
+        cleanup_adapter?.dispose();
+      } finally {
+        cleanup_parent?.();
+      }
     };
     this.#finalization_token = { run: cleanup };
     strict_open_finalization_registry?.register(this, this.#finalization_token, this.#finalization_token);
@@ -1733,45 +1795,62 @@ class StrictOpenRecordingWrapper {
     this.#viewer_stopped = true;
   }
 
-  mark_active() {
-    this.#phase = StrictOpenRecordingWrapper.#merge_phase(this.#phase, "active");
+  [strict_internal_operation_closed]() {
+    this.#operation_closed = true;
   }
 
-  mark_completed() {
-    this.#phase = StrictOpenRecordingWrapper.#merge_phase(this.#phase, "completed");
+  [strict_internal_recording_removed]() {
+    this.#recording_removed = true;
+  }
+
+  [strict_internal_recording_phase](phase: StrictOpenRecordingPhase) {
+    const next = phase;
+    if (next === "active") {
+      this.#phase = StrictOpenRecordingWrapper.#merge_phase(this.#phase, "active");
+    } else if (next === "completed") {
+      this.#phase = StrictOpenRecordingWrapper.#merge_phase(this.#phase, "completed");
+    }
   }
 
   select(): StrictRecordingControlResult {
     if (this.#disposed) return strict_control_result("select", "disposed");
+    if (this.#recording_removed) return strict_control_result("select", "recording_removed");
+    if (this.#operation_closed) return strict_control_result("select", "operation_closed");
     if (this.#viewer_stopped) return strict_control_result("select", "viewer_stopped");
     if (this.#closed) return strict_control_result("select", "recording_closed");
-    return this.#adapter?.select() ?? strict_unavailable_result("select");
+    return this.#adapter?.select(this.#identity) ?? strict_unavailable_result("select");
   }
 
   seek(target: StrictRecordingSeekTarget): StrictRecordingControlResult {
     if (this.#disposed) return strict_control_result("seek", "disposed");
+    if (this.#recording_removed) return strict_control_result("seek", "recording_removed");
+    if (this.#operation_closed) return strict_control_result("seek", "operation_closed");
     if (this.#viewer_stopped) return strict_control_result("seek", "viewer_stopped");
     if (this.#closed) return strict_control_result("seek", "recording_closed");
     const normalized = normalize_strict_seek_target(target);
     if (!normalized) return strict_control_result("seek", "invalid_request");
-    return this.#adapter?.seek(normalized) ?? strict_unavailable_result("seek");
+    return this.#adapter?.seek(this.#identity, normalized) ?? strict_unavailable_result("seek");
   }
 
   play(value: "paused" | "playing"): StrictRecordingControlResult {
     if (this.#disposed) return strict_control_result("play", "disposed");
+    if (this.#recording_removed) return strict_control_result("play", "recording_removed");
+    if (this.#operation_closed) return strict_control_result("play", "operation_closed");
     if (this.#viewer_stopped) return strict_control_result("play", "viewer_stopped");
     if (this.#closed) return strict_control_result("play", "recording_closed");
     if (value !== "paused" && value !== "playing") {
       return strict_control_result("play", "invalid_request");
     }
-    return this.#adapter?.play(value) ?? strict_unavailable_result("play");
+    return this.#adapter?.play(this.#identity, value) ?? strict_unavailable_result("play");
   }
 
   close(): StrictRecordingControlResult {
     if (this.#disposed) return strict_control_result("close", "disposed");
+    if (this.#recording_removed) return strict_control_result("close", "recording_removed");
+    if (this.#operation_closed) return strict_control_result("close", "operation_closed");
     if (this.#viewer_stopped) return strict_control_result("close", "viewer_stopped");
     if (this.#closed) return strict_control_result("close", "recording_closed");
-    const result = this.#adapter?.close() ?? strict_unavailable_result("close");
+    const result = this.#adapter?.close(this.#identity) ?? strict_unavailable_result("close");
     if (result.accepted || result.code === "recording_removed") this.#closed = true;
     return result;
   }
@@ -1798,8 +1877,13 @@ class StrictOpenRecordingWrapper {
   }
 }
 
+type StrictOpenRecordingCacheEntry = {
+  readonly wrapper: StrictOpenRecordingWrapper;
+  readonly token: object;
+};
+
 class StrictOpenOperationWrapper {
-  #recordings = new Map<string, StrictOpenRecordingWrapper>();
+  #recordings = new Map<string, StrictOpenRecordingCacheEntry>();
   #recordings_cache: readonly StrictOpenRecordingWrapper[] | null = null;
   #installation_ack_complete = false;
   #activation_bridge_armed = false;
@@ -1811,37 +1895,41 @@ class StrictOpenOperationWrapper {
   #adapter: StrictOperationControlAdapter | null;
   #listeners = new Map<StrictOpenLifecycleEvent, Set<StrictOpenLifecycleListener>>();
   #finalization_token: StrictFinalizationToken;
+  #schedule: (task: StrictDispatcherTask) => boolean;
 
-  constructor(_operation_key: string, adapter: StrictOperationControlAdapter | null = null) {
+  constructor(
+    _operation_key: string,
+    adapter: StrictOperationControlAdapter | null = null,
+    phase: StrictOpenLifecycleEvent = "accepted",
+    recording_open_behavior: RemoteMcapOpenBehavior = "open_and_select",
+    on_dispose: (() => void) | null = null,
+    schedule: (task: StrictDispatcherTask) => boolean = () => false,
+  ) {
     this.#adapter = adapter;
+    this.#phase = phase;
+    this.#closed = phase === "terminal" || phase === "removed";
+    this.#recording_open_behavior = recording_open_behavior;
+    this.#schedule = schedule;
     const cleanup_state = {
       disposed: false,
       adapter,
+      on_dispose,
     };
     const cleanup = () => {
       if (cleanup_state.disposed) return;
       cleanup_state.disposed = true;
-      cleanup_state.adapter?.dispose();
+      const cleanup_adapter = cleanup_state.adapter;
+      const cleanup_parent = cleanup_state.on_dispose;
       cleanup_state.adapter = null;
+      cleanup_state.on_dispose = null;
+      try {
+        cleanup_adapter?.dispose();
+      } finally {
+        cleanup_parent?.();
+      }
     };
     this.#finalization_token = { run: cleanup };
     strict_open_finalization_registry?.register(this, this.#finalization_token, this.#finalization_token);
-  }
-
-  get recording_count() {
-    return this.#recordings.size;
-  }
-
-  get wrapper_count() {
-    return this.#recordings.size;
-  }
-
-  get installation_ack_complete() {
-    return this.#installation_ack_complete;
-  }
-
-  get activation_bridge_armed() {
-    return this.#activation_bridge_armed;
   }
 
   get phase() {
@@ -1858,34 +1946,75 @@ class StrictOpenOperationWrapper {
 
   [strict_internal_viewer_stopped]() {
     this.#viewer_stopped = true;
-    for (const recording of this.#recordings.values()) recording[strict_internal_viewer_stopped]();
+    for (const entry of this.#recordings.values()) {
+      entry.wrapper[strict_internal_viewer_stopped]();
+    }
   }
 
   get recordings() {
     if (!this.#recordings_cache) {
-      this.#recordings_cache = Object.freeze([...this.#recordings.values()]);
+      this.#recordings_cache = Object.freeze(
+        [...this.#recordings.values()].map((entry) => entry.wrapper),
+      );
     }
     return this.#recordings_cache;
   }
 
-  attach_preexisting_recording(recording_id: string) {
-    return this.#attach_recording(recording_id, "preexisting", null);
+  [strict_internal_attach_recording](
+    identity: StrictPublicRecordingHandleId,
+    alias_kind: StrictOpenRecordingPhase,
+    adapter: StrictRecordingControlAdapter | null,
+  ) {
+    if (this.#disposed || this.#closed || this.#viewer_stopped) return null;
+    return this.#attach_recording(identity, alias_kind, adapter);
   }
 
-  replay_active_recording(recording_id: string) {
-    return this.#attach_recording(recording_id, "active", null);
-  }
-
-  replay_completed_recording(recording_id: string) {
-    return this.#attach_recording(recording_id, "completed", null);
-  }
-
-  complete_installation_ack() {
+  [strict_internal_install_ack]() {
+    if (this.#disposed || this.#closed || this.#viewer_stopped) return false;
     this.#installation_ack_complete = true;
+    return true;
   }
 
-  arm_internal_activation_bridge() {
+  [strict_internal_arm_bridge]() {
+    if (this.#disposed || this.#closed || this.#viewer_stopped) return false;
     this.#activation_bridge_armed = true;
+    return true;
+  }
+
+  [strict_internal_operation_state]() {
+    return {
+      installation_ack_complete: this.#installation_ack_complete,
+      activation_bridge_armed: this.#activation_bridge_armed,
+    };
+  }
+
+  [strict_internal_transition](phase: StrictOpenLifecycleEvent) {
+    if (
+      this.#disposed
+      || this.#viewer_stopped
+      || this.#phase === "removed"
+      || (this.#closed && phase !== "removed")
+    ) return false;
+    if (phase === "terminal" || phase === "removed") {
+      this.#closed = true;
+      for (const entry of this.#recordings.values()) {
+        if (phase === "removed") {
+          entry.wrapper[strict_internal_recording_removed]();
+        } else {
+          entry.wrapper[strict_internal_operation_closed]();
+        }
+      }
+    }
+    this.#phase = phase;
+    const listeners = [...(this.#listeners.get(phase) ?? [])];
+    if (listeners.length > 0) {
+      const handle = this as unknown as OpenRequestHandle;
+      return this.#schedule(() => {
+        if (this.#disposed) return;
+        for (const listener of listeners) listener(handle);
+      });
+    }
+    return true;
   }
 
   on(event: StrictOpenLifecycleEvent, listener: StrictOpenLifecycleListener): () => void {
@@ -1898,11 +2027,14 @@ class StrictOpenOperationWrapper {
 
   close(): StrictRecordingControlResult {
     if (this.#disposed) return strict_control_result("close", "disposed");
-    if (this.#viewer_stopped) return strict_control_result("close", "viewer_stopped");
     if (this.#closed) return strict_control_result("close", "operation_closed");
+    if (this.#viewer_stopped) return strict_control_result("close", "viewer_stopped");
     const result = this.#adapter?.close() ?? strict_unavailable_result("close");
     if (result.accepted || result.code === "operation_closed" || result.code === "recording_removed") {
       this.#closed = true;
+      for (const entry of this.#recordings.values()) {
+        entry.wrapper[strict_internal_operation_closed]();
+      }
     }
     return result;
   }
@@ -1911,7 +2043,7 @@ class StrictOpenOperationWrapper {
     if (this.#disposed) return;
     this.#disposed = true;
     this.#listeners.clear();
-    for (const recording of this.#recordings.values()) recording.dispose();
+    for (const entry of this.#recordings.values()) entry.wrapper.dispose();
     this.#recordings.clear();
     this.#recordings_cache = null;
     this.#installation_ack_complete = false;
@@ -1922,48 +2054,164 @@ class StrictOpenOperationWrapper {
   }
 
   #attach_recording(
-    recording_id: string,
+    identity: StrictPublicRecordingHandleId,
     alias_kind: StrictOpenRecordingPhase,
     adapter: StrictRecordingControlAdapter | null,
   ) {
-    if (this.#disposed) return null;
-    const existing = this.#recordings.get(recording_id);
+    const identity_key = strict_recording_identity_key(identity);
+    const existing_entry = this.#recordings.get(identity_key);
+    const existing = existing_entry?.wrapper;
     if (existing) {
       if (alias_kind === "active") {
-        existing.mark_active();
+        existing[strict_internal_recording_phase]("active");
       } else if (alias_kind === "completed") {
-        existing.mark_completed();
+        existing[strict_internal_recording_phase]("completed");
       }
       return existing;
     }
 
-    const wrapper = new StrictOpenRecordingWrapper(this, recording_id, alias_kind, adapter);
-    this.#recordings.set(recording_id, wrapper);
+    const cache_token = {};
+    const wrapper = new StrictOpenRecordingWrapper(
+      identity,
+      alias_kind,
+      adapter,
+      () => this.#delete_recording(identity_key, cache_token),
+    );
+    this.#recordings.set(identity_key, {
+      wrapper,
+      token: cache_token,
+    });
     this.#recordings_cache = null;
     return wrapper;
   }
+
+  #delete_recording(identity_key: string, token: object) {
+    if (this.#recordings.get(identity_key)?.token === token) {
+      this.#recordings.delete(identity_key);
+      this.#recordings_cache = null;
+    }
+  }
 }
 
+type StrictOpenOperationCacheEntry = {
+  readonly reference: WeakRef<StrictOpenOperationWrapper>;
+  readonly token: object;
+};
+
 class StrictOpenWrapperCache {
-  #operations = new Map<string, StrictOpenOperationWrapper>();
+  #operations = new Map<string, StrictOpenOperationCacheEntry>();
+  #schedule: (task: StrictDispatcherTask) => boolean;
+
+  constructor(schedule: (task: StrictDispatcherTask) => boolean = () => false) {
+    this.#schedule = schedule;
+  }
 
   get operation_count() {
+    this.#drop_dead_operations();
     return this.#operations.size;
   }
 
   get_operation(operation_id: string) {
-    return this.#operations.get(operation_id) ?? null;
+    return this.#get_operation(operation_id);
   }
 
-  install_operation(operation_id: string) {
-    const existing = this.#operations.get(operation_id);
+  recording_count(operation_id: string) {
+    return this.#get_operation(operation_id)?.recordings.length ?? 0;
+  }
+
+  wrapper_count(operation_id: string) {
+    return this.recording_count(operation_id);
+  }
+
+  installation_ack_complete(operation_id: string) {
+    return this.#get_operation(operation_id)?.[strict_internal_operation_state]()
+      .installation_ack_complete ?? false;
+  }
+
+  activation_bridge_armed(operation_id: string) {
+    return this.#get_operation(operation_id)?.[strict_internal_operation_state]()
+      .activation_bridge_armed ?? false;
+  }
+
+  install_operation(
+    operation_id: string,
+    adapter: StrictOperationControlAdapter | null = null,
+    phase: StrictOpenLifecycleEvent = "accepted",
+    recording_open_behavior: RemoteMcapOpenBehavior = "open_and_select",
+  ) {
+    const existing = this.#get_operation(operation_id);
     if (existing) {
       return existing;
     }
 
-    const operation = new StrictOpenOperationWrapper(operation_id);
-    this.#operations.set(operation_id, operation);
+    const cache_token = {};
+    const operation = new StrictOpenOperationWrapper(
+      operation_id,
+      adapter,
+      phase,
+      recording_open_behavior,
+      () => this.#delete_operation(operation_id, cache_token),
+      this.#schedule,
+    );
+    this.#operations.set(operation_id, {
+      reference: new WeakRef(operation),
+      token: cache_token,
+    });
     return operation;
+  }
+
+  attach_preexisting_recording(
+    operation_id: string,
+    recording_key: string,
+    generation = "test-generation",
+    adapter: StrictRecordingControlAdapter | null = null,
+  ) {
+    const operation = this.#get_operation(operation_id);
+    return operation?.[strict_internal_attach_recording](
+      new StrictPublicRecordingHandleId(recording_key, generation),
+      "preexisting",
+      adapter,
+    ) ?? null;
+  }
+
+  replay_active_recording(
+    operation_id: string,
+    recording_key: string,
+    generation = "test-generation",
+    adapter: StrictRecordingControlAdapter | null = null,
+  ) {
+    const operation = this.#get_operation(operation_id);
+    return operation?.[strict_internal_attach_recording](
+      new StrictPublicRecordingHandleId(recording_key, generation),
+      "active",
+      adapter,
+    ) ?? null;
+  }
+
+  replay_completed_recording(
+    operation_id: string,
+    recording_key: string,
+    generation = "test-generation",
+    adapter: StrictRecordingControlAdapter | null = null,
+  ) {
+    const operation = this.#get_operation(operation_id);
+    return operation?.[strict_internal_attach_recording](
+      new StrictPublicRecordingHandleId(recording_key, generation),
+      "completed",
+      adapter,
+    ) ?? null;
+  }
+
+  complete_installation_ack(operation_id: string) {
+    this.#get_operation(operation_id)?.[strict_internal_install_ack]();
+  }
+
+  arm_internal_activation_bridge(operation_id: string) {
+    this.#get_operation(operation_id)?.[strict_internal_arm_bridge]();
+  }
+
+  transition(operation_id: string, phase: StrictOpenLifecycleEvent) {
+    return this.#get_operation(operation_id)?.[strict_internal_transition](phase) ?? false;
   }
 
   install_operation_with_abort(
@@ -1971,8 +2219,19 @@ class StrictOpenWrapperCache {
     build: (operation: StrictOpenOperationWrapper) => void,
     on_abort: () => void,
   ) {
-    const operation = new StrictOpenOperationWrapper(operation_id);
-    this.#operations.set(operation_id, operation);
+    const cache_token = {};
+    const operation = new StrictOpenOperationWrapper(
+      operation_id,
+      null,
+      "accepted",
+      "open_and_select",
+      () => this.#delete_operation(operation_id, cache_token),
+      this.#schedule,
+    );
+    this.#operations.set(operation_id, {
+      reference: new WeakRef(operation),
+      token: cache_token,
+    });
     try {
       build(operation);
       return operation;
@@ -1981,25 +2240,46 @@ class StrictOpenWrapperCache {
         on_abort();
       } finally {
         operation.dispose();
-        this.#operations.delete(operation_id);
+        this.#delete_operation(operation_id, cache_token);
       }
       throw error;
     }
   }
 
   dispose_operation(operation_id: string) {
-    const operation = this.#operations.get(operation_id);
+    const operation = this.#get_operation(operation_id);
     if (!operation) {
       return false;
     }
 
     operation.dispose();
-    this.#operations.delete(operation_id);
     return true;
   }
 
   mark_viewer_stopped() {
-    for (const operation of this.#operations.values()) operation[strict_internal_viewer_stopped]();
+    for (const entry of this.#operations.values()) {
+      entry.reference.deref()?.[strict_internal_viewer_stopped]();
+    }
+    this.#drop_dead_operations();
+  }
+
+  #get_operation(operation_id: string) {
+    const entry = this.#operations.get(operation_id);
+    const operation = entry?.reference.deref();
+    if (entry && !operation) this.#operations.delete(operation_id);
+    return operation ?? null;
+  }
+
+  #delete_operation(operation_id: string, token: object) {
+    if (this.#operations.get(operation_id)?.token === token) {
+      this.#operations.delete(operation_id);
+    }
+  }
+
+  #drop_dead_operations() {
+    for (const [operation_id, entry] of this.#operations) {
+      if (!entry.reference.deref()) this.#operations.delete(operation_id);
+    }
   }
 }
 

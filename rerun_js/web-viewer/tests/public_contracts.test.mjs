@@ -127,6 +127,10 @@ function callsNamed(name) {
   );
 }
 
+function strictCache(viewer) {
+  return globalThis.__rerun_web_viewer_test_state.strict_open_caches.get(viewer);
+}
+
 async function startViewer(rrd = null, options = null) {
   const viewer = new WebViewer();
   await viewer.start(rrd, document.body, options);
@@ -386,7 +390,7 @@ test("strict valid singleton and batch reject before every public effect", async
       return true;
     });
   }
-  assert.equal(viewer._strict_open_cache.operation_count, 0);
+  assert.equal(strictCache(viewer).operation_count, 0);
   assert.equal(viewer._strict_dispatcher.queued_count, 0);
   assert.equal(callsNamed("add_receiver").length, 0);
   assert.equal(viewer.ready, true);
@@ -409,7 +413,7 @@ test("strict route matrix rejects non-HTTP and requires opt-in extensionless sni
     });
   }
 
-  assert.equal(viewer._strict_open_cache.operation_count, 0);
+  assert.equal(strictCache(viewer).operation_count, 0);
   assert.equal(callsNamed("add_receiver").length, 0);
   viewer.stop();
 });
@@ -436,7 +440,7 @@ test("strict request shape errors are request-local and never stop the Viewer", 
     });
   }
   assert.equal(viewer.ready, true);
-  assert.equal(viewer._strict_open_cache.operation_count, 0);
+  assert.equal(strictCache(viewer).operation_count, 0);
   viewer.stop();
 });
 
@@ -492,7 +496,7 @@ test("strict request preflight seals fields, indexes sparse batches, and rejects
     assert.equal(error.index, 0);
     return true;
   });
-  assert.equal(viewer._strict_open_cache.operation_count, 0);
+  assert.equal(strictCache(viewer).operation_count, 0);
   assert.equal(viewer.ready, true);
   viewer.stop();
 });
@@ -516,50 +520,91 @@ test("strict preflight does not fold raw query or duplicate semantic inputs", as
     assert.equal(error.code, "CapabilityUnavailable");
     return true;
   });
-  assert.equal(viewer._strict_open_cache.operation_count, 0);
+  assert.equal(strictCache(viewer).operation_count, 0);
   viewer.stop();
 });
 
 test("strict wrapper cache reuses recording wrappers and cached snapshots", () => {
   const viewer = new WebViewer();
-  const cache = viewer._strict_open_cache;
+  const cache = strictCache(viewer);
 
   assert.equal(cache.operation_count, 0);
 
   const operation = cache.install_operation("operation-1");
   assert.equal(cache.operation_count, 1);
-  assert.equal(operation.recording_count, 0);
-  assert.equal(operation.wrapper_count, 0);
+  assert.equal(cache.recording_count("operation-1"), 0);
+  assert.equal(cache.wrapper_count("operation-1"), 0);
 
-  const first = operation.attach_preexisting_recording("recording-a");
-  const second = operation.attach_preexisting_recording("recording-b");
-  const duplicate = operation.attach_preexisting_recording("recording-a");
+  const first = cache.attach_preexisting_recording("operation-1", "recording-a");
+  const second = cache.attach_preexisting_recording("operation-1", "recording-b");
+  const duplicate = cache.attach_preexisting_recording("operation-1", "recording-a");
 
   assert.strictEqual(first, duplicate);
   assert.strictEqual(operation.recordings, operation.recordings);
   assert.strictEqual(operation.recordings[0], first);
   assert.strictEqual(operation.recordings[1], second);
-  assert.equal(operation.recording_count, 2);
-  assert.equal(operation.wrapper_count, 2);
+  assert.equal(cache.recording_count("operation-1"), 2);
+  assert.equal(cache.wrapper_count("operation-1"), 2);
   assert.equal(first.phase, "preexisting");
 
-  operation.replay_active_recording("recording-a");
-  operation.replay_completed_recording("recording-b");
+  cache.replay_active_recording("operation-1", "recording-a");
+  cache.replay_completed_recording("operation-1", "recording-b");
   assert.strictEqual(operation.recordings[0], first);
   assert.strictEqual(operation.recordings[1], second);
   assert.equal(first.phase, "active");
   assert.equal(second.phase, "completed");
-  assert.equal(operation.recording_count, 2);
+  assert.equal(cache.recording_count("operation-1"), 2);
 
-  operation.complete_installation_ack();
-  operation.arm_internal_activation_bridge();
-  assert.equal(operation.installation_ack_complete, true);
-  assert.equal(operation.activation_bridge_armed, true);
+  cache.complete_installation_ack("operation-1");
+  cache.arm_internal_activation_bridge("operation-1");
+  assert.equal(cache.installation_ack_complete("operation-1"), true);
+  assert.equal(cache.activation_bridge_armed("operation-1"), true);
+});
+
+test("strict wrapper internals are absent from the ordinary runtime object graph", () => {
+  const viewer = new WebViewer();
+  const cache = strictCache(viewer);
+  const operation = cache.install_operation("operation-opaque");
+  const recording = cache.attach_preexisting_recording(
+    "operation-opaque",
+    "recording-opaque",
+  );
+  const forbidden = [
+    "attach_preexisting_recording",
+    "replay_active_recording",
+    "replay_completed_recording",
+    "complete_installation_ack",
+    "arm_internal_activation_bridge",
+    "mark_active",
+    "mark_completed",
+    "recording_count",
+    "wrapper_count",
+    "installation_ack_complete",
+    "activation_bridge_armed",
+  ];
+
+  assert.equal("_strict_open_cache" in viewer, false);
+  assert.deepEqual(Reflect.ownKeys(operation), []);
+  assert.deepEqual(Reflect.ownKeys(recording), []);
+  for (const name of forbidden) {
+    assert.equal(Object.getOwnPropertyNames(Object.getPrototypeOf(operation)).includes(name), false);
+    assert.equal(Object.getOwnPropertyNames(Object.getPrototypeOf(recording)).includes(name), false);
+  }
+
+  const oldTestFlag = process.env.RERUN_WEB_VIEWER_TEST;
+  delete process.env.RERUN_WEB_VIEWER_TEST;
+  try {
+    const ordinaryViewer = new WebViewer();
+    assert.equal(globalThis.__rerun_web_viewer_test_state.strict_open_caches.has(ordinaryViewer), false);
+  } finally {
+    process.env.RERUN_WEB_VIEWER_TEST = oldTestFlag;
+  }
+  operation.dispose();
 });
 
 test("strict wrapper cache aborts before disposing temporary operations", () => {
   const viewer = new WebViewer();
-  const cache = viewer._strict_open_cache;
+  const cache = strictCache(viewer);
   const order = [];
 
   assert.throws(
@@ -567,8 +612,8 @@ test("strict wrapper cache aborts before disposing temporary operations", () => 
       cache.install_operation_with_abort(
         "operation-throw",
         (operation) => {
-          order.push(["build", operation.recording_count]);
-          operation.attach_preexisting_recording("recording-a");
+          order.push(["build", cache.recording_count("operation-throw")]);
+          cache.attach_preexisting_recording("operation-throw", "recording-a");
           throw new Error("constructor failed");
         },
         () => order.push(["abort"]),
@@ -586,10 +631,178 @@ test("strict wrapper cache aborts before disposing temporary operations", () => 
   assert.equal(cache.operation_count, 0);
 });
 
+test("strict exact identity distinguishes same raw recording across Store generations", () => {
+  const viewer = new WebViewer();
+  const cache = strictCache(viewer);
+  const operation = cache.install_operation("operation-generations");
+  const calls = [];
+  const adapter = (label) => ({
+    select(identity) {
+      calls.push([label, "select", identity]);
+      return { command: "select", code: "accepted", accepted: true };
+    },
+    seek(identity) {
+      calls.push([label, "seek", identity]);
+      return { command: "seek", code: "accepted", accepted: true };
+    },
+    play(identity) {
+      calls.push([label, "play", identity]);
+      return { command: "play", code: "accepted", accepted: true };
+    },
+    close(identity) {
+      calls.push([label, "close", identity]);
+      return { command: "close", code: "accepted", accepted: true };
+    },
+    dispose() {},
+  });
+
+  const first = cache.attach_preexisting_recording(
+    "operation-generations",
+    "same-raw-recording",
+    "generation-a",
+    adapter("first"),
+  );
+  const second = cache.attach_preexisting_recording(
+    "operation-generations",
+    "same-raw-recording",
+    "generation-b",
+    adapter("second"),
+  );
+  assert.notStrictEqual(first, second);
+  assert.equal(cache.recording_count("operation-generations"), 2);
+  assert.equal(first.select().code, "accepted");
+  assert.equal(second.select().code, "accepted");
+  assert.deepEqual(calls.map((call) => call.slice(0, 2)), [
+    ["first", "select"],
+    ["second", "select"],
+  ]);
+  assert.notStrictEqual(calls[0][2], calls[1][2]);
+
+  first.dispose();
+  assert.equal(cache.recording_count("operation-generations"), 1);
+  second.dispose();
+  operation.dispose();
+  assert.equal(cache.operation_count, 0);
+});
+
+test("strict operation close gates children, late attach, and lifecycle callbacks", () => {
+  const viewer = new WebViewer();
+  const cache = strictCache(viewer);
+  let sourceCloseCount = 0;
+  let childSelectCount = 0;
+  const operation = cache.install_operation(
+    "operation-close",
+    {
+      close() {
+        sourceCloseCount += 1;
+        return { command: "close", code: "accepted", accepted: true };
+      },
+      dispose() {},
+    },
+    "activated",
+    "background",
+  );
+  const recording = cache.attach_preexisting_recording(
+    "operation-close",
+    "recording-close",
+    "generation-close",
+    {
+      select() {
+        childSelectCount += 1;
+        return { command: "select", code: "accepted", accepted: true };
+      },
+      seek() {
+        return { command: "seek", code: "accepted", accepted: true };
+      },
+      play() {
+        return { command: "play", code: "accepted", accepted: true };
+      },
+      close() {
+        return { command: "close", code: "accepted", accepted: true };
+      },
+      dispose() {},
+    },
+  );
+  const phases = [];
+  operation.on("terminal", (handle) => phases.push(handle.phase));
+  assert.equal(operation.phase, "activated");
+  assert.equal(operation.recordingOpenBehavior, "background");
+  assert.equal(cache.transition("operation-close", "terminal"), true);
+  assert.deepEqual(phases, []);
+  viewer._strict_dispatcher.drain_now();
+  assert.deepEqual(phases, ["terminal"]);
+
+  assert.deepEqual(recording.select(), {
+    command: "select",
+    code: "operation_closed",
+    accepted: false,
+  });
+  assert.equal(childSelectCount, 0);
+  assert.equal(cache.replay_active_recording(
+    "operation-close",
+    "late-recording",
+    "late-generation",
+  ), null);
+  assert.deepEqual(operation.close(), {
+    command: "close",
+    code: "operation_closed",
+    accepted: false,
+  });
+  assert.equal(sourceCloseCount, 0);
+
+  assert.equal(cache.transition("operation-close", "removed"), true);
+  assert.deepEqual(recording.select(), {
+    command: "select",
+    code: "recording_removed",
+    accepted: false,
+  });
+  assert.equal(cache.transition("operation-close", "terminal"), false);
+
+  operation.dispose();
+  assert.equal(cache.operation_count, 0);
+
+  const liveOperation = cache.install_operation(
+    "operation-close-accepted",
+    {
+      close() {
+        sourceCloseCount += 1;
+        return { command: "close", code: "accepted", accepted: true };
+      },
+      dispose() {},
+    },
+  );
+  const liveRecording = cache.attach_preexisting_recording(
+    "operation-close-accepted",
+    "recording-close-accepted",
+    "generation-close-accepted",
+  );
+  assert.deepEqual(liveOperation.close(), {
+    command: "close",
+    code: "accepted",
+    accepted: true,
+  });
+  assert.equal(sourceCloseCount, 1);
+  assert.deepEqual(liveRecording.select(), {
+    command: "select",
+    code: "operation_closed",
+    accepted: false,
+  });
+  assert.equal(cache.replay_active_recording(
+    "operation-close-accepted",
+    "late-recording",
+  ), null);
+  liveOperation.dispose();
+  assert.equal(cache.operation_count, 0);
+});
+
 test("strict exact controls validate sealed targets and keep close separate from dispose", () => {
   const viewer = new WebViewer();
-  const operation = viewer._strict_open_cache.install_operation("operation-exact");
-  const recording = operation.attach_preexisting_recording("same-recording-id");
+  const cache = strictCache(viewer);
+  const operation = cache.install_operation("operation-exact");
+  const recording = cache.attach_preexisting_recording(
+    "operation-exact",
+    "same-recording-id",
+  );
 
   assert.equal("operation_id" in operation, false);
   assert.equal("recording_id" in recording, false);
@@ -662,16 +875,20 @@ test("strict exact controls validate sealed targets and keep close separate from
     code: "disposed",
     accepted: false,
   });
-  assert.equal(operation.recording_count, 1);
+  assert.equal(cache.recording_count("operation-exact"), 0);
   operation.dispose();
   assert.equal(operation.disposed, true);
-  assert.equal(operation.recording_count, 0);
+  assert.equal(cache.recording_count("operation-exact"), 0);
 });
 
 test("strict exact handles become terminal when the viewer stops", async () => {
   const viewer = await startViewer();
-  const operation = viewer._strict_open_cache.install_operation("operation-stopped");
-  const recording = operation.attach_preexisting_recording("recording-stopped");
+  const cache = strictCache(viewer);
+  const operation = cache.install_operation("operation-stopped");
+  const recording = cache.attach_preexisting_recording(
+    "operation-stopped",
+    "recording-stopped",
+  );
   viewer.stop();
 
   assert.deepEqual(recording.select(), {

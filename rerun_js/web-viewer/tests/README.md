@@ -4,6 +4,7 @@ These tests freeze the compatibility behavior that predates strict remote MCAP o
 
 The JavaScript suite compiles and executes the production `index.ts` and replaces only the generated Wasm module and browser DOM.
 The fake `WebHandle` records boundary calls and can inject an ABI exception without duplicating `WebViewer` logic.
+The Node test preload sets `RERUN_WEB_VIEWER_TEST=1` before importing the wrapper; ordinary browser and package hosts cannot expose the cache inspection seam by predefining the fake-Wasm state object.
 
 The suite freezes the following current behavior:
 
