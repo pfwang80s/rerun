@@ -102,6 +102,12 @@
 //! use re_web::range_retry;
 //! ```
 
+//! Remote-MCAP insertion/GC suspension ownership is likewise Web-only and production-disarmed:
+//!
+//! ```compile_fail,ignore-wasm32
+//! use re_web::remote_mutation_suspension;
+//! ```
+
 pub mod browser;
 
 #[cfg(target_arch = "wasm32")]
@@ -133,6 +139,8 @@ pub mod open_source_terminal;
 pub(crate) mod range_retry;
 #[cfg(target_arch = "wasm32")]
 pub mod remote_limits;
+#[cfg(target_arch = "wasm32")]
+pub mod remote_mutation_suspension;
 #[cfg(target_arch = "wasm32")]
 pub mod remote_validator;
 #[cfg(target_arch = "wasm32")]
@@ -179,6 +187,10 @@ mod compatibility_open;
 // Host builds compile only the pure metadata retry state machine for differential unit tests.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod range_retry;
+
+// Host builds compile the pure remote mutation ownership state machine only for its unit tests.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod remote_mutation_suspension;
 
 // Host builds compile the module only for its unit tests and do not publish it to consumers.
 #[cfg(all(test, not(target_arch = "wasm32")))]
