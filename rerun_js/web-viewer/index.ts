@@ -2071,11 +2071,15 @@ class StrictOpenOperationWrapper {
     }
 
     const cache_token = {};
+    const operation_ref = new WeakRef(this);
     const wrapper = new StrictOpenRecordingWrapper(
       identity,
       alias_kind,
       adapter,
-      () => this.#delete_recording(identity_key, cache_token),
+      () => {
+        const operation = operation_ref.deref();
+        if (operation) operation.#delete_recording(identity_key, cache_token);
+      },
     );
     this.#recordings.set(identity_key, {
       wrapper,
