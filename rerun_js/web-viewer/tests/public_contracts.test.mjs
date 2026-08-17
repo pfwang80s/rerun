@@ -247,6 +247,16 @@ test("hidden deadline clear rejects reentrant deadline writes", () => {
   assert.equal(controller.state.kind, "HiddenSuspended");
 });
 
+test("lifecycle listener installation failure resets start for retry", async () => {
+  const viewer = new WebViewer();
+  const add = globalThis.window.addEventListener;
+  globalThis.window.addEventListener = () => { throw new Error("listener failure"); };
+  await assert.rejects(() => viewer.start(null, document.body, null), /listener failure/);
+  globalThis.window.addEventListener = add;
+  await viewer.start(null, document.body, null);
+  viewer.stop();
+});
+
 function callsNamed(name) {
   return globalThis.__rerun_web_viewer_test_state.calls.filter(
     (call) => call[0] === name,

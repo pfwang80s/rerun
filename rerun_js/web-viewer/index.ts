@@ -1015,9 +1015,9 @@ export class WebViewer {
     // Viewer instance was synchronously discarded by stop().
     this._strict_dispatcher.reset();
     this.#strict_open_cache.begin_viewer_instance();
+    this.#state = "starting";
     this.#page_execution?.dispose();
     this.#page_execution = new ChromePageExecutionController();
-    this.#state = "starting";
     this.#clearLoader();
 
     this.#canvas = document.createElement("canvas");
