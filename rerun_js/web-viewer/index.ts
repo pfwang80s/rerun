@@ -780,7 +780,8 @@ export class ChromePageExecutionController {
     }
     if (this.#state.kind === "HiddenSuspended") {
       owner.on_hidden?.(this.#state.epoch);
-      return () => {};
+      this.#owners.add(owner);
+      return () => this.#owners.delete(owner);
     }
     this.#owners.add(owner);
     return () => this.#owners.delete(owner);
