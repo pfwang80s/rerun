@@ -28,6 +28,7 @@ pub struct CompatibilityRemoteMcapSingletonV1 {
     capability_installed: bool,
     registry: OpenSourceClientRegistryV1,
     opening: Option<OpenSourceClientOpeningHandleV1>,
+    opening_suspended: bool,
     page: RemotePageManagerV1,
 }
 
@@ -63,6 +64,7 @@ impl CompatibilityRemoteMcapSingletonV1 {
             capability_installed: false,
             registry: OpenSourceClientRegistryV1::new_v1(),
             opening: None,
+            opening_suspended: false,
             page: RemotePageManagerV1::default(),
         }
     }
@@ -77,7 +79,7 @@ impl CompatibilityRemoteMcapSingletonV1 {
             return CompatibilityRemoteMcapDispatchV1::ExistingDispatcher;
         }
 
-        if !matches!(self.page.state, RemotePageStateV1::Visible { .. }) {
+        if matches!(self.page.state, RemotePageStateV1::Terminated { .. }) {
             return CompatibilityRemoteMcapDispatchV1::RemoteSessionLimitReached;
         }
 
@@ -90,6 +92,8 @@ impl CompatibilityRemoteMcapSingletonV1 {
         match self.registry.claim_opening_v1(owner) {
             Ok(opening) => {
                 self.opening = Some(opening);
+                self.opening_suspended =
+                    matches!(self.page.state, RemotePageStateV1::Hidden { .. });
                 CompatibilityRemoteMcapDispatchV1::RemoteAccepted { source_token }
             }
             Err(
@@ -106,6 +110,9 @@ impl CompatibilityRemoteMcapSingletonV1 {
         }
         self.page.state = RemotePageStateV1::Hidden { epoch };
         self.page.visible_deadline_ms = None;
+        if self.opening.is_some() {
+            self.opening_suspended = true;
+        }
     }
 
     pub fn page_resume_v1(&mut self, from_epoch: u32, to_epoch: u32, resume_nonce: u32) -> bool {
@@ -117,6 +124,7 @@ impl CompatibilityRemoteMcapSingletonV1 {
             resume_nonce,
         };
         self.page.visible_deadline_ms = None;
+        self.opening_suspended = false;
         true
     }
 
@@ -150,6 +158,7 @@ impl CompatibilityRemoteMcapSingletonV1 {
         let Some(opening) = self.opening.take() else {
             return false;
         };
+        self.opening_suspended = false;
         opening.cancel_v1(crate::open_source_terminal::OpenSourceTerminalCauseV1::OpeningFailure)
     }
 }
@@ -183,14 +192,18 @@ mod tests {
         let mut singleton = CompatibilityRemoteMcapSingletonV1::new_disarmed_v1();
         singleton.page_hidden_v1(1);
         singleton.arm_for_test_v1();
-        assert_eq!(
+        assert!(matches!(
             singleton.dispatch_v1(),
-            CompatibilityRemoteMcapDispatchV1::RemoteSessionLimitReached
-        );
+            CompatibilityRemoteMcapDispatchV1::RemoteAccepted { .. }
+        ));
+        assert!(singleton.opening_suspended);
         assert!(!singleton.page_resume_v1(0, 2, 1));
+        assert!(singleton.opening_suspended);
         assert!(singleton.page_resume_v1(1, 2, 1));
+        assert!(!singleton.opening_suspended);
         assert!(singleton.page_visible_deadline_v1(2, Some(10)));
         assert!(!singleton.page_visible_deadline_v1(1, Some(10)));
+        assert!(singleton.cancel_opening_v1());
         assert!(matches!(
             singleton.dispatch_v1(),
             CompatibilityRemoteMcapDispatchV1::RemoteAccepted { .. }
