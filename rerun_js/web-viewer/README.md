@@ -31,6 +31,9 @@ This means that:
 The entrypoint for this packages is the [`WebViewer`](https://ref.rerun.io/docs/js/0.35.0/web-viewer/classes/WebViewer.html) class.
 The web viewer is an object which manages a canvas element:
 
+Remote-MCAP page execution is tracked independently from the Viewer frame driver.
+`ChromePageExecutionController` exposes typed visible, hidden, revalidating, and terminating states for integrations that need to coordinate remote-MCAP work with browser lifecycle signals.
+
 ```js
 import { WebViewer } from "@rerun-io/web-viewer";
 

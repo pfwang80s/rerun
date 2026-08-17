@@ -711,6 +711,130 @@ function normalize_strict_open_spec(
   }
 }
 
+/** The execution state owned by the remote-MCAP page manager. */
+export type ChromePageExecutionState =
+  | { readonly kind: "VisibleRunning"; readonly epoch: number; readonly clock_baseline: number }
+  | { readonly kind: "HiddenSuspended"; readonly epoch: number; readonly remote_wake_pending: boolean }
+  | { readonly kind: "VisibleRevalidating"; readonly from_epoch: number; readonly to_epoch: number; readonly resume_nonce: number }
+  | { readonly kind: "RemoteTerminating"; readonly epoch: number; readonly reason: "pagehide" | "freeze" };
+
+export type ChromePageExecutionOwner = {
+  readonly epoch: number;
+  readonly generation: number;
+  readonly is_current: () => boolean;
+};
+
+export type ChromePageExecutionListenerOptions = {
+  readonly target?: EventTarget;
+  readonly document?: { readonly visibilityState?: string; addEventListener?: EventTarget["addEventListener"]; removeEventListener?: EventTarget["removeEventListener"] };
+  readonly on_state?: (state: ChromePageExecutionState) => void;
+};
+
+/**
+ * Remote-MCAP-only browser lifecycle state machine.
+ *
+ * It deliberately does not suspend the Viewer frame driver or any non-remote receiver.
+ */
+export class ChromePageExecutionController {
+  #target: EventTarget | null;
+  #document: { readonly visibilityState?: string } | null;
+  #on_state: ((state: ChromePageExecutionState) => void) | null;
+  #state: ChromePageExecutionState;
+  #epoch = 0;
+  #generation = 0;
+  #resume_nonce = 0;
+  #disposed = false;
+  #listeners: Array<[EventTarget, string, EventListener]> = [];
+
+  constructor(options: ChromePageExecutionListenerOptions = {}) {
+    this.#target = options.target ?? (typeof window !== "undefined" ? window : null);
+    this.#document = options.document ?? (typeof document !== "undefined" ? document : null);
+    this.#on_state = options.on_state ?? null;
+    const visible = this.#document?.visibilityState !== "hidden";
+    this.#state = visible
+      ? { kind: "VisibleRunning", epoch: this.#epoch, clock_baseline: this.#now() }
+      : { kind: "HiddenSuspended", epoch: this.#epoch, remote_wake_pending: false };
+    this.#install();
+    // Reconcile after listener installation to cover an already-hidden initial page.
+    if (this.#document?.visibilityState === "hidden") this.#hidden();
+  }
+
+  get state(): ChromePageExecutionState { return this.#state; }
+  get epoch(): number { return this.#epoch; }
+
+  acquire_owner(): ChromePageExecutionOwner {
+    const epoch = this.#epoch;
+    const generation = this.#generation;
+    return Object.freeze({
+      epoch,
+      generation,
+      is_current: () => !this.#disposed && epoch === this.#epoch && generation === this.#generation
+        && this.#state.kind !== "RemoteTerminating",
+    });
+  }
+
+  dispose(): void {
+    if (this.#disposed) return;
+    this.#disposed = true;
+    for (const [target, name, listener] of this.#listeners) {
+      target.removeEventListener?.(name, listener);
+    }
+    this.#listeners = [];
+    this.#on_state = null;
+    this.#generation++;
+  }
+
+  #now(): number {
+    return typeof performance !== "undefined" && typeof performance.now === "function" ? performance.now() : 0;
+  }
+
+  #install(): void {
+    if (!this.#target) return;
+    const add = (target: EventTarget | null, name: string, fn: () => void) => {
+      if (!target?.addEventListener) return;
+      const listener = (() => fn()) as EventListener;
+      target.addEventListener(name, listener);
+      this.#listeners.push([target, name, listener]);
+    };
+    const document_target = this.#document as EventTarget | null;
+    add(document_target?.addEventListener ? document_target : this.#target, "visibilitychange", () => this.#document?.visibilityState === "hidden" ? this.#hidden() : this.#visible());
+    add(this.#target, "pagehide", () => this.#terminate("pagehide"));
+    add(this.#target, "freeze", () => this.#terminate("freeze"));
+    add(this.#target, "pageshow", () => this.#visible());
+    add(this.#target, "resume", () => this.#visible());
+  }
+
+  #publish(state: ChromePageExecutionState): void {
+    this.#state = Object.freeze(state);
+    this.#on_state?.(this.#state);
+  }
+
+  #hidden(): void {
+    if (this.#disposed || this.#state.kind === "RemoteTerminating" || this.#state.kind === "HiddenSuspended") return;
+    this.#epoch++;
+    this.#generation++;
+    this.#publish({ kind: "HiddenSuspended", epoch: this.#epoch, remote_wake_pending: false });
+  }
+
+  #visible(): void {
+    if (this.#disposed || this.#state.kind === "RemoteTerminating" || this.#state.kind === "VisibleRunning") return;
+    if (this.#state.kind !== "HiddenSuspended") return;
+    const from = this.#epoch;
+    this.#epoch++;
+    this.#generation++;
+    this.#resume_nonce++;
+    this.#publish({ kind: "VisibleRevalidating", from_epoch: from, to_epoch: this.#epoch, resume_nonce: this.#resume_nonce });
+    this.#publish({ kind: "VisibleRunning", epoch: this.#epoch, clock_baseline: this.#now() });
+  }
+
+  #terminate(reason: "pagehide" | "freeze"): void {
+    if (this.#disposed || this.#state.kind === "RemoteTerminating") return;
+    this.#epoch++;
+    this.#generation++;
+    this.#publish({ kind: "RemoteTerminating", epoch: this.#epoch, reason });
+  }
+}
+
 /**
  * Rerun Web Viewer
  *
@@ -746,6 +870,7 @@ export class WebViewer {
   #state: "ready" | "starting" | "stopped" = "stopped";
   #fullscreen = false;
   #allow_fullscreen = false;
+  #page_execution: ChromePageExecutionController | null = null;
 
   constructor() {
     injectStyle();
@@ -800,6 +925,8 @@ export class WebViewer {
     // Viewer instance was synchronously discarded by stop().
     this._strict_dispatcher.reset();
     this.#strict_open_cache.begin_viewer_instance();
+    this.#page_execution?.dispose();
+    this.#page_execution = new ChromePageExecutionController();
     this.#state = "starting";
     this.#clearLoader();
 
@@ -1171,6 +1298,8 @@ export class WebViewer {
     // Strict remote handles retain their opaque identity across a Viewer restart, but all
     // controls become terminally stopped and can never redirect to a later publication.
     this.#strict_open_cache.mark_viewer_stopped();
+    this.#page_execution?.dispose();
+    this.#page_execution = null;
     // Remote-MCAP work is instance-owned and must be synchronously cancelled before the
     // underlying wasm handle is destroyed.  Compatibility receivers and their existing
     // teardown remain owned by WebHandle.

@@ -107,7 +107,7 @@ globalThis.setTimeout = (callback, delay, ...args) => {
 };
 
 resetState();
-const { LogChannel, StrictOpenError, WebViewer } = await import("../index.js");
+const { ChromePageExecutionController, LogChannel, StrictOpenError, WebViewer } = await import("../index.js");
 
 beforeEach(() => {
   resetState();
@@ -119,6 +119,32 @@ after(() => {
   globalThis.fetch = original.fetch;
   globalThis.requestAnimationFrame = original.requestAnimationFrame;
   globalThis.setTimeout = original.setTimeout;
+});
+
+test("remote page execution lifecycle is epoch-checked and idempotent", () => {
+  const listeners = new Map();
+  const target = {
+    addEventListener(name, listener) { listeners.set(name, listener); },
+    removeEventListener(name, listener) { if (listeners.get(name) === listener) listeners.delete(name); },
+  };
+  const page = { visibilityState: "visible" };
+  const states = [];
+  const controller = new ChromePageExecutionController({ target, document: page, on_state: (state) => states.push(state) });
+  const owner = controller.acquire_owner();
+  page.visibilityState = "hidden";
+  listeners.get("visibilitychange")();
+  listeners.get("visibilitychange")();
+  assert.equal(controller.state.kind, "HiddenSuspended");
+  assert.equal(owner.is_current(), false);
+  page.visibilityState = "visible";
+  listeners.get("pageshow")();
+  assert.equal(controller.state.kind, "VisibleRunning");
+  listeners.get("freeze")();
+  listeners.get("pagehide")();
+  assert.equal(controller.state.kind, "RemoteTerminating");
+  assert.equal(states.filter((state) => state.kind === "HiddenSuspended").length, 1);
+  controller.dispose();
+  assert.equal(listeners.size, 0);
 });
 
 function callsNamed(name) {
