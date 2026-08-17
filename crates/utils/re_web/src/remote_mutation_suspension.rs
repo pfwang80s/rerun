@@ -123,6 +123,7 @@ enum RemoteMutationStateV1 {
     Hidden {
         epoch: u64,
         owner: RemoteMutationOwnershipV1,
+        resume_nonce: u64,
     },
     Poisoned {
         epoch: u64,
@@ -214,9 +215,12 @@ impl RemoteMutationSuspensionV1 {
             self.state = RemoteMutationStateV1::Active { epoch, owner };
             return false;
         }
+        let resume_nonce = self.next_resume_nonce;
+        self.next_resume_nonce = self.next_resume_nonce.saturating_add(1);
         self.state = RemoteMutationStateV1::Hidden {
             epoch: resulting_epoch,
             owner,
+            resume_nonce,
         };
         true
     }
@@ -224,23 +228,34 @@ impl RemoteMutationSuspensionV1 {
     pub fn resume_v1(
         &mut self,
         expected_epoch: u64,
+        resume_nonce: u64,
         facade: RemoteFacadeSnapshotV1,
     ) -> RemoteMutationResumeResultV1 {
         let state = std::mem::replace(
             &mut self.state,
             RemoteMutationStateV1::Terminated { epoch: 0 },
         );
-        let RemoteMutationStateV1::Hidden { epoch, owner } = state else {
+        let RemoteMutationStateV1::Hidden {
+            epoch,
+            owner,
+            resume_nonce: expected_nonce,
+        } = state
+        else {
             self.state = state;
             return RemoteMutationResumeResultV1::Rejected;
         };
-        if expected_epoch != epoch || self.next_resume_nonce <= self.last_resume_nonce {
-            self.state = RemoteMutationStateV1::Hidden { epoch, owner };
+        if expected_epoch != epoch
+            || resume_nonce != expected_nonce
+            || resume_nonce <= self.last_resume_nonce
+        {
+            self.state = RemoteMutationStateV1::Hidden {
+                epoch,
+                owner,
+                resume_nonce: expected_nonce,
+            };
             return RemoteMutationResumeResultV1::Rejected;
         }
-        let nonce = self.next_resume_nonce;
-        self.next_resume_nonce = self.next_resume_nonce.saturating_add(1);
-        self.last_resume_nonce = nonce;
+        self.last_resume_nonce = resume_nonce;
         if owner.facade != facade {
             if owner.physical_mutation_started() {
                 self.state = RemoteMutationStateV1::Poisoned { epoch, owner };
@@ -281,6 +296,13 @@ impl RemoteMutationSuspensionV1 {
             _ => None,
         }
     }
+
+    pub fn suspended_resume_nonce_v1(&self) -> Option<u64> {
+        match self.state {
+            RemoteMutationStateV1::Hidden { resume_nonce, .. } => Some(resume_nonce),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -314,12 +336,13 @@ mod tests {
         assert!(arbiter.suspend_v1(1));
         assert!(arbiter.suspended_owner_v1().is_some());
         let facade = arbiter.suspended_owner_v1().unwrap().facade.clone();
+        let nonce = arbiter.suspended_resume_nonce_v1().unwrap();
         assert_eq!(
-            arbiter.resume_v1(1, facade.clone()),
+            arbiter.resume_v1(1, nonce, facade.clone()),
             RemoteMutationResumeResultV1::Rebound
         );
         assert_eq!(
-            arbiter.resume_v1(1, facade),
+            arbiter.resume_v1(1, nonce, facade),
             RemoteMutationResumeResultV1::Rejected
         );
     }
@@ -337,8 +360,9 @@ mod tests {
             content_revision: 4,
             protection_revision: 5,
         };
+        let nonce = arbiter.suspended_resume_nonce_v1().unwrap();
         assert_eq!(
-            arbiter.resume_v1(1, facade),
+            arbiter.resume_v1(1, nonce, facade),
             RemoteMutationResumeResultV1::Poisoned
         );
         assert!(arbiter.is_poisoned_v1());
