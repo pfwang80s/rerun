@@ -16,6 +16,7 @@ pub enum RemoteMutationKindV1 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RemoteMutationSafePointV1 {
     RunningAddChunk,
+    RunningGc,
     WaitingForLeases,
     BeforeFirstAddChunk,
     BetweenAddChunks,
@@ -38,6 +39,24 @@ impl RemoteMutationSafePointV1 {
     }
 }
 
+fn owner_can_suspend(owner: &RemoteMutationOwnershipV1) -> bool {
+    if !owner.safe_point.can_suspend() {
+        return false;
+    }
+    match owner.kind {
+        RemoteMutationKindV1::Insertion => !matches!(
+            owner.safe_point,
+            RemoteMutationSafePointV1::GcWaitingForLeases
+                | RemoteMutationSafePointV1::AfterGcBeforeReopen
+        ),
+        RemoteMutationKindV1::Gc => matches!(
+            owner.safe_point,
+            RemoteMutationSafePointV1::GcWaitingForLeases
+                | RemoteMutationSafePointV1::AfterGcBeforeReopen
+        ),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteFacadeSnapshotV1 {
     pub facade_revision: u64,
@@ -52,7 +71,7 @@ pub struct RemoteMutationEffectsV1 {
     pub presentation_epoch_effects: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct RemoteMutationOwnershipV1 {
     pub kind: RemoteMutationKindV1,
     pub safe_point: RemoteMutationSafePointV1,
@@ -112,7 +131,7 @@ impl RemoteMutationOwnershipV1 {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum RemoteMutationStateV1 {
     Visible {
         epoch: u64,
@@ -216,7 +235,7 @@ impl RemoteMutationSuspensionV1 {
             self.state = RemoteMutationStateV1::Active { epoch, owner };
             return false;
         };
-        if resulting_epoch != next_epoch || !owner.safe_point.can_suspend() {
+        if resulting_epoch != next_epoch || !owner_can_suspend(&owner) {
             self.state = RemoteMutationStateV1::Active { epoch, owner };
             return false;
         }
@@ -273,7 +292,9 @@ impl RemoteMutationSuspensionV1 {
             self.state = RemoteMutationStateV1::Terminated { epoch };
             return RemoteMutationResumeResultV1::Rejected;
         }
-        self.state = RemoteMutationStateV1::Visible { epoch };
+        // Rebind the complete move-only owner.  The caller can continue the turn or terminate it;
+        // pins, reservations, frozen commit set and effects are not dropped at the page boundary.
+        self.state = RemoteMutationStateV1::Active { epoch, owner };
         RemoteMutationResumeResultV1::Rebound
     }
 
@@ -298,7 +319,8 @@ impl RemoteMutationSuspensionV1 {
 
     pub fn suspended_owner_v1(&self) -> Option<&RemoteMutationOwnershipV1> {
         match &self.state {
-            RemoteMutationStateV1::Hidden { owner, .. }
+            RemoteMutationStateV1::Active { owner, .. }
+            | RemoteMutationStateV1::Hidden { owner, .. }
             | RemoteMutationStateV1::Poisoned { owner, .. } => Some(owner),
             _ => None,
         }
@@ -306,7 +328,7 @@ impl RemoteMutationSuspensionV1 {
 }
 
 fn owner_safe_point(state: &RemoteMutationStateV1) -> bool {
-    matches!(state, RemoteMutationStateV1::Active { owner, .. } if owner.safe_point.can_suspend())
+    matches!(state, RemoteMutationStateV1::Active { owner, .. } if owner_can_suspend(owner))
 }
 
 #[cfg(test)]
@@ -344,6 +366,9 @@ mod tests {
             arbiter.resume_v1(1, 7, facade.clone()),
             RemoteMutationResumeResultV1::Rebound
         );
+        assert!(arbiter.suspended_owner_v1().is_some());
+        assert!(arbiter.terminate_v1(2));
+        assert!(arbiter.suspended_owner_v1().is_none());
         assert_eq!(
             arbiter.resume_v1(1, 7, facade),
             RemoteMutationResumeResultV1::Rejected
@@ -390,5 +415,12 @@ mod tests {
         assert!(arbiter.begin_v1(owner()));
         assert!(arbiter.suspend_v1(1, 12));
         assert!(!arbiter.mark_physical_mutation_started_v1());
+
+        let mut gc_owner = owner();
+        gc_owner.kind = RemoteMutationKindV1::Gc;
+        gc_owner.safe_point = RemoteMutationSafePointV1::BetweenAddChunks;
+        let mut arbiter = RemoteMutationSuspensionV1::default();
+        assert!(arbiter.begin_v1(gc_owner));
+        assert!(!arbiter.suspend_v1(1, 13));
     }
 }
