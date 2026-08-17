@@ -155,7 +155,8 @@ impl CompatibilityRemoteMcapSingletonV1 {
             | RemotePageStateV1::Hidden { epoch: current } => current,
             RemotePageStateV1::Terminated { .. } => return,
         };
-        if epoch != current {
+        // Browser termination carries the resulting epoch, just like hidden.
+        if epoch != current && epoch != current.saturating_add(1) {
             return;
         }
         self.page.state = RemotePageStateV1::Terminated { epoch };
@@ -252,7 +253,7 @@ mod tests {
         ));
         singleton.page_terminate_v1(1);
         assert!(singleton.opening.is_some());
-        singleton.page_terminate_v1(2);
+        singleton.page_terminate_v1(3);
         assert!(singleton.opening.is_none());
     }
 
