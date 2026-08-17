@@ -43,6 +43,7 @@ enum RemotePageStateV1 {
 struct RemotePageManagerV1 {
     state: RemotePageStateV1,
     visible_deadline_ms: Option<u64>,
+    last_resume_nonce: u32,
 }
 
 impl Default for RemotePageManagerV1 {
@@ -53,6 +54,7 @@ impl Default for RemotePageManagerV1 {
                 resume_nonce: 0,
             },
             visible_deadline_ms: None,
+            last_resume_nonce: 0,
         }
     }
 }
@@ -105,7 +107,10 @@ impl CompatibilityRemoteMcapSingletonV1 {
     }
 
     pub fn page_hidden_v1(&mut self, epoch: u32) {
-        if matches!(self.page.state, RemotePageStateV1::Terminated { .. }) {
+        let RemotePageStateV1::Visible { epoch: current, .. } = self.page.state else {
+            return;
+        };
+        if epoch != current {
             return;
         }
         self.page.state = RemotePageStateV1::Hidden { epoch };
@@ -116,7 +121,11 @@ impl CompatibilityRemoteMcapSingletonV1 {
     }
 
     pub fn page_resume_v1(&mut self, from_epoch: u32, to_epoch: u32, resume_nonce: u32) -> bool {
-        if self.page.state != (RemotePageStateV1::Hidden { epoch: from_epoch }) {
+        if self.page.state != (RemotePageStateV1::Hidden { epoch: from_epoch })
+            || to_epoch != from_epoch.saturating_add(1)
+            || resume_nonce == 0
+            || resume_nonce <= self.page.last_resume_nonce
+        {
             return false;
         }
         self.page.state = RemotePageStateV1::Visible {
@@ -124,6 +133,7 @@ impl CompatibilityRemoteMcapSingletonV1 {
             resume_nonce,
         };
         self.page.visible_deadline_ms = None;
+        self.page.last_resume_nonce = resume_nonce;
         self.opening_suspended = false;
         true
     }
@@ -138,6 +148,14 @@ impl CompatibilityRemoteMcapSingletonV1 {
     }
 
     pub fn page_terminate_v1(&mut self, epoch: u32) {
+        let current = match self.page.state {
+            RemotePageStateV1::Visible { epoch: current, .. }
+            | RemotePageStateV1::Hidden { epoch: current } => current,
+            RemotePageStateV1::Terminated { .. } => return,
+        };
+        if epoch != current {
+            return;
+        }
         self.page.state = RemotePageStateV1::Terminated { epoch };
         self.page.visible_deadline_ms = None;
         let _ = self.cancel_opening_v1();
@@ -190,7 +208,7 @@ mod tests {
     #[test]
     fn page_lifecycle_gates_armed_admission_and_requires_matching_resume() {
         let mut singleton = CompatibilityRemoteMcapSingletonV1::new_disarmed_v1();
-        singleton.page_hidden_v1(1);
+        singleton.page_hidden_v1(0);
         singleton.arm_for_test_v1();
         assert!(matches!(
             singleton.dispatch_v1(),
@@ -199,10 +217,15 @@ mod tests {
         assert!(singleton.opening_suspended);
         assert!(!singleton.page_resume_v1(0, 2, 1));
         assert!(singleton.opening_suspended);
-        assert!(singleton.page_resume_v1(1, 2, 1));
+        assert!(singleton.page_resume_v1(0, 1, 1));
         assert!(!singleton.opening_suspended);
-        assert!(singleton.page_visible_deadline_v1(2, Some(10)));
-        assert!(!singleton.page_visible_deadline_v1(1, Some(10)));
+        singleton.page_hidden_v1(0); // stale hidden must not suspend epoch 1
+        assert!(matches!(
+            singleton.page.state,
+            RemotePageStateV1::Visible { epoch: 1, .. }
+        ));
+        assert!(singleton.page_visible_deadline_v1(1, Some(10)));
+        assert!(!singleton.page_visible_deadline_v1(0, Some(10)));
         assert!(singleton.cancel_opening_v1());
         assert!(matches!(
             singleton.dispatch_v1(),
@@ -213,6 +236,22 @@ mod tests {
             singleton.dispatch_v1(),
             CompatibilityRemoteMcapDispatchV1::RemoteSessionLimitReached
         );
+    }
+
+    #[test]
+    fn stale_termination_cannot_cancel_a_new_epoch_owner() {
+        let mut singleton = CompatibilityRemoteMcapSingletonV1::new_disarmed_v1();
+        singleton.arm_for_test_v1();
+        singleton.page_hidden_v1(0);
+        assert!(singleton.page_resume_v1(0, 1, 1));
+        assert!(matches!(
+            singleton.dispatch_v1(),
+            CompatibilityRemoteMcapDispatchV1::RemoteAccepted { .. }
+        ));
+        singleton.page_terminate_v1(0);
+        assert!(singleton.opening.is_some());
+        singleton.page_terminate_v1(1);
+        assert!(singleton.opening.is_none());
     }
 
     #[test]
