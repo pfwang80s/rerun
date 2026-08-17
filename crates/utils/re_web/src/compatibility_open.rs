@@ -106,6 +106,8 @@ impl CompatibilityRemoteMcapSingletonV1 {
         }
     }
 
+    /// Applies a browser hidden transition carrying its resulting epoch.
+    /// Only `current + 1` is accepted; stale or duplicate signals are no-ops.
     pub fn page_hidden_v1(&mut self, epoch: u32) {
         let RemotePageStateV1::Visible { epoch: current, .. } = self.page.state else {
             return;
@@ -121,6 +123,8 @@ impl CompatibilityRemoteMcapSingletonV1 {
         }
     }
 
+    /// Rebinds a hidden owner to a fresh visible epoch and nonce exactly once.
+    /// The `to_epoch` must equal `from_epoch + 1`; stale signals return `false`.
     pub fn page_resume_v1(&mut self, from_epoch: u32, to_epoch: u32, resume_nonce: u32) -> bool {
         if self.page.state != (RemotePageStateV1::Hidden { epoch: from_epoch })
             || to_epoch != from_epoch.saturating_add(1)
@@ -139,6 +143,8 @@ impl CompatibilityRemoteMcapSingletonV1 {
         true
     }
 
+    /// Sets a source-scoped visible deadline for the matching visible epoch.
+    /// Hidden, terminated, and stale epochs are rejected with `false`.
     pub fn page_visible_deadline_v1(&mut self, epoch: u32, deadline_ms: Option<u64>) -> bool {
         if !matches!(self.page.state, RemotePageStateV1::Visible { epoch: current, .. } if current == epoch)
         {
@@ -148,6 +154,8 @@ impl CompatibilityRemoteMcapSingletonV1 {
         true
     }
 
+    /// Terminates remote owners using the browser's resulting epoch.
+    /// Only the next legal epoch is accepted; stale, duplicate, and terminal signals no-op.
     pub fn page_terminate_v1(&mut self, epoch: u32) {
         let current = match self.page.state {
             RemotePageStateV1::Visible { epoch: current, .. }
@@ -155,7 +163,13 @@ impl CompatibilityRemoteMcapSingletonV1 {
             RemotePageStateV1::Terminated { .. } => return,
         };
         // Browser termination carries only the resulting epoch, just like hidden.
-        if epoch != current.saturating_add(1) {
+        let allowed = match self.page.state {
+            RemotePageStateV1::Hidden { .. } => {
+                epoch == current.saturating_add(1) || epoch == current.saturating_add(2)
+            }
+            _ => epoch == current.saturating_add(1),
+        };
+        if !allowed {
             return;
         }
         self.page.state = RemotePageStateV1::Terminated { epoch };
@@ -256,6 +270,19 @@ mod tests {
         singleton.page_terminate_v1(2); // current epoch is not a resulting signal
         assert!(singleton.opening.is_some());
         singleton.page_terminate_v1(3);
+        assert!(singleton.opening.is_none());
+    }
+
+    #[test]
+    fn revalidation_reentrant_termination_accepts_bound_hidden_resulting_epoch() {
+        let mut singleton = CompatibilityRemoteMcapSingletonV1::new_disarmed_v1();
+        singleton.arm_for_test_v1();
+        singleton.page_hidden_v1(1);
+        assert!(matches!(
+            singleton.dispatch_v1(),
+            CompatibilityRemoteMcapDispatchV1::RemoteAccepted { .. }
+        ));
+        singleton.page_terminate_v1(3); // hidden epoch 1 + revalidation terminal epoch 3
         assert!(singleton.opening.is_none());
     }
 
