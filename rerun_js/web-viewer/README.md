@@ -52,6 +52,14 @@ Explicit `.mcap` URLs are accepted directly, while extensionless URLs require `a
 Non-HTTP routes, gRPC/message proxy URLs, Redap URLs, RRD files, and other formats are rejected by the strict APIs and are never handed to the compatibility importer.
 Until the measured release-Wasm remote-MCAP capability is installed, valid strict requests reject with `StrictOpenError` code `CapabilityUnavailable` before creating handles or scheduling work.
 
+When the capability is installed, each opaque `RecordingHandle` targets one exact remote Store publication.
+Its `select()`, `seek({time_type, value})`, `play("paused" | "playing")`, and `close()` methods return a synchronous redacted `StrictRecordingControlResult`.
+`seek` accepts only `timestamp_ns` or `duration_ns` and a canonical decimal value.
+`OpenRequestHandle.close()` closes the operation's shared source, while `RecordingHandle.close()` closes only its exact publication.
+`dispose()` on either handle releases subscriptions, pending promises, wrapper retention, and removed tombstones without closing the source or publication.
+The `FinalizationRegistry` is only a best-effort fallback that invokes the same internal cleanup token as explicit `dispose()`.
+Neither handle exposes a Store ID, recording ID, URL, or lifecycle token.
+
 ```ts
 const handles = await viewer.openBatch([
   { url: "https://example.test/first.mcap" },

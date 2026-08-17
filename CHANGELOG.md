@@ -13,6 +13,10 @@ Added additive `WebViewer.openRequest` and `openBatch` contracts with typed HTTP
 The strict lane rejects non-MCAP and non-HTTP routes without falling back to the compatibility dispatcher.
 The release-Wasm remote-MCAP capability is not installed yet, so valid strict requests return `CapabilityUnavailable` before allocating wrappers or scheduling work.
 
+Exact remote-MCAP recording controls now have a typed opaque contract for the installed capability.
+`RecordingHandle` uses exact publication identity for `select`, canonical `seek`, paused/playing `play`, and exact `close` operations.
+Operation and recording `dispose()` release only subscriptions and tombstone retention, and remain independent from `close()`.
+
 ## [0.35.0](https://github.com/rerun-io/rerun/compare/0.34.1...0.35.0) - 2026-07-23
 
 🧳 Migration guide: https://rerun.io/docs/reference/migration/migration-0-35

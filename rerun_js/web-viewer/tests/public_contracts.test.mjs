@@ -567,23 +567,124 @@ test("strict wrapper cache aborts before disposing temporary operations", () => 
       cache.install_operation_with_abort(
         "operation-throw",
         (operation) => {
-          order.push(["build", operation.operation_id, operation.recording_count]);
+          order.push(["build", operation.recording_count]);
           operation.attach_preexisting_recording("recording-a");
           throw new Error("constructor failed");
         },
-        () => order.push(["abort", "operation-throw"]),
+        () => order.push(["abort"]),
       ),
     /constructor failed/,
   );
 
   order.push(["post"]);
   assert.deepEqual(order, [
-    ["build", "operation-throw", 0],
-    ["abort", "operation-throw"],
+    ["build", 0],
+    ["abort"],
     ["post"],
   ]);
   assert.equal(cache.get_operation("operation-throw"), null);
   assert.equal(cache.operation_count, 0);
+});
+
+test("strict exact controls validate sealed targets and keep close separate from dispose", () => {
+  const viewer = new WebViewer();
+  const operation = viewer._strict_open_cache.install_operation("operation-exact");
+  const recording = operation.attach_preexisting_recording("same-recording-id");
+
+  assert.equal("operation_id" in operation, false);
+  assert.equal("recording_id" in recording, false);
+  assert.deepEqual(recording.select(), {
+    command: "select",
+    code: "capability_unavailable",
+    accepted: false,
+  });
+  assert.deepEqual(recording.seek({ time_type: "timestamp_ns", value: "42" }), {
+    command: "seek",
+    code: "capability_unavailable",
+    accepted: false,
+  });
+  assert.deepEqual(recording.seek({ time_type: "duration_ns", value: "-42" }), {
+    command: "seek",
+    code: "capability_unavailable",
+    accepted: false,
+  });
+  assert.deepEqual(recording.play("playing"), {
+    command: "play",
+    code: "capability_unavailable",
+    accepted: false,
+  });
+  assert.deepEqual(recording.seek({ time_type: "sequence", value: "42" }), {
+    command: "seek",
+    code: "invalid_request",
+    accepted: false,
+  });
+  assert.deepEqual(recording.seek({ time_type: "timestamp_ns", value: "01" }), {
+    command: "seek",
+    code: "invalid_request",
+    accepted: false,
+  });
+  assert.deepEqual(recording.seek({ time_type: "timestamp_ns", value: "-0" }), {
+    command: "seek",
+    code: "invalid_request",
+    accepted: false,
+  });
+  assert.deepEqual(recording.seek({ time_type: "timestamp_ns", value: "-9223372036854775808" }), {
+    command: "seek",
+    code: "invalid_request",
+    accepted: false,
+  });
+  assert.deepEqual(recording.play("following"), {
+    command: "play",
+    code: "invalid_request",
+    accepted: false,
+  });
+  assert.deepEqual(recording.close(), {
+    command: "close",
+    code: "capability_unavailable",
+    accepted: false,
+  });
+  assert.deepEqual(operation.close(), {
+    command: "close",
+    code: "capability_unavailable",
+    accepted: false,
+  });
+
+  // Dispose only drops the exact wrapper/subscription; it does not turn into a close.
+  recording.dispose();
+  assert.equal(recording.disposed, true);
+  assert.deepEqual(recording.select(), {
+    command: "select",
+    code: "disposed",
+    accepted: false,
+  });
+  assert.deepEqual(recording.close(), {
+    command: "close",
+    code: "disposed",
+    accepted: false,
+  });
+  assert.equal(operation.recording_count, 1);
+  operation.dispose();
+  assert.equal(operation.disposed, true);
+  assert.equal(operation.recording_count, 0);
+});
+
+test("strict exact handles become terminal when the viewer stops", async () => {
+  const viewer = await startViewer();
+  const operation = viewer._strict_open_cache.install_operation("operation-stopped");
+  const recording = operation.attach_preexisting_recording("recording-stopped");
+  viewer.stop();
+
+  assert.deepEqual(recording.select(), {
+    command: "select",
+    code: "viewer_stopped",
+    accepted: false,
+  });
+  assert.deepEqual(operation.close(), {
+    command: "close",
+    code: "viewer_stopped",
+    accepted: false,
+  });
+  operation.dispose();
 });
 
 test("strict dispatcher batches into one task, preserves FIFO, and cancels cleanly", () => {

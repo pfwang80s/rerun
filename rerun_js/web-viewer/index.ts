@@ -1135,6 +1135,9 @@ export class WebViewer {
     }
 
     this.#state = "stopped";
+    // Strict remote handles retain their opaque identity across a Viewer restart, but all
+    // controls become terminally stopped and can never redirect to a later publication.
+    this._strict_open_cache.mark_viewer_stopped();
 
     this.#canvas?.remove();
     this.#clearLoader();
@@ -1609,25 +1612,125 @@ export class LogChannel {
 
 type StrictOpenRecordingPhase = "preexisting" | "active" | "completed";
 
+type StrictRecordingControlAdapter = {
+  select: () => StrictRecordingControlResult;
+  seek: (target: StrictRecordingSeekTarget) => StrictRecordingControlResult;
+  play: (value: "paused" | "playing") => StrictRecordingControlResult;
+  close: () => StrictRecordingControlResult;
+  dispose: () => void;
+};
+
+type StrictOperationControlAdapter = {
+  close: () => StrictRecordingControlResult;
+  dispose: () => void;
+};
+
+type StrictFinalizationToken = {
+  run: () => void;
+};
+
+// Internal lifecycle transitions are symbol-keyed so an opaque public handle does not expose
+// string-named constructors, identity mutators, or Viewer-stop hooks.
+const strict_internal_viewer_stopped = Symbol("strict_internal_viewer_stopped");
+
+const strict_open_finalization_registry: FinalizationRegistry<StrictFinalizationToken> | null =
+  typeof FinalizationRegistry === "function"
+    ? new FinalizationRegistry((token) => token.run())
+    : null;
+
+function strict_control_result(
+  command: StrictRecordingControlCommand,
+  code: StrictRecordingControlCode,
+): StrictRecordingControlResult {
+  return Object.freeze({
+    command,
+    code,
+    accepted: code === "accepted",
+  });
+}
+
+function strict_unavailable_result(
+  command: StrictRecordingControlCommand,
+): StrictRecordingControlResult {
+  return strict_control_result(command, "capability_unavailable");
+}
+
+const STRICT_REMOTE_TIME_MAX = "9223372036854775807";
+
+function is_canonical_remote_time_value(value: string): boolean {
+  const negative = value.startsWith("-");
+  const magnitude = negative ? value.slice(1) : value;
+  if (!/^(?:0|[1-9][0-9]{0,18})$/.test(magnitude)) return false;
+  if (negative && magnitude === "0") return false;
+  return magnitude.length < STRICT_REMOTE_TIME_MAX.length
+    || (magnitude.length === STRICT_REMOTE_TIME_MAX.length && magnitude <= STRICT_REMOTE_TIME_MAX);
+}
+
+function normalize_strict_seek_target(target: unknown): StrictRecordingSeekTarget | null {
+  try {
+    if (target === null || typeof target !== "object" || Array.isArray(target)) return null;
+    const record = target as Record<string, unknown>;
+    const prototype = Object.getPrototypeOf(record);
+    if (prototype !== Object.prototype && prototype !== null) return null;
+    const keys = Reflect.ownKeys(record);
+    if (keys.length !== 2 || keys.some((key) =>
+      typeof key !== "string" || (key !== "time_type" && key !== "value"))) {
+      return null;
+    }
+    const type_descriptor = Object.getOwnPropertyDescriptor(record, "time_type");
+    const value_descriptor = Object.getOwnPropertyDescriptor(record, "value");
+    if (!type_descriptor || !("value" in type_descriptor)
+      || !value_descriptor || !("value" in value_descriptor)) return null;
+    const time_type = type_descriptor.value;
+    const value = value_descriptor.value;
+    if (time_type !== "timestamp_ns" && time_type !== "duration_ns") return null;
+    if (typeof value !== "string" || !is_canonical_remote_time_value(value)) return null;
+    return Object.freeze({ time_type, value });
+  } catch {
+    return null;
+  }
+}
+
 class StrictOpenRecordingWrapper {
-  readonly operation_id: string;
-  readonly recording_id: string;
-  readonly alias_kind: StrictOpenRecordingPhase;
   #phase: StrictOpenRecordingPhase;
+  #disposed = false;
+  #closed = false;
+  #viewer_stopped = false;
+  #adapter: StrictRecordingControlAdapter | null;
+  #finalization_token: StrictFinalizationToken;
 
   constructor(
-    operation_id: string,
-    recording_id: string,
+    _operation: StrictOpenOperationWrapper,
+    _recording_key: string,
     alias_kind: StrictOpenRecordingPhase,
+    adapter: StrictRecordingControlAdapter | null = null,
   ) {
-    this.operation_id = operation_id;
-    this.recording_id = recording_id;
-    this.alias_kind = alias_kind;
     this.#phase = alias_kind;
+    this.#adapter = adapter;
+    const cleanup_state = {
+      disposed: false,
+      adapter,
+    };
+    const cleanup = () => {
+      if (cleanup_state.disposed) return;
+      cleanup_state.disposed = true;
+      cleanup_state.adapter?.dispose();
+      cleanup_state.adapter = null;
+    };
+    this.#finalization_token = { run: cleanup };
+    strict_open_finalization_registry?.register(this, this.#finalization_token, this.#finalization_token);
   }
 
   get phase() {
     return this.#phase;
+  }
+
+  get disposed() {
+    return this.#disposed;
+  }
+
+  [strict_internal_viewer_stopped]() {
+    this.#viewer_stopped = true;
   }
 
   mark_active() {
@@ -1636,6 +1739,49 @@ class StrictOpenRecordingWrapper {
 
   mark_completed() {
     this.#phase = StrictOpenRecordingWrapper.#merge_phase(this.#phase, "completed");
+  }
+
+  select(): StrictRecordingControlResult {
+    if (this.#disposed) return strict_control_result("select", "disposed");
+    if (this.#viewer_stopped) return strict_control_result("select", "viewer_stopped");
+    if (this.#closed) return strict_control_result("select", "recording_closed");
+    return this.#adapter?.select() ?? strict_unavailable_result("select");
+  }
+
+  seek(target: StrictRecordingSeekTarget): StrictRecordingControlResult {
+    if (this.#disposed) return strict_control_result("seek", "disposed");
+    if (this.#viewer_stopped) return strict_control_result("seek", "viewer_stopped");
+    if (this.#closed) return strict_control_result("seek", "recording_closed");
+    const normalized = normalize_strict_seek_target(target);
+    if (!normalized) return strict_control_result("seek", "invalid_request");
+    return this.#adapter?.seek(normalized) ?? strict_unavailable_result("seek");
+  }
+
+  play(value: "paused" | "playing"): StrictRecordingControlResult {
+    if (this.#disposed) return strict_control_result("play", "disposed");
+    if (this.#viewer_stopped) return strict_control_result("play", "viewer_stopped");
+    if (this.#closed) return strict_control_result("play", "recording_closed");
+    if (value !== "paused" && value !== "playing") {
+      return strict_control_result("play", "invalid_request");
+    }
+    return this.#adapter?.play(value) ?? strict_unavailable_result("play");
+  }
+
+  close(): StrictRecordingControlResult {
+    if (this.#disposed) return strict_control_result("close", "disposed");
+    if (this.#viewer_stopped) return strict_control_result("close", "viewer_stopped");
+    if (this.#closed) return strict_control_result("close", "recording_closed");
+    const result = this.#adapter?.close() ?? strict_unavailable_result("close");
+    if (result.accepted || result.code === "recording_removed") this.#closed = true;
+    return result;
+  }
+
+  dispose() {
+    if (this.#disposed) return;
+    this.#disposed = true;
+    this.#adapter = null;
+    strict_open_finalization_registry?.unregister(this.#finalization_token);
+    this.#finalization_token.run();
   }
 
   static #merge_phase(
@@ -1653,14 +1799,33 @@ class StrictOpenRecordingWrapper {
 }
 
 class StrictOpenOperationWrapper {
-  readonly operation_id: string;
   #recordings = new Map<string, StrictOpenRecordingWrapper>();
   #recordings_cache: readonly StrictOpenRecordingWrapper[] | null = null;
   #installation_ack_complete = false;
   #activation_bridge_armed = false;
+  #phase: StrictOpenLifecycleEvent = "accepted";
+  #recording_open_behavior: RemoteMcapOpenBehavior = "open_and_select";
+  #disposed = false;
+  #closed = false;
+  #viewer_stopped = false;
+  #adapter: StrictOperationControlAdapter | null;
+  #listeners = new Map<StrictOpenLifecycleEvent, Set<StrictOpenLifecycleListener>>();
+  #finalization_token: StrictFinalizationToken;
 
-  constructor(operation_id: string) {
-    this.operation_id = operation_id;
+  constructor(_operation_key: string, adapter: StrictOperationControlAdapter | null = null) {
+    this.#adapter = adapter;
+    const cleanup_state = {
+      disposed: false,
+      adapter,
+    };
+    const cleanup = () => {
+      if (cleanup_state.disposed) return;
+      cleanup_state.disposed = true;
+      cleanup_state.adapter?.dispose();
+      cleanup_state.adapter = null;
+    };
+    this.#finalization_token = { run: cleanup };
+    strict_open_finalization_registry?.register(this, this.#finalization_token, this.#finalization_token);
   }
 
   get recording_count() {
@@ -1679,6 +1844,23 @@ class StrictOpenOperationWrapper {
     return this.#activation_bridge_armed;
   }
 
+  get phase() {
+    return this.#phase;
+  }
+
+  get recordingOpenBehavior() {
+    return this.#recording_open_behavior;
+  }
+
+  get disposed() {
+    return this.#disposed;
+  }
+
+  [strict_internal_viewer_stopped]() {
+    this.#viewer_stopped = true;
+    for (const recording of this.#recordings.values()) recording[strict_internal_viewer_stopped]();
+  }
+
   get recordings() {
     if (!this.#recordings_cache) {
       this.#recordings_cache = Object.freeze([...this.#recordings.values()]);
@@ -1687,15 +1869,15 @@ class StrictOpenOperationWrapper {
   }
 
   attach_preexisting_recording(recording_id: string) {
-    return this.#attach_recording(recording_id, "preexisting");
+    return this.#attach_recording(recording_id, "preexisting", null);
   }
 
   replay_active_recording(recording_id: string) {
-    return this.#attach_recording(recording_id, "active");
+    return this.#attach_recording(recording_id, "active", null);
   }
 
   replay_completed_recording(recording_id: string) {
-    return this.#attach_recording(recording_id, "completed");
+    return this.#attach_recording(recording_id, "completed", null);
   }
 
   complete_installation_ack() {
@@ -1706,17 +1888,45 @@ class StrictOpenOperationWrapper {
     this.#activation_bridge_armed = true;
   }
 
+  on(event: StrictOpenLifecycleEvent, listener: StrictOpenLifecycleListener): () => void {
+    if (this.#disposed) return () => undefined;
+    const listeners = this.#listeners.get(event) ?? new Set();
+    listeners.add(listener);
+    this.#listeners.set(event, listeners);
+    return () => listeners.delete(listener);
+  }
+
+  close(): StrictRecordingControlResult {
+    if (this.#disposed) return strict_control_result("close", "disposed");
+    if (this.#viewer_stopped) return strict_control_result("close", "viewer_stopped");
+    if (this.#closed) return strict_control_result("close", "operation_closed");
+    const result = this.#adapter?.close() ?? strict_unavailable_result("close");
+    if (result.accepted || result.code === "operation_closed" || result.code === "recording_removed") {
+      this.#closed = true;
+    }
+    return result;
+  }
+
   dispose() {
+    if (this.#disposed) return;
+    this.#disposed = true;
+    this.#listeners.clear();
+    for (const recording of this.#recordings.values()) recording.dispose();
     this.#recordings.clear();
     this.#recordings_cache = null;
     this.#installation_ack_complete = false;
     this.#activation_bridge_armed = false;
+    this.#adapter = null;
+    strict_open_finalization_registry?.unregister(this.#finalization_token);
+    this.#finalization_token.run();
   }
 
   #attach_recording(
     recording_id: string,
     alias_kind: StrictOpenRecordingPhase,
+    adapter: StrictRecordingControlAdapter | null,
   ) {
+    if (this.#disposed) return null;
     const existing = this.#recordings.get(recording_id);
     if (existing) {
       if (alias_kind === "active") {
@@ -1727,11 +1937,7 @@ class StrictOpenOperationWrapper {
       return existing;
     }
 
-    const wrapper = new StrictOpenRecordingWrapper(
-      this.operation_id,
-      recording_id,
-      alias_kind,
-    );
+    const wrapper = new StrictOpenRecordingWrapper(this, recording_id, alias_kind, adapter);
     this.#recordings.set(recording_id, wrapper);
     this.#recordings_cache = null;
     return wrapper;
@@ -1791,6 +1997,10 @@ class StrictOpenWrapperCache {
     this.#operations.delete(operation_id);
     return true;
   }
+
+  mark_viewer_stopped() {
+    for (const operation of this.#operations.values()) operation[strict_internal_viewer_stopped]();
+  }
 }
 
 export type StrictOpenLifecycleEvent =
@@ -1803,6 +2013,37 @@ export type StrictOpenLifecycleEvent =
 
 export type StrictOpenLifecycleListener = (handle: OpenRequestHandle) => void;
 
+/** Commands that target one exact remote-MCAP recording publication. */
+export type StrictRecordingControlCommand = "select" | "seek" | "play" | "close";
+
+/** Redacted result codes returned by exact remote recording controls. */
+export type StrictRecordingControlCode =
+  | "accepted"
+  | "capability_unavailable"
+  | "invalid_request"
+  | "recording_closed"
+  | "recording_removed"
+  | "operation_closed"
+  | "disposed"
+  | "viewer_stopped";
+
+/**
+ * Structured result for an exact remote recording command.
+ *
+ * The result deliberately contains no recording, Store, source, or token identity.
+ */
+export interface StrictRecordingControlResult {
+  readonly command: StrictRecordingControlCommand;
+  readonly code: StrictRecordingControlCode;
+  readonly accepted: boolean;
+}
+
+/** Canonical target on the remote recording's frozen navigation timeline. */
+export interface StrictRecordingSeekTarget {
+  readonly time_type: RemoteMcapTimeType;
+  readonly value: string;
+}
+
 declare const strict_recording_handle_brand: unique symbol;
 
 /** Opaque recording handle type reserved for the installed remote-MCAP capability. */
@@ -1810,6 +2051,16 @@ export interface RecordingHandle {
   readonly [strict_recording_handle_brand]: true;
   readonly phase: "preexisting" | "active" | "completed";
   readonly disposed: boolean;
+  /** Select this exact remote recording publication. */
+  select(): StrictRecordingControlResult;
+  /** Seek this exact publication on its canonical remote timeline. */
+  seek(target: StrictRecordingSeekTarget): StrictRecordingControlResult;
+  /** Set the paused/playing state for this exact publication. */
+  play(value: "paused" | "playing"): StrictRecordingControlResult;
+  /** Close only this exact remote recording publication. */
+  close(): StrictRecordingControlResult;
+  /** Release subscriptions and tombstone retention without closing the publication. */
+  dispose(): void;
 }
 
 declare const strict_open_request_handle_brand: unique symbol;
@@ -1822,6 +2073,10 @@ export interface OpenRequestHandle {
   readonly disposed: boolean;
   readonly recordingOpenBehavior: RemoteMcapOpenBehavior;
   on(event: StrictOpenLifecycleEvent, listener: StrictOpenLifecycleListener): () => void;
+  /** Close the shared source owned by this operation. */
+  close(): StrictRecordingControlResult;
+  /** Release this operation's subscriptions and tombstone retention. */
+  dispose(): void;
 }
 
 type StrictDispatcherTask = () => void;

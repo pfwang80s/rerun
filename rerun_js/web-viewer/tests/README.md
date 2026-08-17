@@ -16,6 +16,8 @@ The suite freezes the following current behavior:
 - `close(url)` removes the matching receiver and recording by URI without stopping the Viewer.
 - `LogChannel` send and close calls are synchronous while ready and become silent no-ops after channel close or Viewer stop.
 - Raw recording-ID controls forward the caller's string and retain their existing missing-recording fallback or no-op behavior.
+- Strict remote recording controls use an opaque exact handle, sealed canonical seek targets, paused/playing play state, and redacted synchronous results.
+- Strict operation and recording `dispose()` are independent from exact `close()`, and stopped handles never redirect to a later recording publication.
 - Public methods reject a stopped wrapper synchronously, while repeated `stop()` calls are no-ops.
 
 The Rust component suite in `crates/viewer/re_viewer/tests/web_public_contracts.rs` complements the wrapper tests with the production `App`, `viewer_harness`, `LogReceiver`, RRD encoder/decoder, and `StoreHub` paths.
