@@ -110,7 +110,9 @@ impl CompatibilityRemoteMcapSingletonV1 {
         let RemotePageStateV1::Visible { epoch: current, .. } = self.page.state else {
             return;
         };
-        if epoch != current {
+        // Browser signals carry the resulting epoch. Accept the initial 0→1
+        // transition as well as an explicit current-epoch signal; later jumps are stale.
+        if epoch != current && epoch != current.saturating_add(1) {
             return;
         }
         self.page.state = RemotePageStateV1::Hidden { epoch };
@@ -208,24 +210,24 @@ mod tests {
     #[test]
     fn page_lifecycle_gates_armed_admission_and_requires_matching_resume() {
         let mut singleton = CompatibilityRemoteMcapSingletonV1::new_disarmed_v1();
-        singleton.page_hidden_v1(0);
+        singleton.page_hidden_v1(1);
         singleton.arm_for_test_v1();
         assert!(matches!(
             singleton.dispatch_v1(),
             CompatibilityRemoteMcapDispatchV1::RemoteAccepted { .. }
         ));
         assert!(singleton.opening_suspended);
-        assert!(!singleton.page_resume_v1(0, 2, 1));
+        assert!(!singleton.page_resume_v1(1, 3, 1));
         assert!(singleton.opening_suspended);
-        assert!(singleton.page_resume_v1(0, 1, 1));
+        assert!(singleton.page_resume_v1(1, 2, 1));
         assert!(!singleton.opening_suspended);
-        singleton.page_hidden_v1(0); // stale hidden must not suspend epoch 1
+        singleton.page_hidden_v1(1); // stale hidden must not suspend epoch 2
         assert!(matches!(
             singleton.page.state,
-            RemotePageStateV1::Visible { epoch: 1, .. }
+            RemotePageStateV1::Visible { epoch: 2, .. }
         ));
-        assert!(singleton.page_visible_deadline_v1(1, Some(10)));
-        assert!(!singleton.page_visible_deadline_v1(0, Some(10)));
+        assert!(singleton.page_visible_deadline_v1(2, Some(10)));
+        assert!(!singleton.page_visible_deadline_v1(1, Some(10)));
         assert!(singleton.cancel_opening_v1());
         assert!(matches!(
             singleton.dispatch_v1(),
@@ -242,15 +244,15 @@ mod tests {
     fn stale_termination_cannot_cancel_a_new_epoch_owner() {
         let mut singleton = CompatibilityRemoteMcapSingletonV1::new_disarmed_v1();
         singleton.arm_for_test_v1();
-        singleton.page_hidden_v1(0);
-        assert!(singleton.page_resume_v1(0, 1, 1));
+        singleton.page_hidden_v1(1);
+        assert!(singleton.page_resume_v1(1, 2, 1));
         assert!(matches!(
             singleton.dispatch_v1(),
             CompatibilityRemoteMcapDispatchV1::RemoteAccepted { .. }
         ));
-        singleton.page_terminate_v1(0);
-        assert!(singleton.opening.is_some());
         singleton.page_terminate_v1(1);
+        assert!(singleton.opening.is_some());
+        singleton.page_terminate_v1(2);
         assert!(singleton.opening.is_none());
     }
 
