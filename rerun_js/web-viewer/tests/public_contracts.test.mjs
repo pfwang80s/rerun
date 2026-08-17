@@ -1126,6 +1126,7 @@ test("strict exact handles become terminal when the viewer stops", async () => {
 test("viewer stop synchronously tears down remote owners and drops stale work", async () => {
   const viewer = await startViewer();
   const cache = strictCache(viewer);
+  const old_epoch = cache.instance_epoch;
   const calls = [];
   const operation = cache.install_operation("operation-teardown", {
     close: () => ({ command: "close", code: "accepted", accepted: true }),
@@ -1164,8 +1165,11 @@ test("viewer stop synchronously tears down remote owners and drops stale work", 
   // A restarted Viewer instance gets a fresh dispatcher epoch; old queued work cannot run.
   await viewer.start(null, document.body, null);
   assert.equal(viewer._strict_dispatcher.stopped, false);
+  assert.equal(cache.install_operation("late-stale", null, "accepted", "open_and_select", old_epoch), null);
   assert.equal(viewer._strict_dispatcher.enqueue(() => calls.push("fresh")), true);
   viewer._strict_dispatcher.drain_now();
+  assert.deepEqual(calls, ["recording", "operation", "fresh"]);
+  await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepEqual(calls, ["recording", "operation", "fresh"]);
   viewer.stop();
 });
