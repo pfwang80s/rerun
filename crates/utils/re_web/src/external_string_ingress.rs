@@ -10,6 +10,7 @@ pub const MAX_FIELD_UTF16: u64 = 65_536;
 pub const MAX_FIELD_UTF8: u64 = 65_536;
 pub const MAX_COMBINED_UTF8: u64 = 65_536;
 pub const MAX_OBJECT_GRAPH_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_FIELDS: u32 = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExternalStringIngressError {
@@ -98,6 +99,9 @@ impl CombinedCopyPermit {
         let mut utf8 = 0u64;
         for value in strings {
             fields = fields.checked_add(1).ok_or(ExternalStringIngressError::ArithmeticOverflow)?;
+            if fields > MAX_FIELDS {
+                return Err(ExternalStringIngressError::CombinedLimit);
+            }
             utf16 = utf16.checked_add(value.utf16_len()).ok_or(ExternalStringIngressError::ArithmeticOverflow)?;
             utf8 = utf8.checked_add(value.utf8_len()).ok_or(ExternalStringIngressError::ArithmeticOverflow)?;
             if utf8 > MAX_COMBINED_UTF8 {
