@@ -462,6 +462,8 @@ export type RemoteMcapOpenBehavior = "open" | "open_and_select" | "background";
 export interface HttpOpenRequestOptions {
   /** Canonical topic filters. */
   topic_filter?: string | readonly string[];
+  /** Canonical decoder selectors. */
+  decoder_selector?: string | readonly string[];
   /** Version of the bounded decoder allowlist, encoded as a decimal string. */
   decoder_allowlist_version?: string;
   /** Version of the bounded assignment policy, encoded as a decimal string. */
@@ -539,6 +541,7 @@ export class StrictOpenError extends Error {
 const STRICT_OPEN_MAX_BATCH_ITEMS = 64;
 const STRICT_OPEN_MAX_TOPIC_FILTERS = 128;
 const STRICT_OPEN_MAX_FIELD_BYTES = 65_536;
+const STRICT_OPEN_MAX_FIELD_UTF16 = 65_536;
 
 type NormalizedStrictOpenSpec = {
   route: "explicit_mcap" | "extensionless_sniff";
@@ -594,7 +597,8 @@ function normalize_strict_open_spec(
       throw new StrictOpenError("InvalidRequestShape", "admission", { index });
     }
     const raw_url = url_descriptor.value;
-    if (strict_utf8_byte_length(raw_url) > STRICT_OPEN_MAX_FIELD_BYTES) {
+    if (raw_url.length > STRICT_OPEN_MAX_FIELD_UTF16
+      || strict_utf8_byte_length(raw_url) > STRICT_OPEN_MAX_FIELD_BYTES) {
       throw new StrictOpenError("ResourceLimitExceeded", "admission", { index });
     }
 
@@ -623,6 +627,7 @@ function normalize_strict_open_spec(
     }
     const known_options = new Set([
       "topic_filter",
+      "decoder_selector",
       "decoder_allowlist_version",
       "assignment_policy_version",
       "mcap_time_type",
@@ -641,32 +646,50 @@ function normalize_strict_open_spec(
       return descriptor?.value ?? fallback;
     };
 
-    const topic_value = option("topic_filter", []);
-    if (typeof topic_value === "string") {
-      if (strict_utf8_byte_length(topic_value) > 4_096) {
-        throw new StrictOpenError("InvalidRequestShape", "admission", { index });
-      }
-    } else if (Array.isArray(topic_value)) {
-      if (topic_value.length > STRICT_OPEN_MAX_TOPIC_FILTERS) {
-        throw new StrictOpenError("InvalidRequestShape", "admission", { index });
-      }
-      let topic_filter_bytes = 0;
-      for (let topic_index = 0; topic_index < topic_value.length; topic_index++) {
-        const topic_descriptor = Object.getOwnPropertyDescriptor(topic_value, String(topic_index));
-        if (!topic_descriptor || !("value" in topic_descriptor)
-          || typeof topic_descriptor.value !== "string"
-          || strict_utf8_byte_length(topic_descriptor.value) > 4_096) {
-          throw new StrictOpenError("InvalidRequestShape", "admission", { index });
-        }
-        const topic_bytes = strict_utf8_byte_length(topic_descriptor.value);
-        if (topic_bytes > STRICT_OPEN_MAX_FIELD_BYTES - topic_filter_bytes) {
+    let combined_utf16 = raw_url.length;
+    let combined_utf8 = strict_utf8_byte_length(raw_url);
+    const validate_string_collection = (name: string) => {
+      const value = option(name, []);
+      if (typeof value === "string") {
+        if (value.length > 4_096 || strict_utf8_byte_length(value) > STRICT_OPEN_MAX_FIELD_BYTES) {
           throw new StrictOpenError("ResourceLimitExceeded", "admission", { index });
         }
-        topic_filter_bytes += topic_bytes;
+        combined_utf16 += value.length;
+        combined_utf8 += strict_utf8_byte_length(value);
+        if (combined_utf16 > STRICT_OPEN_MAX_FIELD_UTF16 || combined_utf8 > STRICT_OPEN_MAX_FIELD_BYTES) {
+          throw new StrictOpenError("ResourceLimitExceeded", "admission", { index });
+        }
+        return;
       }
-    } else {
-      throw new StrictOpenError("InvalidRequestShape", "admission", { index });
-    }
+      if (!Array.isArray(value) || value.length > STRICT_OPEN_MAX_TOPIC_FILTERS) {
+        throw new StrictOpenError("InvalidRequestShape", "admission", { index });
+      }
+      let units = 0;
+      let bytes = 0;
+      for (let item_index = 0; item_index < value.length; item_index++) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(item_index));
+        if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "string") {
+          throw new StrictOpenError("InvalidRequestShape", "admission", { index });
+        }
+        const item = descriptor.value;
+        const item_bytes = strict_utf8_byte_length(item);
+        if (item.length > 4_096 || item_bytes > STRICT_OPEN_MAX_FIELD_BYTES) {
+          throw new StrictOpenError("ResourceLimitExceeded", "admission", { index });
+        }
+        units += item.length;
+        bytes += item_bytes;
+        if (units > STRICT_OPEN_MAX_FIELD_UTF16 || bytes > STRICT_OPEN_MAX_FIELD_BYTES) {
+          throw new StrictOpenError("ResourceLimitExceeded", "admission", { index });
+        }
+      }
+      combined_utf16 += units;
+      combined_utf8 += bytes;
+      if (combined_utf16 > STRICT_OPEN_MAX_FIELD_UTF16 || combined_utf8 > STRICT_OPEN_MAX_FIELD_BYTES) {
+        throw new StrictOpenError("ResourceLimitExceeded", "admission", { index });
+      }
+    };
+    validate_string_collection("topic_filter");
+    validate_string_collection("decoder_selector");
 
     strict_decimal_option(
       option("decoder_allowlist_version", "1"),
@@ -2154,7 +2177,10 @@ function normalize_strict_seek_target(target: unknown): StrictRecordingSeekTarge
     const time_type = type_descriptor.value;
     const value = value_descriptor.value;
     if (time_type !== "timestamp_ns" && time_type !== "duration_ns") return null;
-    if (typeof value !== "string" || !is_canonical_remote_time_value(value)) return null;
+    if (typeof value !== "string"
+      || value.length > 64
+      || strict_utf8_byte_length(value) > 256
+      || !is_canonical_remote_time_value(value)) return null;
     return Object.freeze({ time_type, value });
   } catch {
     return null;

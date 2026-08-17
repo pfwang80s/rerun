@@ -140,6 +140,8 @@ pub(crate) mod range_retry;
 #[cfg(target_arch = "wasm32")]
 pub mod remote_limits;
 #[cfg(target_arch = "wasm32")]
+pub mod external_string_ingress;
+#[cfg(target_arch = "wasm32")]
 pub mod remote_mutation_suspension;
 #[cfg(target_arch = "wasm32")]
 pub mod remote_validator;
@@ -170,6 +172,9 @@ pub mod strict_open_wire;
     reason = "native tests exercise the Web-only schema without publishing its API"
 )]
 mod remote_limits;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod external_string_ingress;
 
 // Host builds compile the pure pump state machine only for its unit tests and do not publish it.
 #[cfg(all(test, not(target_arch = "wasm32")))]
