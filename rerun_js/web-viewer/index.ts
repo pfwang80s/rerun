@@ -2171,6 +2171,20 @@ class StrictOpenOperationWrapper {
       || (this.#closed && phase !== "removed")
       || next_rank !== current_rank + 1
     ) return false;
+    const revision = this.#transition_revision + 1;
+    const listeners = [...(this.#listeners.get(phase) ?? [])];
+    if (listeners.length > 0) {
+      const handle = this as unknown as OpenRequestHandle;
+      if (!this.#schedule(() => {
+        if (
+          this.#disposed
+          || this.#viewer_stopped
+          || this.#phase !== phase
+          || this.#transition_revision !== revision
+        ) return;
+        for (const listener of listeners) listener(handle);
+      })) return false;
+    }
     if (phase === "terminal" || phase === "removed") {
       this.#closed = true;
       for (const entry of this.#recordings.values()) {
@@ -2182,20 +2196,7 @@ class StrictOpenOperationWrapper {
       }
     }
     this.#phase = phase;
-    const revision = ++this.#transition_revision;
-    const listeners = [...(this.#listeners.get(phase) ?? [])];
-    if (listeners.length > 0) {
-      const handle = this as unknown as OpenRequestHandle;
-      return this.#schedule(() => {
-        if (
-          this.#disposed
-          || this.#viewer_stopped
-          || this.#phase !== phase
-          || this.#transition_revision !== revision
-        ) return;
-        for (const listener of listeners) listener(handle);
-      });
-    }
+    this.#transition_revision = revision;
     return true;
   }
 
@@ -2216,7 +2217,11 @@ class StrictOpenOperationWrapper {
       this.#transition_revision += 1;
       this.#closed = true;
       for (const entry of this.#recordings.values()) {
-        strict_recording_operation_closed(entry.wrapper);
+        if (result.code === "recording_removed") {
+          strict_recording_removed(entry.wrapper);
+        } else {
+          strict_recording_operation_closed(entry.wrapper);
+        }
       }
     }
     return result;
@@ -2420,6 +2425,8 @@ class StrictOpenWrapperCache {
     build: (operation: StrictOpenOperationWrapper) => void,
     on_abort: () => void,
   ) {
+    const existing = this.#get_operation(operation_id);
+    if (existing) return existing;
     const cache_token = {};
     const cache_ref = new WeakRef(this);
     const operation = new StrictOpenOperationWrapper(

@@ -826,6 +826,25 @@ test("strict operation close gates children, late attach, and lifecycle callback
   assert.equal(cache.operation_count, 0);
 });
 
+test("strict operation close propagates recording_removed to exact children", () => {
+  const viewer = new WebViewer();
+  const cache = strictCache(viewer);
+  const operation = cache.install_operation("operation-close-removed", {
+    close: () => ({ command: "close", code: "recording_removed", accepted: false }),
+    dispose() {},
+  });
+  const recording = cache.attach_preexisting_recording(
+    "operation-close-removed", "recording-close-removed",
+  );
+  assert.deepEqual(operation.close(), {
+    command: "close", code: "recording_removed", accepted: false,
+  });
+  assert.deepEqual(recording.select(), {
+    command: "select", code: "recording_removed", accepted: false,
+  });
+  operation.dispose();
+});
+
 test("strict lifecycle transitions are contiguous and drop stale queued listeners", () => {
   const viewer = new WebViewer();
   const cache = strictCache(viewer);
@@ -884,6 +903,39 @@ test("strict operation close discards queued lifecycle callbacks", async () => {
   viewer._strict_dispatcher.drain_now();
   assert.equal(callbacks, 0);
   operation.dispose();
+});
+
+test("strict lifecycle transition does not partially commit when dispatcher is full", () => {
+  const viewer = new WebViewer();
+  const cache = strictCache(viewer);
+  const operation = cache.install_operation("operation-backpressure");
+  operation.on("activated", () => {});
+  for (let index = 0; index < viewer._strict_dispatcher.max_queue_length; index++) {
+    assert.equal(viewer._strict_dispatcher.enqueue(() => {}), true);
+  }
+  assert.equal(cache.transition("operation-backpressure", "activated"), false);
+  assert.equal(operation.phase, "accepted");
+  viewer._strict_dispatcher.cancel();
+  assert.equal(cache.transition("operation-backpressure", "activated"), false);
+  operation.dispose();
+});
+
+test("strict abort install never replaces an existing operation identity", () => {
+  const viewer = new WebViewer();
+  const cache = strictCache(viewer);
+  const existing = cache.install_operation("operation-abort-existing");
+  let built = false;
+  assert.strictEqual(
+    cache.install_operation_with_abort(
+      "operation-abort-existing",
+      () => { built = true; },
+      () => { throw new Error("abort callback must not run"); },
+    ),
+    existing,
+  );
+  assert.equal(built, false);
+  assert.strictEqual(cache.get_operation("operation-abort-existing"), existing);
+  existing.dispose();
 });
 
 test("strict duplicate identity rejects adapter conflicts and upgrades null adapters once", () => {
