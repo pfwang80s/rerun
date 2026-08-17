@@ -755,6 +755,7 @@ export class ChromePageExecutionController {
   #listeners: Array<[EventTarget, string, EventListener]> = [];
   #owners = new Set<ChromePageExecutionRemoteOwner>();
   #visible_deadline_ms: number | null = null;
+  #lifecycle_transitioning = false;
 
   constructor(options: ChromePageExecutionListenerOptions = {}) {
     this.#target = options.target ?? (typeof window !== "undefined" ? window : null);
@@ -789,7 +790,7 @@ export class ChromePageExecutionController {
 
   set_visible_deadline(deadline_ms: number | null): void {
     if (this.#disposed) return;
-    if (this.#state.kind !== "VisibleRunning") {
+    if (this.#state.kind !== "VisibleRunning" || this.#lifecycle_transitioning) {
       this.#visible_deadline_ms = null;
       return;
     }
@@ -860,7 +861,13 @@ export class ChromePageExecutionController {
     const hidden_epoch = this.#epoch;
     const hidden_generation = this.#generation;
     this.#visible_deadline_ms = null;
-    for (const owner of this.#owners) { try { owner.on_visible_deadline?.(null); } catch {} }
+    this.#lifecycle_transitioning = true;
+    try {
+      for (const owner of this.#owners) { try { owner.on_visible_deadline?.(null); } catch {} }
+    } finally {
+      this.#lifecycle_transitioning = false;
+      this.#visible_deadline_ms = null;
+    }
     if (this.#disposed || this.#epoch !== hidden_epoch || this.#generation !== hidden_generation) return;
     this.#publish({ kind: "HiddenSuspended", epoch: this.#epoch, remote_wake_pending: false });
     if (this.#disposed || this.#epoch !== hidden_epoch || this.#generation !== hidden_generation) return;

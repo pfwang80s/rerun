@@ -232,6 +232,21 @@ test("deadline fanout stops after a reentrant lifecycle transition", () => {
   assert.equal(controller.state.kind, "RemoteTerminating");
 });
 
+test("hidden deadline clear rejects reentrant deadline writes", () => {
+  const listeners = new Map();
+  const target = { addEventListener: (n, f) => listeners.set(n, f), removeEventListener: () => {} };
+  const page = { visibilityState: "visible" };
+  const controller = new ChromePageExecutionController({ target, document: page });
+  controller.register_remote_owner({ on_visible_deadline: (deadline) => {
+    if (deadline === null) controller.set_visible_deadline(20);
+  }});
+  controller.set_visible_deadline(10);
+  page.visibilityState = "hidden";
+  listeners.get("visibilitychange")();
+  assert.equal(controller.visible_deadline, null);
+  assert.equal(controller.state.kind, "HiddenSuspended");
+});
+
 function callsNamed(name) {
   return globalThis.__rerun_web_viewer_test_state.calls.filter(
     (call) => call[0] === name,
