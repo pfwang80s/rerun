@@ -168,6 +168,24 @@ test("remote owner teardown and reentrant resume are guarded", () => {
   controller.dispose();
 });
 
+test("remote page callbacks isolate throws and hidden deadlines stay cleared", () => {
+  const listeners = new Map();
+  const target = { addEventListener: (n, f) => listeners.set(n, f), removeEventListener: () => {} };
+  const page = { visibilityState: "visible" };
+  const controller = new ChromePageExecutionController({ target, document: page });
+  let later = 0;
+  controller.register_remote_owner({ on_hidden: () => { throw new Error("hidden"); }, on_terminate: () => { throw new Error("terminate"); } });
+  controller.register_remote_owner({ on_hidden: () => later++, on_terminate: () => later++ });
+  controller.set_visible_deadline(10);
+  page.visibilityState = "hidden";
+  listeners.get("visibilitychange")();
+  assert.equal(controller.visible_deadline, null);
+  controller.set_visible_deadline(20);
+  assert.equal(controller.visible_deadline, null);
+  listeners.get("pagehide")();
+  assert.equal(later, 2);
+});
+
 function callsNamed(name) {
   return globalThis.__rerun_web_viewer_test_state.calls.filter(
     (call) => call[0] === name,
