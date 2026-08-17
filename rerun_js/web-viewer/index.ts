@@ -840,7 +840,7 @@ export class ChromePageExecutionController {
 
   #publish(state: ChromePageExecutionState): void {
     this.#state = Object.freeze(state);
-    this.#on_state?.(this.#state);
+    try { this.#on_state?.(this.#state); } catch { /* lifecycle observers are isolated */ }
   }
 
   #hidden(): void {
@@ -924,6 +924,7 @@ export class WebViewer {
   #fullscreen = false;
   #allow_fullscreen = false;
   #page_execution: ChromePageExecutionController | null = null;
+  #page_owner_release: (() => void) | null = null;
 
   constructor() {
     injectStyle();
@@ -980,6 +981,12 @@ export class WebViewer {
     this.#strict_open_cache.begin_viewer_instance();
     this.#page_execution?.dispose();
     this.#page_execution = new ChromePageExecutionController();
+    this.#page_owner_release = this.#page_execution.register_remote_owner({
+      on_hidden: (epoch) => this.#strict_open_cache.page_hidden(epoch),
+      on_resume: (from, to, nonce) => this.#strict_open_cache.page_resume(from, to, nonce),
+      on_visible_deadline: (deadline) => this.#strict_open_cache.page_deadline(deadline),
+      on_terminate: (reason, epoch) => this.#strict_open_cache.page_terminate(reason, epoch),
+    });
     this.#state = "starting";
     this.#clearLoader();
 
@@ -1036,6 +1043,15 @@ export class WebViewer {
       this.#clearLoader();
       this.#page_execution?.dispose();
       this.#page_execution = null;
+      this.#page_owner_release?.();
+      this.#page_owner_release = null;
+      this.#handle?.destroy();
+      this.#handle?.free();
+      this.#handle = null;
+      this.#canvas?.remove();
+      this.#canvas = null;
+      this.#strict_open_cache.mark_viewer_stopped();
+      this._strict_dispatcher.cancel();
       this.#state = "stopped";
       this.#fail("Failed to load rerun", String(e));
       throw e;
@@ -1085,6 +1101,15 @@ export class WebViewer {
       this.#clearLoader();
       this.#page_execution?.dispose();
       this.#page_execution = null;
+      this.#page_owner_release?.();
+      this.#page_owner_release = null;
+      this.#handle?.destroy();
+      this.#handle?.free();
+      this.#handle = null;
+      this.#canvas?.remove();
+      this.#canvas = null;
+      this.#strict_open_cache.mark_viewer_stopped();
+      this._strict_dispatcher.cancel();
       this.#state = "stopped";
       this.#fail("Failed to start", String(e));
       throw e;
@@ -1359,6 +1384,8 @@ export class WebViewer {
     this.#strict_open_cache.mark_viewer_stopped();
     this.#page_execution?.dispose();
     this.#page_execution = null;
+    this.#page_owner_release?.();
+    this.#page_owner_release = null;
     // Remote-MCAP work is instance-owned and must be synchronously cancelled before the
     // underlying wasm handle is destroyed.  Compatibility receivers and their existing
     // teardown remain owned by WebHandle.
@@ -2575,14 +2602,14 @@ class StrictOpenWrapperCache {
     this.#has_started_instance = true;
   }
 
-  register_remote_owner(owner: { cancel: () => void }, epoch = this.#instance_epoch) {
+  register_remote_owner(owner: { cancel: () => void; on_hidden?: (epoch: number) => void; on_resume?: (from: number, to: number, nonce: number) => void; on_deadline?: (deadline: number | null) => void }, epoch = this.#instance_epoch) {
     if (!this.#accepting || epoch !== this.#instance_epoch) return false;
     if (this.#remote_owners.has(owner)) return true;
     this.#remote_owners.set(owner, epoch);
     return true;
   }
 
-  #remote_owners = new Map<{ cancel: () => void }, number>();
+  #remote_owners = new Map<{ cancel: () => void; on_hidden?: (epoch: number) => void; on_resume?: (from: number, to: number, nonce: number) => void; on_deadline?: (deadline: number | null) => void }, number>();
 
   cancel_remote_owners() {
     for (const owner of this.#remote_owners.keys()) {
@@ -2590,6 +2617,11 @@ class StrictOpenWrapperCache {
     }
     this.#remote_owners.clear();
   }
+
+  page_hidden(epoch: number) { for (const owner of this.#remote_owners.keys()) { try { owner.on_hidden?.(epoch); } catch {} } }
+  page_resume(from: number, to: number, nonce: number) { for (const owner of this.#remote_owners.keys()) { try { owner.on_resume?.(from, to, nonce); } catch {} } }
+  page_deadline(deadline: number | null) { for (const owner of this.#remote_owners.keys()) { try { owner.on_deadline?.(deadline); } catch {} } }
+  page_terminate(_reason: "pagehide" | "freeze", _epoch: number) { this.cancel_remote_owners(); }
 
   get_operation(operation_id: string, epoch: number) {
     if (!this.#accepting || epoch !== this.#instance_epoch) return null;
