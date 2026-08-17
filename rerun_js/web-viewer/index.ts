@@ -2394,25 +2394,26 @@ class StrictOpenWrapperCache {
     this.#remote_owners.clear();
   }
 
-  get_operation(operation_id: string) {
+  get_operation(operation_id: string, epoch = this.#instance_epoch) {
+    if (!this.#accepting || epoch !== this.#instance_epoch) return null;
     return this.#get_operation(operation_id);
   }
 
-  recording_count(operation_id: string) {
-    return this.#get_operation(operation_id)?.recordings.length ?? 0;
+  recording_count(operation_id: string, epoch = this.#instance_epoch) {
+    return this.get_operation(operation_id, epoch)?.recordings.length ?? 0;
   }
 
-  wrapper_count(operation_id: string) {
-    return this.recording_count(operation_id);
+  wrapper_count(operation_id: string, epoch = this.#instance_epoch) {
+    return this.recording_count(operation_id, epoch);
   }
 
-  installation_ack_complete(operation_id: string) {
-    return strict_operation_state(this.#get_operation(operation_id) ?? undefined)
+  installation_ack_complete(operation_id: string, epoch = this.#instance_epoch) {
+    return strict_operation_state(this.get_operation(operation_id, epoch) ?? undefined)
       .installation_ack_complete;
   }
 
-  activation_bridge_armed(operation_id: string) {
-    return strict_operation_state(this.#get_operation(operation_id) ?? undefined)
+  activation_bridge_armed(operation_id: string, epoch = this.#instance_epoch) {
+    return strict_operation_state(this.get_operation(operation_id, epoch) ?? undefined)
       .activation_bridge_armed;
   }
 
@@ -2512,14 +2513,18 @@ class StrictOpenWrapperCache {
     return recording;
   }
 
-  complete_installation_ack(operation_id: string) {
+  complete_installation_ack(operation_id: string, epoch = this.#instance_epoch) {
+    if (!this.#accepting || epoch !== this.#instance_epoch) return false;
     const operation = this.#get_operation(operation_id);
     if (operation) strict_operation_install_ack(operation);
+    return Boolean(operation);
   }
 
-  arm_internal_activation_bridge(operation_id: string) {
+  arm_internal_activation_bridge(operation_id: string, epoch = this.#instance_epoch) {
+    if (!this.#accepting || epoch !== this.#instance_epoch) return false;
     const operation = this.#get_operation(operation_id);
     if (operation) strict_operation_arm_bridge(operation);
+    return Boolean(operation);
   }
 
   transition(
@@ -2572,7 +2577,8 @@ class StrictOpenWrapperCache {
     }
   }
 
-  dispose_operation(operation_id: string) {
+  dispose_operation(operation_id: string, epoch = this.#instance_epoch) {
+    if (!this.#accepting || epoch !== this.#instance_epoch) return false;
     const operation = this.#get_operation(operation_id);
     if (!operation) {
       return false;
@@ -2791,6 +2797,9 @@ class BoundedSingleTaskDispatcher {
     this.#draining = true;
     try {
       while (this.#queue.length > 0) {
+        if (epoch !== this.#epoch) {
+          return;
+        }
         if (this.#stopped) {
           this.#queue.length = 0;
           return;
@@ -2804,12 +2813,13 @@ class BoundedSingleTaskDispatcher {
         try {
           task();
           this.#delivered_count += 1;
+          if (epoch !== this.#epoch) return;
         } catch (error) {
           this.#report_task_error(error);
         }
       }
     } finally {
-      this.#draining = false;
+      if (epoch === this.#epoch) this.#draining = false;
     }
   }
 
