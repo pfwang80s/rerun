@@ -1146,10 +1146,13 @@ test("viewer stop synchronously tears down remote owners and drops stale work", 
   let listener_calls = 0;
   operation.on("activated", () => listener_calls++);
   viewer._strict_dispatcher.enqueue(() => calls.push("stale"));
+  let owner_cancels = 0;
+  assert.equal(cache.register_remote_owner({ cancel: () => owner_cancels++ }), true);
 
   viewer.stop();
 
   assert.deepEqual(calls, ["recording", "operation"]);
+  assert.equal(owner_cancels, 1);
   assert.equal(listener_calls, 0);
   assert.equal(viewer._strict_dispatcher.stopped, true);
   assert.deepEqual(recording.select(), {

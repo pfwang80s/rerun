@@ -799,6 +799,7 @@ export class WebViewer {
     // A restart creates a fresh remote-MCAP dispatcher epoch.  Work queued by the previous
     // Viewer instance was synchronously discarded by stop().
     this._strict_dispatcher.reset();
+    this.#strict_open_cache.begin_viewer_instance();
     this.#state = "starting";
     this.#clearLoader();
 
@@ -1960,10 +1961,11 @@ class StrictOpenRecordingWrapper {
     this.#viewer_stopped = true;
     if (this.#remote_torn_down) return;
     this.#remote_torn_down = true;
-    const adapter = this.#adapter;
     this.#adapter = null;
     try {
-      adapter?.dispose();
+      // Consume the same once-only finalization token used by explicit dispose, so a caller
+      // retaining this handle cannot release the adapter twice after Viewer.stop().
+      this.#finalization_token.run();
     } catch {
       // Viewer teardown is best-effort across independent remote owners. A stale completion
       // must never prevent the remaining owners from being invalidated synchronously.
@@ -2133,10 +2135,9 @@ class StrictOpenOperationWrapper {
     }
     if (this.#remote_torn_down) return;
     this.#remote_torn_down = true;
-    const adapter = this.#adapter;
     this.#adapter = null;
     try {
-      adapter?.dispose();
+      this.#finalization_token.run();
     } catch {
       // See recording teardown above: cleanup of one remote owner cannot block invalidation of
       // the rest of the instance.
@@ -2326,6 +2327,12 @@ type StrictOpenOperationCacheEntry = {
 
 class StrictOpenWrapperCache {
   #operations = new Map<string, StrictOpenOperationCacheEntry>();
+  // Strong retention is intentional for remote recording owners: an operation may be collected
+  // while a caller still holds a recording handle. The owner is removed on explicit disposal or
+  // when the next teardown/prune observes a disposed wrapper.
+  #recording_owners = new Set<StrictOpenRecordingWrapper>();
+  #accepting = true;
+  #instance_epoch = 1;
   #schedule: (task: StrictDispatcherTask) => boolean;
 
   constructor(schedule: (task: StrictDispatcherTask) => boolean = () => false) {
@@ -2335,6 +2342,41 @@ class StrictOpenWrapperCache {
   get operation_count() {
     this.#drop_dead_operations();
     return this.#operations.size;
+  }
+
+  get instance_epoch() {
+    return this.#instance_epoch;
+  }
+
+  get recording_owner_count() {
+    this.#prune_recording_owners();
+    return this.#recording_owners.size;
+  }
+
+  #prune_recording_owners() {
+    for (const recording of this.#recording_owners) {
+      if (recording.disposed) this.#recording_owners.delete(recording);
+    }
+  }
+
+  begin_viewer_instance() {
+    this.#instance_epoch += 1;
+    this.#accepting = true;
+  }
+
+  register_remote_owner(owner: { cancel: () => void }, epoch = this.#instance_epoch) {
+    if (!this.#accepting || epoch !== this.#instance_epoch) return false;
+    this.#remote_owners.add({ owner, epoch });
+    return true;
+  }
+
+  #remote_owners = new Set<{ owner: { cancel: () => void }; epoch: number }>();
+
+  cancel_remote_owners() {
+    for (const entry of this.#remote_owners) {
+      try { entry.owner.cancel(); } catch { /* continue cancelling independent owners */ }
+    }
+    this.#remote_owners.clear();
   }
 
   get_operation(operation_id: string) {
@@ -2364,7 +2406,9 @@ class StrictOpenWrapperCache {
     adapter: StrictOperationControlAdapter | null = null,
     phase: StrictOpenLifecycleEvent = "accepted",
     recording_open_behavior: RemoteMcapOpenBehavior = "open_and_select",
+    epoch = this.#instance_epoch,
   ) {
+    if (!this.#accepting || epoch !== this.#instance_epoch) return null;
     const existing = this.#get_operation(operation_id);
     if (existing) {
       return strict_operation_accept_adapter(existing, adapter) ? existing : null;
@@ -2395,14 +2439,18 @@ class StrictOpenWrapperCache {
     recording_key: string,
     generation = "test-generation",
     adapter: StrictRecordingControlAdapter | null = null,
+    epoch = this.#instance_epoch,
   ) {
+    if (!this.#accepting || epoch !== this.#instance_epoch) return null;
     const operation = this.#get_operation(operation_id);
-    return strict_operation_attach_recording(
+    const recording = strict_operation_attach_recording(
       operation,
       new StrictPublicRecordingHandleId(recording_key, generation),
       "preexisting",
       adapter,
     );
+    if (recording) this.#recording_owners.add(recording);
+    return recording;
   }
 
   replay_active_recording(
@@ -2410,14 +2458,18 @@ class StrictOpenWrapperCache {
     recording_key: string,
     generation = "test-generation",
     adapter: StrictRecordingControlAdapter | null = null,
+    epoch = this.#instance_epoch,
   ) {
+    if (!this.#accepting || epoch !== this.#instance_epoch) return null;
     const operation = this.#get_operation(operation_id);
-    return strict_operation_attach_recording(
+    const recording = strict_operation_attach_recording(
       operation,
       new StrictPublicRecordingHandleId(recording_key, generation),
       "active",
       adapter,
     );
+    if (recording) this.#recording_owners.add(recording);
+    return recording;
   }
 
   replay_completed_recording(
@@ -2425,14 +2477,18 @@ class StrictOpenWrapperCache {
     recording_key: string,
     generation = "test-generation",
     adapter: StrictRecordingControlAdapter | null = null,
+    epoch = this.#instance_epoch,
   ) {
+    if (!this.#accepting || epoch !== this.#instance_epoch) return null;
     const operation = this.#get_operation(operation_id);
-    return strict_operation_attach_recording(
+    const recording = strict_operation_attach_recording(
       operation,
       new StrictPublicRecordingHandleId(recording_key, generation),
       "completed",
       adapter,
     );
+    if (recording) this.#recording_owners.add(recording);
+    return recording;
   }
 
   complete_installation_ack(operation_id: string) {
@@ -2445,7 +2501,12 @@ class StrictOpenWrapperCache {
     if (operation) strict_operation_arm_bridge(operation);
   }
 
-  transition(operation_id: string, phase: StrictOpenLifecycleEvent) {
+  transition(
+    operation_id: string,
+    phase: StrictOpenLifecycleEvent,
+    epoch = this.#instance_epoch,
+  ) {
+    if (!this.#accepting || epoch !== this.#instance_epoch) return false;
     const operation = this.#get_operation(operation_id);
     return operation ? strict_operation_transition(operation, phase) : false;
   }
@@ -2454,7 +2515,9 @@ class StrictOpenWrapperCache {
     operation_id: string,
     build: (operation: StrictOpenOperationWrapper) => void,
     on_abort: () => void,
+    epoch = this.#instance_epoch,
   ) {
+    if (!this.#accepting || epoch !== this.#instance_epoch) return null;
     const existing = this.#get_operation(operation_id);
     if (existing) return existing;
     const cache_token = {};
@@ -2499,10 +2562,18 @@ class StrictOpenWrapperCache {
   }
 
   mark_viewer_stopped() {
+    this.#accepting = false;
+    this.#instance_epoch += 1;
+    this.#prune_recording_owners();
     for (const entry of this.#operations.values()) {
       const operation = entry.reference.deref();
       if (operation) strict_operation_viewer_stopped(operation);
     }
+    for (const recording of this.#recording_owners) {
+      strict_recording_viewer_stopped(recording);
+      if (recording.disposed) this.#recording_owners.delete(recording);
+    }
+    this.cancel_remote_owners();
     this.#drop_dead_operations();
   }
 
@@ -2613,6 +2684,7 @@ class BoundedSingleTaskDispatcher {
   #delivered_count = 0;
   #error_notification_count = 0;
   #report_error_count = 0;
+  #epoch = 1;
   #error_hook: ((error: unknown) => void) | null = null;
   readonly max_queue_length: number;
 
@@ -2657,31 +2729,34 @@ class BoundedSingleTaskDispatcher {
     if (!this.#scheduled && !this.#draining) {
       this.#scheduled = true;
       this.#schedule_count += 1;
-      setTimeout(() => this.#drain(), 0);
+      const epoch = this.#epoch;
+      setTimeout(() => this.#drain(epoch), 0);
     }
 
     return true;
   }
 
   drain_now() {
-    this.#drain();
+    this.#drain(this.#epoch);
   }
 
   cancel() {
     this.#stopped = true;
+    this.#epoch += 1;
     this.#scheduled = false;
     this.#queue.length = 0;
   }
 
   reset() {
+    this.#epoch += 1;
     this.#stopped = false;
     this.#scheduled = false;
     this.#draining = false;
     this.#queue.length = 0;
   }
 
-  #drain() {
-    if (this.#stopped) {
+  #drain(epoch: number) {
+    if (this.#stopped || epoch !== this.#epoch) {
       this.#scheduled = false;
       this.#queue.length = 0;
       return;
