@@ -257,6 +257,19 @@ test("lifecycle listener installation failure resets start for retry", async () 
   viewer.stop();
 });
 
+test("partial lifecycle listener installation rolls back before retry", () => {
+  let adds = 0;
+  let removes = 0;
+  const target = {
+    addEventListener() { if (++adds === 3) throw new Error("partial listener failure"); },
+    removeEventListener() { removes++; },
+  };
+  assert.throws(() => new ChromePageExecutionController({ target, document: { visibilityState: "visible" } }), /partial listener failure/);
+  assert.equal(removes, 2);
+  const restarted = new ChromePageExecutionController({ target: { addEventListener() {}, removeEventListener() {} }, document: { visibilityState: "visible" } });
+  restarted.dispose();
+});
+
 function callsNamed(name) {
   return globalThis.__rerun_web_viewer_test_state.calls.filter(
     (call) => call[0] === name,

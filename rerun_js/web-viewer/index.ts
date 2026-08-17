@@ -841,12 +841,18 @@ export class ChromePageExecutionController {
       target.addEventListener(name, listener);
       this.#listeners.push([target, name, listener]);
     };
-    const document_target = this.#document as EventTarget | null;
-    add(document_target?.addEventListener ? document_target : this.#target, "visibilitychange", () => this.#document?.visibilityState === "hidden" ? this.#hidden() : this.#visible());
-    add(this.#target, "pagehide", () => this.#terminate("pagehide"));
-    add(this.#target, "freeze", () => this.#terminate("freeze"));
-    add(this.#target, "pageshow", () => this.#visible());
-    add(this.#target, "resume", () => this.#visible());
+    try {
+      const document_target = this.#document as EventTarget | null;
+      add(document_target?.addEventListener ? document_target : this.#target, "visibilitychange", () => this.#document?.visibilityState === "hidden" ? this.#hidden() : this.#visible());
+      add(this.#target, "pagehide", () => this.#terminate("pagehide"));
+      add(this.#target, "freeze", () => this.#terminate("freeze"));
+      add(this.#target, "pageshow", () => this.#visible());
+      add(this.#target, "resume", () => this.#visible());
+    } catch (error) {
+      for (const [target, name, listener] of this.#listeners) target.removeEventListener?.(name, listener);
+      this.#listeners = [];
+      throw error;
+    }
   }
 
   #publish(state: ChromePageExecutionState): void {
