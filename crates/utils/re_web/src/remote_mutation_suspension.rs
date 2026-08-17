@@ -15,6 +15,7 @@ pub enum RemoteMutationKindV1 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RemoteMutationSafePointV1 {
+    RunningAddChunk,
     WaitingForLeases,
     BeforeFirstAddChunk,
     BetweenAddChunks,
@@ -144,7 +145,6 @@ pub enum RemoteMutationResumeResultV1 {
 /// Store-scoped page-control seam for one remote mutation turn.
 pub struct RemoteMutationSuspensionV1 {
     state: RemoteMutationStateV1,
-    next_resume_nonce: u64,
     last_resume_nonce: u64,
 }
 
@@ -152,7 +152,6 @@ impl Default for RemoteMutationSuspensionV1 {
     fn default() -> Self {
         Self {
             state: RemoteMutationStateV1::Visible { epoch: 0 },
-            next_resume_nonce: 1,
             last_resume_nonce: 0,
         }
     }
@@ -183,8 +182,7 @@ impl RemoteMutationSuspensionV1 {
     /// Records that a synchronous physical add/delete has started before a page signal.
     pub fn mark_physical_mutation_started_v1(&mut self) -> bool {
         let owner = match &mut self.state {
-            RemoteMutationStateV1::Active { owner, .. }
-            | RemoteMutationStateV1::Hidden { owner, .. } => owner,
+            RemoteMutationStateV1::Active { owner, .. } => owner,
             _ => return false,
         };
         owner.mark_physical_mutation_started();
@@ -195,14 +193,17 @@ impl RemoteMutationSuspensionV1 {
         let RemoteMutationStateV1::Active { epoch, .. } = self.state else {
             return false;
         };
-        if resulting_epoch != epoch.saturating_add(1) {
+        let Some(next_epoch) = epoch.checked_add(1) else {
+            return false;
+        };
+        if resulting_epoch != next_epoch {
             return false;
         }
-        true
+        owner_safe_point(&self.state)
     }
 
     /// Move the active owner to page-hidden storage.  Only explicit safe points are suspendable.
-    pub fn suspend_v1(&mut self, resulting_epoch: u64) -> bool {
+    pub fn suspend_v1(&mut self, resulting_epoch: u64, resume_nonce: u64) -> bool {
         let state = std::mem::replace(
             &mut self.state,
             RemoteMutationStateV1::Terminated { epoch: 0 },
@@ -211,12 +212,18 @@ impl RemoteMutationSuspensionV1 {
             self.state = state;
             return false;
         };
-        if resulting_epoch != epoch.saturating_add(1) || !owner.safe_point.can_suspend() {
+        let Some(next_epoch) = epoch.checked_add(1) else {
+            self.state = RemoteMutationStateV1::Active { epoch, owner };
+            return false;
+        };
+        if resulting_epoch != next_epoch || !owner.safe_point.can_suspend() {
             self.state = RemoteMutationStateV1::Active { epoch, owner };
             return false;
         }
-        let resume_nonce = self.next_resume_nonce;
-        self.next_resume_nonce = self.next_resume_nonce.saturating_add(1);
+        if resume_nonce == 0 || resume_nonce <= self.last_resume_nonce {
+            self.state = RemoteMutationStateV1::Active { epoch, owner };
+            return false;
+        }
         self.state = RemoteMutationStateV1::Hidden {
             epoch: resulting_epoch,
             owner,
@@ -296,13 +303,10 @@ impl RemoteMutationSuspensionV1 {
             _ => None,
         }
     }
+}
 
-    pub fn suspended_resume_nonce_v1(&self) -> Option<u64> {
-        match self.state {
-            RemoteMutationStateV1::Hidden { resume_nonce, .. } => Some(resume_nonce),
-            _ => None,
-        }
-    }
+fn owner_safe_point(state: &RemoteMutationStateV1) -> bool {
+    matches!(state, RemoteMutationStateV1::Active { owner, .. } if owner.safe_point.can_suspend())
 }
 
 #[cfg(test)]
@@ -333,16 +337,15 @@ mod tests {
     fn hidden_moves_owner_and_resume_is_one_shot() {
         let mut arbiter = RemoteMutationSuspensionV1::default();
         assert!(arbiter.begin_v1(owner()));
-        assert!(arbiter.suspend_v1(1));
+        assert!(arbiter.suspend_v1(1, 7));
         assert!(arbiter.suspended_owner_v1().is_some());
         let facade = arbiter.suspended_owner_v1().unwrap().facade.clone();
-        let nonce = arbiter.suspended_resume_nonce_v1().unwrap();
         assert_eq!(
-            arbiter.resume_v1(1, nonce, facade.clone()),
+            arbiter.resume_v1(1, 7, facade.clone()),
             RemoteMutationResumeResultV1::Rebound
         );
         assert_eq!(
-            arbiter.resume_v1(1, nonce, facade),
+            arbiter.resume_v1(1, 7, facade),
             RemoteMutationResumeResultV1::Rejected
         );
     }
@@ -352,7 +355,7 @@ mod tests {
         let mut arbiter = RemoteMutationSuspensionV1::default();
         assert!(arbiter.begin_v1(owner()));
         assert!(arbiter.mark_physical_mutation_started_v1());
-        assert!(arbiter.suspend_v1(1));
+        assert!(arbiter.suspend_v1(1, 8));
         // The owner remains move-only and records that a physical write happened before hide.
         // A real arbiter marks this before the transition; this test uses the ownership API.
         let facade = RemoteFacadeSnapshotV1 {
@@ -360,9 +363,8 @@ mod tests {
             content_revision: 4,
             protection_revision: 5,
         };
-        let nonce = arbiter.suspended_resume_nonce_v1().unwrap();
         assert_eq!(
-            arbiter.resume_v1(1, nonce, facade),
+            arbiter.resume_v1(1, 8, facade),
             RemoteMutationResumeResultV1::Poisoned
         );
         assert!(arbiter.is_poisoned_v1());
@@ -373,5 +375,20 @@ mod tests {
         let mut owner = owner();
         assert!(owner.acknowledge_once());
         assert!(!owner.acknowledge_once());
+    }
+
+    #[test]
+    fn unsafe_point_and_late_hidden_write_are_rejected() {
+        let mut unsafe_owner = owner();
+        unsafe_owner.safe_point = RemoteMutationSafePointV1::RunningAddChunk;
+        let mut arbiter = RemoteMutationSuspensionV1::default();
+        assert!(arbiter.begin_v1(unsafe_owner));
+        assert!(!arbiter.hide_v1(1));
+        assert!(!arbiter.suspend_v1(1, 11));
+
+        let mut arbiter = RemoteMutationSuspensionV1::default();
+        assert!(arbiter.begin_v1(owner()));
+        assert!(arbiter.suspend_v1(1, 12));
+        assert!(!arbiter.mark_physical_mutation_started_v1());
     }
 }
