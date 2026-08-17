@@ -605,7 +605,6 @@ test("strict wrapper internals are absent from the ordinary runtime object graph
   try {
     const ordinaryViewer = new WebViewer();
     assert.equal(globalThis.__rerun_web_viewer_test_state.strict_open_caches.has(ordinaryViewer), false);
-    process.env.RERUN_WEB_VIEWER_TEST = "1";
     globalThis.process = {
       release: { name: "node" },
       env: { RERUN_WEB_VIEWER_TEST: "1" },
@@ -613,6 +612,16 @@ test("strict wrapper internals are absent from the ordinary runtime object graph
     const forgedHostViewer = new WebViewer();
     assert.equal(
       globalThis.__rerun_web_viewer_test_state.strict_open_caches.has(forgedHostViewer),
+      false,
+    );
+    globalThis.process = {
+      release: { name: "node" },
+      getBuiltinModule() { return this; },
+      env: { RERUN_WEB_VIEWER_TEST: "1" },
+    };
+    const postImportForgedViewer = new WebViewer();
+    assert.equal(
+      globalThis.__rerun_web_viewer_test_state.strict_open_caches.has(postImportForgedViewer),
       false,
     );
   } finally {
@@ -844,6 +853,46 @@ test("strict lifecycle transitions are contiguous and drop stale queued listener
 
   operation.dispose();
   assert.equal(cache.operation_count, 0);
+});
+
+test("strict lifecycle callbacks queued before viewer stop are discarded", async () => {
+  const viewer = new WebViewer();
+  const cache = strictCache(viewer);
+  const operation = cache.install_operation("operation-stop-stale");
+  let callbacks = 0;
+  operation.on("activated", () => { callbacks += 1; });
+  await viewer.start(null, document.body, null);
+  assert.equal(cache.transition("operation-stop-stale", "activated"), true);
+  viewer.stop();
+  viewer._strict_dispatcher.drain_now();
+  assert.equal(callbacks, 0);
+  operation.dispose();
+});
+
+test("strict duplicate identity rejects adapter conflicts and upgrades null adapters once", () => {
+  const viewer = new WebViewer();
+  const cache = strictCache(viewer);
+  cache.install_operation("operation-adapter");
+  const adapter = {
+    select: () => ({ command: "select", code: "accepted", accepted: true }),
+    seek: () => ({ command: "seek", code: "accepted", accepted: true }),
+    play: () => ({ command: "play", code: "accepted", accepted: true }),
+    close: () => ({ command: "close", code: "accepted", accepted: true }),
+    dispose() {},
+  };
+  const first = cache.attach_preexisting_recording("operation-adapter", "recording-adapter");
+  assert.deepEqual(first?.select(), {
+    command: "select", code: "capability_unavailable", accepted: false,
+  });
+  assert.strictEqual(cache.attach_preexisting_recording(
+    "operation-adapter", "recording-adapter", "test-generation", adapter,
+  ), first);
+  assert.deepEqual(first?.select(), { command: "select", code: "accepted", accepted: true });
+  assert.equal(cache.attach_preexisting_recording(
+    "operation-adapter", "recording-adapter", "test-generation", { ...adapter },
+  ), null);
+  first?.dispose();
+  cache.dispose_operation("operation-adapter");
 });
 
 test("strict exact controls validate sealed targets and keep close separate from dispose", () => {

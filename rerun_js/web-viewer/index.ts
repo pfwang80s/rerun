@@ -1,6 +1,10 @@
 // @ts-ignore
 import type { WebHandle, wasm_bindgen } from "./re_viewer";
 
+// Capture the host binding while this module initializes. Constructors must not consult a
+// replaceable global `process` property after import.
+const strict_open_process_binding = (globalThis as any).process;
+
 let get_wasm_bindgen: (() => typeof wasm_bindgen) | null = null;
 let _wasm_module: WebAssembly.Module | null = null;
 
@@ -746,7 +750,7 @@ export class WebViewer {
   constructor() {
     injectStyle();
     setupGlobalEventListeners();
-    const node_process = (globalThis as any).process;
+    const node_process = strict_open_process_binding;
     const test_state = (globalThis as any).__rerun_web_viewer_test_state;
     let is_node_runtime = false;
     try {
@@ -1661,6 +1665,7 @@ type StrictOpenRecordingInternals = {
   readonly operation_closed: () => void;
   readonly recording_removed: () => void;
   readonly recording_phase: (phase: StrictOpenRecordingPhase) => void;
+  readonly accept_adapter: (adapter: StrictRecordingControlAdapter | null) => boolean;
 };
 
 type StrictOpenOperationInternals = {
@@ -1705,6 +1710,13 @@ function strict_recording_phase(
   phase: StrictOpenRecordingPhase,
 ) {
   strict_open_recording_internals.get(recording)?.recording_phase(phase);
+}
+
+function strict_recording_accept_adapter(
+  recording: StrictOpenRecordingWrapper,
+  adapter: StrictRecordingControlAdapter | null,
+) {
+  return strict_open_recording_internals.get(recording)?.accept_adapter(adapter) ?? false;
 }
 
 function strict_operation_viewer_stopped(operation: StrictOpenOperationWrapper) {
@@ -1910,6 +1922,7 @@ class StrictOpenRecordingWrapper {
       operation_closed: () => this.#internal_operation_closed(),
       recording_removed: () => this.#internal_recording_removed(),
       recording_phase: (phase) => this.#internal_recording_phase(phase),
+      accept_adapter: (adapter) => this.#internal_accept_adapter(adapter),
     });
   }
 
@@ -1940,6 +1953,15 @@ class StrictOpenRecordingWrapper {
     } else if (next === "completed") {
       this.#phase = StrictOpenRecordingWrapper.#merge_phase(this.#phase, "completed");
     }
+  }
+
+  #internal_accept_adapter(adapter: StrictRecordingControlAdapter | null) {
+    if (adapter === null || this.#adapter === adapter) return true;
+    if (this.#adapter === null) {
+      this.#adapter = adapter;
+      return true;
+    }
+    return false;
   }
 
   select(): StrictRecordingControlResult {
@@ -2069,6 +2091,7 @@ class StrictOpenOperationWrapper {
 
   #internal_viewer_stopped() {
     this.#viewer_stopped = true;
+    this.#transition_revision += 1;
     for (const entry of this.#recordings.values()) {
       strict_recording_viewer_stopped(entry.wrapper);
     }
@@ -2140,6 +2163,7 @@ class StrictOpenOperationWrapper {
       return this.#schedule(() => {
         if (
           this.#disposed
+          || this.#viewer_stopped
           || this.#phase !== phase
           || this.#transition_revision !== revision
         ) return;
@@ -2195,6 +2219,9 @@ class StrictOpenOperationWrapper {
     const existing_entry = this.#recordings.get(identity_key);
     const existing = existing_entry?.wrapper;
     if (existing) {
+      // A duplicate identity cannot silently retain a different adapter. A wrapper created
+      // before capability handoff may be upgraded once with its first non-null adapter.
+      if (!strict_recording_accept_adapter(existing, adapter)) return null;
       if (alias_kind === "active") {
         strict_recording_phase(existing, "active");
       } else if (alias_kind === "completed") {
