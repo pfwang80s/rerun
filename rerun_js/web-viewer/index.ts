@@ -1656,6 +1656,7 @@ type StrictOperationControlAdapter = {
 
 type StrictFinalizationToken = {
   run: () => void;
+  set_adapter: (adapter: { dispose: () => void }) => void;
 };
 
 // Internal lifecycle transitions stay behind WeakMap/#private dispatch so an opaque public handle
@@ -1682,6 +1683,7 @@ type StrictOpenOperationInternals = {
     activation_bridge_armed: boolean;
   };
   readonly transition: (phase: StrictOpenLifecycleEvent) => boolean;
+  readonly accept_adapter: (adapter: StrictOperationControlAdapter | null) => boolean;
 };
 
 const strict_open_recording_internals = new WeakMap<
@@ -1767,6 +1769,13 @@ function strict_operation_transition(
   return strict_open_operation_internals.get(operation)?.transition(phase) ?? false;
 }
 
+function strict_operation_accept_adapter(
+  operation: StrictOpenOperationWrapper,
+  adapter: StrictOperationControlAdapter | null,
+) {
+  return strict_open_operation_internals.get(operation)?.accept_adapter(adapter) ?? false;
+}
+
 const strict_open_lifecycle_rank: Record<StrictOpenLifecycleEvent, number> = {
   accepted: 0,
   activated: 1,
@@ -1793,6 +1802,11 @@ function strict_finalization_token(
     on_dispose,
   };
   return {
+    set_adapter: (next_adapter) => {
+      if (!cleanup_state.disposed && cleanup_state.adapter_ref === null) {
+        cleanup_state.adapter_ref = new WeakRef(next_adapter);
+      }
+    },
     run: () => {
       if (cleanup_state.disposed) return;
       cleanup_state.disposed = true;
@@ -1959,6 +1973,7 @@ class StrictOpenRecordingWrapper {
     if (adapter === null || this.#adapter === adapter) return true;
     if (this.#adapter === null) {
       this.#adapter = adapter;
+      this.#finalization_token.set_adapter(adapter);
       return true;
     }
     return false;
@@ -2074,6 +2089,7 @@ class StrictOpenOperationWrapper {
       arm_bridge: () => this.#internal_arm_bridge(),
       operation_state: () => this.#internal_operation_state(),
       transition: (phase) => this.#internal_transition(phase),
+      accept_adapter: (adapter) => this.#internal_accept_adapter(adapter),
     });
   }
 
@@ -2134,6 +2150,16 @@ class StrictOpenOperationWrapper {
     };
   }
 
+  #internal_accept_adapter(adapter: StrictOperationControlAdapter | null) {
+    if (adapter === null || this.#adapter === adapter) return true;
+    if (this.#adapter === null) {
+      this.#adapter = adapter;
+      this.#finalization_token.set_adapter(adapter);
+      return true;
+    }
+    return false;
+  }
+
   #internal_transition(phase: StrictOpenLifecycleEvent) {
     if (!Object.hasOwn(strict_open_lifecycle_rank, phase)) return false;
     const current_rank = strict_open_lifecycle_rank[this.#phase];
@@ -2187,6 +2213,7 @@ class StrictOpenOperationWrapper {
     if (this.#viewer_stopped) return strict_control_result("close", "viewer_stopped");
     const result = this.#adapter?.close() ?? strict_unavailable_result("close");
     if (result.accepted || result.code === "operation_closed" || result.code === "recording_removed") {
+      this.#transition_revision += 1;
       this.#closed = true;
       for (const entry of this.#recordings.values()) {
         strict_recording_operation_closed(entry.wrapper);
@@ -2305,7 +2332,7 @@ class StrictOpenWrapperCache {
   ) {
     const existing = this.#get_operation(operation_id);
     if (existing) {
-      return existing;
+      return strict_operation_accept_adapter(existing, adapter) ? existing : null;
     }
 
     const cache_token = {};

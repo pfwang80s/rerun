@@ -869,16 +869,34 @@ test("strict lifecycle callbacks queued before viewer stop are discarded", async
   operation.dispose();
 });
 
+test("strict operation close discards queued lifecycle callbacks", async () => {
+  const viewer = new WebViewer();
+  const cache = strictCache(viewer);
+  const operation = cache.install_operation("operation-close-stale", {
+    close: () => ({ command: "close", code: "accepted", accepted: true }),
+    dispose() {},
+  });
+  let callbacks = 0;
+  operation.on("activated", () => { callbacks += 1; });
+  await viewer.start(null, document.body, null);
+  assert.equal(cache.transition("operation-close-stale", "activated"), true);
+  assert.deepEqual(operation.close(), { command: "close", code: "accepted", accepted: true });
+  viewer._strict_dispatcher.drain_now();
+  assert.equal(callbacks, 0);
+  operation.dispose();
+});
+
 test("strict duplicate identity rejects adapter conflicts and upgrades null adapters once", () => {
   const viewer = new WebViewer();
   const cache = strictCache(viewer);
   cache.install_operation("operation-adapter");
+  let disposeCount = 0;
   const adapter = {
     select: () => ({ command: "select", code: "accepted", accepted: true }),
     seek: () => ({ command: "seek", code: "accepted", accepted: true }),
     play: () => ({ command: "play", code: "accepted", accepted: true }),
     close: () => ({ command: "close", code: "accepted", accepted: true }),
-    dispose() {},
+    dispose() { disposeCount += 1; },
   };
   const first = cache.attach_preexisting_recording("operation-adapter", "recording-adapter");
   assert.deepEqual(first?.select(), {
@@ -892,7 +910,29 @@ test("strict duplicate identity rejects adapter conflicts and upgrades null adap
     "operation-adapter", "recording-adapter", "test-generation", { ...adapter },
   ), null);
   first?.dispose();
+  assert.equal(disposeCount, 1);
   cache.dispose_operation("operation-adapter");
+});
+
+test("strict duplicate operation identity upgrades null adapter and rejects conflicts", () => {
+  const viewer = new WebViewer();
+  const cache = strictCache(viewer);
+  const first = cache.install_operation("operation-adapter-upgrade");
+  let disposeCount = 0;
+  const adapter = {
+    close: () => ({ command: "close", code: "accepted", accepted: true }),
+    dispose: () => { disposeCount += 1; },
+  };
+  assert.strictEqual(
+    cache.install_operation("operation-adapter-upgrade", adapter),
+    first,
+  );
+  assert.equal(cache.install_operation(
+    "operation-adapter-upgrade",
+    { ...adapter },
+  ), null);
+  first.dispose();
+  assert.equal(disposeCount, 1);
 });
 
 test("strict exact controls validate sealed targets and keep close separate from dispose", () => {
