@@ -12,6 +12,7 @@ use re_chunk_store::{ChunkStore, WebRemoteMcapRootCapabilityV1};
 use re_log_types::TimeInt;
 
 use crate::remote_channel_group::StableDecoderGroupIdV1;
+use crate::remote_loaded_coverage::CanonicalIndexedExtentV1;
 use crate::remote_manifest::{
     DerivationPartitionKeyV1, ImmutableRemoteMcapManifestV1, RemoteMcapSessionIdV1,
 };
@@ -74,6 +75,9 @@ pub(crate) enum RemoteWindowDemandErrorV1 {
 
     #[error("the remote MCAP window demand phase owner does not match")]
     PhaseOwnerMismatch,
+
+    #[error("remote MCAP prefetch demand is not bound to an exact physical-Chunk body owner")]
+    PrefetchUnstarted,
 }
 
 /// Frozen caller phase identity for one demand class.
@@ -99,18 +103,32 @@ pub(crate) struct RemoteWindowDemandPolicyInputsV1 {
     pub(crate) active_visible_deadline_millis: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteWindowDemandPhaseStateV1 {
+    Uninstalled,
+    PrefetchUnstarted,
+    Installed(RemoteWindowDemandPolicyInputsV1),
+}
+
 /// Sealed phase-owner installation state for one demand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RemoteWindowDemandPhaseV1 {
     identity: RemoteWindowDemandPhaseIdentityV1,
-    policy_inputs: Option<RemoteWindowDemandPolicyInputsV1>,
+    state: RemoteWindowDemandPhaseStateV1,
 }
 
 impl RemoteWindowDemandPhaseV1 {
-    fn new_uninstalled(identity: RemoteWindowDemandPhaseIdentityV1) -> Self {
+    fn new_uninstalled(
+        class: RemoteWindowDemandClassV1,
+        identity: RemoteWindowDemandPhaseIdentityV1,
+    ) -> Self {
         Self {
             identity,
-            policy_inputs: None,
+            state: if class == RemoteWindowDemandClassV1::PrefetchDesired {
+                RemoteWindowDemandPhaseStateV1::PrefetchUnstarted
+            } else {
+                RemoteWindowDemandPhaseStateV1::Uninstalled
+            },
         }
     }
 
@@ -119,11 +137,15 @@ impl RemoteWindowDemandPhaseV1 {
     }
 
     pub(crate) const fn policy_inputs_v1(&self) -> Option<RemoteWindowDemandPolicyInputsV1> {
-        self.policy_inputs
+        match self.state {
+            RemoteWindowDemandPhaseStateV1::Installed(policy_inputs) => Some(policy_inputs),
+            RemoteWindowDemandPhaseStateV1::Uninstalled
+            | RemoteWindowDemandPhaseStateV1::PrefetchUnstarted => None,
+        }
     }
 
     pub(crate) const fn can_start_retry_v1(&self) -> bool {
-        self.policy_inputs.is_some()
+        matches!(self.state, RemoteWindowDemandPhaseStateV1::Installed(_))
     }
 
     pub(crate) fn install_matching_phase_owner_v1(
@@ -134,8 +156,16 @@ impl RemoteWindowDemandPhaseV1 {
         if self.identity != identity {
             return Err(RemoteWindowDemandErrorV1::PhaseOwnerMismatch);
         }
-        self.policy_inputs = Some(policy_inputs);
-        Ok(())
+        match self.state {
+            RemoteWindowDemandPhaseStateV1::PrefetchUnstarted => {
+                Err(RemoteWindowDemandErrorV1::PrefetchUnstarted)
+            }
+            RemoteWindowDemandPhaseStateV1::Uninstalled
+            | RemoteWindowDemandPhaseStateV1::Installed(_) => {
+                self.state = RemoteWindowDemandPhaseStateV1::Installed(policy_inputs);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -152,7 +182,7 @@ impl RemoteWindowDemandV1 {
     ) -> Self {
         Self {
             class,
-            phase: RemoteWindowDemandPhaseV1::new_uninstalled(identity),
+            phase: RemoteWindowDemandPhaseV1::new_uninstalled(class, identity),
         }
     }
 
@@ -442,6 +472,103 @@ pub(crate) fn plan_window_ordinals_v1(
     })
 }
 
+fn validate_temporal_cursor_v1(
+    indexed_extent: CanonicalIndexedExtentV1,
+    cursor: TimeInt,
+) -> Result<(), RemoteWindowDemandErrorV1> {
+    match indexed_extent {
+        CanonicalIndexedExtentV1::NoIndexedMessages => {
+            Err(RemoteWindowDemandErrorV1::InvalidWindow)
+        }
+        CanonicalIndexedExtentV1::Known(extent) if !extent.contains(cursor) => {
+            Err(RemoteWindowDemandErrorV1::InvalidWindow)
+        }
+        CanonicalIndexedExtentV1::Known(_) => Ok(()),
+    }
+}
+
+fn ordinal_plan_with_desired_prefetch_excluding_v1(
+    plan: RemoteWindowOrdinalPlanV1,
+    excluded_ordinals: &[usize],
+    limit: u64,
+) -> Result<RemoteWindowOrdinalPlanV1, RemoteWindowDemandErrorV1> {
+    let desired_prefetch_ordinals = exclude_sorted_ordinals_v1(
+        plan.desired_prefetch_ordinals_v1(),
+        excluded_ordinals,
+        limit,
+    )?
+    .into_boxed_slice();
+    Ok(RemoteWindowOrdinalPlanV1 {
+        desired_prefetch_ordinals,
+        ..plan
+    })
+}
+
+fn validate_backfill_partition_v1(
+    partition: DerivationPartitionKeyV1,
+    session_id: RemoteMcapSessionIdV1,
+    source_generation: u64,
+    selected_groups: &[StableDecoderGroupIdV1],
+    partition_for: &impl Fn(
+        usize,
+        StableDecoderGroupIdV1,
+    ) -> Result<DerivationPartitionKeyV1, RemoteWindowDemandErrorV1>,
+) -> Result<(), RemoteWindowDemandErrorV1> {
+    if partition.session_id_v1() != session_id
+        || partition.source_generation_v1() != source_generation
+    {
+        return Err(RemoteWindowDemandErrorV1::InvalidPartition);
+    }
+
+    let group = match partition.kind_v1() {
+        crate::remote_manifest::DerivationPartitionKindV1::TemporalChannelGroup(group) => group,
+        crate::remote_manifest::DerivationPartitionKindV1::OpeningStatic => {
+            return Err(RemoteWindowDemandErrorV1::InvalidPartition);
+        }
+    };
+    if !selected_groups.contains(&group) {
+        return Err(RemoteWindowDemandErrorV1::InvalidPartition);
+    }
+    let ordinal = usize::try_from(partition.source_unit_ordinal_v1())
+        .map_err(|_error| RemoteWindowDemandErrorV1::ArithmeticOverflow)?;
+    let expected = partition_for(ordinal, group)?;
+    if expected != partition {
+        return Err(RemoteWindowDemandErrorV1::InvalidPartition);
+    }
+    Ok(())
+}
+
+fn collect_backfill_ordinals_v1(
+    backfill_additions: &[DerivationPartitionKeyV1],
+    session_id: RemoteMcapSessionIdV1,
+    source_generation: u64,
+    selected_groups: &[StableDecoderGroupIdV1],
+    partition_for: &impl Fn(
+        usize,
+        StableDecoderGroupIdV1,
+    ) -> Result<DerivationPartitionKeyV1, RemoteWindowDemandErrorV1>,
+) -> Result<Vec<usize>, RemoteWindowDemandErrorV1> {
+    let mut ordinals = Vec::new();
+    for &partition in backfill_additions {
+        validate_backfill_partition_v1(
+            partition,
+            session_id,
+            source_generation,
+            selected_groups,
+            partition_for,
+        )?;
+        let ordinal = usize::try_from(partition.source_unit_ordinal_v1())
+            .map_err(|_error| RemoteWindowDemandErrorV1::ArithmeticOverflow)?;
+        ordinals
+            .try_reserve(1)
+            .map_err(|_error| RemoteWindowDemandErrorV1::ResourceLimitExceeded)?;
+        ordinals.push(ordinal);
+    }
+    ordinals.sort_unstable();
+    ordinals.dedup();
+    Ok(ordinals)
+}
+
 fn push_unique_partition_v1(
     output: &mut Vec<DerivationPartitionKeyV1>,
     seen: &mut HashSet<DerivationPartitionKeyV1>,
@@ -472,6 +599,8 @@ fn expand_partition_set_v1(
     include_opening_static: bool,
     opening_static: DerivationPartitionKeyV1,
     backfill_additions: &[DerivationPartitionKeyV1],
+    session_id: RemoteMcapSessionIdV1,
+    source_generation: u64,
     partition_for: impl Fn(
         usize,
         StableDecoderGroupIdV1,
@@ -480,6 +609,16 @@ fn expand_partition_set_v1(
 ) -> Result<Vec<DerivationPartitionKeyV1>, RemoteWindowDemandErrorV1> {
     let mut output = Vec::new();
     let mut seen = HashSet::default();
+
+    for &partition in backfill_additions {
+        validate_backfill_partition_v1(
+            partition,
+            session_id,
+            source_generation,
+            selected_groups,
+            &partition_for,
+        )?;
+    }
 
     if include_opening_static {
         push_unique_partition_v1(&mut output, &mut seen, opening_static, max_partitions)?;
@@ -563,6 +702,8 @@ fn partition_sets_from_ordinal_plan_v1(
         true,
         opening_static,
         backfill_additions,
+        session_id,
+        source_generation,
         &partition_for,
         max_generation_partitions,
     )?;
@@ -572,6 +713,8 @@ fn partition_sets_from_ordinal_plan_v1(
         false,
         opening_static,
         &[],
+        session_id,
+        source_generation,
         &partition_for,
         max_generation_partitions,
     )?;
@@ -712,13 +855,8 @@ pub(crate) fn plan_window_demands_v1(
     backfill_additions: &[DerivationPartitionKeyV1],
     limits: RemoteWindowDemandLimitsV1,
 ) -> Result<RemoteWindowDemandPlanV1, RemoteWindowDemandErrorV1> {
-    let ordinal_plan = plan_window_ordinals_v1(
-        manifest.source_layout_v1(),
-        cursor,
-        minimum_buffer,
-        desired_prefetch,
-        limits,
-    )?;
+    validate_temporal_cursor_v1(manifest.indexed_extent_v1(), cursor)?;
+
     let selected_groups = collect_bounded_group_ids_v1(
         manifest.groups_v1().iter().map(|group| group.group_id()),
         limits.max_selected_channel_groups,
@@ -728,6 +866,34 @@ pub(crate) fn plan_window_demands_v1(
         .map_err(|_error| RemoteWindowDemandErrorV1::InvalidPartition)?
         .partition_v1()
         .key_v1();
+    let partition_for = |ordinal, group| {
+        let ordinal = u32::try_from(ordinal)
+            .map_err(|_error| RemoteWindowDemandErrorV1::ArithmeticOverflow)?;
+        manifest
+            .temporal_partition_v1(ordinal, group)
+            .map(|authority| authority.partition_v1().key_v1())
+            .map_err(|_error| RemoteWindowDemandErrorV1::InvalidPartition)
+    };
+    let backfill_ordinals = collect_backfill_ordinals_v1(
+        backfill_additions,
+        manifest.session_id_v1(),
+        manifest.source_generation_v1(),
+        &selected_groups,
+        &partition_for,
+    )?;
+    let ordinal_plan = plan_window_ordinals_v1(
+        manifest.source_layout_v1(),
+        cursor,
+        minimum_buffer,
+        desired_prefetch,
+        limits,
+    )?;
+    let ordinal_plan = ordinal_plan_with_desired_prefetch_excluding_v1(
+        ordinal_plan,
+        &backfill_ordinals,
+        limits.max_window_chunk_hits,
+    )?;
+
     partition_sets_from_ordinal_plan_v1(
         &ordinal_plan,
         manifest.session_id_v1(),
@@ -738,14 +904,7 @@ pub(crate) fn plan_window_demands_v1(
         &selected_groups,
         opening_static,
         backfill_additions,
-        |ordinal, group| {
-            let ordinal = u32::try_from(ordinal)
-                .map_err(|_error| RemoteWindowDemandErrorV1::ArithmeticOverflow)?;
-            manifest
-                .temporal_partition_v1(ordinal, group)
-                .map(|authority| authority.partition_v1().key_v1())
-                .map_err(|_error| RemoteWindowDemandErrorV1::InvalidPartition)
-        },
+        partition_for,
         |partition| {
             root_index
                 .is_partition_fully_resident_v1(store, capability, partition)
@@ -829,7 +988,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_owner_installation_is_matching_and_prevents_retry_before_install() {
+    fn phase_owner_installation_is_matching_and_prefetch_stays_unstarted() {
         let identity = phase_identity_v1(
             session_id(),
             7,
@@ -866,23 +1025,374 @@ mod tests {
         );
         assert!(!demand.can_start_retry_v1());
 
-        demand
-            .install_matching_phase_owner_v1(
+        assert_eq!(
+            demand.install_matching_phase_owner_v1(
                 identity,
                 RemoteWindowDemandPolicyInputsV1 {
                     cumulative_range_requests: 3,
                     active_visible_deadline_millis: 7,
                 },
-            )
+            ),
+            Err(RemoteWindowDemandErrorV1::PrefetchUnstarted)
+        );
+        assert!(!demand.can_start_retry_v1());
+        assert_eq!(demand.phase_v1().policy_inputs_v1(), None);
+    }
+
+    #[test]
+    fn presentation_demand_becomes_retry_startable_after_matching_install() {
+        let identity = phase_identity_v1(
+            session_id(),
+            7,
+            RemoteWindowDemandClassV1::PresentationRequired,
+            time(1),
+            time(2),
+            time(3),
+            true,
+        );
+        let mut demand = RemoteWindowDemandV1::new_uninstalled(
+            RemoteWindowDemandClassV1::PresentationRequired,
+            identity,
+        );
+        assert!(!demand.can_start_retry_v1());
+
+        let policy_inputs = RemoteWindowDemandPolicyInputsV1 {
+            cumulative_range_requests: 3,
+            active_visible_deadline_millis: 7,
+        };
+        demand
+            .install_matching_phase_owner_v1(identity, policy_inputs)
             .unwrap();
         assert!(demand.can_start_retry_v1());
+        assert_eq!(demand.phase_v1().policy_inputs_v1(), Some(policy_inputs));
+    }
+
+    #[test]
+    fn desired_prefetch_excludes_backfill_partition_ordinals() {
+        let base = plan_window_ordinals_v1(
+            &layout(&[(0, 0), (5, 5), (10, 10)]),
+            time(0),
+            time(3),
+            time(20),
+            RemoteWindowDemandLimitsV1::generous_disarmed_v1(),
+        )
+        .unwrap();
+        let plan = ordinal_plan_with_desired_prefetch_excluding_v1(
+            base,
+            &[1],
+            RemoteWindowDemandLimitsV1::generous_disarmed_v1().max_window_chunk_hits,
+        )
+        .unwrap();
+        assert_eq!(plan.cursor_ordinals_v1(), &[0]);
+        assert_eq!(plan.minimum_buffer_ordinals_v1(), &[0]);
+        assert_eq!(plan.required_union_ordinals_v1(), &[0]);
+        assert_eq!(plan.desired_prefetch_ordinals_v1(), &[2]);
+    }
+
+    #[test]
+    fn temporal_cursor_must_fall_inside_indexed_extent() {
+        use re_log_types::AbsoluteTimeRange;
+
         assert_eq!(
-            demand.phase_v1().policy_inputs_v1(),
-            Some(RemoteWindowDemandPolicyInputsV1 {
-                cumulative_range_requests: 3,
-                active_visible_deadline_millis: 7,
-            })
+            validate_temporal_cursor_v1(
+                CanonicalIndexedExtentV1::Known(AbsoluteTimeRange::new(10, 20)),
+                time(9),
+            ),
+            Err(RemoteWindowDemandErrorV1::InvalidWindow)
         );
+        assert_eq!(
+            validate_temporal_cursor_v1(
+                CanonicalIndexedExtentV1::Known(AbsoluteTimeRange::new(10, 20)),
+                time(21),
+            ),
+            Err(RemoteWindowDemandErrorV1::InvalidWindow)
+        );
+        assert_eq!(
+            validate_temporal_cursor_v1(
+                CanonicalIndexedExtentV1::Known(AbsoluteTimeRange::new(10, 20)),
+                time(20),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_temporal_cursor_v1(CanonicalIndexedExtentV1::NoIndexedMessages, time(0)),
+            Err(RemoteWindowDemandErrorV1::InvalidWindow)
+        );
+    }
+
+    #[test]
+    fn backfill_partition_identity_is_validated() {
+        let selected_groups = [StableDecoderGroupIdV1::first_for_assignment_test_v1()];
+        let partition_for = |ordinal, group| {
+            assert_eq!(
+                group,
+                StableDecoderGroupIdV1::first_for_assignment_test_v1()
+            );
+            Ok(temporal_partition(u32::try_from(ordinal).unwrap()))
+        };
+
+        let foreign_session = DerivationPartitionKeyV1::for_window_demand_test_v1(
+            RemoteMcapSessionIdV1::for_registration_test_v1(2),
+            1,
+            9,
+            DerivationPartitionKindV1::TemporalChannelGroup(
+                StableDecoderGroupIdV1::first_for_assignment_test_v1(),
+            ),
+        );
+        assert_eq!(
+            validate_backfill_partition_v1(
+                foreign_session,
+                session_id(),
+                1,
+                &selected_groups,
+                &partition_for,
+            ),
+            Err(RemoteWindowDemandErrorV1::InvalidPartition)
+        );
+
+        let foreign_generation = DerivationPartitionKeyV1::for_window_demand_test_v1(
+            session_id(),
+            2,
+            9,
+            DerivationPartitionKindV1::TemporalChannelGroup(
+                StableDecoderGroupIdV1::first_for_assignment_test_v1(),
+            ),
+        );
+        assert_eq!(
+            validate_backfill_partition_v1(
+                foreign_generation,
+                session_id(),
+                1,
+                &selected_groups,
+                &partition_for,
+            ),
+            Err(RemoteWindowDemandErrorV1::InvalidPartition)
+        );
+
+        let foreign_kind = DerivationPartitionKeyV1::for_window_demand_test_v1(
+            session_id(),
+            1,
+            u32::MAX,
+            DerivationPartitionKindV1::OpeningStatic,
+        );
+        assert_eq!(
+            validate_backfill_partition_v1(
+                foreign_kind,
+                session_id(),
+                1,
+                &selected_groups,
+                &partition_for,
+            ),
+            Err(RemoteWindowDemandErrorV1::InvalidPartition)
+        );
+
+        assert_eq!(
+            validate_backfill_partition_v1(
+                temporal_partition(9),
+                session_id(),
+                1,
+                &selected_groups,
+                &partition_for,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn checked_cross_product_fails_before_partition_expansion() {
+        let ordinal_plan = RemoteWindowOrdinalPlanV1 {
+            cursor_ordinals: vec![0, 1, 2].into_boxed_slice(),
+            minimum_buffer_ordinals: vec![0, 1, 2].into_boxed_slice(),
+            desired_prefetch_ordinals: vec![].into_boxed_slice(),
+            required_union_ordinals: vec![0, 1, 2].into_boxed_slice(),
+        };
+        let selected_groups = [
+            StableDecoderGroupIdV1::first_for_assignment_test_v1(),
+            StableDecoderGroupIdV1::first_for_assignment_test_v1(),
+        ];
+        let limits = RemoteWindowDemandLimitsV1 {
+            max_planning_cross_product_ops: 5,
+            ..RemoteWindowDemandLimitsV1::generous_disarmed_v1()
+        };
+        let error = partition_sets_from_ordinal_plan_v1(
+            &ordinal_plan,
+            session_id(),
+            1,
+            time(0),
+            time(1),
+            time(2),
+            &selected_groups,
+            opening_static_partition(),
+            &[],
+            |ordinal, _group| Ok(temporal_partition(u32::try_from(ordinal).unwrap())),
+            |_partition| Ok(false),
+            limits,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(error, RemoteWindowDemandErrorV1::ResourceLimitExceeded);
+    }
+
+    #[test]
+    fn long_chunk_and_half_open_boundary_are_differential_against_layout() {
+        let base = plan_window_ordinals_v1(
+            &layout(&[(0, 100), (101, 101)]),
+            time(90),
+            time(5),
+            time(12),
+            RemoteWindowDemandLimitsV1::generous_disarmed_v1(),
+        )
+        .unwrap();
+        assert_eq!(base.cursor_ordinals_v1(), &[0]);
+        assert_eq!(base.minimum_buffer_ordinals_v1(), &[0]);
+        assert_eq!(base.required_union_ordinals_v1(), &[0]);
+        assert_eq!(base.desired_prefetch_ordinals_v1(), &[1]);
+
+        let boundary = plan_window_ordinals_v1(
+            &layout(&[(0, 0), (9, 9), (10, 10)]),
+            time(0),
+            time(1),
+            time(10),
+            RemoteWindowDemandLimitsV1::generous_disarmed_v1(),
+        )
+        .unwrap();
+        assert_eq!(boundary.cursor_ordinals_v1(), &[0]);
+        assert_eq!(boundary.minimum_buffer_ordinals_v1(), &[0]);
+        assert_eq!(boundary.desired_prefetch_ordinals_v1(), &[1]);
+    }
+
+    #[test]
+    fn file_order_is_ignored_when_ordinals_are_time_ordered() {
+        let plan = plan_window_ordinals_v1(
+            &layout(&[(30, 40), (0, 10), (20, 20)]),
+            time(20),
+            time(1),
+            time(10),
+            RemoteWindowDemandLimitsV1::generous_disarmed_v1(),
+        )
+        .unwrap();
+        assert_eq!(plan.cursor_ordinals_v1(), &[2]);
+        assert_eq!(plan.minimum_buffer_ordinals_v1(), &[2]);
+        assert_eq!(plan.desired_prefetch_ordinals_v1(), &[] as &[usize]);
+    }
+
+    #[test]
+    fn physical_ordinal_selection_differentially_covers_all_layers() {
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_chunks([
+                FixtureChunk::single(FixtureMessage::new(1, 0, 20)),
+                FixtureChunk::new([FixtureMessage::new(1, 1, 10), FixtureMessage::new(1, 2, 20)]),
+                FixtureChunk::single(FixtureMessage::new(1, 3, 20)),
+            ])
+            .build()
+            .unwrap();
+
+        let intervals = fixture
+            .layout
+            .chunk_indexes
+            .iter()
+            .map(|index| {
+                (
+                    i64::try_from(index.message_range.start).unwrap(),
+                    i64::try_from(index.message_range.end).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let layout = layout(&intervals);
+        let cursor = 15;
+        let minimum_buffer = 6;
+        let desired_prefetch = 10;
+        let plan = plan_window_ordinals_v1(
+            &layout,
+            time(cursor),
+            time(minimum_buffer),
+            time(desired_prefetch),
+            RemoteWindowDemandLimitsV1::generous_disarmed_v1(),
+        )
+        .unwrap();
+
+        let upstream = fixture
+            .read_upstream_indexed(Some(cursor as u64), Some((cursor + minimum_buffer) as u64))
+            .unwrap();
+        let upstream_ordinals = upstream
+            .chunk_payload_offsets
+            .iter()
+            .map(|offset| {
+                fixture
+                    .layout
+                    .chunks
+                    .iter()
+                    .position(|chunk| chunk.compressed_data_start as u64 == *offset)
+                    .unwrap()
+            })
+            .collect::<HashSet<_>>();
+        let planned_ordinals = plan
+            .minimum_buffer_ordinals_v1()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        assert_eq!(planned_ordinals, upstream_ordinals);
+
+        let cursor_upstream = fixture
+            .read_upstream_indexed(Some(cursor as u64), Some((cursor + 1) as u64))
+            .unwrap()
+            .chunk_payload_offsets
+            .iter()
+            .map(|offset| {
+                fixture
+                    .layout
+                    .chunks
+                    .iter()
+                    .position(|chunk| chunk.compressed_data_start as u64 == *offset)
+                    .unwrap()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            plan.cursor_ordinals_v1()
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>(),
+            cursor_upstream
+        );
+
+        let desired_upstream = fixture
+            .read_upstream_indexed(
+                Some(cursor as u64),
+                Some((cursor + desired_prefetch) as u64),
+            )
+            .unwrap()
+            .chunk_payload_offsets
+            .iter()
+            .map(|offset| {
+                fixture
+                    .layout
+                    .chunks
+                    .iter()
+                    .position(|chunk| chunk.compressed_data_start as u64 == *offset)
+                    .unwrap()
+            })
+            .collect::<HashSet<_>>();
+        let required_union = plan
+            .required_union_ordinals_v1()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let expected_prefetch = desired_upstream
+            .difference(&required_union)
+            .copied()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            plan.desired_prefetch_ordinals_v1()
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>(),
+            expected_prefetch
+        );
+
+        assert_eq!(plan.cursor_ordinals_v1(), &[1]);
+        assert_eq!(plan.minimum_buffer_ordinals_v1(), &[0, 1, 2]);
+        assert_eq!(plan.required_union_ordinals_v1(), &[0, 1, 2]);
+        assert_eq!(plan.desired_prefetch_ordinals_v1(), &[] as &[usize]);
     }
 
     #[test]

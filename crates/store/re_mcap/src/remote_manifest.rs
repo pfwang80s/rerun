@@ -156,12 +156,33 @@ impl DerivationPartitionKeyV1 {
         self.source_unit.session
     }
 
+    pub(crate) const fn source_generation_v1(self) -> u64 {
+        self.source_unit.source_generation
+    }
+
     pub(crate) const fn kind_v1(self) -> DerivationPartitionKindV1 {
         self.kind
     }
 
     pub(crate) const fn source_unit_ordinal_v1(self) -> u32 {
         self.source_unit.ordinal
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_window_demand_test_v1(
+        session: RemoteMcapSessionIdV1,
+        source_generation: u64,
+        source_ordinal: u32,
+        kind: DerivationPartitionKindV1,
+    ) -> Self {
+        Self {
+            source_unit: SourceUnitIdV1 {
+                session,
+                source_generation,
+                ordinal: source_ordinal,
+            },
+            kind,
+        }
     }
 }
 
