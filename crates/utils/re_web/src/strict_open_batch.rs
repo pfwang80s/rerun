@@ -121,7 +121,16 @@ impl StrictOpenBatchPrepareContextV1 {
                                 index,
                             )
                         })?;
-                    let graph_bytes = (url.len() + semantic.retained_bytes_v1()) as u64;
+                    let graph_bytes = url
+                        .len()
+                        .checked_add(semantic.retained_bytes_v1())
+                        .and_then(|bytes| u64::try_from(bytes).ok())
+                        .ok_or_else(|| {
+                            admission_error_v1(
+                                StrictOpenAdmissionCodeV1::ResourceLimitExceeded,
+                                index,
+                            )
+                        })?;
                     let ingress_permit =
                         CombinedCopyPermit::prepare([url_string, topic_string], graph_bytes)
                             .map_err(|_| {
