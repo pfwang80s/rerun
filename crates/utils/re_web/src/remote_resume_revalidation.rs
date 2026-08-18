@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Upper bound for the number of slots, queued entries, and snapshots admitted in one resume.
 pub const MAX_REMOTE_RESUME_SLOTS_V1: usize = 256;
@@ -64,13 +65,43 @@ impl RemoteResumeWorkKindV1 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RemoteResumeSlotFactsV1 {
-    pub validator_revision: u64,
-    pub body_reader_revision: u64,
-    pub validator_valid: bool,
-    pub body_reader_valid: bool,
-    pub mutation_owned: bool,
-    pub reservation_valid: bool,
+pub enum RemoteResumeValidationFactV1 {
+    Valid(u64),
+    Invalid(u64),
+}
+
+impl RemoteResumeValidationFactV1 {
+    const fn revision(self) -> u64 {
+        match self {
+            Self::Valid(revision) | Self::Invalid(revision) => revision,
+        }
+    }
+
+    const fn valid(self) -> bool {
+        matches!(self, Self::Valid(_))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteResumeReservationFactV1 {
+    Valid,
+    Invalid,
+}
+
+impl RemoteResumeReservationFactV1 {
+    const fn valid(self) -> bool {
+        matches!(self, Self::Valid)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RemoteResumeSlotFactsV1 {
+    validator_revision: u64,
+    body_reader_revision: u64,
+    validator_valid: bool,
+    body_reader_valid: bool,
+    mutation_owned: bool,
+    reservation_valid: bool,
 }
 
 impl Default for RemoteResumeSlotFactsV1 {
@@ -126,7 +157,15 @@ struct Slot {
     facts: RemoteResumeSlotFactsV1,
 }
 
-const MANAGER_ISSUER_V1: u64 = 0x5245_5355_4d45_5631;
+static NEXT_MANAGER_ISSUER_V1: AtomicU64 = AtomicU64::new(1);
+
+fn next_manager_issuer_v1() -> u64 {
+    NEXT_MANAGER_ISSUER_V1
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |issuer| {
+            issuer.checked_add(1)
+        })
+        .unwrap_or_else(|_| panic!("RemoteResumeRevalidationV1 issuer allocator exhausted"))
+}
 
 /// Remote-only resume coordinator with a bounded per-frame quantum.
 pub struct RemoteResumeRevalidationV1 {
@@ -147,14 +186,14 @@ impl Default for RemoteResumeRevalidationV1 {
 }
 
 impl RemoteResumeRevalidationV1 {
-    pub const fn new_v1() -> Self {
+    pub fn new_v1() -> Self {
         Self {
             generation: 0,
             phase: RemoteResumePhaseV1::Visible,
             terminated: false,
             next_slot: 1,
             next_token: 1,
-            issuer: MANAGER_ISSUER_V1,
+            issuer: next_manager_issuer_v1(),
             slots: BTreeMap::new(),
             queue: VecDeque::new(),
         }
@@ -220,7 +259,9 @@ impl RemoteResumeRevalidationV1 {
     pub fn update_facts_v1(
         &mut self,
         token: RemoteResumeSlotTokenV1,
-        facts: RemoteResumeSlotFactsV1,
+        validator: RemoteResumeValidationFactV1,
+        body_reader: RemoteResumeValidationFactV1,
+        reservation: RemoteResumeReservationFactV1,
     ) -> Result<(), RemoteResumeRevalidationErrorV1> {
         if self.terminated {
             return Err(RemoteResumeRevalidationErrorV1::Terminated);
@@ -228,14 +269,22 @@ impl RemoteResumeRevalidationV1 {
         if self.phase == RemoteResumePhaseV1::Revalidating {
             return Err(RemoteResumeRevalidationErrorV1::InvalidToken);
         }
-        if self.slot_for_token_identity(token).is_none() {
-            return Err(RemoteResumeRevalidationErrorV1::InvalidToken);
-        }
+        let kind = self
+            .slot_for_token_identity(token)
+            .ok_or(RemoteResumeRevalidationErrorV1::InvalidToken)?
+            .kind;
         let slot = self
             .slots
             .get_mut(&token.slot)
             .expect("slot identity check returned a live slot");
-        slot.facts = facts;
+        slot.facts = RemoteResumeSlotFactsV1 {
+            validator_revision: validator.revision(),
+            body_reader_revision: body_reader.revision(),
+            validator_valid: validator.valid(),
+            body_reader_valid: body_reader.valid(),
+            mutation_owned: kind.mutation_owned(),
+            reservation_valid: reservation.valid(),
+        };
         Ok(())
     }
 
@@ -331,7 +380,9 @@ impl RemoteResumeRevalidationV1 {
                 && snapshot.kind == slot.kind
                 && snapshot.facts == slot.facts
                 && snapshot.facts.validator_valid
-                && snapshot.facts.body_reader_valid;
+                && snapshot.facts.body_reader_valid
+                && snapshot.facts.reservation_valid
+                && snapshot.facts.mutation_owned == snapshot.kind.mutation_owned();
             if !valid {
                 outcomes.push((snapshot.slot, RemoteResumeRevalidationResultV1::Dropped));
                 continue;
@@ -350,13 +401,13 @@ impl RemoteResumeRevalidationV1 {
         }
 
         self.slots.retain(|slot, _| accepted_slots.contains(slot));
-        for slot in accepted_slots.iter() {
+        for slot in &accepted_slots {
             if let Some(slot_state) = self.slots.get_mut(slot) {
                 slot_state.generation = next_generation;
             }
         }
         self.queue.clear();
-        self.queue.extend(accepted_slots.iter());
+        self.queue.extend(&accepted_slots);
         self.generation = next_generation;
         self.phase = RemoteResumePhaseV1::Visible;
 
@@ -390,8 +441,11 @@ impl RemoteResumeRevalidationV1 {
                 .is_some_and(|slot| slot.token == token.token && slot.generation == self.generation)
     }
 
-    /// Runs a bounded remote quantum. At most one retry starts in a turn; viewer work receives
-    /// its normal opportunity independently of remote backlog.
+    /// Runs a bounded frame quantum.
+    ///
+    /// `max_remote_work` is the total work budget for the frame, including the optional viewer
+    /// turn. At most one retry starts in a turn; if viewer work is available it consumes one unit
+    /// before the remaining remote budget is dispatched.
     pub fn pump_frame_v1(
         &mut self,
         max_remote_work: u32,
@@ -406,8 +460,8 @@ impl RemoteResumeRevalidationV1 {
             return empty_frame;
         }
 
-        let remote_budget = if viewer_work_available && max_remote_work > 1 {
-            max_remote_work - 1
+        let remote_budget = if viewer_work_available {
+            max_remote_work.saturating_sub(1)
         } else {
             max_remote_work
         };
@@ -480,6 +534,20 @@ mod tests {
         }
     }
 
+    fn update_valid_facts(
+        manager: &mut RemoteResumeRevalidationV1,
+        token: RemoteResumeSlotTokenV1,
+    ) {
+        manager
+            .update_facts_v1(
+                token,
+                RemoteResumeValidationFactV1::Valid(7),
+                RemoteResumeValidationFactV1::Valid(11),
+                RemoteResumeReservationFactV1::Valid,
+            )
+            .unwrap();
+    }
+
     #[test]
     fn register_derives_retry_and_is_current_while_visible() {
         let mut manager = RemoteResumeRevalidationV1::new_v1();
@@ -491,12 +559,92 @@ mod tests {
     }
 
     #[test]
+    fn managers_have_distinct_identity_and_reject_old_capabilities() {
+        let mut old_manager = RemoteResumeRevalidationV1::new_v1();
+        let old_token = old_manager
+            .register_v1(RemoteResumeWorkKindV1::Completion)
+            .unwrap();
+        update_valid_facts(&mut old_manager, old_token);
+        old_manager.hidden_v1().unwrap();
+        let old_snapshot = old_manager.snapshot_v1(old_token).unwrap();
+
+        let mut new_manager = RemoteResumeRevalidationV1::new_v1();
+        let new_token = new_manager
+            .register_v1(RemoteResumeWorkKindV1::Completion)
+            .unwrap();
+        update_valid_facts(&mut new_manager, new_token);
+        assert_eq!(
+            new_manager.update_facts_v1(
+                old_token,
+                RemoteResumeValidationFactV1::Valid(7),
+                RemoteResumeValidationFactV1::Valid(11),
+                RemoteResumeReservationFactV1::Valid,
+            ),
+            Err(RemoteResumeRevalidationErrorV1::InvalidToken)
+        );
+
+        new_manager.hidden_v1().unwrap();
+        let new_snapshot = new_manager.snapshot_v1(new_token).unwrap();
+        let new_outcomes = new_manager.resume_v1([old_snapshot]).unwrap();
+        assert_eq!(new_outcomes[0].1, RemoteResumeRevalidationResultV1::Dropped);
+        assert!(!new_manager.callback_is_current_v1(old_token));
+        assert!(!new_manager.callback_is_current_v1(new_token));
+
+        let old_outcomes = old_manager.resume_v1([new_snapshot]).unwrap();
+        assert_eq!(old_outcomes[0].1, RemoteResumeRevalidationResultV1::Dropped);
+        assert!(!old_manager.callback_is_current_v1(new_token));
+    }
+
+    #[test]
+    fn phase_and_token_errors_are_explicit() {
+        let mut manager = RemoteResumeRevalidationV1::new_v1();
+        let token = manager
+            .register_v1(RemoteResumeWorkKindV1::Completion)
+            .unwrap();
+
+        assert_eq!(
+            manager.resume_v1([]),
+            Err(RemoteResumeRevalidationErrorV1::NotHidden)
+        );
+        assert_eq!(
+            manager.snapshot_v1(token),
+            Err(RemoteResumeRevalidationErrorV1::NotHidden)
+        );
+
+        manager.hidden_v1().unwrap();
+        assert_eq!(
+            manager.register_v1(RemoteResumeWorkKindV1::Completion),
+            Err(RemoteResumeRevalidationErrorV1::NotVisible)
+        );
+
+        let forged_token = RemoteResumeSlotTokenV1 {
+            slot: 999,
+            token: 1,
+            execution_generation: manager.generation(),
+            issuer: manager.issuer,
+        };
+        assert_eq!(
+            manager.update_facts_v1(
+                forged_token,
+                RemoteResumeValidationFactV1::Valid(7),
+                RemoteResumeValidationFactV1::Valid(11),
+                RemoteResumeReservationFactV1::Valid,
+            ),
+            Err(RemoteResumeRevalidationErrorV1::InvalidToken)
+        );
+        assert_eq!(
+            manager.snapshot_v1(forged_token),
+            Err(RemoteResumeRevalidationErrorV1::InvalidToken)
+        );
+    }
+
+    #[test]
     fn resume_requires_hidden_and_returns_fresh_opaque_token() {
         let mut manager = RemoteResumeRevalidationV1::new_v1();
         let token = manager
             .register_v1(RemoteResumeWorkKindV1::Completion)
             .unwrap();
-        manager.update_facts_v1(token, valid_facts(false)).unwrap();
+        update_valid_facts(&mut manager, token);
 
         assert_eq!(
             manager.snapshot_v1(token),
@@ -561,9 +709,14 @@ mod tests {
         let token = manager
             .register_v1(RemoteResumeWorkKindV1::Completion)
             .unwrap();
-        let mut facts = valid_facts(false);
-        facts.body_reader_valid = false;
-        manager.update_facts_v1(token, facts).unwrap();
+        manager
+            .update_facts_v1(
+                token,
+                RemoteResumeValidationFactV1::Valid(7),
+                RemoteResumeValidationFactV1::Invalid(11),
+                RemoteResumeReservationFactV1::Valid,
+            )
+            .unwrap();
         manager.hidden_v1().unwrap();
         let snapshot = manager.snapshot_v1(token).unwrap();
         assert_eq!(
@@ -575,12 +728,64 @@ mod tests {
     }
 
     #[test]
+    fn invalid_reservation_is_dropped_before_rebind() {
+        let mut manager = RemoteResumeRevalidationV1::new_v1();
+        let token = manager
+            .register_v1(RemoteResumeWorkKindV1::Completion)
+            .unwrap();
+        manager
+            .update_facts_v1(
+                token,
+                RemoteResumeValidationFactV1::Valid(7),
+                RemoteResumeValidationFactV1::Valid(11),
+                RemoteResumeReservationFactV1::Invalid,
+            )
+            .unwrap();
+        manager.hidden_v1().unwrap();
+        let snapshot = manager.snapshot_v1(token).unwrap();
+
+        let outcomes = manager.resume_v1([snapshot]).unwrap();
+        assert_eq!(outcomes[0].1, RemoteResumeRevalidationResultV1::Dropped);
+        assert!(manager.slots.is_empty());
+        assert!(manager.queue.is_empty());
+    }
+
+    #[test]
+    fn mutation_ownership_and_kind_mismatch_are_dropped() {
+        let mut manager = RemoteResumeRevalidationV1::new_v1();
+        let token = manager
+            .register_v1(RemoteResumeWorkKindV1::Mutation)
+            .unwrap();
+        update_valid_facts(&mut manager, token);
+        manager.hidden_v1().unwrap();
+        let mut wrong_owner = manager.snapshot_v1(token).unwrap();
+        wrong_owner.facts.mutation_owned = false;
+
+        let outcomes = manager.resume_v1([wrong_owner]).unwrap();
+        assert_eq!(outcomes[0].1, RemoteResumeRevalidationResultV1::Dropped);
+        assert!(manager.slots.is_empty());
+
+        let mut manager = RemoteResumeRevalidationV1::new_v1();
+        let token = manager
+            .register_v1(RemoteResumeWorkKindV1::Mutation)
+            .unwrap();
+        update_valid_facts(&mut manager, token);
+        manager.hidden_v1().unwrap();
+        let mut wrong_kind = manager.snapshot_v1(token).unwrap();
+        wrong_kind.kind = RemoteResumeWorkKindV1::Completion;
+
+        let outcomes = manager.resume_v1([wrong_kind]).unwrap();
+        assert_eq!(outcomes[0].1, RemoteResumeRevalidationResultV1::Dropped);
+        assert!(manager.slots.is_empty());
+    }
+
+    #[test]
     fn duplicate_snapshot_is_deduplicated() {
         let mut manager = RemoteResumeRevalidationV1::new_v1();
         let token = manager
             .register_v1(RemoteResumeWorkKindV1::Completion)
             .unwrap();
-        manager.update_facts_v1(token, valid_facts(false)).unwrap();
+        update_valid_facts(&mut manager, token);
         manager.hidden_v1().unwrap();
         let snapshot = manager.snapshot_v1(token).unwrap();
 
@@ -603,8 +808,8 @@ mod tests {
         let second = manager
             .register_v1(RemoteResumeWorkKindV1::Decoder)
             .unwrap();
-        manager.update_facts_v1(first, valid_facts(false)).unwrap();
-        manager.update_facts_v1(second, valid_facts(false)).unwrap();
+        update_valid_facts(&mut manager, first);
+        update_valid_facts(&mut manager, second);
         manager.hidden_v1().unwrap();
         let snapshot = manager.snapshot_v1(first).unwrap();
 
@@ -625,7 +830,7 @@ mod tests {
         let token = manager
             .register_v1(RemoteResumeWorkKindV1::Mutation)
             .unwrap();
-        manager.update_facts_v1(token, valid_facts(true)).unwrap();
+        update_valid_facts(&mut manager, token);
         manager.hidden_v1().unwrap();
         let snapshot = manager.snapshot_v1(token).unwrap();
 
@@ -636,6 +841,30 @@ mod tests {
         assert!(slot.facts.mutation_owned);
         assert!(slot.facts.reservation_valid);
         assert_eq!(slot.kind, RemoteResumeWorkKindV1::Mutation);
+    }
+
+    #[test]
+    fn callbacks_are_stale_after_hide_resume_and_terminate() {
+        let mut manager = RemoteResumeRevalidationV1::new_v1();
+        let token = manager
+            .register_v1(RemoteResumeWorkKindV1::Completion)
+            .unwrap();
+        update_valid_facts(&mut manager, token);
+        assert!(manager.callback_is_current_v1(token));
+
+        manager.hidden_v1().unwrap();
+        assert!(!manager.callback_is_current_v1(token));
+
+        let snapshot = manager.snapshot_v1(token).unwrap();
+        let outcomes = manager.resume_v1([snapshot]).unwrap();
+        let fresh = rebound_token(&outcomes[0]);
+        assert!(!manager.callback_is_current_v1(token));
+        assert!(manager.callback_is_current_v1(fresh));
+
+        manager.hidden_v1().unwrap();
+        assert!(!manager.callback_is_current_v1(fresh));
+        manager.terminate_v1().unwrap();
+        assert!(!manager.callback_is_current_v1(fresh));
     }
 
     #[test]
@@ -698,7 +927,7 @@ mod tests {
         let token = manager
             .register_v1(RemoteResumeWorkKindV1::Completion)
             .unwrap();
-        manager.update_facts_v1(token, valid_facts(false)).unwrap();
+        update_valid_facts(&mut manager, token);
         manager.hidden_v1().unwrap();
         let snapshot = manager.snapshot_v1(token).unwrap();
         let snapshots = vec![snapshot; MAX_REMOTE_RESUME_SNAPSHOTS_V1 + 1];
@@ -729,6 +958,26 @@ mod tests {
         assert_eq!(frame.remote_started, 0);
         assert_eq!(frame.retry_started, 0);
         assert_eq!(manager.queue.len(), 8);
+    }
+
+    #[test]
+    fn pump_preserves_viewer_turn_when_budget_is_one() {
+        let mut manager = RemoteResumeRevalidationV1::new_v1();
+        manager
+            .register_v1(RemoteResumeWorkKindV1::Completion)
+            .unwrap();
+
+        let frame = manager.pump_frame_v1(1, true);
+        assert_eq!(frame.remote_started, 0);
+        assert_eq!(frame.retry_started, 0);
+        assert_eq!(frame.viewer_turns, 1);
+        assert_eq!(manager.queue.len(), 1);
+
+        let frame = manager.pump_frame_v1(1, false);
+        assert_eq!(frame.remote_started, 1);
+        assert_eq!(frame.retry_started, 0);
+        assert_eq!(frame.viewer_turns, 0);
+        assert!(manager.queue.is_empty());
     }
 
     #[test]
