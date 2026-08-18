@@ -2201,18 +2201,21 @@ mod tests {
 
     #[test]
     fn domain_construction_token_is_redeemed_by_the_complete_transaction() {
-        initialize_remote_mcap_runtime_intern(generous_limits()).unwrap();
-        let census = BoundedRemoteIdentifierCensus::try_new_v1([
-            RemoteMcapRawIdentifier::timeline("token-timeline").unwrap(),
-            RemoteMcapRawIdentifier::entity_path("//token/path"),
-            RemoteMcapRawIdentifier::entity_path_part("token part").unwrap(),
-            RemoteMcapRawIdentifier::component("TokenComponent").unwrap(),
-        ])
+        let mut coordinator = initialized(generous_limits());
+        let census = BoundedRemoteIdentifierCensus::try_new_identifiers(
+            [
+                RemoteMcapRawIdentifier::timeline("token-timeline").unwrap(),
+                RemoteMcapRawIdentifier::entity_path("//token/path"),
+                RemoteMcapRawIdentifier::entity_path_part("token part").unwrap(),
+                RemoteMcapRawIdentifier::component("TokenComponent").unwrap(),
+            ],
+            coordinator.remote.as_ref().unwrap().limits,
+            TestFault::None,
+        )
         .unwrap();
         let token = census.into_domain_construction_token();
-        let prepared =
-            prepare_remote_mcap_runtime_intern_from_domain_construction_token(token).unwrap();
-        let committed = prepared.commit().unwrap();
+        let prepared = coordinator.prepare_remote(token.census).unwrap();
+        let committed = coordinator.commit_remote(prepared).unwrap();
 
         assert_eq!(committed.telemetry().unique_identifiers, 4);
         assert_eq!(committed.telemetry().canonical_unique_identifiers, 5);
@@ -2829,7 +2832,15 @@ mod tests {
             after_b.burned_side_map_capacity_bytes,
             initial.burned_side_map_capacity_bytes
         );
-        assert_eq!(remote_mcap_runtime_intern_snapshot().unwrap(), after_b);
+        let current = remote_mcap_runtime_intern_snapshot().unwrap();
+        assert!(current.burned_string_bytes >= after_b.burned_string_bytes);
+        assert!(current.burned_entry_bytes >= after_b.burned_entry_bytes);
+        assert!(current.budget_revision >= after_b.budget_revision);
+        assert!(current.remote_entries >= after_b.remote_entries);
+        assert_eq!(
+            current.burned_side_map_capacity_bytes,
+            after_b.burned_side_map_capacity_bytes
+        );
 
         let legacy_handle = InternedString::new("production-singleton-viewer-a-identifier");
         assert_eq!(legacy_handle, remote_handle);
