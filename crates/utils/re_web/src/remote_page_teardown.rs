@@ -1,8 +1,9 @@
 //! Production-disarmed remote-MCAP pagehide/freeze teardown.
 //!
 //! This module owns only the remote work admitted by the page-control seam. It models the
-//! synchronous teardown of remote tokens, Fetch, CPU, mutation, facade, Store capability, secret,
-//! and reservation owners when the browser reports `pagehide` or Chrome `freeze`.
+//! synchronous teardown of remote tokens, Fetch, CPU, mutation, facade, query lease, Store
+//! capability, secret, and reservation owners when the browser reports `pagehide` or Chrome
+//! `freeze`.
 //!
 //! Viewer, canvas, non-MCAP Stores, receivers, observers, and handlers are deliberately outside
 //! this type. A terminated page never revives an old remote token; the host can explicitly reopen
@@ -52,7 +53,10 @@ pub enum RemotePageOwnerKindV1 {
     Fetch,
     Cpu,
     Mutation,
+    /// The facade capability only. Query leases have a distinct owner category.
     Facade,
+    /// A query lease admitted for exactly-once teardown and callback release.
+    QueryLease,
     StoreCapability,
     Secret,
     Reservation,
@@ -432,12 +436,13 @@ impl RemotePageTeardownV1 {
 mod tests {
     use super::*;
 
-    const ALL_OWNER_KINDS: [RemotePageOwnerKindV1; 8] = [
+    const ALL_OWNER_KINDS: [RemotePageOwnerKindV1; 9] = [
         RemotePageOwnerKindV1::RemoteToken,
         RemotePageOwnerKindV1::Fetch,
         RemotePageOwnerKindV1::Cpu,
         RemotePageOwnerKindV1::Mutation,
         RemotePageOwnerKindV1::Facade,
+        RemotePageOwnerKindV1::QueryLease,
         RemotePageOwnerKindV1::StoreCapability,
         RemotePageOwnerKindV1::Secret,
         RemotePageOwnerKindV1::Reservation,
@@ -463,7 +468,7 @@ mod tests {
         let outcome = manager.apply_signal_v1(signal).unwrap();
         assert!(matches!(
             outcome,
-            RemotePageSignalOutcomeV1::Terminated { torn_down: 8, .. }
+            RemotePageSignalOutcomeV1::Terminated { torn_down: 9, .. }
         ));
         assert!(manager.is_terminated_v1());
         assert_eq!(manager.owner_count_v1(), 0);
@@ -533,6 +538,96 @@ mod tests {
             manager.apply_signal_v1(resume).unwrap(),
             RemotePageSignalOutcomeV1::RevivalRejected
         );
+    }
+
+    #[test]
+    fn pagehide_and_freeze_terminate_query_lease_and_reject_stale_callback() {
+        for signal_kind in [
+            RemotePageSignalKindV1::PageHide,
+            RemotePageSignalKindV1::Freeze,
+        ] {
+            let mut manager = RemotePageTeardownV1::new_v1();
+            let query_lease = manager
+                .register_owner_v1(RemotePageOwnerKindV1::QueryLease)
+                .unwrap();
+            let stale_callback = manager.callback_v1(query_lease).unwrap();
+            let signal = manager.page_signal_v1(signal_kind).unwrap();
+
+            let outcome = manager.apply_signal_v1(signal).unwrap();
+            assert!(matches!(
+                outcome,
+                RemotePageSignalOutcomeV1::Terminated { torn_down: 1, .. }
+            ));
+            assert!(manager.is_terminated_v1());
+            assert_eq!(manager.owner_count_v1(), 0);
+            assert_eq!(manager.teardown_count_v1(), 1);
+            assert!(!manager.owner_is_current_v1(query_lease));
+            assert_eq!(
+                manager.complete_callback_v1(stale_callback),
+                RemotePageCallbackOutcomeV1::RejectedTerminated
+            );
+
+            assert_eq!(
+                manager.apply_signal_v1(signal).unwrap(),
+                RemotePageSignalOutcomeV1::Stale
+            );
+            assert_eq!(manager.teardown_count_v1(), 1);
+        }
+    }
+
+    #[test]
+    fn query_leases_and_facade_release_and_teardown_are_counted_separately() {
+        let mut manager = RemotePageTeardownV1::new_v1();
+        let query_lease_a = manager
+            .register_owner_v1(RemotePageOwnerKindV1::QueryLease)
+            .unwrap();
+        let query_lease_b = manager
+            .register_owner_v1(RemotePageOwnerKindV1::QueryLease)
+            .unwrap();
+        let query_lease_c = manager
+            .register_owner_v1(RemotePageOwnerKindV1::QueryLease)
+            .unwrap();
+        let facade_a = manager
+            .register_owner_v1(RemotePageOwnerKindV1::Facade)
+            .unwrap();
+        let facade_b = manager
+            .register_owner_v1(RemotePageOwnerKindV1::Facade)
+            .unwrap();
+        assert_eq!(manager.owner_count_v1(), 5);
+
+        let query_lease_a_callback = manager.callback_v1(query_lease_a).unwrap();
+        assert_eq!(
+            manager.complete_callback_v1(query_lease_a_callback),
+            RemotePageCallbackOutcomeV1::Released(RemotePageOwnerKindV1::QueryLease)
+        );
+        assert_eq!(manager.owner_count_v1(), 4);
+
+        let facade_a_callback = manager.callback_v1(facade_a).unwrap();
+        assert_eq!(
+            manager.complete_callback_v1(facade_a_callback),
+            RemotePageCallbackOutcomeV1::Released(RemotePageOwnerKindV1::Facade)
+        );
+        assert_eq!(manager.owner_count_v1(), 3);
+        assert_eq!(
+            manager.complete_callback_v1(query_lease_a_callback),
+            RemotePageCallbackOutcomeV1::RejectedStale
+        );
+        assert_eq!(
+            manager.complete_callback_v1(facade_a_callback),
+            RemotePageCallbackOutcomeV1::RejectedStale
+        );
+
+        let signal = manager
+            .page_signal_v1(RemotePageSignalKindV1::Freeze)
+            .unwrap();
+        assert!(matches!(
+            manager.apply_signal_v1(signal).unwrap(),
+            RemotePageSignalOutcomeV1::Terminated { torn_down: 3, .. }
+        ));
+        assert_eq!(manager.owner_count_v1(), 0);
+        assert!(!manager.owner_is_current_v1(query_lease_b));
+        assert!(!manager.owner_is_current_v1(query_lease_c));
+        assert!(!manager.owner_is_current_v1(facade_b));
     }
 
     #[test]
