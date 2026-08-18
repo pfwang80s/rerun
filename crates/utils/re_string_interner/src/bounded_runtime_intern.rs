@@ -2236,6 +2236,78 @@ mod tests {
     }
 
     #[test]
+    fn production_domain_construction_token_reaches_the_public_global_commit() {
+        let initial = initialize_remote_mcap_runtime_intern(generous_limits()).unwrap();
+        let before = remote_mcap_runtime_intern_snapshot().unwrap();
+        let raw_path = "/mcap-081/production/token/handoff";
+        let census = BoundedRemoteIdentifierCensus::try_new_identifiers(
+            [RemoteMcapRawIdentifier::entity_path(raw_path)],
+            generous_limits(),
+            TestFault::None,
+        )
+        .unwrap()
+        .into_domain_construction_token();
+
+        let prepared =
+            prepare_remote_mcap_runtime_intern_from_domain_construction_token(census).unwrap();
+        let telemetry = prepared.telemetry();
+        assert_eq!(telemetry.candidate_identifiers, 1);
+        assert_eq!(telemetry.candidate_raw_bytes, raw_path.len() as u64);
+        assert_eq!(telemetry.unique_identifiers, 1);
+        assert_eq!(telemetry.canonical_unique_identifiers, 4);
+        assert_eq!(
+            telemetry.canonical_bytes,
+            ["mcap-081", "production", "token", "handoff"]
+                .iter()
+                .map(|part| part.len() as u64)
+                .sum::<u64>()
+        );
+        assert_eq!(telemetry.existing_legacy, 0);
+        assert_eq!(telemetry.existing_remote, 0);
+        assert_eq!(telemetry.missing, 4);
+
+        let committed = prepared.commit().unwrap();
+        let after_commit = committed.module_snapshot();
+        match committed.domain_handle(0).unwrap() {
+            RemoteMcapDomainIdentifierHandle::EntityPath(parts) => {
+                assert_eq!(parts.len(), 4);
+                assert_eq!(parts[0].as_str(), "mcap-081");
+                assert_eq!(parts[1].as_str(), "production");
+                assert_eq!(parts[2].as_str(), "token");
+                assert_eq!(parts[3].as_str(), "handoff");
+            }
+            handle => panic!("unexpected domain handle: {handle:?}"),
+        }
+
+        let after = remote_mcap_runtime_intern_snapshot().unwrap();
+        fn assert_snapshot_is_monotonic(
+            after: RemoteMcapRuntimeInternSnapshot,
+            before: RemoteMcapRuntimeInternSnapshot,
+        ) {
+            assert_eq!(
+                after.capacity_accounting_version,
+                before.capacity_accounting_version
+            );
+            assert!(after.coordination_revision >= before.coordination_revision);
+            assert!(after.budget_revision >= before.budget_revision);
+            assert!(after.legacy_entries >= before.legacy_entries);
+            assert!(after.legacy_capacity >= before.legacy_capacity);
+            assert!(after.burned_string_bytes >= before.burned_string_bytes);
+            assert!(after.burned_entry_bytes >= before.burned_entry_bytes);
+            assert!(after.remote_entries >= before.remote_entries);
+            assert!(after.remote_capacity >= before.remote_capacity);
+            assert_eq!(
+                after.burned_side_map_capacity_bytes,
+                before.burned_side_map_capacity_bytes
+            );
+        }
+
+        assert_snapshot_is_monotonic(before, initial);
+        assert_snapshot_is_monotonic(after_commit, before);
+        assert_snapshot_is_monotonic(after, after_commit);
+    }
+
+    #[test]
     fn mixed_duplicate_legacy_remote_and_missing_identifiers_are_exact() {
         let mut coordinator = initialized(generous_limits());
         let legacy = coordinator.intern_legacy("legacy-existing");
