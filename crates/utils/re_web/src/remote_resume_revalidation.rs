@@ -266,7 +266,7 @@ impl RemoteResumeRevalidationV1 {
         if self.terminated {
             return Err(RemoteResumeRevalidationErrorV1::Terminated);
         }
-        if self.phase == RemoteResumePhaseV1::Revalidating {
+        if self.phase != RemoteResumePhaseV1::Visible {
             return Err(RemoteResumeRevalidationErrorV1::InvalidToken);
         }
         let kind = self
@@ -636,6 +636,38 @@ mod tests {
             manager.snapshot_v1(forged_token),
             Err(RemoteResumeRevalidationErrorV1::InvalidToken)
         );
+    }
+
+    #[test]
+    fn hidden_facts_cannot_be_updated_after_hide() {
+        let mut manager = RemoteResumeRevalidationV1::new_v1();
+        let token = manager
+            .register_v1(RemoteResumeWorkKindV1::Completion)
+            .unwrap();
+        update_valid_facts(&mut manager, token);
+
+        manager.hidden_v1().unwrap();
+        assert!(!manager.callback_is_current_v1(token));
+        assert_eq!(
+            manager.update_facts_v1(
+                token,
+                RemoteResumeValidationFactV1::Valid(99),
+                RemoteResumeValidationFactV1::Valid(100),
+                RemoteResumeReservationFactV1::Valid,
+            ),
+            Err(RemoteResumeRevalidationErrorV1::InvalidToken)
+        );
+
+        let snapshot = manager.snapshot_v1(token).unwrap();
+        assert_eq!(snapshot.facts, valid_facts(false));
+
+        let outcomes = manager.resume_v1([snapshot]).unwrap();
+        assert_eq!(outcomes.len(), 1);
+        let fresh = rebound_token(&outcomes[0]);
+        assert!(manager.callback_is_current_v1(fresh));
+        let slot = &manager.slots[&outcomes[0].0];
+        assert_eq!(slot.facts, valid_facts(false));
+        assert_eq!(slot.generation, fresh.execution_generation);
     }
 
     #[test]
