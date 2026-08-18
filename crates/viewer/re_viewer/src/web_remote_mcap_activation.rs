@@ -244,6 +244,20 @@ impl OpenedRemoteMcap {
     pub(crate) const fn use_state_v1(&self) -> RemoteRecordingUseStateV1 {
         self.use_state
     }
+
+    fn validate_sealed_identity_v1(&self) -> Result<(), RemoteMcapActivationErrorV1> {
+        let (session_identity, source_generation) = self.manifest.identity_v1();
+        if session_identity == 0
+            || source_generation == 0
+            || self.controller.identity_v1() == 0
+            || self.controller.identity_v1() != source_generation
+            || self.navigation.timeline != self.store_projection.canonical_timeline
+        {
+            return Err(RemoteMcapActivationErrorV1::IdentityMismatch);
+        }
+
+        Ok(())
+    }
 }
 
 impl fmt::Debug for OpenedRemoteMcap {
@@ -340,6 +354,7 @@ pub(crate) enum RemoteMcapActivationErrorV1 {
     SlotOccupied,
     NotOpening,
     StaleActivation,
+    IdentityMismatch,
     StoreCreationFailed,
     OpeningTokenExhausted,
     ReservationLimitExceeded,
@@ -474,10 +489,17 @@ impl RemoteMcapSessionV1 {
             return Err(RemoteMcapActivationErrorV1::StaleActivation);
         }
 
+        // Identity invariants that can be checked without allocating or publishing a Store must
+        // fail before the activation closure runs.
+        opened.validate_sealed_identity_v1()?;
+
         // The public Store is the first allocation/effect of activation and is created only after
         // the token and phase checks above.
         let store = install_store(opened.store_projection_v1())
             .map_err(|_error| RemoteMcapActivationErrorV1::StoreCreationFailed)?;
+        if store.store_id_v1() != &opened.store_projection_v1().store_id {
+            return Err(RemoteMcapActivationErrorV1::IdentityMismatch);
+        }
 
         let OpenedRemoteMcap {
             manifest,
@@ -564,7 +586,7 @@ mod tests {
         let mut session = RemoteMcapSessionV1::new_v1();
         let token = session.begin_opening_v1(source(1)).unwrap();
         let manifest_owner = manifest(0x1234_5678_9abc_def0, 4);
-        let controller = RemoteMcapControllerV1::new_v1(99);
+        let controller = RemoteMcapControllerV1::new_v1(4);
         let ledger = ledger();
         let reservation = ledger.acquire_v1(40).unwrap();
         let opened = OpenedRemoteMcap::new_v1(
@@ -605,7 +627,7 @@ mod tests {
             store_projection(),
             navigation(),
             initial_gate(),
-            RemoteMcapControllerV1::new_v1(1),
+            RemoteMcapControllerV1::new_v1(2),
             RemoteRecordingUseStateV1::CatalogOnly,
             reservation,
         );
@@ -620,6 +642,215 @@ mod tests {
             active.use_state_v1(),
             RemoteRecordingUseStateV1::CatalogOnly
         );
+    }
+
+    #[test]
+    fn zero_manifest_identity_is_rejected_before_store_creation() {
+        let mut session = RemoteMcapSessionV1::new_v1();
+        let token = session.begin_opening_v1(source(1)).unwrap();
+        let ledger = ledger();
+        let reservation = ledger.acquire_v1(24).unwrap();
+        let opened = OpenedRemoteMcap::new_v1(
+            manifest(0, 2),
+            store_projection(),
+            navigation(),
+            initial_gate(),
+            RemoteMcapControllerV1::new_v1(2),
+            RemoteRecordingUseStateV1::Foreground,
+            reservation,
+        );
+
+        let mut store_installations = 0_u64;
+        let result = session.activate_v1(token, opened, |_projection| {
+            store_installations += 1;
+            Ok(PublicRemoteStoreV1::new_v1(
+                StoreId::recording("activation-test", "zero-manifest"),
+                10,
+            ))
+        });
+
+        assert_eq!(
+            result.err(),
+            Some(RemoteMcapActivationErrorV1::IdentityMismatch)
+        );
+        assert_eq!(store_installations, 0);
+        assert_eq!(session.slot_phase_v1(), RemoteMcapSlotPhaseV1::Opening);
+        assert!(session.active_bundle_v1().is_none());
+        assert_eq!(ledger.active_bytes_v1(), 0);
+    }
+
+    #[test]
+    fn zero_manifest_source_generation_is_rejected_before_store_creation() {
+        let mut session = RemoteMcapSessionV1::new_v1();
+        let token = session.begin_opening_v1(source(1)).unwrap();
+        let ledger = ledger();
+        let reservation = ledger.acquire_v1(24).unwrap();
+        let opened = OpenedRemoteMcap::new_v1(
+            manifest(10, 0),
+            store_projection(),
+            navigation(),
+            initial_gate(),
+            RemoteMcapControllerV1::new_v1(1),
+            RemoteRecordingUseStateV1::Foreground,
+            reservation,
+        );
+
+        let mut store_installations = 0_u64;
+        let result = session.activate_v1(token, opened, |_projection| {
+            store_installations += 1;
+            Ok(PublicRemoteStoreV1::new_v1(
+                StoreId::recording("activation-test", "zero-source-generation"),
+                15,
+            ))
+        });
+
+        assert_eq!(
+            result.err(),
+            Some(RemoteMcapActivationErrorV1::IdentityMismatch)
+        );
+        assert_eq!(store_installations, 0);
+        assert_eq!(session.slot_phase_v1(), RemoteMcapSlotPhaseV1::Opening);
+        assert!(session.active_bundle_v1().is_none());
+        assert_eq!(ledger.active_bytes_v1(), 0);
+    }
+
+    #[test]
+    fn zero_controller_identity_is_rejected_before_store_creation() {
+        let mut session = RemoteMcapSessionV1::new_v1();
+        let token = session.begin_opening_v1(source(1)).unwrap();
+        let ledger = ledger();
+        let reservation = ledger.acquire_v1(24).unwrap();
+        let opened = OpenedRemoteMcap::new_v1(
+            manifest(5, 3),
+            store_projection(),
+            navigation(),
+            initial_gate(),
+            RemoteMcapControllerV1::new_v1(0),
+            RemoteRecordingUseStateV1::Foreground,
+            reservation,
+        );
+
+        let mut store_installations = 0_u64;
+        let result = session.activate_v1(token, opened, |_projection| {
+            store_installations += 1;
+            Ok(PublicRemoteStoreV1::new_v1(
+                StoreId::recording("activation-test", "zero-controller"),
+                11,
+            ))
+        });
+
+        assert_eq!(
+            result.err(),
+            Some(RemoteMcapActivationErrorV1::IdentityMismatch)
+        );
+        assert_eq!(store_installations, 0);
+        assert_eq!(ledger.active_bytes_v1(), 0);
+    }
+
+    #[test]
+    fn controller_source_generation_mismatch_is_rejected_before_store_creation() {
+        let mut session = RemoteMcapSessionV1::new_v1();
+        let token = session.begin_opening_v1(source(1)).unwrap();
+        let ledger = ledger();
+        let reservation = ledger.acquire_v1(24).unwrap();
+        let opened = OpenedRemoteMcap::new_v1(
+            manifest(6, 4),
+            store_projection(),
+            navigation(),
+            initial_gate(),
+            RemoteMcapControllerV1::new_v1(5),
+            RemoteRecordingUseStateV1::Foreground,
+            reservation,
+        );
+
+        let mut store_installations = 0_u64;
+        let result = session.activate_v1(token, opened, |_projection| {
+            store_installations += 1;
+            Ok(PublicRemoteStoreV1::new_v1(
+                StoreId::recording("activation-test", "controller-mismatch"),
+                12,
+            ))
+        });
+
+        assert_eq!(
+            result.err(),
+            Some(RemoteMcapActivationErrorV1::IdentityMismatch)
+        );
+        assert_eq!(store_installations, 0);
+        assert_eq!(ledger.active_bytes_v1(), 0);
+    }
+
+    #[test]
+    fn navigation_timeline_mismatch_is_rejected_before_store_creation() {
+        let mut session = RemoteMcapSessionV1::new_v1();
+        let token = session.begin_opening_v1(source(1)).unwrap();
+        let ledger = ledger();
+        let reservation = ledger.acquire_v1(24).unwrap();
+        let mismatched_navigation = RemoteCanonicalNavigationV1 {
+            timeline: TimelineName::log_tick(),
+            committed_cursor: None,
+            play_state: RemotePlayStateV1::Paused,
+        };
+        let opened = OpenedRemoteMcap::new_v1(
+            manifest(7, 5),
+            store_projection(),
+            mismatched_navigation,
+            initial_gate(),
+            RemoteMcapControllerV1::new_v1(5),
+            RemoteRecordingUseStateV1::Foreground,
+            reservation,
+        );
+
+        let mut store_installations = 0_u64;
+        let result = session.activate_v1(token, opened, |_projection| {
+            store_installations += 1;
+            Ok(PublicRemoteStoreV1::new_v1(
+                StoreId::recording("activation-test", "timeline-mismatch"),
+                13,
+            ))
+        });
+
+        assert_eq!(
+            result.err(),
+            Some(RemoteMcapActivationErrorV1::IdentityMismatch)
+        );
+        assert_eq!(store_installations, 0);
+        assert_eq!(ledger.active_bytes_v1(), 0);
+    }
+
+    #[test]
+    fn store_identity_mismatch_does_not_install_an_active_bundle() {
+        let mut session = RemoteMcapSessionV1::new_v1();
+        let token = session.begin_opening_v1(source(1)).unwrap();
+        let ledger = ledger();
+        let reservation = ledger.acquire_v1(24).unwrap();
+        let opened = OpenedRemoteMcap::new_v1(
+            manifest(8, 6),
+            store_projection(),
+            navigation(),
+            initial_gate(),
+            RemoteMcapControllerV1::new_v1(6),
+            RemoteRecordingUseStateV1::Foreground,
+            reservation,
+        );
+
+        let mut store_installations = 0_u64;
+        let result = session.activate_v1(token, opened, |_projection| {
+            store_installations += 1;
+            Ok(PublicRemoteStoreV1::new_v1(
+                StoreId::recording("activation-test", "different-recording"),
+                14,
+            ))
+        });
+
+        assert_eq!(
+            result.err(),
+            Some(RemoteMcapActivationErrorV1::IdentityMismatch)
+        );
+        assert_eq!(store_installations, 1);
+        assert_eq!(session.slot_phase_v1(), RemoteMcapSlotPhaseV1::Opening);
+        assert!(session.active_bundle_v1().is_none());
+        assert_eq!(ledger.active_bytes_v1(), 0);
     }
 
     #[test]
@@ -672,7 +903,7 @@ mod tests {
             store_projection(),
             navigation(),
             initial_gate(),
-            RemoteMcapControllerV1::new_v1(2),
+            RemoteMcapControllerV1::new_v1(4),
             RemoteRecordingUseStateV1::Inactive,
             reservation,
         );
