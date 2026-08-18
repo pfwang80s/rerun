@@ -13,6 +13,54 @@ pub const PHASE_A_AUDIT_SCHEMA_V1: &str = "rerun-mcap-phase-a-audit-v1";
 const PHASE_A_PROFILE_STATUS_V1: &str = "unfrozen";
 const PHASE_A_BODY_TRANSFER_STRATEGY_V1: &str = "zero-copy-v1";
 
+const RE_MCAP_REMOTE_MODULES: &[&str] = &[
+    "web_body_handoff",
+    "remote_time",
+    "remote_fixed_layout",
+    "remote_summary",
+    "remote_decompression",
+    "remote_chunk_scan",
+    "remote_physical_resolution",
+    "remote_protobuf_projection_boundary",
+    "remote_protobuf_descriptor",
+    "remote_decoder_assignment",
+    "remote_deterministic_insertion",
+    "remote_channel_group",
+    "remote_chunk_validation_count",
+    "remote_manifest",
+    "remote_loaded_coverage",
+    "remote_partition_residency",
+    "remote_chunk_dispatch",
+    "remote_typed_output",
+    "remote_runtime_intern",
+    "remote_ros2_reflection",
+];
+
+const RE_WEB_REMOTE_MODULES: &[&str] = &[
+    "chrome_byob",
+    "chrome_range",
+    "compatibility_open",
+    "external_string_ingress",
+    "format_sniffer",
+    "open_lifecycle_delivery",
+    "open_lifecycle_registry",
+    "open_lifecycle_sequencer",
+    "open_source_client_registry",
+    "open_source_terminal",
+    "range_retry",
+    "remote_limits",
+    "remote_mutation_suspension",
+    "remote_page_teardown",
+    "remote_resume_revalidation",
+    "remote_validator",
+    "secret_url",
+    "source_reuse",
+    "store_publication",
+    "strict_open_batch",
+    "strict_open_handoff",
+    "strict_open_wire",
+];
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PhaseAAuditReportV1 {
@@ -230,16 +278,7 @@ impl WorkspaceAudit {
         let Ok(text) = self.text(relative) else {
             return true;
         };
-        let needle = format!("impl {type_name}");
-        let Some(start) = text.find(&needle) else {
-            return false;
-        };
-        let after_impl = &text[start + needle.len()..];
-        let next_impl = after_impl.find("\nimpl ").unwrap_or(after_impl.len());
-        let block = &after_impl[..next_impl];
-        block
-            .lines()
-            .any(|line| line.trim_start().starts_with("pub fn"))
+        impl_block_has_public_fn_static(&text, type_name)
     }
 
     fn remote_modules_are_target_gated(&self) -> bool {
@@ -248,16 +287,8 @@ impl WorkspaceAudit {
         let (Ok(re_web_lib), Ok(re_mcap_lib)) = (re_web_lib, re_mcap_lib) else {
             return false;
         };
-        module_has_preceding_cfg(
-            &re_web_lib,
-            "pub mod remote_limits;",
-            "target_arch = \"wasm32\"",
-        ) && module_has_preceding_cfg(
-            &re_mcap_lib,
-            "pub mod web_body_handoff;",
-            "any(target_arch = \"wasm32\", test)",
-        ) && !re_mcap_lib.contains("pub mod remote_summary;")
-            && !re_mcap_lib.contains("pub mod remote_chunk_scan;")
+        module_declarations_are_target_gated(&re_mcap_lib, RE_MCAP_REMOTE_MODULES)
+            && module_declarations_are_target_gated(&re_web_lib, RE_WEB_REMOTE_MODULES)
     }
 
     fn legacy_intern_constructors_remain(&self) -> bool {
@@ -266,6 +297,20 @@ impl WorkspaceAudit {
         };
         text.contains("pub fn new(string: &str) -> Self") && text.contains("fn global_intern(")
     }
+}
+
+fn impl_block_has_public_fn_static(text: &str, type_name: &str) -> bool {
+    let mut in_target_impl = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("impl ") && trimmed.contains('{') {
+            in_target_impl = direct_impl_targets(trimmed, type_name);
+        }
+        if in_target_impl && is_public_constructor_line(trimmed) {
+            return true;
+        }
+    }
+    false
 }
 
 fn package_depends_on(
@@ -350,17 +395,176 @@ fn is_allowed_cross_crate_callsite(path: &Path) -> bool {
         || path.ends_with("crates/viewer/re_viewer/src/web_remote_mcap_cpu.rs")
 }
 
+#[cfg(test)]
 fn module_has_preceding_cfg(text: &str, module_line: &str, expected_cfg: &str) -> bool {
     let Some(position) = text.find(module_line) else {
         return false;
     };
-    let prefix = &text[..position];
-    prefix.lines().rev().take(3).any(|line| {
-        line.trim()
-            .strip_prefix("#[cfg(")
-            .and_then(|cfg| cfg.strip_suffix(")]"))
-            .is_some_and(|cfg| cfg.contains(expected_cfg))
+    module_preceding_cfg(&text[..position]).is_some_and(|cfg| cfg.contains(expected_cfg))
+}
+
+#[derive(Clone, Copy)]
+struct ModuleDeclaration<'a> {
+    public_external: bool,
+    cfg: Option<&'a str>,
+}
+
+fn module_declarations<'a>(text: &'a str, module_name: &str) -> Vec<ModuleDeclaration<'a>> {
+    let needle = format!("mod {module_name};");
+    let mut declarations = Vec::new();
+    let mut remaining = text;
+
+    while let Some(position) = remaining.find(&needle) {
+        let line_start = remaining[..position]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let declaration_line = &remaining[line_start..position + needle.len()];
+        declarations.push(ModuleDeclaration {
+            public_external: declaration_line.trim_start().starts_with("pub mod "),
+            cfg: module_preceding_cfg(&remaining[..position]),
+        });
+        remaining = &remaining[position + needle.len()..];
+    }
+
+    declarations
+}
+
+fn module_declarations_are_target_gated(text: &str, remote_modules: &[&str]) -> bool {
+    remote_modules.iter().all(|module_name| {
+        let declarations = module_declarations(text, module_name);
+        !declarations.is_empty()
+            && declarations.iter().all(|declaration| {
+                !declaration.public_external
+                    || declaration.cfg.and_then(cfg_expr_native_production_value) == Some(false)
+            })
     })
+}
+
+fn module_preceding_cfg(text_before_module: &str) -> Option<&str> {
+    for line in text_before_module.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        if let Some(cfg) = trim_cfg_attribute(trimmed) {
+            return Some(cfg);
+        }
+        if is_rust_item_start(trimmed) {
+            break;
+        }
+    }
+    None
+}
+
+fn trim_cfg_attribute(line: &str) -> Option<&str> {
+    line.strip_prefix("#[cfg(")
+        .and_then(|cfg| cfg.strip_suffix(")]"))
+}
+
+fn is_rust_item_start(line: &str) -> bool {
+    [
+        "pub mod ",
+        "pub(crate) mod ",
+        "pub(super) mod ",
+        "pub(in ",
+        "mod ",
+        "pub use ",
+        "use ",
+        "pub struct ",
+        "struct ",
+        "pub enum ",
+        "enum ",
+        "pub trait ",
+        "trait ",
+        "impl ",
+        "pub fn ",
+        "pub const fn ",
+        "pub async fn ",
+        "fn ",
+        "const ",
+        "static ",
+        "type ",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+}
+
+fn direct_impl_targets(line: &str, type_name: &str) -> bool {
+    let after_impl = line
+        .strip_prefix("impl ")
+        .and_then(|line| line.strip_suffix(" {"))
+        .or_else(|| line.strip_prefix("impl "));
+    after_impl.is_some_and(|target| target.split_whitespace().next() == Some(type_name))
+}
+
+fn is_public_constructor_line(line: &str) -> bool {
+    line.starts_with("pub const fn")
+        || line.starts_with("pub async fn")
+        || line.starts_with("pub fn")
+}
+
+fn cfg_expr_native_production_value(expr: &str) -> Option<bool> {
+    let expr = expr.trim();
+    match expr {
+        "test" | "target_arch = \"wasm32\"" | "target_arch = \"wasm64\"" => Some(false),
+        _ if expr.starts_with("all(") && expr.ends_with(')') => {
+            let parts = split_top_level_cfg(&expr["all(".len()..expr.len() - 1]);
+            parts
+                .iter()
+                .map(|part| cfg_expr_native_production_value(part))
+                .collect::<Option<Vec<_>>>()
+                .map(|values| values.iter().all(|value| *value))
+        }
+        _ if expr.starts_with("any(") && expr.ends_with(')') => {
+            let parts = split_top_level_cfg(&expr["any(".len()..expr.len() - 1]);
+            parts
+                .iter()
+                .map(|part| cfg_expr_native_production_value(part))
+                .collect::<Option<Vec<_>>>()
+                .map(|values| values.iter().any(|value| *value))
+        }
+        _ if expr.starts_with("not(") && expr.ends_with(')') => {
+            cfg_expr_native_production_value(&expr["not(".len()..expr.len() - 1])
+                .map(|value| !value)
+        }
+        _ => None,
+    }
+}
+
+fn split_top_level_cfg(expr: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut start = 0;
+
+    for (index, character) in expr.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match character {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(expr[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < expr.len() {
+        parts.push(expr[start..].trim());
+    }
+    parts
 }
 
 fn code_prefix_before_line_comment(line: &str) -> &str {
@@ -431,6 +635,84 @@ mod tests {
             "pub mod web_body_handoff;",
             "pub mod web_body_handoff;",
             "any(target_arch = \"wasm32\", test)"
+        ));
+    }
+
+    #[test]
+    fn remote_module_audit_rejects_native_public_declarations() {
+        let safe = "\
+#[cfg(target_arch = \"wasm32\")]
+pub mod remote_time;
+#[cfg(any(target_arch = \"wasm32\", test))]
+mod remote_decompression;
+";
+        assert!(module_declarations_are_target_gated(
+            safe,
+            &["remote_time", "remote_decompression"]
+        ));
+
+        let unconfigured_public = "\
+pub mod remote_decompression;
+";
+        assert!(!module_declarations_are_target_gated(
+            unconfigured_public,
+            &["remote_decompression"]
+        ));
+
+        let native_public = "\
+#[cfg(not(target_arch = \"wasm32\"))]
+pub mod remote_decompression;
+";
+        assert!(!module_declarations_are_target_gated(
+            native_public,
+            &["remote_decompression"]
+        ));
+    }
+
+    #[test]
+    fn public_constructor_scan_covers_all_target_impl_forms() {
+        let text = "\
+impl ProductionWebRemoteLimitsV1 {
+    fn private_one() {}
+}
+
+impl fmt::Debug for ProductionWebRemoteLimitsV1 {
+    pub fn ignored_trait_method() {}
+}
+
+impl ProductionWebRemoteLimitsV1 {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+";
+        assert!(impl_block_has_public_fn_static(
+            text,
+            "ProductionWebRemoteLimitsV1"
+        ));
+
+        let async_text = "\
+impl ProductionWebRemoteLimitsV1 {
+    pub async fn new() -> Self {
+        Self
+    }
+}
+";
+        assert!(impl_block_has_public_fn_static(
+            async_text,
+            "ProductionWebRemoteLimitsV1"
+        ));
+
+        let plain_text = "\
+impl ProductionWebRemoteLimitsV1 {
+    pub fn new() -> Self {
+        Self
+    }
+}
+";
+        assert!(impl_block_has_public_fn_static(
+            plain_text,
+            "ProductionWebRemoteLimitsV1"
         ));
     }
 }
