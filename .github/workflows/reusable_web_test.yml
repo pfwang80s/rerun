@@ -30,6 +30,26 @@ permissions:
   id-token: "write"
 
 jobs:
+  mcap-phase-a-native-exit-gate:
+    name: MCAP Phase A native exit gate
+    timeout-minutes: 20
+    runs-on: ubuntu-latest-16-cores
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.REF || (github.event_name == 'pull_request' && github.event.pull_request.head.ref) || '' }}
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache_key: "web-test-mcap-phase-a-native"
+          save_cache: false
+          workload_identity_provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+
+      - name: Run disarmed Phase A exit-condition audit
+        run: cargo test -p re_web_tests phase_a_audit
+
   web-test:
     name: Browser tests
     timeout-minutes: 60

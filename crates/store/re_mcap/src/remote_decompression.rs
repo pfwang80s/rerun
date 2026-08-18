@@ -521,6 +521,95 @@ impl Drop for ExactCompressedChunkInput<'_> {
     }
 }
 
+/// Exact compressed payload borrowed from a live Web body owner.
+///
+/// This is the zero-copy handoff used by the Web physical body adapter before a canonical profile
+/// is sealed. The body owner remains alive for the duration of decompression and must be dropped
+/// only after the resulting `ExactOutputChunk` has been produced.
+pub(crate) struct BorrowedExactCompressedChunkInput<'a, 'body> {
+    compressed_payload: &'body [u8],
+    reservation: Option<CompressedChunkInputReservation>,
+    identity: Option<PhysicalChunkReadIdentity<'a>>,
+    codec: ChunkCompressionCodec,
+    declared_uncompressed_size: u64,
+    declared_uncompressed_crc: u32,
+}
+
+impl std::fmt::Debug for BorrowedExactCompressedChunkInput<'_, '_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BorrowedExactCompressedChunkInput")
+            .field("identity", &"<opaque>")
+            .field("codec", &self.codec)
+            .field("compressed_payload", &"<borrowed exact bytes and permit>")
+            .field(
+                "declared_uncompressed_size",
+                &self.declared_uncompressed_size,
+            )
+            .field("declared_uncompressed_crc", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, 'body> BorrowedExactCompressedChunkInput<'a, 'body> {
+    fn ensure_current(&self) -> Result<(), ChunkDecompressionError> {
+        self.identity
+            .as_ref()
+            .expect("live borrowed compressed input retains its evidence identity")
+            .ensure_current()
+    }
+
+    fn compressed_payload(&self) -> &'body [u8] {
+        self.compressed_payload
+    }
+
+    fn budget_state(&self) -> Arc<ChunkDecompressionBudgetState> {
+        Arc::clone(
+            &self
+                .reservation
+                .as_ref()
+                .expect("live borrowed compressed input retains its source profile")
+                .state,
+        )
+    }
+
+    fn take_identity_after_releasing_borrowed(mut self) -> PhysicalChunkReadIdentity<'a> {
+        drop(self.reservation.take());
+        self.identity
+            .take()
+            .expect("live borrowed compressed input retains its evidence identity")
+    }
+}
+
+impl Drop for BorrowedExactCompressedChunkInput<'_, '_> {
+    fn drop(&mut self) {
+        drop(self.reservation.take());
+    }
+}
+
+pub(super) fn prepare_header_validated_borrowed_compressed_chunk_input<'a, 'body>(
+    lease: PhysicalChunkReadLease<'a, HeaderValidated>,
+    codec: ChunkCompressionCodec,
+    compressed_payload: &'body [u8],
+    declared_uncompressed_size: u64,
+    declared_uncompressed_crc: u32,
+) -> Result<BorrowedExactCompressedChunkInput<'a, 'body>, ChunkDecompressionError> {
+    let expected_compressed_bytes = u64::try_from(compressed_payload.len())
+        .map_err(|_overflow| ChunkDecompressionError::CompressedBytesLimitExceeded)?;
+    let reservation = lease
+        .decompression_budget()
+        .state
+        .try_reserve_input(expected_compressed_bytes)?;
+    Ok(BorrowedExactCompressedChunkInput {
+        compressed_payload,
+        reservation: Some(reservation),
+        identity: Some(PhysicalChunkReadIdentity::Lease(lease)),
+        codec,
+        declared_uncompressed_size,
+        declared_uncompressed_crc,
+    })
+}
+
 /// The release-Wasm codec allowlist frozen into an exact output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ChunkCompressionCodec {
@@ -762,6 +851,97 @@ pub(crate) fn decompress_exact_chunk(
             let mut output = allocate_exact_output(output_len);
             decompress_lz4_single_frame(input.compressed_payload(), &mut output)?;
             (input.take_identity_after_releasing_compressed(), output)
+        }
+        ChunkCompressionCodec::Unsupported => unreachable!("unsupported codecs fail above"),
+    };
+
+    let validation = if declared_uncompressed_crc == 0 {
+        OptionalCrcValidation::NotProvided
+    } else if crc32fast::hash(&output) == declared_uncompressed_crc {
+        OptionalCrcValidation::Verified
+    } else {
+        drop(output);
+        drop(reservation);
+        drop(identity);
+        return Err(ChunkDecompressionError::ChunkChecksumMismatch);
+    };
+
+    if let Err(error) = identity.ensure_current() {
+        drop(output);
+        drop(reservation);
+        drop(identity);
+        return Err(error);
+    }
+
+    Ok(ExactOutputChunk {
+        bytes: Some(output),
+        reservation: Some(reservation.complete()),
+        identity: Some(identity),
+        codec,
+        crc: ChunkCrcEvidence {
+            declared: declared_uncompressed_crc,
+            validation,
+        },
+    })
+}
+
+/// Decompresses one exact physical payload borrowed directly from a live Web body owner.
+///
+/// The caller must keep the body owner alive until this function returns.
+pub(crate) fn decompress_exact_chunk_borrowed<'a>(
+    input: BorrowedExactCompressedChunkInput<'a, '_>,
+) -> Result<ExactOutputChunk<'a>, ChunkDecompressionError> {
+    input.ensure_current()?;
+    let budget_state = input.budget_state();
+    let codec = match input.codec {
+        ChunkCompressionCodec::Unsupported => {
+            return Err(ChunkDecompressionError::UnsupportedCompression);
+        }
+        codec => codec,
+    };
+    let compressed_bytes = u64::try_from(input.compressed_payload().len())
+        .map_err(|_overflow| ChunkDecompressionError::CompressedBytesLimitExceeded)?;
+    let output_len = usize::try_from(input.declared_uncompressed_size)
+        .map_err(|_overflow| ChunkDecompressionError::DeclaredOutputSizeUnsupported)?;
+    let zstd_working_bytes = match codec {
+        ChunkCompressionCodec::Zstd => {
+            estimate_zstd_working_bytes(budget_state.limits.max_zstd_window_log)?
+        }
+        ChunkCompressionCodec::None | ChunkCompressionCodec::Lz4 => 0,
+        ChunkCompressionCodec::Unsupported => unreachable!("unsupported codecs fail above"),
+    };
+    let reservation = budget_state.try_reserve(
+        compressed_bytes,
+        input.declared_uncompressed_size,
+        zstd_working_bytes,
+    )?;
+    let declared_uncompressed_crc = input.declared_uncompressed_crc;
+
+    let (identity, output) = match codec {
+        ChunkCompressionCodec::None => {
+            if input.compressed_payload().len() < output_len {
+                return Err(ChunkDecompressionError::OutputTooShort);
+            }
+            if input.compressed_payload().len() > output_len {
+                return Err(ChunkDecompressionError::OutputTooLong);
+            }
+            let mut output = allocate_exact_output(output_len);
+            output.copy_from_slice(input.compressed_payload());
+            (input.take_identity_after_releasing_borrowed(), output)
+        }
+        ChunkCompressionCodec::Zstd => {
+            let mut output = allocate_exact_output(output_len);
+            decompress_zstd_single_frame(
+                input.compressed_payload(),
+                &mut output,
+                budget_state.limits.max_zstd_window_log,
+            )?;
+            (input.take_identity_after_releasing_borrowed(), output)
+        }
+        ChunkCompressionCodec::Lz4 => {
+            let mut output = allocate_exact_output(output_len);
+            decompress_lz4_single_frame(input.compressed_payload(), &mut output)?;
+            (input.take_identity_after_releasing_borrowed(), output)
         }
         ChunkCompressionCodec::Unsupported => unreachable!("unsupported codecs fail above"),
     };

@@ -19,8 +19,9 @@ use parking_lot::Mutex;
 use re_log_types::TimeInt;
 
 use crate::remote_decompression::{
-    ChunkCompressionCodec, ChunkDecompressionBudget, ChunkDecompressionError,
-    ExactCompressedChunkInput, ExactOutputChunk, PhysicalChunkReadIdentity,
+    BorrowedExactCompressedChunkInput, ChunkCompressionCodec, ChunkDecompressionBudget,
+    ChunkDecompressionError, ExactCompressedChunkInput, ExactOutputChunk,
+    PhysicalChunkReadIdentity, prepare_header_validated_borrowed_compressed_chunk_input,
     prepare_header_validated_compressed_chunk_input,
 };
 use crate::remote_summary::definitions::{
@@ -1332,6 +1333,10 @@ impl BorrowedHeaderValidatedPhysicalChunkRead<'_, '_> {
     pub(super) fn payload_len_v1(&self) -> usize {
         self.payload.len()
     }
+
+    pub(super) const fn uncompressed_size_v1(&self) -> u64 {
+        self.uncompressed_size
+    }
 }
 
 struct ValidatedPhysicalChunkHeaderV1 {
@@ -1502,6 +1507,33 @@ pub(super) fn install_borrowed_header_validated_payload_copy_v1<'a>(
     prepared
         .install(destination.into_boxed_slice())
         .map_err(Into::into)
+}
+
+pub(super) fn install_borrowed_header_validated_payload_zero_copy_v1<'a, 'body>(
+    mut validated: BorrowedHeaderValidatedPhysicalChunkRead<'a, 'body>,
+) -> Result<BorrowedExactCompressedChunkInput<'a, 'body>, PhysicalChunkValidationError> {
+    let lease = validated
+        .lease
+        .take()
+        .expect("a borrowed header-validated owner retains its lease");
+    lease.ensure_current()?;
+    let payload = validated
+        .body
+        .get(validated.payload)
+        .ok_or(PhysicalChunkValidationError::CompressedPayloadRangeMismatch)?;
+    let actual_bytes = u64::try_from(payload.len())
+        .map_err(|_overflow| PhysicalChunkValidationError::ArithmeticOverflow)?;
+    if actual_bytes != validated.compressed_size {
+        return Err(PhysicalChunkValidationError::HeaderSizeMismatch);
+    }
+    prepare_header_validated_borrowed_compressed_chunk_input(
+        lease,
+        validated.codec,
+        payload,
+        validated.uncompressed_size,
+        validated.declared_uncompressed_crc,
+    )
+    .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -3014,7 +3046,57 @@ mod tests {
         );
         assert_eq!(
             WEB_PHYSICAL_BODY_PHASE_A_CANDIDATE_PROFILE_V1.strategy,
-            WebPhysicalBodyStrategyV1::ExplicitCopyV1
+            WebPhysicalBodyStrategyV1::ZeroCopyV1
+        );
+        assert_eq!(
+            WEB_PHYSICAL_BODY_PHASE_A_CANDIDATE_PROFILE_V1.status,
+            WebPhysicalBodyProfileStatusV1::Unfrozen
+        );
+        let (active, retained, high_water) = budget.usage_for_test_v1();
+        assert_eq!(active, 1);
+        assert!(retained > body.len() as u64);
+        assert_eq!(retained, high_water);
+        drop(body);
+        let cache = completed.into_cache_after_body_drop_v1();
+        assert!(cache.is_current_for_test_v1());
+        assert_eq!(budget.usage_for_test_v1(), (0, 0, high_water));
+        drop(cache);
+    }
+
+    #[test]
+    fn web_zero_copy_handoff_borrows_payload_and_allocates_no_destination_before_decompression() {
+        use crate::web_body_handoff::{
+            WEB_PHYSICAL_BODY_PHASE_A_CANDIDATE_PROFILE_V1, WebPendingPhysicalChunkReadV1,
+            WebPhysicalBodyProfileStatusV1, WebPhysicalBodySafePointV1, WebPhysicalBodyStrategyV1,
+            WebPhysicalCopyOverlapBudgetV1, process_zero_copy_body_v1,
+        };
+
+        let fixture = web_handoff_fixture();
+        let authority = build_authority(&fixture);
+        let body = full_record(&fixture, 0);
+        let pending = WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&authority, 0));
+        let budget = WebPhysicalCopyOverlapBudgetV1::new_unfrozen_phase_a_v1();
+        let mut observed = Vec::new();
+        reset_web_destination_allocation_attempts_for_test_v1();
+        let completed = process_zero_copy_body_v1(pending, &body, &budget, |point| {
+            observed.push(point);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            observed,
+            [
+                WebPhysicalBodySafePointV1::BeforeHeaderValidation,
+                WebPhysicalBodySafePointV1::AfterPayloadTransfer,
+                WebPhysicalBodySafePointV1::AfterExactDecompression,
+                WebPhysicalBodySafePointV1::AfterPhysicalScan,
+                WebPhysicalBodySafePointV1::BeforeCachePublication,
+            ]
+        );
+        assert_eq!(web_destination_allocation_attempts_for_test_v1(), 0);
+        assert_eq!(
+            WEB_PHYSICAL_BODY_PHASE_A_CANDIDATE_PROFILE_V1.strategy,
+            WebPhysicalBodyStrategyV1::ZeroCopyV1
         );
         assert_eq!(
             WEB_PHYSICAL_BODY_PHASE_A_CANDIDATE_PROFILE_V1.status,

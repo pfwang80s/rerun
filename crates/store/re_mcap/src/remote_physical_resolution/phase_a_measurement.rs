@@ -582,7 +582,7 @@ mod tests {
                     crate::web_body_handoff::WebPhysicalBudgetProfileV1::UnfrozenPhaseACandidate,
                 )
                 .unwrap()
-                .process_explicit_copy_v1(
+                .process_zero_copy_v1(
                     &crate::web_body_handoff::WebPhysicalCopyOverlapBudgetV1::new_unfrozen_phase_a_v1(),
                     |_safe_point| Ok(()),
                 )

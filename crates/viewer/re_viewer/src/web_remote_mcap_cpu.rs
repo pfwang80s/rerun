@@ -1507,7 +1507,7 @@ impl<'a> WasmPhysicalBodyOwnerAdapterV1<'a> {
             )
             .map_err(WasmPhysicalBodyAdapterErrorV1::Bind)?;
         let completed = borrowed
-            .process_explicit_copy_v1(&self.overlap_budget, |_safe_point| {
+            .process_zero_copy_v1(&self.overlap_budget, |_safe_point| {
                 authority.ensure_current_v1()
             })
             .map_err(WasmPhysicalBodyAdapterErrorV1::Handoff)?;
