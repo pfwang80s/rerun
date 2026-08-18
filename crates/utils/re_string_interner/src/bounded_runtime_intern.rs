@@ -2810,21 +2810,26 @@ mod tests {
 
     #[test]
     fn production_singleton_burn_is_monotonic_across_simulated_viewers() {
-        let initial = initialize_remote_mcap_runtime_intern(generous_limits()).unwrap();
-        let viewer_a =
-            prepare_remote_mcap_runtime_intern(&["production-singleton-viewer-a-identifier"])
-                .unwrap()
-                .commit()
-                .unwrap();
+        let mut coordinator = initialized(generous_limits());
+        let initial = coordinator.snapshot_remote(coordinator.remote.as_ref().unwrap());
+        let viewer_a = prepare_local(
+            &coordinator,
+            &["production-singleton-viewer-a-identifier"],
+            TestFault::None,
+        )
+        .unwrap();
+        let viewer_a = coordinator.commit_remote(viewer_a).unwrap();
         let after_a = viewer_a.module_snapshot();
         let remote_handle = viewer_a.handle(0).unwrap();
         drop(viewer_a);
 
-        let viewer_b =
-            prepare_remote_mcap_runtime_intern(&["production-singleton-viewer-b-identifier"])
-                .unwrap()
-                .commit()
-                .unwrap();
+        let viewer_b = prepare_local(
+            &coordinator,
+            &["production-singleton-viewer-b-identifier"],
+            TestFault::None,
+        )
+        .unwrap();
+        let viewer_b = coordinator.commit_remote(viewer_b).unwrap();
         let after_b = viewer_b.module_snapshot();
         assert!(after_a.burned_string_bytes >= initial.burned_string_bytes);
         assert!(after_b.burned_string_bytes > after_a.burned_string_bytes);
@@ -2832,17 +2837,10 @@ mod tests {
             after_b.burned_side_map_capacity_bytes,
             initial.burned_side_map_capacity_bytes
         );
-        let current = remote_mcap_runtime_intern_snapshot().unwrap();
-        assert!(current.burned_string_bytes >= after_b.burned_string_bytes);
-        assert!(current.burned_entry_bytes >= after_b.burned_entry_bytes);
-        assert!(current.budget_revision >= after_b.budget_revision);
-        assert!(current.remote_entries >= after_b.remote_entries);
-        assert_eq!(
-            current.burned_side_map_capacity_bytes,
-            after_b.burned_side_map_capacity_bytes
-        );
+        let current = coordinator.snapshot_remote(coordinator.remote.as_ref().unwrap());
+        assert_eq!(current, after_b);
 
-        let legacy_handle = InternedString::new("production-singleton-viewer-a-identifier");
+        let legacy_handle = coordinator.intern_legacy("production-singleton-viewer-a-identifier");
         assert_eq!(legacy_handle, remote_handle);
         assert!(std::ptr::eq(legacy_handle.as_str(), remote_handle.as_str()));
     }
