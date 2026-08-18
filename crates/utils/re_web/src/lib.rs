@@ -107,6 +107,12 @@
 //! ```compile_fail,ignore-wasm32
 //! use re_web::remote_mutation_suspension;
 //! ```
+//!
+//! Remote-MCAP pagehide/freeze teardown ownership is likewise Web-only and production-disarmed:
+//!
+//! ```compile_fail,ignore-wasm32
+//! use re_web::remote_page_teardown;
+//! ```
 
 pub mod browser;
 
@@ -143,6 +149,8 @@ pub(crate) mod range_retry;
 pub mod remote_limits;
 #[cfg(target_arch = "wasm32")]
 pub mod remote_mutation_suspension;
+#[cfg(target_arch = "wasm32")]
+pub mod remote_page_teardown;
 #[cfg(target_arch = "wasm32")]
 pub mod remote_resume_revalidation;
 #[cfg(target_arch = "wasm32")]
@@ -202,6 +210,10 @@ mod range_retry;
 // Host builds compile the pure remote mutation ownership state machine only for its unit tests.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod remote_mutation_suspension;
+
+// Host builds compile the pure pagehide/freeze teardown state machine only for its unit tests.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod remote_page_teardown;
 
 // Host builds compile the module only for its unit tests and do not publish it to consumers.
 #[cfg(all(test, not(target_arch = "wasm32")))]
