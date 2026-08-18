@@ -251,7 +251,7 @@ impl<'a> RawRuntimeIdentifierCensusV1<'a> {
 #[derive(Debug)]
 enum RemoteRuntimeDomainIdentifierV1 {
     Timeline(TimelineName),
-    EntityPath { raw: String, value: EntityPath },
+    EntityPath { value: EntityPath },
     Component(ComponentIdentifier),
     Archetype(ArchetypeName),
 }
@@ -274,9 +274,9 @@ impl RemoteRuntimeIdentifiersV1 {
 
     pub(crate) fn entity_path(&self, raw_lookup: &str) -> Option<EntityPath> {
         self.domains.iter().find_map(|identifier| match identifier {
-            RemoteRuntimeDomainIdentifierV1::EntityPath { raw, value } => (raw == raw_lookup
-                || remote_entity_path_matches_v1(value, raw_lookup))
-            .then_some(value.clone()),
+            RemoteRuntimeDomainIdentifierV1::EntityPath { value } => {
+                remote_entity_path_matches_v1(value, raw_lookup).then_some(value.clone())
+            }
             _ => None,
         })
     }
@@ -334,7 +334,6 @@ fn commit_raw_census(
 }
 
 fn redeem_summary_domain_handles_v1(
-    raw_identifiers: &[RemoteMcapRawIdentifier<'_>],
     committed: &CommittedRemoteInternBatch,
 ) -> Result<Vec<RemoteRuntimeDomainIdentifierV1>, RemoteRuntimeInternAdmissionErrorV1> {
     let mut domains = Vec::new();
@@ -345,7 +344,7 @@ fn redeem_summary_domain_handles_v1(
     domains
         .try_reserve_exact(domain_capacity)
         .map_err(|_allocation_error| RemoteRuntimeInternAdmissionErrorV1::AllocationFailed)?;
-    for (index, raw) in raw_identifiers.iter().take(committed.len()).enumerate() {
+    for index in 0..committed.len() {
         let handle = committed
             .domain_handle(index)
             .ok_or(RemoteRuntimeInternAdmissionErrorV1::ProtocolViolation)?;
@@ -370,10 +369,7 @@ fn redeem_summary_domain_handles_v1(
                     .iter()
                     .map(|part| EntityPathPart::new(*part))
                     .collect::<EntityPath>();
-                RemoteRuntimeDomainIdentifierV1::EntityPath {
-                    raw: raw.as_str().to_owned(),
-                    value,
-                }
+                RemoteRuntimeDomainIdentifierV1::EntityPath { value }
             }
         };
         domains.push(domain);
@@ -412,9 +408,8 @@ pub(crate) fn admit_summary_identifiers_with_decoders_v1(
     }
 
     let raw = RawRuntimeIdentifierCensusV1::try_new(identifiers)?;
-    let raw_identifiers = raw.identifiers.clone();
     let committed = commit_raw_census(&raw)?;
-    let domains = redeem_summary_domain_handles_v1(&raw_identifiers, &committed)?;
+    let domains = redeem_summary_domain_handles_v1(&committed)?;
 
     Ok(RemoteRuntimeIdentifiersV1 { domains, committed })
 }
@@ -606,9 +601,8 @@ mod tests {
             RemoteMcapRawIdentifier::entity_path("foo/bar"),
         ];
         let raw = RawRuntimeIdentifierCensusV1::try_new(identifiers).unwrap();
-        let raw_identifiers = raw.identifiers.clone();
         let committed = commit_raw_census(&raw).unwrap();
-        let domains = redeem_summary_domain_handles_v1(&raw_identifiers, &committed).unwrap();
+        let domains = redeem_summary_domain_handles_v1(&committed).unwrap();
         let admitted = RemoteRuntimeIdentifiersV1 { domains, committed };
 
         assert_eq!(
@@ -621,6 +615,39 @@ mod tests {
         );
         assert!(admitted.typed_domain_output_v1("/foo///bar/", None).is_ok());
         assert!(admitted.typed_domain_output_v1("foo/bar", None).is_ok());
+    }
+
+    #[test]
+    fn duplicate_scalar_before_entity_path_is_not_redeemed_as_entity_path_raw() {
+        ensure_disarmed_test_profile_v1();
+
+        let identifiers = [
+            RemoteMcapRawIdentifier::timeline("message_log_time").unwrap(),
+            RemoteMcapRawIdentifier::timeline("message_publish_time").unwrap(),
+            RemoteMcapRawIdentifier::component("message").unwrap(),
+            RemoteMcapRawIdentifier::component("shared/topic").unwrap(),
+            RemoteMcapRawIdentifier::component("shared/topic").unwrap(),
+            RemoteMcapRawIdentifier::entity_path("/foo///bar/"),
+            RemoteMcapRawIdentifier::entity_path("foo/bar"),
+        ];
+        let raw = RawRuntimeIdentifierCensusV1::try_new(identifiers).unwrap();
+        let committed = commit_raw_census(&raw).unwrap();
+        let domains = redeem_summary_domain_handles_v1(&committed).unwrap();
+        let admitted = RemoteRuntimeIdentifiersV1 { domains, committed };
+
+        assert_eq!(
+            admitted.entity_path("/foo///bar/").unwrap().to_string(),
+            "/foo/bar"
+        );
+        assert_eq!(
+            admitted.entity_path("foo/bar").unwrap().to_string(),
+            "/foo/bar"
+        );
+        assert!(admitted.entity_path("shared/topic").is_none());
+        assert_eq!(
+            admitted.component("shared/topic").unwrap().as_str(),
+            "shared/topic"
+        );
     }
 
     #[test]
@@ -758,7 +785,6 @@ mod tests {
         let validated = crate::remote_summary::validated_summary_definitions_for_test(&fixture);
         let identifiers = summary_definition_identifiers_v1(&validated).unwrap();
         let raw = RawRuntimeIdentifierCensusV1::try_new(identifiers).unwrap();
-        let raw_identifiers = raw.identifiers.clone();
         let census =
             BoundedRemoteIdentifierCensus::try_new_v1(raw.identifiers.iter().copied()).unwrap();
         let prepared = intern::prepare_remote_mcap_runtime_intern_from_domain_construction_token(
@@ -784,7 +810,7 @@ mod tests {
         );
         assert_eq!(after_race.remote_entries, before_race.remote_entries);
 
-        let domains = redeem_summary_domain_handles_v1(&raw_identifiers, &committed).unwrap();
+        let domains = redeem_summary_domain_handles_v1(&committed).unwrap();
         let admitted = RemoteRuntimeIdentifiersV1 { domains, committed };
         assert_eq!(
             admitted.component(schema).map(|value| value.as_str()),
