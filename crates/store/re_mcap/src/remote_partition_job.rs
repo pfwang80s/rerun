@@ -84,6 +84,9 @@ impl RemoteWindowDemandPhaseOwnerV1 {
         range_requests_remaining: u64,
         active_visible_deadline_remaining: u64,
     ) -> Result<Self, RemotePartitionJobErrorV1> {
+        if demand.is_prefetch_unstarted_v1() {
+            return Err(RemotePartitionJobErrorV1::PrefetchUnstarted);
+        }
         if !demand.can_start_retry_v1() {
             return Err(RemotePartitionJobErrorV1::PhaseOwnerMismatch);
         }
@@ -321,6 +324,16 @@ impl RemotePartitionBatchV1 {
                 {
                     return Err(RemotePartitionJobErrorV1::InvalidBatch);
                 }
+                for root in insertion.roots_v1() {
+                    let (registered_descriptor, registered_is_static) = registration
+                        .registered_root_for_insertion_v1(root.root_v1().root_chunk_id_v1())
+                        .ok_or(RemotePartitionJobErrorV1::InvalidBatch)?;
+                    if registered_descriptor != root.root_v1()
+                        || registered_is_static != root.chunk_v1().is_static()
+                    {
+                        return Err(RemotePartitionJobErrorV1::InvalidBatch);
+                    }
+                }
             }
             (None, None) => {}
             _ => return Err(RemotePartitionJobErrorV1::InvalidBatch),
@@ -432,6 +445,9 @@ pub(crate) enum RemotePartitionJobErrorV1 {
     #[error("remote MCAP partition job phase owner does not match")]
     PhaseOwnerMismatch,
 
+    #[error("remote MCAP prefetch demand is not bound to an exact physical-Chunk body owner")]
+    PrefetchUnstarted,
+
     #[error("remote MCAP partition job exhausted its matching phase budget")]
     PhaseFailure(RemotePartitionJobPhaseFailureV1),
 
@@ -506,10 +522,18 @@ impl RemotePartitionDerivationCoordinatorV1 {
         &mut self,
         owner: RemoteWindowDemandPhaseOwnerV1,
     ) -> Result<(), RemotePartitionJobErrorV1> {
+        if owner.identity_v1().source_generation_v1() != self.current_generation {
+            return Err(RemotePartitionJobErrorV1::PhaseOwnerMismatch);
+        }
         if let Some(existing) = self.phase_owners.get(&owner.class_v1())
             && existing.identity_v1() != owner.identity_v1()
         {
             return Err(RemotePartitionJobErrorV1::PhaseOwnerMismatch);
+        }
+        if !self.phase_owners.contains_key(&owner.class_v1()) {
+            self.phase_owners
+                .try_reserve(1)
+                .map_err(|_error| RemotePartitionJobErrorV1::ResourceLimitExceeded)?;
         }
         self.phase_owners.insert(owner.class_v1(), owner);
         Ok(())
@@ -525,6 +549,7 @@ impl RemotePartitionDerivationCoordinatorV1 {
     pub(crate) fn rebind_generation_v1(&mut self, generation: u64, work_epoch: u64) {
         self.current_generation = generation;
         self.current_work_epoch = work_epoch;
+        self.phase_owners.clear();
         self.staged.clear();
         self.staged_roots = 0;
         self.staged_bytes = 0;
@@ -540,10 +565,17 @@ impl RemotePartitionDerivationCoordinatorV1 {
         if demand_generation != self.current_generation || work_epoch != self.current_work_epoch {
             return Err(RemotePartitionJobErrorV1::StaleWork);
         }
-        self.phase_owners
+        if phase_identity.source_generation_v1() != self.current_generation {
+            return Err(RemotePartitionJobErrorV1::PhaseOwnerMismatch);
+        }
+        let owner = self
+            .phase_owners
             .get(&phase_identity.class_v1())
-            .ok_or(RemotePartitionJobErrorV1::PhaseOwnerMismatch)?
-            .validate_job_v1(phase_identity)
+            .ok_or(RemotePartitionJobErrorV1::PhaseOwnerMismatch)?;
+        if owner.identity_v1().source_generation_v1() != self.current_generation {
+            return Err(RemotePartitionJobErrorV1::PhaseOwnerMismatch);
+        }
+        owner.validate_job_v1(phase_identity)
     }
 
     pub(crate) fn record_phase_failure_v1(
@@ -610,6 +642,13 @@ impl RemotePartitionDerivationCoordinatorV1 {
         if next_bytes > self.limits.max_staged_bytes {
             return Err(RemotePartitionJobErrorV1::ResourceLimitExceeded);
         }
+
+        self.staged
+            .try_reserve(1)
+            .map_err(|_error| RemotePartitionJobErrorV1::ResourceLimitExceeded)?;
+        self.known_partition_jobs
+            .try_reserve(1)
+            .map_err(|_error| RemotePartitionJobErrorV1::ResourceLimitExceeded)?;
 
         self.staged_roots = next_roots;
         self.staged_bytes = next_bytes;
@@ -693,9 +732,19 @@ impl RemotePartitionDerivationCoordinatorV1 {
                         RootRegistrationErrorV1::RegistrationConflict,
                     ),
                 )?;
-                let permit = capability
-                    .issue_refetch_v1(store, descriptor)
-                    .map_err(|_error| RemotePartitionJobErrorV1::StoreCapability)?;
+                let permit = match capability.issue_refetch_v1(store, descriptor) {
+                    Ok(permit) => permit,
+                    Err(_error) => {
+                        if !pending_events.is_empty() {
+                            let _reconciled = root_index.observe_store_events_v1(
+                                store,
+                                capability,
+                                &pending_events,
+                            );
+                        }
+                        return Err(RemotePartitionJobErrorV1::StoreCapability);
+                    }
+                };
                 let events =
                     match store.insert_external_refetchable_root_v1(permit, root.chunk_v1()) {
                         Ok(events) => events,
@@ -747,7 +796,8 @@ mod tests {
     use crate::remote_channel_group::StableDecoderGroupIdV1;
     use crate::remote_loaded_coverage::RemoteTemporalCoveragePlanV1;
     use crate::remote_manifest::{
-        ManifestPartitionDescriptorV1, RemoteMcapSessionIdV1, RemoteRegistrationCapacityV1,
+        ManifestPartitionDescriptorV1, ManifestRootDescriptorV1, RemoteMcapSessionIdV1,
+        RemoteRegistrationCapacityV1,
     };
     use re_chunk::RowId;
     use re_chunk_store::{GarbageCollectionOptions, WebRemoteMcapStoreConfigV1};
@@ -818,10 +868,13 @@ mod tests {
         }
     }
 
-    fn phase_identity(class: RemoteWindowDemandClassV1) -> RemoteWindowDemandPhaseIdentityV1 {
+    fn phase_identity_for_generation(
+        class: RemoteWindowDemandClassV1,
+        source_generation: u64,
+    ) -> RemoteWindowDemandPhaseIdentityV1 {
         crate::remote_window_demand::phase_identity_v1(
             session_id(),
-            1,
+            source_generation,
             class,
             re_log_types::TimeInt::new_temporal(1),
             re_log_types::TimeInt::new_temporal(2),
@@ -830,13 +883,18 @@ mod tests {
         )
     }
 
-    fn installed_phase_owner(
+    fn phase_identity(class: RemoteWindowDemandClassV1) -> RemoteWindowDemandPhaseIdentityV1 {
+        phase_identity_for_generation(class, 1)
+    }
+
+    fn installed_phase_owner_for_generation(
         class: RemoteWindowDemandClassV1,
+        source_generation: u64,
         attempts: u64,
         ranges: u64,
         deadline: u64,
     ) -> RemoteWindowDemandPhaseOwnerV1 {
-        let identity = phase_identity(class);
+        let identity = phase_identity_for_generation(class, source_generation);
         let mut demand = RemoteWindowDemandV1::new_uninstalled(class, identity);
         demand
             .install_matching_phase_owner_v1(
@@ -848,6 +906,15 @@ mod tests {
             )
             .unwrap();
         RemoteWindowDemandPhaseOwnerV1::bind_v1(&demand, attempts, ranges, deadline).unwrap()
+    }
+
+    fn installed_phase_owner(
+        class: RemoteWindowDemandClassV1,
+        attempts: u64,
+        ranges: u64,
+        deadline: u64,
+    ) -> RemoteWindowDemandPhaseOwnerV1 {
+        installed_phase_owner_for_generation(class, 1, attempts, ranges, deadline)
     }
 
     fn empty_registration(
@@ -879,6 +946,50 @@ mod tests {
         let registration = PreparedPartitionRegistrationV1::complete_roots_for_test_v1(
             partition,
             &[root],
+            insertion.total_size_bytes_v1().unwrap(),
+            false,
+        )
+        .unwrap();
+        RemotePartitionBatchV1::complete_v1(
+            generation,
+            work_epoch,
+            DerivationJobKeyV1::new_v1(partition.key_v1()),
+            phase_identity(class),
+            registration,
+            Some(insertion),
+        )
+        .unwrap()
+    }
+
+    fn multi_roots_batch(
+        generation: u64,
+        work_epoch: u64,
+        session: RemoteMcapSessionIdV1,
+        ordinal: u32,
+        bound: u32,
+        class: RemoteWindowDemandClassV1,
+        roots: &[ManifestRootDescriptorV1],
+    ) -> RemotePartitionBatchV1 {
+        let (partition, _) = temporal_partition(session, ordinal, bound);
+        let insertion = RemotePartitionInsertionV1::seal_v1(
+            partition,
+            roots
+                .iter()
+                .map(|root| {
+                    RemotePartitionRootInsertionV1::seal_v1(
+                        partition,
+                        Arc::new(temporal_chunk(root.root_chunk_id_v1())),
+                        *root,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+        .unwrap();
+        let registration = PreparedPartitionRegistrationV1::complete_roots_for_test_v1(
+            partition,
+            roots,
             insertion.total_size_bytes_v1().unwrap(),
             false,
         )
@@ -1275,5 +1386,211 @@ mod tests {
                 .is_partition_fully_resident_v1(&store, &capability, partition_key)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn rebind_generation_drops_phase_owners_and_rejects_old_identity() {
+        let session = session_id();
+        let (store, capability) = store_and_capability();
+        let index = new_index(session, generous_limits(), &store, &capability);
+        let mut coordinator = RemotePartitionDerivationCoordinatorV1::new_v1(
+            1,
+            1,
+            RemotePartitionStagingLimitsV1::generous_disarmed_v1(),
+        );
+        coordinator
+            .install_phase_owner_v1(installed_phase_owner(
+                RemoteWindowDemandClassV1::PresentationRequired,
+                1,
+                1,
+                1,
+            ))
+            .unwrap();
+
+        coordinator.rebind_generation_v1(2, 2);
+        assert!(
+            coordinator
+                .phase_owner_v1(RemoteWindowDemandClassV1::PresentationRequired)
+                .is_none()
+        );
+        assert_eq!(
+            coordinator.install_phase_owner_v1(installed_phase_owner(
+                RemoteWindowDemandClassV1::PresentationRequired,
+                1,
+                1,
+                1,
+            )),
+            Err(RemotePartitionJobErrorV1::PhaseOwnerMismatch)
+        );
+
+        let old_identity_batch = roots_batch(
+            2,
+            2,
+            session,
+            0,
+            RemoteWindowDemandClassV1::PresentationRequired,
+        );
+        assert_eq!(
+            coordinator.stage_terminal_v1(old_identity_batch, &store, &capability, &index),
+            Err(RemotePartitionJobErrorV1::PhaseOwnerMismatch)
+        );
+
+        coordinator
+            .install_phase_owner_v1(installed_phase_owner_for_generation(
+                RemoteWindowDemandClassV1::PresentationRequired,
+                2,
+                1,
+                1,
+                1,
+            ))
+            .unwrap();
+        assert!(
+            coordinator
+                .phase_owner_v1(RemoteWindowDemandClassV1::PresentationRequired)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn issue_refetch_failure_replays_pending_store_events() {
+        let session = session_id();
+        let (mut store, capability) = store_and_capability();
+        let (_, issuer) = temporal_partition(session, 0, 2);
+        let root0 = issuer.descriptor_v1(0).unwrap();
+        let root1 = issuer.descriptor_v1(1).unwrap();
+
+        let root1_chunk = temporal_chunk(root1.root_chunk_id_v1());
+        let external = capability
+            .register_root_origin_v1(&mut store, root1.root_chunk_id_v1(), false)
+            .unwrap();
+        let permit = capability.issue_refetch_v1(&store, external).unwrap();
+        store
+            .insert_external_refetchable_root_v1(permit, &Arc::new(root1_chunk))
+            .unwrap();
+
+        let mut index = new_index(session, generous_limits(), &store, &capability);
+        let mut coordinator = RemotePartitionDerivationCoordinatorV1::new_v1(
+            1,
+            1,
+            RemotePartitionStagingLimitsV1::generous_disarmed_v1(),
+        );
+        coordinator
+            .install_phase_owner_v1(installed_phase_owner(
+                RemoteWindowDemandClassV1::PresentationRequired,
+                1,
+                1,
+                1,
+            ))
+            .unwrap();
+        let batch = multi_roots_batch(
+            1,
+            1,
+            session,
+            0,
+            2,
+            RemoteWindowDemandClassV1::PresentationRequired,
+            &[root0, root1],
+        );
+        coordinator
+            .stage_terminal_v1(batch, &store, &capability, &index)
+            .unwrap();
+
+        assert_eq!(
+            coordinator.commit_staged_v1(&mut store, &capability, &mut index),
+            Err(RemotePartitionJobErrorV1::StoreCapability)
+        );
+        assert_eq!(store.num_physical_chunks(), 2);
+        assert_eq!(
+            index.root_load_state_v1(root0.root_chunk_id_v1()),
+            Some(crate::remote_partition_residency::RefetchableRootLoadStateV1::FullyLoaded)
+        );
+    }
+
+    #[test]
+    fn complete_v1_rejects_descriptor_and_static_registration_mismatch() {
+        let session = session_id();
+        let (partition, issuer) = temporal_partition(session, 0, 2);
+        let root = issuer.descriptor_v1(0).unwrap();
+        let insertion = RemotePartitionInsertionV1::seal_v1(
+            partition,
+            vec![
+                RemotePartitionRootInsertionV1::seal_v1(
+                    partition,
+                    Arc::new(temporal_chunk(root.root_chunk_id_v1())),
+                    root,
+                )
+                .unwrap(),
+            ]
+            .into_boxed_slice(),
+        )
+        .unwrap();
+        let ordinal_mismatch = ManifestRootDescriptorV1::for_registration_mismatch_test_v1(
+            partition.key_v1(),
+            1,
+            root.root_chunk_id_v1(),
+        );
+        let registration = PreparedPartitionRegistrationV1::complete_roots_for_test_v1(
+            partition,
+            &[ordinal_mismatch],
+            insertion.total_size_bytes_v1().unwrap(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            RemotePartitionBatchV1::complete_v1(
+                1,
+                1,
+                DerivationJobKeyV1::new_v1(partition.key_v1()),
+                phase_identity(RemoteWindowDemandClassV1::PresentationRequired),
+                registration,
+                Some(insertion.clone()),
+            ),
+            Err(RemotePartitionJobErrorV1::InvalidBatch)
+        );
+
+        let static_mismatch = PreparedPartitionRegistrationV1::complete_roots_for_test_v1(
+            partition,
+            &[root],
+            insertion.total_size_bytes_v1().unwrap(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            RemotePartitionBatchV1::complete_v1(
+                1,
+                1,
+                DerivationJobKeyV1::new_v1(partition.key_v1()),
+                phase_identity(RemoteWindowDemandClassV1::PresentationRequired),
+                static_mismatch,
+                Some(insertion),
+            ),
+            Err(RemotePartitionJobErrorV1::InvalidBatch)
+        );
+    }
+
+    #[test]
+    fn prefetch_owner_binding_is_explicitly_unstarted() {
+        let identity = phase_identity(RemoteWindowDemandClassV1::PrefetchDesired);
+        let mut demand = RemoteWindowDemandV1::new_uninstalled(
+            RemoteWindowDemandClassV1::PrefetchDesired,
+            identity,
+        );
+        assert!(demand.is_prefetch_unstarted_v1());
+
+        assert_eq!(
+            RemoteWindowDemandPhaseOwnerV1::bind_v1(&demand, 1, 1, 1),
+            Err(RemotePartitionJobErrorV1::PrefetchUnstarted)
+        );
+        assert_eq!(
+            demand.install_matching_phase_owner_v1(
+                identity,
+                crate::remote_window_demand::RemoteWindowDemandPolicyInputsV1 {
+                    cumulative_range_requests: 1,
+                    active_visible_deadline_millis: 1,
+                },
+            ),
+            Err(crate::remote_window_demand::RemoteWindowDemandErrorV1::PrefetchUnstarted)
+        );
+        assert!(!demand.can_start_retry_v1());
     }
 }

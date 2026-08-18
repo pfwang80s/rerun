@@ -207,6 +207,21 @@ impl ManifestRootDescriptorV1 {
     }
 }
 
+#[cfg(test)]
+impl ManifestRootDescriptorV1 {
+    pub(crate) const fn for_registration_mismatch_test_v1(
+        key: DerivationPartitionKeyV1,
+        output_ordinal: u32,
+        root_chunk_id: ChunkId,
+    ) -> Self {
+        Self {
+            key,
+            output_ordinal,
+            root_chunk_id,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ManifestPartitionDescriptorV1 {
     key: DerivationPartitionKeyV1,

@@ -172,6 +172,19 @@ impl PreparedPartitionRegistrationV1 {
         }
     }
 
+    pub(crate) fn registered_root_for_insertion_v1(
+        &self,
+        root_chunk_id: ChunkId,
+    ) -> Option<(ManifestRootDescriptorV1, bool)> {
+        match &self.outcome {
+            PreparedPartitionOutcomeV1::CompleteEmpty => None,
+            PreparedPartitionOutcomeV1::Roots { roots, .. } => roots
+                .iter()
+                .find(|root| root.manifest_descriptor.root_chunk_id_v1() == root_chunk_id)
+                .map(|root| (root.manifest_descriptor, root.is_static)),
+        }
+    }
+
     fn complete_empty_v1(partition: ManifestPartitionDescriptorV1) -> Self {
         Self {
             partition,
@@ -652,6 +665,11 @@ impl RefetchableRootIndexV1 {
         root: ChunkId,
     ) -> Option<ExternalRefetchableRootDescriptorV1> {
         self.roots.get(&root).map(|root| root.external_descriptor)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_load_state_v1(&self, root: ChunkId) -> Option<RefetchableRootLoadStateV1> {
+        self.roots.get(&root).map(|root| root.load_state)
     }
 
     pub(crate) fn partition_residency_v1(

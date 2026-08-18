@@ -100,6 +100,10 @@ impl RemoteWindowDemandPhaseIdentityV1 {
     pub(crate) const fn class_v1(&self) -> RemoteWindowDemandClassV1 {
         self.class
     }
+
+    pub(crate) const fn source_generation_v1(self) -> u64 {
+        self.source_generation
+    }
 }
 
 /// Cumulative retry-policy inputs frozen with a matching phase owner.
@@ -152,6 +156,13 @@ impl RemoteWindowDemandPhaseV1 {
 
     pub(crate) const fn can_start_retry_v1(&self) -> bool {
         matches!(self.state, RemoteWindowDemandPhaseStateV1::Installed(_))
+    }
+
+    pub(crate) const fn is_prefetch_unstarted_v1(&self) -> bool {
+        matches!(
+            self.state,
+            RemoteWindowDemandPhaseStateV1::PrefetchUnstarted
+        )
     }
 
     pub(crate) fn install_matching_phase_owner_v1(
@@ -211,6 +222,15 @@ impl RemoteWindowDemandV1 {
 
     pub(crate) const fn can_start_retry_v1(&self) -> bool {
         self.phase.can_start_retry_v1()
+    }
+
+    /// Returns `true` when this demand is an explicitly unsupported prefetch phase.
+    ///
+    /// Prefetch demand currently has no sealed exact physical-Chunk body owner/lease binding
+    /// available to turn it into a startable retry owner. Callers must keep this state visible
+    /// instead of treating it as a generic uninstalled phase.
+    pub(crate) const fn is_prefetch_unstarted_v1(&self) -> bool {
+        self.phase.is_prefetch_unstarted_v1()
     }
 }
 
