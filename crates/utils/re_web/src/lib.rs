@@ -144,6 +144,8 @@ pub mod remote_limits;
 #[cfg(target_arch = "wasm32")]
 pub mod remote_mutation_suspension;
 #[cfg(target_arch = "wasm32")]
+pub mod remote_resume_revalidation;
+#[cfg(target_arch = "wasm32")]
 pub mod remote_validator;
 #[cfg(target_arch = "wasm32")]
 pub mod secret_url;
@@ -172,6 +174,10 @@ pub mod strict_open_wire;
     reason = "native tests exercise the Web-only schema without publishing its API"
 )]
 mod remote_limits;
+
+// Host builds compile the pure resume coordinator only for its unit tests.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod remote_resume_revalidation;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod external_string_ingress;
