@@ -117,6 +117,8 @@ pub mod chrome_range;
 #[cfg(target_arch = "wasm32")]
 pub mod compatibility_open;
 #[cfg(target_arch = "wasm32")]
+pub mod external_string_ingress;
+#[cfg(target_arch = "wasm32")]
 mod format_sniffer;
 #[cfg(target_arch = "wasm32")]
 pub mod open_lifecycle_delivery;
@@ -139,8 +141,6 @@ pub mod open_source_terminal;
 pub(crate) mod range_retry;
 #[cfg(target_arch = "wasm32")]
 pub mod remote_limits;
-#[cfg(target_arch = "wasm32")]
-pub mod external_string_ingress;
 #[cfg(target_arch = "wasm32")]
 pub mod remote_mutation_suspension;
 #[cfg(target_arch = "wasm32")]

@@ -7,6 +7,7 @@
 
 use std::fmt;
 
+use crate::external_string_ingress::{CombinedCopyPermit, OpaqueJsString};
 use crate::open_source_terminal::{OpenSourceStatusOwnerV1, OpenSourceToken};
 use crate::secret_url::{HttpUrlIngress, SecretUrl, SecretUrlParserLimits};
 use crate::source_reuse::RemoteMcapSemanticConfigV1;
@@ -39,6 +40,8 @@ pub struct PreparedStrictOpenOperationV1 {
     pub route: PreparedStrictOpenRouteV1,
     pub url: SecretUrl,
     pub semantic: RemoteMcapSemanticConfigV1,
+    #[allow(dead_code, reason = "retained by the future handoff release adapter")]
+    pub(crate) ingress_permit: CombinedCopyPermit,
 }
 
 impl fmt::Debug for PreparedStrictOpenOperationV1 {
@@ -108,6 +111,25 @@ impl StrictOpenBatchPrepareContextV1 {
                 } => {
                     let route = classify_http_remote_mcap_route_v1(&url)
                         .map_err(|code| admission_error_v1(code, index))?;
+                    let url_string = OpaqueJsString::from_utf8(&url).map_err(|_| {
+                        admission_error_v1(StrictOpenAdmissionCodeV1::ResourceLimitExceeded, index)
+                    })?;
+                    let topic_string = OpaqueJsString::from_utf8(semantic.topic_filter_bytes_v1())
+                        .map_err(|_| {
+                            admission_error_v1(
+                                StrictOpenAdmissionCodeV1::ResourceLimitExceeded,
+                                index,
+                            )
+                        })?;
+                    let graph_bytes = (url.len() + semantic.retained_bytes_v1()) as u64;
+                    let ingress_permit =
+                        CombinedCopyPermit::prepare([url_string, topic_string], graph_bytes)
+                            .map_err(|_| {
+                                admission_error_v1(
+                                    StrictOpenAdmissionCodeV1::ResourceLimitExceeded,
+                                    index,
+                                )
+                            })?;
                     let url = SecretUrl::parse(url, ingress, url_limits).map_err(|_err| {
                         admission_error_v1(StrictOpenAdmissionCodeV1::InvalidUrl, index)
                     })?;
@@ -115,6 +137,7 @@ impl StrictOpenBatchPrepareContextV1 {
                         route,
                         url,
                         semantic,
+                        ingress_permit,
                     }
                 }
                 StrictOpenRequestSpecV1::UnsupportedRoute => {
@@ -143,6 +166,7 @@ impl StrictOpenBatchPrepareContextV1 {
                 route: staged_operation.route,
                 url: staged_operation.url,
                 semantic: staged_operation.semantic,
+                ingress_permit: staged_operation.ingress_permit,
             });
         }
 
@@ -162,6 +186,7 @@ struct StagedStrictOpenOperationV1 {
     route: PreparedStrictOpenRouteV1,
     url: SecretUrl,
     semantic: RemoteMcapSemanticConfigV1,
+    ingress_permit: CombinedCopyPermit,
 }
 
 fn admission_error_v1(code: StrictOpenAdmissionCodeV1, index: usize) -> StrictOpenWireErrorV1 {
@@ -371,5 +396,42 @@ mod tests {
         );
         assert_eq!(first.url.scheme().to_string(), "https");
         assert_eq!(first.public_recording_id, PublicRecordingIdentity::new(3));
+    }
+
+    #[test]
+    fn ingress_graph_limit_fails_before_identity_or_secret_url_materialization() {
+        let oversized = RemoteMcapSemanticConfigV1::new_v1(
+            vec![b'x'; crate::external_string_ingress::MAX_COMBINED_UTF8 as usize]
+                .into_boxed_slice(),
+            1,
+            1,
+            TimeType::Sequence,
+            RepresentationConsistencyPolicy::RequireStrongValidator,
+            RepresentationConsistency::StrongValidator,
+        );
+        let mut context = StrictOpenBatchPrepareContextV1::new_v1(1);
+        let error = context
+            .prepare_batch_v1(
+                vec![StrictOpenRequestSpecV1::HttpRemoteMcapCandidate {
+                    url: b"https://example.invalid/a.mcap"
+                        .to_vec()
+                        .into_boxed_slice(),
+                    ingress: HttpUrlIngress::DirectExternal,
+                    semantic: oversized,
+                }],
+                &limits(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            admission_code(error),
+            (StrictOpenAdmissionCodeV1::ResourceLimitExceeded, Some(0))
+        );
+        let prepared = context
+            .prepare_batch_v1(vec![http("https://example.invalid/ok.mcap")], &limits())
+            .unwrap();
+        assert_eq!(
+            prepared.operations_v1()[0].operation_id,
+            OpenOperationIdentity::new(1)
+        );
     }
 }

@@ -67,6 +67,9 @@ pub struct RemoteMcapSemanticConfigV1 {
 }
 
 impl RemoteMcapSemanticConfigV1 {
+    pub(crate) fn topic_filter_bytes_v1(&self) -> &[u8] {
+        &self.topic_filter_canonical_bytes
+    }
     pub fn new_v1(
         topic_filter_canonical_bytes: Box<[u8]>,
         decoder_allowlist_version: u64,
