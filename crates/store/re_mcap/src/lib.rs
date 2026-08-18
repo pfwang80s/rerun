@@ -170,6 +170,11 @@ mod remote_loaded_coverage;
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
 mod remote_partition_residency;
 
+// Bounded three-layer window planner and production-disarmed demand ownership. It remains
+// independent of metadata-opening retry owners and is absent from native/local MCAP builds.
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+mod remote_window_demand;
+
 // Admitted second-pass dispatch remains crate-private and production-disarmed until the Web
 // Store mutation arbiter is wired to the complete terminal contract.
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]

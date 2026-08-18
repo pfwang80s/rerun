@@ -9,9 +9,13 @@ use re_chunk::ChunkId;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::remote_channel_group::{ImmutableRemoteChannelGroupsV1, StableDecoderGroupIdV1};
+use crate::remote_channel_group::{
+    ImmutableChannelGroupV1, ImmutableRemoteChannelGroupsV1, StableDecoderGroupIdV1,
+};
 use crate::remote_loaded_coverage::{CanonicalIndexedExtentV1, RemoteTemporalCoveragePlanV1};
-use crate::remote_physical_resolution::ResolvedRemotePhysicalSourceRefV1;
+use crate::remote_physical_resolution::{
+    ResolvedCanonicalPhysicalLayoutV1, ResolvedRemotePhysicalSourceRefV1,
+};
 
 const MANIFEST_VERSION_V1: u16 = 1;
 const MAX_MANIFEST_RETAINED_BYTES_V1: u64 = 64 * 1024 * 1024;
@@ -746,6 +750,14 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
 
     pub(crate) const fn registration_capacity_v1(&self) -> RemoteRegistrationCapacityV1 {
         self.registration_capacity
+    }
+
+    pub(crate) fn source_layout_v1(&self) -> &ResolvedCanonicalPhysicalLayoutV1 {
+        self.source.layout_v1()
+    }
+
+    pub(crate) fn groups_v1(&self) -> &[ImmutableChannelGroupV1] {
+        self.groups.groups_v1()
     }
 
     pub(crate) const fn indexed_extent_v1(&self) -> CanonicalIndexedExtentV1 {

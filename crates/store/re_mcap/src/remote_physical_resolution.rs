@@ -1008,6 +1008,59 @@ impl ResolvedCanonicalPhysicalLayoutV1 {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_window_planner_test_v1(intervals: &[(i64, i64)]) -> Self {
+        let count = intervals.len();
+        let mut classifications = Vec::with_capacity(count);
+        let mut sorted_intervals = Vec::with_capacity(count);
+        let mut prefix_max_end = Vec::with_capacity(count);
+        for &(start, end) in intervals {
+            classifications.push(ResolutionClassificationV1::NonEmpty {
+                start: TimeInt::new_temporal(start),
+                end: TimeInt::new_temporal(end),
+            });
+        }
+        for (ordinal, classification) in classifications.iter().copied().enumerate() {
+            if let ResolutionClassificationV1::NonEmpty { start, end } = classification {
+                sorted_intervals.push(CanonicalIntervalV1 {
+                    start,
+                    end,
+                    canonical_ordinal: ordinal,
+                });
+            }
+        }
+        sorted_intervals.sort_unstable_by_key(|interval| {
+            (interval.start, interval.end, interval.canonical_ordinal)
+        });
+        let mut max_end = TimeInt::MIN;
+        for interval in &sorted_intervals {
+            max_end = max_end.max(interval.end);
+            prefix_max_end.push(max_end);
+        }
+        let extent = sorted_intervals.iter().fold(
+            CanonicalPhysicalExtentV1::KnownEmpty,
+            |extent, interval| match extent {
+                CanonicalPhysicalExtentV1::KnownEmpty => CanonicalPhysicalExtentV1::Known {
+                    start: interval.start,
+                    end: interval.end,
+                },
+                CanonicalPhysicalExtentV1::Known { start, end } => {
+                    CanonicalPhysicalExtentV1::Known {
+                        start: start.min(interval.start),
+                        end: end.max(interval.end),
+                    }
+                }
+            },
+        );
+        Self {
+            classifications: classifications.into_boxed_slice(),
+            intervals: sorted_intervals.into_boxed_slice(),
+            prefix_max_end: prefix_max_end.into_boxed_slice(),
+            interval_count: count,
+            extent,
+        }
+    }
+
     pub fn intersecting_ordinals_v1(
         &self,
         query_start: TimeInt,

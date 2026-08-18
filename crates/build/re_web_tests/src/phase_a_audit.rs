@@ -30,6 +30,7 @@ const RE_MCAP_REMOTE_MODULES: &[&str] = &[
     "remote_manifest",
     "remote_loaded_coverage",
     "remote_partition_residency",
+    "remote_window_demand",
     "remote_chunk_dispatch",
     "remote_typed_output",
     "remote_runtime_intern",
