@@ -2595,6 +2595,25 @@ mod tests {
         assert_eq!(db.num_physical_chunks(), chunks.len());
     }
 
+    fn run_ignored_proof_in_subprocess(test_name: &str) {
+        let executable = std::env::current_exe().unwrap();
+        let status = std::process::Command::new(executable)
+            .args(["--ignored", "--exact", test_name, "--test-threads=1"])
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated proof `{test_name}` failed with status {status}"
+        );
+    }
+
+    #[test]
+    fn runtime_identifier_exhaustion_proof_runs_in_an_isolated_process() {
+        run_ignored_proof_in_subprocess(
+            "remote_physical_resolution::tests::runtime_identifier_exhaustion_bounds_opening_active_and_store_failure",
+        );
+    }
+
     #[test]
     #[ignore = "exhausts the process-global module budget; run this proof in isolation"]
     fn runtime_identifier_exhaustion_bounds_opening_active_and_store_failure() {

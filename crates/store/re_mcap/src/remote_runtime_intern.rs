@@ -60,16 +60,18 @@ impl RemoteRuntimeInternAdmissionErrorV1 {
             | RemoteMcapRuntimeInternError::ModuleBudgetAlreadyInitializedWithDifferentLimits => {
                 Self::ProtocolViolation
             }
-            RemoteMcapRuntimeInternError::InvalidLimitProfile
-            | RemoteMcapRuntimeInternError::CensusIdentifierLimitExceeded
+            RemoteMcapRuntimeInternError::CensusIdentifierLimitExceeded
             | RemoteMcapRuntimeInternError::CensusRawBytesExceeded
-            | RemoteMcapRuntimeInternError::CensusRetainedBytesExceeded
-            | RemoteMcapRuntimeInternError::CandidatePeakExceeded
-            | RemoteMcapRuntimeInternError::ArithmeticOverflow => Self::CensusLimitExceeded,
-            RemoteMcapRuntimeInternError::CensusCanonicalizationFailed
+            | RemoteMcapRuntimeInternError::CensusRetainedBytesExceeded => {
+                Self::CensusLimitExceeded
+            }
+            RemoteMcapRuntimeInternError::CandidatePeakExceeded
+            | RemoteMcapRuntimeInternError::AllocationFailed => Self::AllocationFailed,
+            RemoteMcapRuntimeInternError::InvalidLimitProfile
+            | RemoteMcapRuntimeInternError::ArithmeticOverflow
+            | RemoteMcapRuntimeInternError::CensusCanonicalizationFailed
             | RemoteMcapRuntimeInternError::IdentifierHashCollision
             | RemoteMcapRuntimeInternError::ProtocolViolation => Self::ProtocolViolation,
-            RemoteMcapRuntimeInternError::AllocationFailed => Self::AllocationFailed,
             RemoteMcapRuntimeInternError::StringBudgetExceeded
             | RemoteMcapRuntimeInternError::EntryAndCapacityBudgetExceeded
             | RemoteMcapRuntimeInternError::SideMapEntryLimitExceeded
@@ -77,6 +79,128 @@ impl RemoteRuntimeInternAdmissionErrorV1 {
             RemoteMcapRuntimeInternError::CoordinationRevisionExhausted => {
                 Self::CoordinationRevisionExhausted
             }
+        }
+    }
+}
+
+struct RemoteEntityPathTokenIter<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> RemoteEntityPathTokenIter<'a> {
+    const fn new(raw: &'a str) -> Self {
+        Self {
+            bytes: raw.as_bytes(),
+        }
+    }
+}
+
+impl<'a> Iterator for RemoteEntityPathTokenIter<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.bytes.is_empty() {
+            return None;
+        }
+
+        let mut index = 0;
+        let mut is_in_escape = false;
+        while index < self.bytes.len() {
+            if !is_in_escape && self.bytes[index] == b'/' {
+                break;
+            }
+            is_in_escape = self.bytes[index] == b'\\';
+            index += 1;
+        }
+        if index == 0 {
+            index = 1;
+        }
+
+        let token = std::str::from_utf8(&self.bytes[..index]).ok()?;
+        self.bytes = &self.bytes[index..];
+        Some(token)
+    }
+}
+
+fn parse_remote_entity_path_unicode_escape<'a>(input: &mut &'a str) -> Result<char, &'a str> {
+    let consumed_start = *input;
+    let mut consumed_bytes = 0_usize;
+    while let Some(character) = input.chars().next() {
+        *input = &input[character.len_utf8()..];
+        consumed_bytes += character.len_utf8();
+        if character == '}' || consumed_bytes == 6 {
+            break;
+        }
+    }
+
+    let consumed = &consumed_start[..consumed_bytes];
+    let Some(body) = consumed.strip_prefix('{') else {
+        return Err(consumed);
+    };
+    let Some(digits) = body.strip_suffix('}') else {
+        return Err(consumed);
+    };
+    if digits.len() != 4 {
+        return Err(consumed);
+    }
+
+    u32::from_str_radix(digits, 16)
+        .ok()
+        .and_then(char::from_u32)
+        .ok_or(consumed)
+}
+
+fn push_remote_entity_path_unescaped_character(input: &mut &str, first: char, output: &mut String) {
+    if first != '\\' {
+        output.push(first);
+        return;
+    }
+
+    let Some(next) = input.chars().next() else {
+        output.push('\\');
+        return;
+    };
+    *input = &input[next.len_utf8()..];
+    match next {
+        'n' => output.push('\n'),
+        'r' => output.push('\r'),
+        't' => output.push('\t'),
+        'u' => match parse_remote_entity_path_unicode_escape(input) {
+            Ok(character) => output.push(character),
+            Err(invalid) => {
+                output.push('\\');
+                output.push('u');
+                output.push_str(invalid);
+            }
+        },
+        character => output.push(character),
+    }
+}
+
+fn canonicalize_remote_entity_path_part_into(raw: &str, output: &mut String) {
+    let mut input = raw;
+    while let Some(first) = input.chars().next() {
+        input = &input[first.len_utf8()..];
+        push_remote_entity_path_unescaped_character(&mut input, first, output);
+    }
+}
+
+fn remote_entity_path_matches_v1(value: &EntityPath, raw_lookup: &str) -> bool {
+    let mut actual_parts = value.iter();
+    let mut raw_parts = RemoteEntityPathTokenIter::new(raw_lookup).filter(|token| *token != "/");
+    let mut canonical = String::new();
+
+    loop {
+        match (actual_parts.next(), raw_parts.next()) {
+            (Some(actual), Some(raw)) => {
+                canonical.clear();
+                canonicalize_remote_entity_path_part_into(raw, &mut canonical);
+                if actual.unescaped_str() != canonical {
+                    return false;
+                }
+            }
+            (None, None) => return true,
+            _ => return false,
         }
     }
 }
@@ -150,9 +274,9 @@ impl RemoteRuntimeIdentifiersV1 {
 
     pub(crate) fn entity_path(&self, raw_lookup: &str) -> Option<EntityPath> {
         self.domains.iter().find_map(|identifier| match identifier {
-            RemoteRuntimeDomainIdentifierV1::EntityPath { raw, value } => {
-                (raw == raw_lookup).then_some(value.clone())
-            }
+            RemoteRuntimeDomainIdentifierV1::EntityPath { raw, value } => (raw == raw_lookup
+                || remote_entity_path_matches_v1(value, raw_lookup))
+            .then_some(value.clone()),
             _ => None,
         })
     }
@@ -471,6 +595,57 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_entity_path_raw_topics_redeem_the_same_census_domain() {
+        ensure_disarmed_test_profile_v1();
+
+        let identifiers = [
+            RemoteMcapRawIdentifier::timeline("message_log_time").unwrap(),
+            RemoteMcapRawIdentifier::timeline("message_publish_time").unwrap(),
+            RemoteMcapRawIdentifier::component("message").unwrap(),
+            RemoteMcapRawIdentifier::entity_path("/foo///bar/"),
+            RemoteMcapRawIdentifier::entity_path("foo/bar"),
+        ];
+        let raw = RawRuntimeIdentifierCensusV1::try_new(identifiers).unwrap();
+        let raw_identifiers = raw.identifiers.clone();
+        let committed = commit_raw_census(&raw).unwrap();
+        let domains = redeem_summary_domain_handles_v1(&raw_identifiers, &committed).unwrap();
+        let admitted = RemoteRuntimeIdentifiersV1 { domains, committed };
+
+        assert_eq!(
+            admitted.entity_path("/foo///bar/").unwrap().to_string(),
+            "/foo/bar"
+        );
+        assert_eq!(
+            admitted.entity_path("foo/bar").unwrap().to_string(),
+            "/foo/bar"
+        );
+        assert!(admitted.typed_domain_output_v1("/foo///bar/", None).is_ok());
+        assert!(admitted.typed_domain_output_v1("foo/bar", None).is_ok());
+    }
+
+    #[test]
+    fn intern_errors_are_classified_without_folding_internal_failures_into_census_limits() {
+        assert_eq!(
+            RemoteRuntimeInternAdmissionErrorV1::from_intern(
+                RemoteMcapRuntimeInternError::InvalidLimitProfile,
+            ),
+            RemoteRuntimeInternAdmissionErrorV1::ProtocolViolation
+        );
+        assert_eq!(
+            RemoteRuntimeInternAdmissionErrorV1::from_intern(
+                RemoteMcapRuntimeInternError::CandidatePeakExceeded,
+            ),
+            RemoteRuntimeInternAdmissionErrorV1::AllocationFailed
+        );
+        assert_eq!(
+            RemoteRuntimeInternAdmissionErrorV1::from_intern(
+                RemoteMcapRuntimeInternError::ArithmeticOverflow,
+            ),
+            RemoteRuntimeInternAdmissionErrorV1::ProtocolViolation
+        );
+    }
+
+    #[test]
     fn chunk_descriptor_census_reuses_side_map_entries() {
         ensure_disarmed_test_profile_v1();
         let before = remote_mcap_runtime_intern_snapshot().unwrap();
@@ -653,6 +828,25 @@ mod tests {
         assert_eq!(
             reject_undelayable_constructor_v1(),
             RemoteRuntimeInternAdmissionErrorV1::ConstructorCannotBeDelayed
+        );
+    }
+
+    fn run_ignored_proof_in_subprocess(test_name: &str) {
+        let executable = std::env::current_exe().unwrap();
+        let status = std::process::Command::new(executable)
+            .args(["--ignored", "--exact", test_name, "--test-threads=1"])
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated proof `{test_name}` failed with status {status}"
+        );
+    }
+
+    #[test]
+    fn actual_budget_failure_proof_runs_in_an_isolated_process() {
+        run_ignored_proof_in_subprocess(
+            "remote_runtime_intern::tests::actual_budget_failure_is_atomic_and_nonremote_construction_survives",
         );
     }
 
