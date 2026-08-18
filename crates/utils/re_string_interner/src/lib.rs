@@ -441,17 +441,32 @@ macro_rules! declare_new_type_nonempty {
                 /// Currently only forbids the empty string, but this is where future rules
                 /// (e.g. no whitespace) would go.
                 #[inline]
-                pub fn try_new(string: impl AsRef<str>) -> Result<Self, [<Invalid $StructName Error>]> {
-                    let string = string.as_ref();
-                    if string.is_empty() {
-                        return Err([<Invalid $StructName Error>] { reason: "must not be empty" });
-                    }
-                    Ok(Self($crate::InternedString::new(string)))
+            pub fn try_new(string: impl AsRef<str>) -> Result<Self, [<Invalid $StructName Error>]> {
+                let string = string.as_ref();
+                if string.is_empty() {
+                    return Err([<Invalid $StructName Error>] { reason: "must not be empty" });
                 }
+                Ok(Self($crate::InternedString::new(string)))
+            }
 
-                /// Create from a trusted compile-time string literal.
-                ///
-                /// # Panics
+            /// Construct from an already-interned string without interning it again.
+            ///
+            /// This is for trusted bounded-intern transactions which have already canonicalized and
+            /// admitted the identifier. The validity check remains so an arbitrary empty interned
+            /// string cannot bypass the type's invariant.
+            #[inline]
+            pub fn try_from_interned(
+                interned: $crate::InternedString,
+            ) -> Result<Self, [<Invalid $StructName Error>]> {
+                if interned.as_str().is_empty() {
+                    return Err([<Invalid $StructName Error>] { reason: "must not be empty" });
+                }
+                Ok(Self(interned))
+            }
+
+            /// Create from a trusted compile-time string literal.
+            ///
+            /// # Panics
                 /// Panics if `string` is invalid (e.g. empty).
                 #[inline]
                 pub fn from_static_str(string: &'static str) -> Self {

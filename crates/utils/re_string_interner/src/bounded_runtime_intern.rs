@@ -22,7 +22,6 @@
 //! ```
 
 use std::fmt;
-use std::fmt::Write as _;
 use std::num::{NonZeroU64, NonZeroUsize};
 
 use nohash_hasher::IntMap;
@@ -181,11 +180,27 @@ pub struct RemoteMcapRuntimeInternSnapshot {
 /// Identifier-free telemetry for one prepared/committed census.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RemoteInternBatchTelemetry {
+    /// Duplicate-inclusive number of submitted raw identifiers.
+    pub candidate_identifiers: u64,
+    /// Duplicate-inclusive UTF-8 byte count of submitted raw identifiers.
+    pub candidate_raw_bytes: u64,
+    /// Unique domain identifiers after canonicalization and deduplication.
     pub unique_identifiers: u64,
-    pub raw_bytes: u64,
+    /// Unique canonical string identities retained by those domain identifiers.
+    ///
+    /// A full entity path can reference multiple canonical part identities.
+    pub canonical_unique_identifiers: u64,
+    /// Unique canonical UTF-8 byte count retained by the census.
+    pub canonical_bytes: u64,
+    /// Census capacity actually retained by strings and deduplication/result structures.
     pub retained_bytes: u64,
+    /// Conservative byte bound for all duplicate-inclusive census candidates.
+    pub candidate_peak_upper_bound: u64,
+    /// Canonical string identities already present in the legacy map.
     pub existing_legacy: u64,
+    /// Canonical string identities already present in the remote side-map.
     pub existing_remote: u64,
+    /// Canonical string identities absent at preparation/revalidation time.
     pub missing: u64,
     pub missing_string_bytes: u64,
     pub missing_entry_bytes: u64,
@@ -204,9 +219,9 @@ pub enum RemoteMcapRawIdentifierKind {
 
 /// One borrowed, not-yet-interned identifier.
 ///
-/// Construction validates the raw shape for the requested family. Entity paths use the same
-/// forgiving unescaping and canonical display form as the local parser, but without constructing
-/// an `EntityPath` or interning any part.
+/// Construction validates the raw shape for the requested family. Entity paths and path parts use
+/// the same slash tokenization and forgiving unescaping as the local parser, but without
+/// constructing domain values or interning any part.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RemoteMcapRawIdentifier<'a> {
     kind: RemoteMcapRawIdentifierKind,
@@ -256,10 +271,20 @@ impl<'a> RemoteMcapRawIdentifier<'a> {
     }
 }
 
+/// One unique canonical string owner, referenced by one or more domain records.
 #[derive(Debug)]
-struct OwnedRawIdentifier {
+struct OwnedCanonicalIdentifier {
     hash: u64,
     raw: Option<String>,
+}
+
+/// One unique domain record after canonicalization.
+#[derive(Debug)]
+enum OwnedDomainIdentifier {
+    Timeline { canonical: usize },
+    EntityPathPart { canonical: usize },
+    Component { canonical: usize },
+    EntityPath { parts: (usize, usize) },
 }
 
 /// A complete, canonical, owned raw identifier census.
@@ -267,8 +292,12 @@ struct OwnedRawIdentifier {
 /// The fields are private and the value is move-only. It cannot be assembled from caller-selected
 /// internals, and it owns every temporary string until the interner transaction consumes it.
 pub struct BoundedRemoteIdentifierCensus {
-    identifiers: Vec<OwnedRawIdentifier>,
-    raw_bytes: u64,
+    identifiers: Vec<OwnedDomainIdentifier>,
+    part_references: Vec<usize>,
+    canonical_identifiers: Vec<OwnedCanonicalIdentifier>,
+    candidate_identifiers: u64,
+    candidate_raw_bytes: u64,
+    canonical_bytes: u64,
     retained_bytes: u64,
     candidate_peak_upper_bound: u64,
 }
@@ -280,7 +309,13 @@ impl fmt::Debug for BoundedRemoteIdentifierCensus {
         formatter
             .debug_struct("BoundedRemoteIdentifierCensus")
             .field("identifier_count", &self.identifiers.len())
-            .field("raw_bytes", &self.raw_bytes)
+            .field("candidate_identifiers", &self.candidate_identifiers)
+            .field("candidate_raw_bytes", &self.candidate_raw_bytes)
+            .field(
+                "canonical_identifier_count",
+                &self.canonical_identifiers.len(),
+            )
+            .field("canonical_bytes", &self.canonical_bytes)
             .field("retained_bytes", &self.retained_bytes)
             .field(
                 "candidate_peak_upper_bound",
@@ -310,6 +345,7 @@ impl fmt::Debug for RemoteMcapDomainConstructionToken {
 pub struct PreparedRemoteInternBatch {
     census: BoundedRemoteIdentifierCensus,
     resolved: Vec<Option<InternedString>>,
+    part_handles: Vec<InternedString>,
     telemetry: RemoteInternBatchTelemetry,
 }
 
@@ -317,8 +353,17 @@ impl fmt::Debug for PreparedRemoteInternBatch {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PreparedRemoteInternBatch")
+            .field(
+                "candidate_identifiers",
+                &self.telemetry.candidate_identifiers,
+            )
+            .field("candidate_raw_bytes", &self.telemetry.candidate_raw_bytes)
             .field("unique_identifiers", &self.telemetry.unique_identifiers)
-            .field("raw_bytes", &self.telemetry.raw_bytes)
+            .field(
+                "canonical_unique_identifiers",
+                &self.telemetry.canonical_unique_identifiers,
+            )
+            .field("canonical_bytes", &self.telemetry.canonical_bytes)
             .field("retained_bytes", &self.telemetry.retained_bytes)
             .finish_non_exhaustive()
     }
@@ -336,7 +381,27 @@ impl PreparedRemoteInternBatch {
 }
 
 /// Domain-neutral handles returned by one successful atomic batch.
+pub enum RemoteMcapDomainIdentifierHandle<'a> {
+    Timeline(InternedString),
+    EntityPathPart(InternedString),
+    Component(InternedString),
+    EntityPath(&'a [InternedString]),
+}
+
+impl fmt::Debug for RemoteMcapDomainIdentifierHandle<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeline(_) => formatter.write_str("Timeline(<identifier-free>)"),
+            Self::EntityPathPart(_) => formatter.write_str("EntityPathPart(<identifier-free>)"),
+            Self::Component(_) => formatter.write_str("Component(<identifier-free>)"),
+            Self::EntityPath(parts) => write!(formatter, "EntityPath({} parts)", parts.len()),
+        }
+    }
+}
+
 pub struct CommittedRemoteInternBatch {
+    identifiers: Vec<OwnedDomainIdentifier>,
+    part_handles: Vec<InternedString>,
     handles: Vec<Option<InternedString>>,
     telemetry: RemoteInternBatchTelemetry,
     module_snapshot: RemoteMcapRuntimeInternSnapshot,
@@ -349,22 +414,54 @@ impl fmt::Debug for CommittedRemoteInternBatch {
             .field("handles", &self.handles.len())
             .field("telemetry", &self.telemetry)
             .field("module_snapshot", &self.module_snapshot)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl CommittedRemoteInternBatch {
     pub fn len(&self) -> usize {
-        self.handles.len()
+        self.identifiers.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.handles.is_empty()
+        self.identifiers.is_empty()
     }
 
-    /// Returns the handle at its first-seen unique-census position.
+    /// Returns a scalar identifier handle, or `None` for a full entity path.
     pub fn handle(&self, index: usize) -> Option<InternedString> {
-        self.handles.get(index).copied().flatten()
+        match self.identifiers.get(index)? {
+            OwnedDomainIdentifier::Timeline { canonical }
+            | OwnedDomainIdentifier::EntityPathPart { canonical }
+            | OwnedDomainIdentifier::Component { canonical } => {
+                self.handles.get(*canonical).copied().flatten()
+            }
+            OwnedDomainIdentifier::EntityPath { .. } => None,
+        }
+    }
+
+    /// Returns the canonical identity needed to construct the corresponding typed domain value.
+    pub fn domain_handle(&self, index: usize) -> Option<RemoteMcapDomainIdentifierHandle<'_>> {
+        match self.identifiers.get(index)? {
+            OwnedDomainIdentifier::Timeline { canonical } => self
+                .handles
+                .get(*canonical)
+                .and_then(|handle| *handle)
+                .map(RemoteMcapDomainIdentifierHandle::Timeline),
+            OwnedDomainIdentifier::EntityPathPart { canonical } => self
+                .handles
+                .get(*canonical)
+                .and_then(|handle| *handle)
+                .map(RemoteMcapDomainIdentifierHandle::EntityPathPart),
+            OwnedDomainIdentifier::Component { canonical } => self
+                .handles
+                .get(*canonical)
+                .and_then(|handle| *handle)
+                .map(RemoteMcapDomainIdentifierHandle::Component),
+            OwnedDomainIdentifier::EntityPath { parts } => self
+                .part_handles
+                .get(parts.0..parts.0.checked_add(parts.1)?)
+                .map(RemoteMcapDomainIdentifierHandle::EntityPath),
+        }
     }
 
     pub const fn telemetry(&self) -> RemoteInternBatchTelemetry {
@@ -477,6 +574,14 @@ fn checked_vec_bytes<T>(capacity: usize) -> Result<u64, RemoteMcapRuntimeInternE
         .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)
 }
 
+fn checked_add_checked(
+    left: u64,
+    right: Result<u64, RemoteMcapRuntimeInternError>,
+) -> Result<u64, RemoteMcapRuntimeInternError> {
+    left.checked_add(right?)
+        .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)
+}
+
 fn conservative_hash_capacity_for_entries(
     entries: usize,
 ) -> Result<usize, RemoteMcapRuntimeInternError> {
@@ -491,188 +596,380 @@ fn conservative_hash_capacity_for_entries(
 }
 
 fn checked_census_capacity_upper_bound(
-    raw_bytes: u64,
-    identifiers: usize,
+    canonical_bytes: u64,
+    canonical_identifiers: usize,
+    domain_identifiers: usize,
+    part_references: usize,
 ) -> Result<u64, RemoteMcapRuntimeInternError> {
-    let with_identifier_vec = raw_bytes
-        .checked_add(checked_vec_bytes::<OwnedRawIdentifier>(identifiers)?)
+    let retained = canonical_bytes
+        .checked_add(checked_vec_bytes::<OwnedCanonicalIdentifier>(
+            canonical_identifiers,
+        )?)
         .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
-    let dedup_capacity = conservative_hash_capacity_for_entries(identifiers)?;
-    with_identifier_vec
-        .checked_add(checked_capacity_bytes(dedup_capacity)?)
-        .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)
+    let retained = checked_add_checked(
+        retained,
+        checked_vec_bytes::<OwnedDomainIdentifier>(domain_identifiers),
+    )?;
+    let retained = checked_add_checked(retained, checked_vec_bytes::<usize>(part_references))?;
+    let canonical_dedup = conservative_hash_capacity_for_entries(canonical_identifiers)?;
+    let domain_dedup = conservative_hash_capacity_for_entries(domain_identifiers)?;
+    let retained = retained
+        .checked_add(checked_capacity_bytes(canonical_dedup)?)
+        .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
+    checked_add_checked(retained, checked_capacity_bytes(domain_dedup))
 }
 
 fn checked_candidate_peak_upper_bound(
-    raw_bytes: u64,
-    identifiers: usize,
+    canonical_bytes: u64,
+    canonical_identifiers: usize,
+    domain_identifiers: usize,
+    part_references: usize,
 ) -> Result<u64, RemoteMcapRuntimeInternError> {
-    checked_census_capacity_upper_bound(raw_bytes, identifiers)?
-        .checked_add(checked_vec_bytes::<Option<InternedString>>(identifiers)?)
-        .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)
+    let peak = checked_census_capacity_upper_bound(
+        canonical_bytes,
+        canonical_identifiers,
+        domain_identifiers,
+        part_references,
+    )?;
+    let peak = peak
+        .checked_add(checked_vec_bytes::<Option<InternedString>>(
+            canonical_identifiers,
+        )?)
+        .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
+    checked_add_checked(peak, checked_vec_bytes::<InternedString>(part_references))
 }
 
 fn checked_census_retained_bytes(
     string_capacity_bytes: u64,
-    identifier_capacity: usize,
-    dedup_capacity: usize,
+    canonical_capacity: usize,
+    domain_capacity: usize,
+    part_reference_capacity: usize,
+    canonical_dedup_capacity: usize,
+    domain_dedup_capacity: usize,
 ) -> Result<u64, RemoteMcapRuntimeInternError> {
     let retained = string_capacity_bytes
-        .checked_add(checked_vec_bytes::<OwnedRawIdentifier>(
-            identifier_capacity,
+        .checked_add(checked_vec_bytes::<OwnedCanonicalIdentifier>(
+            canonical_capacity,
         )?)
         .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
-    retained
-        .checked_add(checked_capacity_bytes(dedup_capacity)?)
-        .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)
+    let retained = checked_add_checked(
+        retained,
+        checked_vec_bytes::<OwnedDomainIdentifier>(domain_capacity),
+    )?;
+    let retained = checked_add_checked(
+        retained,
+        checked_vec_bytes::<usize>(part_reference_capacity),
+    )?;
+    let retained = retained
+        .checked_add(checked_capacity_bytes(canonical_dedup_capacity)?)
+        .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
+    checked_add_checked(retained, checked_capacity_bytes(domain_dedup_capacity))
 }
 
-fn push_escaped_character(output: &mut String, character: char) {
-    if character.is_alphanumeric() || matches!(character, '_' | '-' | '.') {
-        output.push(character);
-        return;
-    }
-    match character {
-        '\n' => output.push_str("\\n"),
-        '\r' => output.push_str("\\r"),
-        '\t' => output.push_str("\\t"),
-        character if character.is_ascii_punctuation() || character == ' ' => {
-            output.push('\\');
-            output.push(character);
-        }
-        character => {
-            write!(output, "\\u{{{:04X}}}", u32::from(character)).ok();
-        }
-    }
-}
-
-struct InvalidUnicodeEscape {
-    consumed: [char; 6],
-    length: usize,
-}
-
-fn parse_unicode_escape(
-    input: &mut impl Iterator<Item = char>,
-) -> Result<char, InvalidUnicodeEscape> {
-    let mut consumed = ['\0'; 6];
-    let mut length = 0;
-    for character in input {
-        consumed[length] = character;
-        length += 1;
-        if character == '}' || length == consumed.len() {
+fn parse_unicode_escape<'a>(input: &mut &'a str) -> Result<char, &'a str> {
+    let consumed_start = *input;
+    let mut consumed_bytes = 0_usize;
+    while let Some(character) = input.chars().next() {
+        *input = &input[character.len_utf8()..];
+        consumed_bytes += character.len_utf8();
+        // EntityPathPart stops at exactly six consumed UTF-8 bytes, not six characters.
+        if character == '}' || consumed_bytes == 6 {
             break;
         }
     }
-
-    let body = &consumed[..length];
-    if body.last() != Some(&'}') {
-        return Err(InvalidUnicodeEscape { consumed, length });
+    let consumed = &consumed_start[..consumed_bytes];
+    let Some(body) = consumed.strip_prefix('{') else {
+        return Err(consumed);
+    };
+    let Some(digits) = body.strip_suffix('}') else {
+        return Err(consumed);
+    };
+    if digits.len() != 4 {
+        return Err(consumed);
     }
-    let digits = &body[..length - 1];
-    if digits.len() != 5 || digits[0] != '{' {
-        return Err(InvalidUnicodeEscape { consumed, length });
-    }
-    let mut codepoint = 0_u32;
-    for digit in &digits[1..] {
-        let Some(digit) = digit.to_digit(16) else {
-            return Err(InvalidUnicodeEscape { consumed, length });
-        };
-        codepoint = codepoint * 16 + digit;
-    }
-    char::from_u32(codepoint).ok_or(InvalidUnicodeEscape { consumed, length })
+    u32::from_str_radix(digits, 16)
+        .ok()
+        .and_then(char::from_u32)
+        .ok_or(consumed)
 }
 
-fn push_unescaped_character(
-    input: &mut impl Iterator<Item = char>,
-    first: char,
-    output: &mut String,
-) {
+fn push_unescaped_character(input: &mut &str, first: char, output: &mut String) {
     if first != '\\' {
-        push_escaped_character(output, first);
+        output.push(first);
         return;
     }
 
-    let Some(next) = input.next() else {
-        push_escaped_character(output, '\\');
+    let Some(next) = input.chars().next() else {
+        output.push('\\');
         return;
     };
+    *input = &input[next.len_utf8()..];
     match next {
-        'n' => push_escaped_character(output, '\n'),
-        'r' => push_escaped_character(output, '\r'),
-        't' => push_escaped_character(output, '\t'),
+        'n' => output.push('\n'),
+        'r' => output.push('\r'),
+        't' => output.push('\t'),
         'u' => match parse_unicode_escape(input) {
-            Ok(character) => push_escaped_character(output, character),
+            Ok(character) => output.push(character),
             Err(invalid) => {
-                push_escaped_character(output, '\\');
+                output.push('\\');
                 output.push('u');
-                for character in &invalid.consumed[..invalid.length] {
-                    push_escaped_character(output, *character);
-                }
+                output.push_str(invalid);
             }
         },
-        character => push_escaped_character(output, character),
+        character => output.push(character),
     }
 }
 
 fn canonicalize_entity_path_part_into(raw: &str, output: &mut String) {
-    let mut input = raw.chars();
-    while let Some(first) = input.next() {
+    let mut input = raw;
+    while let Some(first) = input.chars().next() {
+        input = &input[first.len_utf8()..];
         push_unescaped_character(&mut input, first, output);
     }
 }
 
-fn canonicalize_entity_path_into(raw: &str, output: &mut String) {
-    let mut input = raw.chars();
-    let mut part_has_content = false;
-    while let Some(first) = input.next() {
-        if first == '/' {
-            part_has_content = false;
-            continue;
+struct EntityPathTokenIter<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> EntityPathTokenIter<'a> {
+    fn new(raw: &'a str) -> Self {
+        Self {
+            bytes: raw.as_bytes(),
         }
-        if !part_has_content {
-            output.push('/');
-            part_has_content = true;
-        }
-        push_unescaped_character(&mut input, first, output);
-    }
-    if output.is_empty() {
-        output.push('/');
     }
 }
 
-fn canonicalize_identifier_into(
-    identifier: RemoteMcapRawIdentifier<'_>,
-    output: &mut String,
-) -> Result<(), RemoteMcapRuntimeInternError> {
-    if identifier.kind == RemoteMcapRawIdentifierKind::EntityPathPart && identifier.raw.is_empty() {
-        return Err(RemoteMcapRuntimeInternError::CensusCanonicalizationFailed);
+impl<'a> Iterator for EntityPathTokenIter<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.bytes.is_empty() {
+            return None;
+        }
+        let mut index = 0;
+        let mut is_in_escape = false;
+        while index < self.bytes.len() {
+            if !is_in_escape && self.bytes[index] == b'/' {
+                break;
+            }
+            is_in_escape = self.bytes[index] == b'\\';
+            index += 1;
+        }
+        if index == 0 {
+            index = 1;
+        }
+        // UTF-8 is only split on either side of the one-byte ASCII `/`.
+        let token = std::str::from_utf8(&self.bytes[..index]).ok()?;
+        self.bytes = &self.bytes[index..];
+        Some(token)
     }
-    match identifier.kind {
-        RemoteMcapRawIdentifierKind::Timeline | RemoteMcapRawIdentifierKind::Component => {
-            output.push_str(identifier.raw);
+}
+
+fn entity_path_part_count(raw: &str) -> usize {
+    EntityPathTokenIter::new(raw)
+        .filter(|token| *token != "/")
+        .count()
+}
+
+fn canonical_domain_identifier_hash(
+    kind: RemoteMcapRawIdentifierKind,
+    canonical_indices: &[usize],
+) -> u64 {
+    hash((kind, canonical_indices))
+}
+
+fn domain_identifiers_equal(
+    left: &OwnedDomainIdentifier,
+    right: &OwnedDomainIdentifier,
+    canonical_identifiers: &[OwnedCanonicalIdentifier],
+    part_references: &[usize],
+) -> bool {
+    let canonical = |index: usize| {
+        let identifier = canonical_identifiers.get(index)?;
+        identifier.raw.as_deref()
+    };
+    match (left, right) {
+        (
+            OwnedDomainIdentifier::Timeline { canonical: left },
+            OwnedDomainIdentifier::Timeline { canonical: right },
+        )
+        | (
+            OwnedDomainIdentifier::EntityPathPart { canonical: left },
+            OwnedDomainIdentifier::EntityPathPart { canonical: right },
+        )
+        | (
+            OwnedDomainIdentifier::Component { canonical: left },
+            OwnedDomainIdentifier::Component { canonical: right },
+        ) => canonical(*left) == canonical(*right),
+        (
+            OwnedDomainIdentifier::EntityPath {
+                parts: (left_start, left_len),
+            },
+            OwnedDomainIdentifier::EntityPath {
+                parts: (right_start, right_len),
+            },
+        ) => {
+            let Some(left_parts) = part_references.get(*left_start..left_start + *left_len) else {
+                return false;
+            };
+            let Some(right_parts) = part_references.get(*right_start..right_start + *right_len)
+            else {
+                return false;
+            };
+            left_parts.len() == right_parts.len()
+                && left_parts
+                    .iter()
+                    .zip(right_parts)
+                    .all(|(left, right)| canonical(*left) == canonical(*right))
         }
-        RemoteMcapRawIdentifierKind::EntityPathPart => {
-            canonicalize_entity_path_part_into(identifier.raw, output);
-        }
-        RemoteMcapRawIdentifierKind::EntityPath => {
-            canonicalize_entity_path_into(identifier.raw, output);
-        }
+        _ => false,
     }
-    Ok(())
 }
 
 fn canonical_byte_upper_bound(identifier: RemoteMcapRawIdentifier<'_>) -> Option<u64> {
-    let raw_bytes = u64::try_from(identifier.raw.len()).ok()?;
-    if matches!(
-        identifier.kind,
-        RemoteMcapRawIdentifierKind::EntityPath | RemoteMcapRawIdentifierKind::EntityPathPart
-    ) {
-        let characters = u64::try_from(identifier.raw.chars().count()).ok()?;
-        // Every input character expands to at most 12 canonical bytes. The extra byte covers the
-        // canonical entity-path slash.
-        characters.checked_mul(12)?.checked_add(1)
-    } else {
-        Some(raw_bytes)
+    u64::try_from(identifier.raw.len()).ok()
+}
+
+struct CensusBuilder {
+    limits: RemoteMcapRuntimeInternLimits,
+    fault: TestFault,
+    canonical_identifiers: Vec<OwnedCanonicalIdentifier>,
+    part_references: Vec<usize>,
+    domain_identifiers: Vec<OwnedDomainIdentifier>,
+    canonical_dedup: IntMap<u64, usize>,
+    domain_dedup: IntMap<u64, usize>,
+    string_capacity_bytes: u64,
+    canonical_bytes: u64,
+}
+
+impl CensusBuilder {
+    fn retained_bytes(&self) -> Result<u64, RemoteMcapRuntimeInternError> {
+        checked_census_retained_bytes(
+            self.string_capacity_bytes,
+            self.canonical_identifiers.capacity(),
+            self.domain_identifiers.capacity(),
+            self.part_references.capacity(),
+            self.canonical_dedup.capacity(),
+            self.domain_dedup.capacity(),
+        )
+    }
+
+    fn add_canonical(
+        &mut self,
+        kind: RemoteMcapRawIdentifierKind,
+        raw: &str,
+    ) -> Result<usize, RemoteMcapRuntimeInternError> {
+        let canonical_capacity_bound =
+            canonical_byte_upper_bound(RemoteMcapRawIdentifier::unchecked(kind, raw))
+                .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
+        let temporary_peak = self
+            .retained_bytes()?
+            .checked_add(canonical_capacity_bound)
+            .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
+        if temporary_peak > self.limits.max_census_retained_bytes.get() {
+            return Err(RemoteMcapRuntimeInternError::CensusRetainedBytesExceeded);
+        }
+        if temporary_peak > self.limits.max_candidate_peak_bytes.get() {
+            return Err(RemoteMcapRuntimeInternError::CandidatePeakExceeded);
+        }
+
+        if self.fault == TestFault::CensusString {
+            return Err(RemoteMcapRuntimeInternError::AllocationFailed);
+        }
+        let canonical_capacity = usize::try_from(canonical_capacity_bound)
+            .map_err(|_conversion_error| RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
+        let mut canonical = String::new();
+        canonical
+            .try_reserve_exact(canonical_capacity)
+            .map_err(|_reserve_error| RemoteMcapRuntimeInternError::AllocationFailed)?;
+        let actual_canonical_capacity = u64::try_from(canonical.capacity())
+            .map_err(|_conversion_error| RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
+        if actual_canonical_capacity > canonical_capacity_bound {
+            return Err(RemoteMcapRuntimeInternError::ProtocolViolation);
+        }
+        match kind {
+            RemoteMcapRawIdentifierKind::Timeline | RemoteMcapRawIdentifierKind::Component => {
+                canonical.push_str(raw);
+            }
+            RemoteMcapRawIdentifierKind::EntityPathPart => {
+                canonicalize_entity_path_part_into(raw, &mut canonical);
+            }
+            RemoteMcapRawIdentifierKind::EntityPath => {
+                return Err(RemoteMcapRuntimeInternError::ProtocolViolation);
+            }
+        }
+        if u64::try_from(canonical.len())
+            .map_err(|_conversion_error| RemoteMcapRuntimeInternError::ArithmeticOverflow)?
+            > canonical_capacity_bound
+        {
+            return Err(RemoteMcapRuntimeInternError::ProtocolViolation);
+        }
+
+        let canonical_hash = hash(&canonical);
+        if let Some(index) = self.canonical_dedup.get(&canonical_hash).copied() {
+            let existing = self
+                .canonical_identifiers
+                .get(index)
+                .and_then(|identifier| identifier.raw.as_deref())
+                .ok_or(RemoteMcapRuntimeInternError::ProtocolViolation)?;
+            if existing != canonical {
+                return Err(RemoteMcapRuntimeInternError::IdentifierHashCollision);
+            }
+            return Ok(index);
+        }
+
+        let canonical_len = u64::try_from(canonical.len())
+            .map_err(|_conversion_error| RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
+        self.canonical_bytes = self
+            .canonical_bytes
+            .checked_add(canonical_len)
+            .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
+        self.string_capacity_bytes = self
+            .string_capacity_bytes
+            .checked_add(actual_canonical_capacity)
+            .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
+        let retained_bytes = self.retained_bytes()?;
+        if retained_bytes > self.limits.max_census_retained_bytes.get() {
+            return Err(RemoteMcapRuntimeInternError::CensusRetainedBytesExceeded);
+        }
+        if retained_bytes > self.limits.max_candidate_peak_bytes.get() {
+            return Err(RemoteMcapRuntimeInternError::CandidatePeakExceeded);
+        }
+
+        let index = self.canonical_identifiers.len();
+        self.canonical_identifiers.push(OwnedCanonicalIdentifier {
+            hash: canonical_hash,
+            raw: Some(canonical),
+        });
+        self.canonical_dedup.insert(canonical_hash, index);
+        Ok(index)
+    }
+
+    fn add_domain(
+        &mut self,
+        domain_hash: u64,
+        record: OwnedDomainIdentifier,
+    ) -> Result<(), RemoteMcapRuntimeInternError> {
+        if let Some(index) = self.domain_dedup.get(&domain_hash).copied() {
+            let Some(existing) = self.domain_identifiers.get(index) else {
+                return Err(RemoteMcapRuntimeInternError::ProtocolViolation);
+            };
+            if !domain_identifiers_equal(
+                existing,
+                &record,
+                &self.canonical_identifiers,
+                &self.part_references,
+            ) {
+                return Err(RemoteMcapRuntimeInternError::IdentifierHashCollision);
+            }
+            return Ok(());
+        }
+
+        let index = self.domain_identifiers.len();
+        self.domain_identifiers.push(record);
+        self.domain_dedup.insert(domain_hash, index);
+        Ok(())
     }
 }
 
@@ -704,170 +1001,184 @@ impl BoundedRemoteIdentifierCensus {
         let max_identifiers = usize::try_from(limits.max_census_identifiers.get())
             .map_err(|_conversion_error| RemoteMcapRuntimeInternError::InvalidLimitProfile)?;
 
-        // Validate the complete borrowed input before hashing or allocating anything.
-        // This intentionally counts duplicate positions: an adversarial duplicate list must not
-        // obtain unbounded pre-dedup CPU or byte work merely because its canonical result is small.
-        let mut input_count = 0_usize;
-        let mut input_raw_bytes = 0_u64;
+        // Validate the complete borrowed input before hashing or allocating anything. Duplicate
+        // candidate positions and full-path part expansions are both deliberately counted here.
+        let mut candidate_count = 0_usize;
+        let mut candidate_raw_bytes = 0_u64;
         let mut canonical_bytes_upper_bound = 0_u64;
+        let mut canonical_count_upper_bound = 0_usize;
+        let mut part_reference_count_upper_bound = 0_usize;
         for identifier in input_identifiers.clone() {
-            input_count = input_count
+            candidate_count = candidate_count
                 .checked_add(1)
                 .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
-            if input_count > max_identifiers {
+            if candidate_count > max_identifiers {
                 return Err(RemoteMcapRuntimeInternError::CensusIdentifierLimitExceeded);
             }
-            if identifier.kind == RemoteMcapRawIdentifierKind::EntityPathPart
-                && identifier.raw.is_empty()
-            {
-                return Err(RemoteMcapRuntimeInternError::CensusCanonicalizationFailed);
-            }
-            input_raw_bytes =
-                input_raw_bytes
+            let raw_bytes = canonical_byte_upper_bound(identifier)
+                .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
+            candidate_raw_bytes =
+                candidate_raw_bytes
                     .checked_add(u64::try_from(identifier.raw.len()).map_err(
                         |_conversion_error| RemoteMcapRuntimeInternError::ArithmeticOverflow,
                     )?)
                     .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
             canonical_bytes_upper_bound = canonical_bytes_upper_bound
-                .checked_add(
-                    canonical_byte_upper_bound(identifier)
-                        .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?,
-                )
+                .checked_add(raw_bytes)
                 .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
+            let canonical_positions = match identifier.kind {
+                RemoteMcapRawIdentifierKind::EntityPath => entity_path_part_count(identifier.raw),
+                RemoteMcapRawIdentifierKind::Timeline
+                | RemoteMcapRawIdentifierKind::EntityPathPart
+                | RemoteMcapRawIdentifierKind::Component => 1,
+            };
+            canonical_count_upper_bound = canonical_count_upper_bound
+                .checked_add(canonical_positions)
+                .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
+            if identifier.kind == RemoteMcapRawIdentifierKind::EntityPath {
+                part_reference_count_upper_bound = part_reference_count_upper_bound
+                    .checked_add(canonical_positions)
+                    .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
+            }
         }
-        if input_raw_bytes > limits.max_census_retained_bytes.get() {
+        if candidate_raw_bytes > limits.max_census_retained_bytes.get() {
             return Err(RemoteMcapRuntimeInternError::CensusRawBytesExceeded);
         }
         if canonical_bytes_upper_bound > limits.max_census_retained_bytes.get() {
             return Err(RemoteMcapRuntimeInternError::CensusRetainedBytesExceeded);
         }
-        let census_bytes_upper_bound = input_raw_bytes.max(canonical_bytes_upper_bound);
 
-        if input_count > max_identifiers {
-            return Err(RemoteMcapRuntimeInternError::CensusIdentifierLimitExceeded);
-        }
-
-        let census_capacity_upper_bound =
-            checked_census_capacity_upper_bound(census_bytes_upper_bound, input_count)?;
+        let census_capacity_upper_bound = checked_census_capacity_upper_bound(
+            canonical_bytes_upper_bound,
+            canonical_count_upper_bound,
+            candidate_count,
+            part_reference_count_upper_bound,
+        )?;
         if census_capacity_upper_bound > limits.max_census_retained_bytes.get() {
             return Err(RemoteMcapRuntimeInternError::CensusRetainedBytesExceeded);
         }
-        let candidate_peak_upper_bound =
-            checked_candidate_peak_upper_bound(census_bytes_upper_bound, input_count)?;
+        let candidate_peak_upper_bound = checked_candidate_peak_upper_bound(
+            canonical_bytes_upper_bound,
+            canonical_count_upper_bound,
+            candidate_count,
+            part_reference_count_upper_bound,
+        )?;
         if candidate_peak_upper_bound > limits.max_candidate_peak_bytes.get() {
             return Err(RemoteMcapRuntimeInternError::CandidatePeakExceeded);
         }
 
-        let mut owned_identifiers = Vec::new();
-        let mut dedup = IntMap::<u64, usize>::default();
+        let mut canonical_identifiers = Vec::new();
+        let mut part_references = Vec::new();
+        let mut domain_identifiers = Vec::new();
+        let mut canonical_dedup = IntMap::<u64, usize>::default();
+        let mut domain_dedup = IntMap::<u64, usize>::default();
         if fault == TestFault::CensusStructures {
             return Err(RemoteMcapRuntimeInternError::AllocationFailed);
         }
-        owned_identifiers
-            .try_reserve_exact(input_count)
+        canonical_identifiers
+            .try_reserve_exact(canonical_count_upper_bound)
             .map_err(|_reserve_error| RemoteMcapRuntimeInternError::AllocationFailed)?;
-        dedup
-            .try_reserve(input_count)
+        part_references
+            .try_reserve_exact(part_reference_count_upper_bound)
             .map_err(|_reserve_error| RemoteMcapRuntimeInternError::AllocationFailed)?;
-        if dedup.capacity() > conservative_hash_capacity_for_entries(input_count)? {
+        domain_identifiers
+            .try_reserve_exact(candidate_count)
+            .map_err(|_reserve_error| RemoteMcapRuntimeInternError::AllocationFailed)?;
+        canonical_dedup
+            .try_reserve(canonical_count_upper_bound)
+            .map_err(|_reserve_error| RemoteMcapRuntimeInternError::AllocationFailed)?;
+        domain_dedup
+            .try_reserve(candidate_count)
+            .map_err(|_reserve_error| RemoteMcapRuntimeInternError::AllocationFailed)?;
+        if canonical_dedup.capacity()
+            > conservative_hash_capacity_for_entries(canonical_count_upper_bound)?
+            || domain_dedup.capacity() > conservative_hash_capacity_for_entries(candidate_count)?
+        {
             return Err(RemoteMcapRuntimeInternError::InvalidLimitProfile);
         }
 
-        let mut raw_bytes = 0_u64;
-        let mut string_capacity_bytes = 0_u64;
+        let mut builder = CensusBuilder {
+            limits,
+            fault,
+            canonical_identifiers,
+            part_references,
+            domain_identifiers,
+            canonical_dedup,
+            domain_dedup,
+            string_capacity_bytes: 0,
+            canonical_bytes: 0,
+        };
 
         for identifier in input_identifiers {
-            let canonical_capacity_bound = canonical_byte_upper_bound(identifier)
-                .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
-            let temporary_peak = checked_census_retained_bytes(
-                string_capacity_bytes,
-                owned_identifiers.capacity(),
-                dedup.capacity(),
-            )?
-            .checked_add(canonical_capacity_bound)
-            .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
-            if temporary_peak > limits.max_census_retained_bytes.get() {
-                return Err(RemoteMcapRuntimeInternError::CensusRetainedBytesExceeded);
-            }
-            if temporary_peak > limits.max_candidate_peak_bytes.get() {
-                return Err(RemoteMcapRuntimeInternError::CandidatePeakExceeded);
-            }
-
-            if fault == TestFault::CensusString {
-                return Err(RemoteMcapRuntimeInternError::AllocationFailed);
-            }
-            let canonical_capacity = usize::try_from(canonical_capacity_bound)
-                .map_err(|_conversion_error| RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
-            let mut canonical = String::new();
-            canonical
-                .try_reserve_exact(canonical_capacity)
-                .map_err(|_reserve_error| RemoteMcapRuntimeInternError::AllocationFailed)?;
-            let actual_canonical_capacity = u64::try_from(canonical.capacity())
-                .map_err(|_conversion_error| RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
-            if actual_canonical_capacity > canonical_capacity_bound {
-                return Err(RemoteMcapRuntimeInternError::ProtocolViolation);
-            }
-            canonicalize_identifier_into(identifier, &mut canonical)?;
-            if u64::try_from(canonical.len())
-                .map_err(|_conversion_error| RemoteMcapRuntimeInternError::ArithmeticOverflow)?
-                > canonical_capacity_bound
-            {
-                return Err(RemoteMcapRuntimeInternError::ProtocolViolation);
-            }
-
-            let raw_hash = hash(&canonical);
-            if let Some(index) = dedup.get(&raw_hash).copied() {
-                let existing = owned_identifiers
-                    .get(index)
-                    .and_then(|entry: &OwnedRawIdentifier| entry.raw.as_deref())
-                    .ok_or(RemoteMcapRuntimeInternError::ProtocolViolation)?;
-                if existing != canonical {
-                    return Err(RemoteMcapRuntimeInternError::IdentifierHashCollision);
+            match identifier.kind {
+                RemoteMcapRawIdentifierKind::Timeline => {
+                    let canonical = builder.add_canonical(identifier.kind, identifier.raw)?;
+                    let domain_hash =
+                        canonical_domain_identifier_hash(identifier.kind, &[canonical]);
+                    builder
+                        .add_domain(domain_hash, OwnedDomainIdentifier::Timeline { canonical })?;
                 }
-                continue;
+                RemoteMcapRawIdentifierKind::EntityPathPart => {
+                    if identifier.raw.is_empty() {
+                        return Err(RemoteMcapRuntimeInternError::CensusCanonicalizationFailed);
+                    }
+                    let canonical = builder.add_canonical(identifier.kind, identifier.raw)?;
+                    let domain_hash =
+                        canonical_domain_identifier_hash(identifier.kind, &[canonical]);
+                    builder.add_domain(
+                        domain_hash,
+                        OwnedDomainIdentifier::EntityPathPart { canonical },
+                    )?;
+                }
+                RemoteMcapRawIdentifierKind::Component => {
+                    let canonical = builder.add_canonical(identifier.kind, identifier.raw)?;
+                    let domain_hash =
+                        canonical_domain_identifier_hash(identifier.kind, &[canonical]);
+                    builder
+                        .add_domain(domain_hash, OwnedDomainIdentifier::Component { canonical })?;
+                }
+                RemoteMcapRawIdentifierKind::EntityPath => {
+                    let start = builder.part_references.len();
+                    let mut length = 0_usize;
+                    for token in
+                        EntityPathTokenIter::new(identifier.raw).filter(|token| *token != "/")
+                    {
+                        let canonical = builder
+                            .add_canonical(RemoteMcapRawIdentifierKind::EntityPathPart, token)?;
+                        builder.part_references.push(canonical);
+                        length = length
+                            .checked_add(1)
+                            .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
+                    }
+                    let end = start
+                        .checked_add(length)
+                        .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
+                    let domain_hash = builder
+                        .part_references
+                        .get(start..end)
+                        .map(|canonical_indices| {
+                            canonical_domain_identifier_hash(identifier.kind, canonical_indices)
+                        })
+                        .ok_or(RemoteMcapRuntimeInternError::ProtocolViolation)?;
+                    builder.add_domain(
+                        domain_hash,
+                        OwnedDomainIdentifier::EntityPath {
+                            parts: (start, length),
+                        },
+                    )?;
+                }
             }
-
-            if owned_identifiers.len() >= max_identifiers {
-                return Err(RemoteMcapRuntimeInternError::CensusIdentifierLimitExceeded);
-            }
-            let raw_len = u64::try_from(canonical.len())
-                .map_err(|_conversion_error| RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
-            raw_bytes = raw_bytes
-                .checked_add(raw_len)
-                .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
-
-            string_capacity_bytes = string_capacity_bytes
-                .checked_add(actual_canonical_capacity)
-                .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
-
-            let retained_bytes = checked_census_retained_bytes(
-                string_capacity_bytes,
-                owned_identifiers.capacity(),
-                dedup.capacity(),
-            )?;
-            if retained_bytes > limits.max_census_retained_bytes.get() {
-                return Err(RemoteMcapRuntimeInternError::CensusRetainedBytesExceeded);
-            }
-            if retained_bytes > limits.max_candidate_peak_bytes.get() {
-                return Err(RemoteMcapRuntimeInternError::CandidatePeakExceeded);
-            }
-
-            let index = owned_identifiers.len();
-            owned_identifiers.push(OwnedRawIdentifier {
-                hash: raw_hash,
-                raw: Some(canonical),
-            });
-            dedup.insert(raw_hash, index);
         }
 
-        let retained_bytes = checked_census_retained_bytes(
-            string_capacity_bytes,
-            owned_identifiers.capacity(),
-            dedup.capacity(),
-        )?;
+        let retained_bytes = builder.retained_bytes()?;
         Ok(Self {
-            identifiers: owned_identifiers,
-            raw_bytes,
+            identifiers: builder.domain_identifiers,
+            part_references: builder.part_references,
+            canonical_identifiers: builder.canonical_identifiers,
+            candidate_identifiers: u64::try_from(candidate_count)
+                .map_err(|_conversion_error| RemoteMcapRuntimeInternError::ArithmeticOverflow)?,
+            candidate_raw_bytes,
+            canonical_bytes: builder.canonical_bytes,
             retained_bytes,
             candidate_peak_upper_bound,
         })
@@ -1147,7 +1458,7 @@ impl CoordinatedStringInterner {
         mut resolved: Option<&mut [Option<InternedString>]>,
     ) -> Result<Plan, RemoteMcapRuntimeInternError> {
         let mut plan = Plan::default();
-        for (index, identifier) in census.identifiers.iter().enumerate() {
+        for (index, identifier) in census.canonical_identifiers.iter().enumerate() {
             let raw = identifier
                 .raw
                 .as_deref()
@@ -1211,17 +1522,24 @@ impl CoordinatedStringInterner {
         let plan = self.plan_census(&census, None)?;
         self.validate_plan(remote, &plan)?;
         let resolved_capacity_upper_bound =
-            checked_vec_bytes::<Option<InternedString>>(census.identifiers.len())?;
+            checked_vec_bytes::<Option<InternedString>>(census.canonical_identifiers.len())?;
+        let part_handle_capacity_upper_bound =
+            checked_vec_bytes::<InternedString>(census.part_references.len())?;
         let candidate_peak_before_result_allocation = census
             .retained_bytes
             .checked_add(resolved_capacity_upper_bound)
+            .and_then(|bytes| bytes.checked_add(part_handle_capacity_upper_bound))
             .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
         if candidate_peak_before_result_allocation > remote.limits.max_candidate_peak_bytes.get() {
             return Err(RemoteMcapRuntimeInternError::CandidatePeakExceeded);
         }
         let mut resolved = Vec::new();
+        let mut part_handles = Vec::new();
         resolved
-            .try_reserve_exact(census.identifiers.len())
+            .try_reserve_exact(census.canonical_identifiers.len())
+            .map_err(|_reserve_error| RemoteMcapRuntimeInternError::AllocationFailed)?;
+        part_handles
+            .try_reserve_exact(census.part_references.len())
             .map_err(|_reserve_error| RemoteMcapRuntimeInternError::AllocationFailed)?;
         let actual_candidate_peak = census
             .retained_bytes
@@ -1229,14 +1547,19 @@ impl CoordinatedStringInterner {
                 resolved.capacity(),
             )?)
             .ok_or(RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
+        let actual_candidate_peak = checked_add_checked(
+            actual_candidate_peak,
+            checked_vec_bytes::<InternedString>(part_handles.capacity()),
+        )?;
         if actual_candidate_peak > remote.limits.max_candidate_peak_bytes.get() {
             return Err(RemoteMcapRuntimeInternError::CandidatePeakExceeded);
         }
-        resolved.resize(census.identifiers.len(), None);
+        resolved.resize(census.canonical_identifiers.len(), None);
         let telemetry = self.telemetry(&census, plan, false);
         Ok(PreparedRemoteInternBatch {
             census,
             resolved,
+            part_handles,
             telemetry,
         })
     }
@@ -1295,7 +1618,8 @@ impl CoordinatedStringInterner {
             .remote
             .as_mut()
             .expect("remote state was validated under the same exclusive lock");
-        for (index, mut identifier) in prepared.census.identifiers.into_iter().enumerate() {
+        let canonical_identifiers = std::mem::take(&mut prepared.census.canonical_identifiers);
+        for (index, mut identifier) in canonical_identifiers.into_iter().enumerate() {
             if prepared.resolved[index].is_some() {
                 continue;
             }
@@ -1313,6 +1637,11 @@ impl CoordinatedStringInterner {
                 hash: identifier.hash,
                 string: static_string,
             });
+        }
+        for canonical in &prepared.census.part_references {
+            let handle = prepared.resolved[*canonical]
+                .expect("the complete preflight resolved every canonical identity");
+            prepared.part_handles.push(handle);
         }
         if let Some(next) = next_coordination_revision {
             self.coordination_revision = next;
@@ -1336,6 +1665,9 @@ impl CoordinatedStringInterner {
             remote_capacity: remote.side_map.capacity() as u64,
         };
         Ok(CommittedRemoteInternBatch {
+            identifiers: prepared.census.identifiers,
+            part_handles: prepared.part_handles,
+            // The domain records still index this canonical-handle vector.
             handles: prepared.resolved,
             telemetry,
             module_snapshot,
@@ -1346,13 +1678,21 @@ impl CoordinatedStringInterner {
         census: &BoundedRemoteIdentifierCensus,
         limits: RemoteMcapRuntimeInternLimits,
     ) -> Result<(), RemoteMcapRuntimeInternError> {
-        let count = u64::try_from(census.identifiers.len())
-            .map_err(|_conversion_error| RemoteMcapRuntimeInternError::ArithmeticOverflow)?;
+        let count = census.candidate_identifiers;
         if count > limits.max_census_identifiers.get() {
             return Err(RemoteMcapRuntimeInternError::CensusIdentifierLimitExceeded);
         }
-        if census.raw_bytes > limits.max_census_retained_bytes.get() {
+        if census.candidate_raw_bytes > limits.max_census_retained_bytes.get() {
             return Err(RemoteMcapRuntimeInternError::CensusRawBytesExceeded);
+        }
+        if census.canonical_bytes > limits.max_census_retained_bytes.get() {
+            return Err(RemoteMcapRuntimeInternError::CensusRetainedBytesExceeded);
+        }
+        if u64::try_from(census.canonical_identifiers.len())
+            .map_err(|_conversion_error| RemoteMcapRuntimeInternError::ArithmeticOverflow)?
+            > limits.max_census_retained_bytes.get()
+        {
+            return Err(RemoteMcapRuntimeInternError::CensusRetainedBytesExceeded);
         }
         if census.retained_bytes > limits.max_census_retained_bytes.get() {
             return Err(RemoteMcapRuntimeInternError::CensusRetainedBytesExceeded);
@@ -1417,9 +1757,13 @@ impl CoordinatedStringInterner {
         recomputed_after_revision_change: bool,
     ) -> RemoteInternBatchTelemetry {
         RemoteInternBatchTelemetry {
+            candidate_identifiers: census.candidate_identifiers,
+            candidate_raw_bytes: census.candidate_raw_bytes,
             unique_identifiers: census.identifiers.len() as u64,
-            raw_bytes: census.raw_bytes,
+            canonical_unique_identifiers: census.canonical_identifiers.len() as u64,
+            canonical_bytes: census.canonical_bytes,
             retained_bytes: census.retained_bytes,
+            candidate_peak_upper_bound: census.candidate_peak_upper_bound,
             existing_legacy: plan.existing_legacy,
             existing_remote: plan.existing_remote,
             missing: plan.missing,
@@ -1474,10 +1818,11 @@ mod tests {
 
     use super::*;
 
-    fn canonicalize_entity_path(raw: &str) -> String {
-        let mut canonical = String::new();
-        canonicalize_entity_path_into(raw, &mut canonical);
-        canonical
+    fn canonicalize_entity_path(raw: &str) -> Vec<String> {
+        EntityPathTokenIter::new(raw)
+            .filter(|token| *token != "/")
+            .map(canonicalize_entity_path_part)
+            .collect()
     }
 
     fn canonicalize_entity_path_part(raw: &str) -> String {
@@ -1489,22 +1834,55 @@ mod tests {
     #[test]
     fn entity_path_canonicalization_matches_forgiving_display_shape() {
         for (raw, expected) in [
-            ("", "/"),
-            ("/", "/"),
-            ("///", "/"),
-            ("foo///bar/", "/foo/bar"),
-            (r"foo\/bar", r"/foo\/bar"),
-            (r"foo\ bar\!", r"/foo\ bar\!"),
-            (r"foo\bar", "/foobar"),
-            (r"foo\", r"/foo\\"),
-            (r"\u{00E5}", "/å"),
-            (r"\u{apa}", r"/\\u\{apa\}"),
+            ("", Vec::new()),
+            ("/", Vec::new()),
+            ("///", Vec::new()),
+            ("foo///bar/", vec!["foo".to_owned(), "bar".to_owned()]),
+            (r"foo\/bar", vec!["foo/bar".to_owned()]),
+            (r"foo\ bar\!", vec!["foo bar!".to_owned()]),
+            (r"foo\bar", vec!["foobar".to_owned()]),
+            (r"foo\", vec!["foo\\".to_owned()]),
+            (r"\u{00E5}", vec!["å".to_owned()]),
+            (r"\u{apa}", vec![r"\u{apa}".to_owned()]),
         ] {
             assert_eq!(canonicalize_entity_path(raw), expected, "raw: {raw:?}");
         }
 
-        assert_eq!(canonicalize_entity_path_part(r"\u{apa}"), r"\\u\{apa\}");
-        assert_eq!(canonicalize_entity_path_part(r"foo\!"), r"foo\!");
+        assert_eq!(canonicalize_entity_path_part(r"\u{apa}"), r"\u{apa}");
+        assert_eq!(canonicalize_entity_path_part(r"foo\!"), "foo!");
+    }
+
+    #[test]
+    fn entity_path_canonicalization_matches_malformed_tokenizer_semantics() {
+        assert_eq!(
+            canonicalize_entity_path(r"foo\\\\/bar"),
+            vec![r"foo\\/bar".to_owned()],
+        );
+        assert_eq!(canonicalize_entity_path_part(r"\u{å}"), r"\u{å}");
+        assert_eq!(canonicalize_entity_path_part(r"\u{åå"), r"\u{åå");
+        assert_eq!(canonicalize_entity_path_part(r"\u{😀😀"), r"\u{😀😀",);
+    }
+
+    #[test]
+    fn root_entity_path_is_a_domain_record_not_a_flattened_string() {
+        let mut coordinator = initialized(generous_limits());
+        let prepared = prepare_identifier_local(
+            &coordinator,
+            &[RemoteMcapRawIdentifier::entity_path("/")],
+            TestFault::None,
+        )
+        .unwrap();
+        assert_eq!(prepared.telemetry().unique_identifiers, 1);
+        assert_eq!(prepared.telemetry().canonical_unique_identifiers, 0);
+        let committed = coordinator.commit_remote(prepared).unwrap();
+
+        assert_eq!(committed.len(), 1);
+        assert!(!committed.is_empty());
+        assert_eq!(committed.handle(0), None);
+        match committed.domain_handle(0).unwrap() {
+            RemoteMcapDomainIdentifierHandle::EntityPath(parts) => assert_eq!(parts.len(), 0),
+            handle => panic!("unexpected domain handle: {handle:?}"),
+        }
     }
 
     fn nz(value: u64) -> NonZeroU64 {
@@ -1587,51 +1965,73 @@ mod tests {
         let prepared =
             prepare_identifier_local(&coordinator, &identifiers, TestFault::None).unwrap();
         assert_eq!(prepared.telemetry().unique_identifiers, 5);
+        assert_eq!(prepared.telemetry().canonical_unique_identifiers, 5);
         let committed = coordinator.commit_remote(prepared).unwrap();
 
         assert_eq!(committed.len(), 5);
         assert_eq!(committed.handle(0).unwrap().as_str(), "message_log_time");
         assert_eq!(committed.handle(1).unwrap().as_str(), "McapMessage");
-        assert_eq!(committed.handle(2).unwrap().as_str(), "/foo/bar");
+        assert_eq!(committed.handle(2), None);
+        assert_eq!(committed.handle(3), None);
+        assert_eq!(committed.handle(4).unwrap().as_str(), "remote path!");
+        match committed.domain_handle(2).unwrap() {
+            RemoteMcapDomainIdentifierHandle::EntityPath(parts) => {
+                assert_eq!(parts.len(), 2);
+                assert_eq!(parts[0].as_str(), "foo");
+                assert_eq!(parts[1].as_str(), "bar");
+            }
+            handle => panic!("unexpected domain handle: {handle:?}"),
+        }
+        match committed.domain_handle(3).unwrap() {
+            RemoteMcapDomainIdentifierHandle::EntityPath(parts) => {
+                assert_eq!(parts.len(), 2);
+                assert_eq!(parts[0].as_str(), "foo");
+                assert_eq!(parts[1].as_str(), "remote path!");
+            }
+            handle => panic!("unexpected domain handle: {handle:?}"),
+        }
         assert_eq!(
-            committed.handle(3).unwrap().as_str(),
-            r"/foo/remote\ path\!"
+            committed.handle(4).unwrap(),
+            match committed.domain_handle(4).unwrap() {
+                RemoteMcapDomainIdentifierHandle::EntityPathPart(handle) => handle,
+                handle => panic!("unexpected domain handle: {handle:?}"),
+            }
         );
-        assert_eq!(committed.handle(4).unwrap().as_str(), r"remote\ path\!");
-        assert!((0..committed.len()).all(|index| committed.handle(index).is_some()));
     }
 
     #[test]
     fn raw_census_failures_have_zero_intern_effect() {
-        initialize_remote_mcap_runtime_intern(generous_limits()).unwrap();
-        let before = remote_mcap_runtime_intern_snapshot().unwrap();
+        let coordinator = initialized(generous_limits());
+        let before = coordinator.snapshot_remote(coordinator.remote.as_ref().unwrap());
+        let fail_locally = |identifiers: &[RemoteMcapRawIdentifier<'_>]| {
+            BoundedRemoteIdentifierCensus::try_new_identifiers(
+                identifiers.iter().copied(),
+                coordinator.remote.as_ref().unwrap().limits,
+                TestFault::None,
+            )
+        };
 
         assert_eq!(
-            RemoteMcapRawIdentifier::timeline("")
-                .and_then(|identifier| BoundedRemoteIdentifierCensus::try_new_v1([identifier]))
-                .unwrap_err(),
+            RemoteMcapRawIdentifier::timeline("").unwrap_err(),
             RemoteMcapRuntimeInternError::CensusCanonicalizationFailed
         );
         assert_eq!(
-            RemoteMcapRawIdentifier::component("")
-                .and_then(|identifier| BoundedRemoteIdentifierCensus::try_new_v1([identifier]))
-                .unwrap_err(),
+            RemoteMcapRawIdentifier::component("").unwrap_err(),
             RemoteMcapRuntimeInternError::CensusCanonicalizationFailed
         );
         assert_eq!(
-            RemoteMcapRawIdentifier::entity_path_part("")
-                .and_then(|identifier| BoundedRemoteIdentifierCensus::try_new_v1([identifier]))
-                .unwrap_err(),
+            fail_locally(&[RemoteMcapRawIdentifier::unchecked(
+                RemoteMcapRawIdentifierKind::EntityPathPart,
+                "",
+            )])
+            .unwrap_err(),
             RemoteMcapRuntimeInternError::CensusCanonicalizationFailed
         );
 
         let oversized_raw = "x".repeat(32 * 1024 + 1);
         assert_eq!(
-            BoundedRemoteIdentifierCensus::try_new_v1([RemoteMcapRawIdentifier::timeline(
-                &oversized_raw
-            )
-            .unwrap()])
-            .unwrap_err(),
+            fail_locally(&[RemoteMcapRawIdentifier::timeline(&oversized_raw).unwrap()])
+                .unwrap_err(),
             RemoteMcapRuntimeInternError::CensusRawBytesExceeded
         );
 
@@ -1642,17 +2042,98 @@ mod tests {
             .unwrap()
         });
         assert_eq!(
-            BoundedRemoteIdentifierCensus::try_new_v1(too_many).unwrap_err(),
+            BoundedRemoteIdentifierCensus::try_new_identifiers(
+                too_many,
+                coordinator.remote.as_ref().unwrap().limits,
+                TestFault::None,
+            )
+            .unwrap_err(),
             RemoteMcapRuntimeInternError::CensusIdentifierLimitExceeded
         );
-        assert_eq!(remote_mcap_runtime_intern_snapshot().unwrap(), before);
+        assert_eq!(
+            coordinator.snapshot_remote(coordinator.remote.as_ref().unwrap()),
+            before
+        );
     }
 
     #[test]
-    fn canonical_expansion_is_owned_and_counted_before_domain_construction() {
+    fn telemetry_separates_raw_candidates_from_canonical_retention() {
+        let coordinator = initialized(generous_limits());
+        let identifiers = [
+            RemoteMcapRawIdentifier::timeline("same").unwrap(),
+            RemoteMcapRawIdentifier::timeline("same").unwrap(),
+            RemoteMcapRawIdentifier::entity_path("/foo///bar/"),
+            RemoteMcapRawIdentifier::entity_path("foo/bar"),
+            RemoteMcapRawIdentifier::entity_path_part(r"remote\ path").unwrap(),
+            RemoteMcapRawIdentifier::entity_path_part("remote path").unwrap(),
+        ];
+        let prepared =
+            prepare_identifier_local(&coordinator, &identifiers, TestFault::None).unwrap();
+        let telemetry = prepared.telemetry();
+
+        assert_eq!(telemetry.candidate_identifiers, 6);
+        assert_eq!(
+            telemetry.candidate_raw_bytes,
+            identifiers
+                .iter()
+                .map(|identifier| identifier.as_str().len() as u64)
+                .sum::<u64>()
+        );
+        assert_eq!(telemetry.unique_identifiers, 3);
+        assert_eq!(telemetry.canonical_unique_identifiers, 4);
+        assert_eq!(
+            telemetry.canonical_bytes,
+            ["same", "foo", "bar", "remote path"]
+                .iter()
+                .map(|identifier| identifier.len() as u64)
+                .sum::<u64>()
+        );
+        assert!(telemetry.retained_bytes > telemetry.canonical_bytes);
+        assert!(telemetry.candidate_peak_upper_bound >= telemetry.retained_bytes);
+    }
+
+    #[test]
+    fn legacy_unescaped_handles_reuse_without_second_intern_pass() {
+        let mut coordinator = initialized(generous_limits());
+        let first = coordinator.intern_legacy("first");
+        let second = coordinator.intern_legacy("legacy part!");
+        let before = coordinator.snapshot_remote(coordinator.remote.as_ref().unwrap());
+
+        let prepared = prepare_identifier_local(
+            &coordinator,
+            &[
+                RemoteMcapRawIdentifier::entity_path(r"first/legacy\ part\!"),
+                RemoteMcapRawIdentifier::entity_path_part(r"legacy\ part\!").unwrap(),
+            ],
+            TestFault::None,
+        )
+        .unwrap();
+        assert_eq!(prepared.telemetry().existing_legacy, 2);
+        assert_eq!(prepared.telemetry().missing, 0);
+        let committed = coordinator.commit_remote(prepared).unwrap();
+
+        assert_eq!(committed.handle(0), None);
+        assert_eq!(committed.handle(1).unwrap(), second);
+        match committed.domain_handle(0).unwrap() {
+            RemoteMcapDomainIdentifierHandle::EntityPath(parts) => {
+                assert_eq!(parts[0], first);
+                assert_eq!(parts[1], second);
+                assert!(std::ptr::eq(parts[0].as_str(), first.as_str()));
+                assert!(std::ptr::eq(parts[1].as_str(), second.as_str()));
+            }
+            handle => panic!("unexpected domain handle: {handle:?}"),
+        }
+        assert_eq!(
+            coordinator.snapshot_remote(coordinator.remote.as_ref().unwrap()),
+            before
+        );
+    }
+
+    #[test]
+    fn canonical_identity_is_owned_and_counted_before_domain_construction() {
         let coordinator = initialized(generous_limits());
         let raw = r"\u{262E}";
-        let canonical = r"/\u{262E}";
+        let canonical = "☮";
         let census = BoundedRemoteIdentifierCensus::try_new_identifiers(
             [
                 RemoteMcapRawIdentifier::entity_path(raw),
@@ -1664,10 +2145,17 @@ mod tests {
         )
         .unwrap();
 
-        assert!(census.raw_bytes > raw.len() as u64);
-        assert_eq!(census.identifiers.len(), 2);
-        assert_eq!(census.identifiers[0].raw.as_deref(), Some(canonical));
-        assert_eq!(census.identifiers[1].raw.as_deref(), Some("shared"));
+        assert!(census.canonical_bytes < census.candidate_raw_bytes);
+        assert_eq!(census.identifiers.len(), 3);
+        assert_eq!(census.canonical_identifiers.len(), 2);
+        assert_eq!(
+            census.canonical_identifiers[0].raw.as_deref(),
+            Some(canonical)
+        );
+        assert_eq!(
+            census.canonical_identifiers[1].raw.as_deref(),
+            Some("shared")
+        );
 
         let token = census.into_domain_construction_token();
         let debug = format!("{token:?}");
@@ -1676,7 +2164,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_expansion_counts_toward_candidate_preflight() {
+    fn path_part_result_capacity_counts_toward_candidate_preflight() {
         let coordinator = initialized(generous_limits());
         let before = coordinator.snapshot_remote(coordinator.remote.as_ref().unwrap());
         let identifiers = [
@@ -1691,10 +2179,9 @@ mod tests {
             .iter()
             .map(|identifier| canonical_byte_upper_bound(*identifier).unwrap())
             .sum::<u64>();
+        assert!(raw_bytes > 0);
         let complete_peak =
-            checked_candidate_peak_upper_bound(canonical_bytes_upper_bound, identifiers.len())
-                .unwrap();
-        assert!(complete_peak > checked_candidate_peak_upper_bound(raw_bytes, 2).unwrap());
+            checked_candidate_peak_upper_bound(canonical_bytes_upper_bound, 2, 2, 2).unwrap();
 
         let limits = limits(16 * 1024, 128 * 1024, 2, 32 * 1024, complete_peak - 1);
         assert_eq!(
@@ -1728,9 +2215,21 @@ mod tests {
         let committed = prepared.commit().unwrap();
 
         assert_eq!(committed.telemetry().unique_identifiers, 4);
+        assert_eq!(committed.telemetry().canonical_unique_identifiers, 5);
         assert_eq!(committed.len(), 4);
-        assert_eq!(committed.handle(1).unwrap().as_str(), "/token/path");
-        assert!((0..committed.len()).all(|index| committed.handle(index).is_some()));
+        assert_eq!(committed.handle(1), None);
+        match committed.domain_handle(1).unwrap() {
+            RemoteMcapDomainIdentifierHandle::EntityPath(parts) => {
+                assert_eq!(parts[0].as_str(), "token");
+                assert_eq!(parts[1].as_str(), "path");
+            }
+            handle => panic!("unexpected domain handle: {handle:?}"),
+        }
+        assert!(
+            [0, 2, 3]
+                .iter()
+                .all(|index| committed.handle(*index).is_some())
+        );
     }
 
     #[test]
@@ -1876,8 +2375,13 @@ mod tests {
             .iter()
             .map(|raw| raw.len() as u64)
             .sum::<u64>();
-        let complete_peak =
-            checked_candidate_peak_upper_bound(raw_bytes, duplicate_positions.len()).unwrap();
+        let complete_peak = checked_candidate_peak_upper_bound(
+            raw_bytes,
+            duplicate_positions.len(),
+            duplicate_positions.len(),
+            0,
+        )
+        .unwrap();
         let one_byte_short = limits(
             8192,
             32768,
@@ -1895,8 +2399,8 @@ mod tests {
             RemoteMcapRuntimeInternError::CandidatePeakExceeded
         );
 
-        let without_result = checked_census_capacity_upper_bound(1, 1).unwrap();
-        let with_result = checked_candidate_peak_upper_bound(1, 1).unwrap();
+        let without_result = checked_census_capacity_upper_bound(1, 1, 1, 0).unwrap();
+        let with_result = checked_candidate_peak_upper_bound(1, 1, 1, 0).unwrap();
         assert!(with_result > without_result);
         assert_eq!(
             BoundedRemoteIdentifierCensus::try_new(
@@ -2236,7 +2740,10 @@ mod tests {
 
         let mut prepared =
             prepare_local(&coordinator, &["spare-capacity"], TestFault::None).unwrap();
-        let raw = prepared.census.identifiers[0].raw.as_mut().unwrap();
+        let raw = prepared.census.canonical_identifiers[0]
+            .raw
+            .as_mut()
+            .unwrap();
         let old_capacity = raw.capacity();
         raw.reserve(256);
         let leaked_capacity = raw.capacity();
@@ -2353,5 +2860,12 @@ mod tests {
         let nonempty_roundtrip: NonemptyIdentifier = serde_json::from_str(&nonempty_json).unwrap();
         assert_eq!(nonempty_roundtrip, nonempty);
         assert!(NonemptyIdentifier::try_new("").is_err());
+        let nonempty_from_interned = NonemptyIdentifier::try_from_interned(interned).unwrap();
+        assert_eq!(nonempty_from_interned.as_str(), interned.as_str());
+        assert!(std::ptr::eq(
+            nonempty_from_interned.as_str(),
+            interned.as_str()
+        ));
+        assert!(NonemptyIdentifier::try_from_interned(InternedString::new("")).is_err());
     }
 }
