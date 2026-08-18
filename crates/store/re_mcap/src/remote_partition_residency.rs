@@ -161,6 +161,17 @@ impl From<ExternalRefetchableRootErrorV1> for RootRegistrationErrorV1 {
 }
 
 impl PreparedPartitionRegistrationV1 {
+    pub(crate) const fn partition_v1(&self) -> ManifestPartitionDescriptorV1 {
+        self.partition
+    }
+
+    pub(crate) fn expected_root_chunk_ids_v1(&self) -> Option<Box<[ChunkId]>> {
+        match &self.outcome {
+            PreparedPartitionOutcomeV1::CompleteEmpty => None,
+            PreparedPartitionOutcomeV1::Roots { root_ids, .. } => Some(root_ids.clone()),
+        }
+    }
+
     fn complete_empty_v1(partition: ManifestPartitionDescriptorV1) -> Self {
         Self {
             partition,
@@ -215,6 +226,50 @@ impl PreparedPartitionRegistrationV1 {
             outcome: PreparedPartitionOutcomeV1::Roots {
                 root_ids: unique_roots.into_iter().collect(),
                 roots: roots.into_boxed_slice(),
+            },
+        })
+    }
+}
+
+#[cfg(test)]
+impl PreparedPartitionRegistrationV1 {
+    pub(crate) fn complete_empty_for_test_v1(partition: ManifestPartitionDescriptorV1) -> Self {
+        Self::complete_empty_v1(partition)
+    }
+
+    pub(crate) fn complete_roots_for_test_v1(
+        partition: ManifestPartitionDescriptorV1,
+        roots: &[ManifestRootDescriptorV1],
+        estimated_bytes: u64,
+        is_static: bool,
+    ) -> Result<Self, RootRegistrationErrorV1> {
+        if roots.is_empty()
+            || roots.len()
+                > usize::try_from(partition.registration_bound_v1())
+                    .map_err(|_error| RootRegistrationErrorV1::ResourceLimitExceeded)?
+        {
+            return Err(RootRegistrationErrorV1::ResourceLimitExceeded);
+        }
+        let prepared = roots
+            .iter()
+            .map(|root| PreparedRootRegistrationV1 {
+                manifest_descriptor: *root,
+                estimated_bytes,
+                is_static,
+            })
+            .collect::<Vec<_>>();
+        let root_ids = prepared
+            .iter()
+            .map(|root| root.manifest_descriptor.root_chunk_id_v1())
+            .collect::<BTreeSet<_>>();
+        if root_ids.len() != prepared.len() {
+            return Err(RootRegistrationErrorV1::RegistrationConflict);
+        }
+        Ok(Self {
+            partition,
+            outcome: PreparedPartitionOutcomeV1::Roots {
+                roots: prepared.into_boxed_slice(),
+                root_ids: root_ids.into_iter().collect(),
             },
         })
     }

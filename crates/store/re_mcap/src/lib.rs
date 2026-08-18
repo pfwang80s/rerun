@@ -175,6 +175,12 @@ mod remote_partition_residency;
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
 mod remote_window_demand;
 
+// Generation/job-driven staging and Store insertion consume the bounded window-demand planner,
+// atomic registration, and deterministic insertion contract. It remains absent from native/local
+// MCAP builds and owns no HTTP client or retry transport.
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+mod remote_partition_job;
+
 // Admitted second-pass dispatch remains crate-private and production-disarmed until the Web
 // Store mutation arbiter is wired to the complete terminal contract.
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]

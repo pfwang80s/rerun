@@ -96,6 +96,12 @@ pub(crate) struct RemoteWindowDemandPhaseIdentityV1 {
     playing: bool,
 }
 
+impl RemoteWindowDemandPhaseIdentityV1 {
+    pub(crate) const fn class_v1(&self) -> RemoteWindowDemandClassV1 {
+        self.class
+    }
+}
+
 /// Cumulative retry-policy inputs frozen with a matching phase owner.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RemoteWindowDemandPolicyInputsV1 {
@@ -118,7 +124,7 @@ pub(crate) struct RemoteWindowDemandPhaseV1 {
 }
 
 impl RemoteWindowDemandPhaseV1 {
-    fn new_uninstalled(
+    pub(crate) fn new_uninstalled(
         class: RemoteWindowDemandClassV1,
         identity: RemoteWindowDemandPhaseIdentityV1,
     ) -> Self {
@@ -176,7 +182,7 @@ pub(crate) struct RemoteWindowDemandV1 {
 }
 
 impl RemoteWindowDemandV1 {
-    fn new_uninstalled(
+    pub(crate) fn new_uninstalled(
         class: RemoteWindowDemandClassV1,
         identity: RemoteWindowDemandPhaseIdentityV1,
     ) -> Self {
@@ -635,7 +641,7 @@ fn expand_partition_set_v1(
     Ok(output)
 }
 
-fn phase_identity_v1(
+pub(crate) fn phase_identity_v1(
     session_id: RemoteMcapSessionIdV1,
     source_generation: u64,
     class: RemoteWindowDemandClassV1,
