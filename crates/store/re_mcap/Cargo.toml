@@ -17,6 +17,11 @@ workspace = true
 [features]
 ## Enables reusable MCAP fixture builders for downstream tests.
 testing = ["dep:crc32fast", "dep:lz4_flex", "dep:zstd"]
+## Keeps the bounded runtime-intern transaction compiled only for its disarmed proof feature.
+rerun_mcap_locked_remote_wasm_allocator_v1 = [
+  "dep:re_string_interner",
+  "re_string_interner/bounded_runtime_intern",
+]
 
 [dependencies]
 re_chunk.workspace = true
@@ -28,6 +33,7 @@ re_quota_channel.workspace = true
 re_tuid.workspace = true
 re_ros_msg.workspace = true
 re_sdk_types = { workspace = true, features = ["ecolor", "glam", "image", "video"] }
+re_string_interner = { workspace = true, optional = true }
 re_tracing.workspace = true
 
 ahash.workspace = true
@@ -68,6 +74,7 @@ re_arrow_util.workspace = true
 re_chunk_store = { workspace = true, features = ["remote_mcap_test"] }
 re_entity_db = { workspace = true, features = ["remote_mcap_test"] }
 re_log = { workspace = true, features = ["setup"] }
+re_string_interner = { workspace = true, features = ["bounded_runtime_intern"] }
 static_assertions.workspace = true
 xxhash-rust.workspace = true
 zstd = { version = "0.13.3", features = ["experimental"] }

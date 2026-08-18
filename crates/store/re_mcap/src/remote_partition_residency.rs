@@ -371,15 +371,18 @@ fn temporary_registration_bytes_with_hash_slack_v1(
             .map_err(|_error| RootRegistrationErrorV1::ResourceLimitExceeded)?
             .checked_add(HASH_BUCKET_OVERHEAD_V1)
             .ok_or(RootRegistrationErrorV1::ResourceLimitExceeded)?;
-    partitions
+    let partition_bytes = partitions
         .checked_mul(hash_capacity_slack)
-        .and_then(|count| count.checked_mul(partition_bucket))
-        .and_then(|bytes| {
-            roots
-                .checked_mul(hash_capacity_slack)
-                .and_then(|count| count.checked_mul(root_bucket))
-                .and_then(|root_bytes| bytes.checked_add(root_bytes))
-        })
+        .ok_or(RootRegistrationErrorV1::ResourceLimitExceeded)?
+        .checked_mul(partition_bucket)
+        .ok_or(RootRegistrationErrorV1::ResourceLimitExceeded)?;
+    let root_bytes = roots
+        .checked_mul(hash_capacity_slack)
+        .ok_or(RootRegistrationErrorV1::ResourceLimitExceeded)?
+        .checked_mul(root_bucket)
+        .ok_or(RootRegistrationErrorV1::ResourceLimitExceeded)?;
+    partition_bytes
+        .checked_add(root_bytes)
         .ok_or(RootRegistrationErrorV1::ResourceLimitExceeded)
 }
 

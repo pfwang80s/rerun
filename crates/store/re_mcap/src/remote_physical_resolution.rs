@@ -2596,6 +2596,308 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "exhausts the process-global module budget; run this proof in isolation"]
+    fn runtime_identifier_exhaustion_bounds_opening_active_and_store_failure() {
+        use re_string_interner::bounded_runtime_intern as intern;
+
+        crate::remote_runtime_intern::ensure_disarmed_test_profile_v1();
+
+        fn exhaust_remaining_budget() {
+            fn ordinal_tag(mut ordinal: usize) -> String {
+                const ALPHANUMERICS: &[u8; 62] =
+                    b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+                let mut tag = Vec::new();
+                loop {
+                    tag.push(ALPHANUMERICS[ordinal % 62]);
+                    ordinal /= 62;
+                    if ordinal == 0 {
+                        break;
+                    }
+                }
+                tag.reverse();
+                String::from_utf8(tag).unwrap()
+            }
+
+            let mut size = 262_144;
+            let mut ordinal = 0_usize;
+            loop {
+                let suffix = ordinal_tag(ordinal);
+                assert!(suffix.len() <= size);
+                let mut raw = "x".repeat(size - suffix.len());
+                raw.push_str(&suffix);
+                let before_failure =
+                    intern::remote_mcap_runtime_intern_snapshot().expect("budget is initialized");
+                let result = intern::prepare_remote_mcap_runtime_intern(&[raw.as_str()])
+                    .and_then(intern::PreparedRemoteInternBatch::commit);
+                match result {
+                    Ok(_) => ordinal += 1,
+                    Err(
+                        intern::RemoteMcapRuntimeInternError::StringBudgetExceeded
+                        | intern::RemoteMcapRuntimeInternError::EntryAndCapacityBudgetExceeded
+                        | intern::RemoteMcapRuntimeInternError::SideMapEntryLimitExceeded,
+                    ) => {
+                        assert_eq!(
+                            intern::remote_mcap_runtime_intern_snapshot().unwrap(),
+                            before_failure
+                        );
+                        if size == 1 {
+                            return;
+                        }
+                        size /= 2;
+                    }
+                    Err(error) => panic!("unexpected remote exhaustion error: {error}"),
+                }
+            }
+        }
+
+        let mut payload = vec![0, 1, 0, 0];
+        payload.extend_from_slice(&20_i32.to_le_bytes());
+        let fixture = AdversarialMcapFixtureBuilder::new()
+            .with_schemas([FixtureSchema::new(7, "pkg/Root", "ros2msg").with_data(b"int32 value")])
+            .with_channels([FixtureChannel::schema_less(1, "/root").with_schema(7, "cdr")])
+            .with_chunks([FixtureChunk::new([
+                FixtureMessage::new(1, 0, 1).with_data(payload)
+            ])])
+            .with_partition_fixture(PartitionFixture::default())
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+
+        let exact = retained_layout_bytes(1).unwrap();
+        let resolved = bound_pair(&fixture, layout_budget(1, exact))
+            .prepare()
+            .unwrap()
+            .finalize_v1()
+            .unwrap();
+        let metadata_source = resolved.source_v1();
+        let unit = metadata_source.source_unit_v1(0).unwrap();
+        let metadata = unit.metadata_v1().unwrap();
+        let physical = metadata.definitions_capability_for_full_chain_test_v1();
+        let record = fixture.layout.chunks[0].record;
+        let validated = install_exact_physical_chunk_record_for_test(
+            unit.issue_lease_v1().unwrap(),
+            fixture.bytes[record.start..record.end]
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .unwrap();
+        let compressed = install_header_validated_payload_for_test(validated).unwrap();
+        let decompressed = crate::remote_decompression::decompress_exact_chunk(compressed).unwrap();
+        let cache = crate::remote_chunk_scan::PhysicalChunkScanCacheEntry::new(
+            scan_decompressed_physical_chunk(decompressed).unwrap(),
+        )
+        .unwrap();
+
+        let initial =
+            crate::remote_decoder_assignment::try_dispatch_group_from_finalized_source_for_test_v1(
+                resolved.source_v1(),
+                &physical,
+                cache.consumer().into_message_evidence_v1().unwrap(),
+                1,
+                crate::remote_decoder_assignment::RemoteDispatchTestMutationV1::None,
+            )
+            .unwrap();
+        let crate::remote_chunk_dispatch::RemoteChunkTerminalV1::Complete(handoff) = initial else {
+            panic!("the initial remote source must complete before exhaustion");
+        };
+        let partition = handoff.partition_v1();
+        let chunks = handoff.chunks_v1().cloned().collect::<Vec<_>>();
+        let registration =
+            crate::remote_partition_residency::prepare_terminal_registration_for_test_v1(
+                &crate::remote_chunk_dispatch::RemoteChunkTerminalV1::Complete(handoff),
+            )
+            .unwrap();
+
+        exhaust_remaining_budget();
+        let exhausted = intern::remote_mcap_runtime_intern_snapshot().unwrap();
+
+        let existing_only =
+            crate::remote_decoder_assignment::try_dispatch_group_from_finalized_source_for_test_v1(
+                resolved.source_v1(),
+                &physical,
+                cache.consumer().into_message_evidence_v1().unwrap(),
+                1,
+                crate::remote_decoder_assignment::RemoteDispatchTestMutationV1::None,
+            )
+            .unwrap();
+        assert!(matches!(
+            existing_only,
+            crate::remote_chunk_dispatch::RemoteChunkTerminalV1::Complete(_)
+        ));
+
+        let active = crate::remote_decoder_assignment::try_dispatch_group_from_finalized_source_for_test_v1(
+            resolved.source_v1(),
+            &physical,
+            cache.consumer().into_message_evidence_v1().unwrap(),
+            1,
+            crate::remote_decoder_assignment::RemoteDispatchTestMutationV1::ExhaustChunkRuntimeIdentifier,
+        )
+        .unwrap();
+        let crate::remote_chunk_dispatch::RemoteChunkTerminalV1::Failed(
+            crate::remote_chunk_dispatch::RemoteChunkDispatchFailureV1::RuntimeIdentifier(error),
+        ) = active
+        else {
+            panic!("an active Chunk requiring a new identifier must fail");
+        };
+        assert_eq!(
+            error,
+            crate::remote_runtime_intern::RemoteRuntimeInternAdmissionErrorV1::BudgetExhausted
+        );
+        assert_eq!(
+            crate::remote_runtime_intern::RemoteRuntimeInternAdmissionErrorV1::terminal_kind_v1(
+                crate::remote_runtime_intern::RemoteRuntimeInternAdmissionPhaseV1::ActiveChunk
+            ),
+            crate::remote_runtime_intern::RemoteRuntimeInternTerminalV1::ActiveSessionFatal
+        );
+        assert_eq!(
+            cache.consumer().into_message_evidence_v1().err(),
+            Some(PhysicalChunkValidationError::SourceClosed)
+        );
+
+        let mut opening_payload = vec![0, 1, 0, 0];
+        opening_payload.extend_from_slice(&21_i32.to_le_bytes());
+        let opening_fixture = AdversarialMcapFixtureBuilder::new()
+            .with_schemas([
+                FixtureSchema::new(9, "mcap083/OpeningExhaustedSchema", "ros2msg")
+                    .with_data(b"int32 value"),
+            ])
+            .with_channels([
+                FixtureChannel::schema_less(1, "/mcap083/opening/exhausted").with_schema(9, "cdr")
+            ])
+            .with_chunks([FixtureChunk::new([
+                FixtureMessage::new(1, 0, 1).with_data(opening_payload)
+            ])])
+            .with_partition_fixture(PartitionFixture::default())
+            .with_summary_crc(FixtureCrc::Zero)
+            .build()
+            .unwrap();
+        let opening_exact = retained_layout_bytes(1).unwrap();
+        let opening_resolved = bound_pair(&opening_fixture, layout_budget(1, opening_exact))
+            .prepare()
+            .unwrap()
+            .finalize_v1()
+            .unwrap();
+        let opening_source = opening_resolved.source_v1();
+        let opening_unit = opening_source.source_unit_v1(0).unwrap();
+        let opening_metadata = opening_unit.metadata_v1().unwrap();
+        let opening_physical = opening_metadata.definitions_capability_for_full_chain_test_v1();
+        let opening_record = opening_fixture.layout.chunks[0].record;
+        let opening_validated = install_exact_physical_chunk_record_for_test(
+            opening_unit.issue_lease_v1().unwrap(),
+            opening_fixture.bytes[opening_record.start..opening_record.end]
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .unwrap();
+        let opening_compressed =
+            install_header_validated_payload_for_test(opening_validated).unwrap();
+        let opening_decompressed =
+            crate::remote_decompression::decompress_exact_chunk(opening_compressed).unwrap();
+        let opening_cache = crate::remote_chunk_scan::PhysicalChunkScanCacheEntry::new(
+            scan_decompressed_physical_chunk(opening_decompressed).unwrap(),
+        )
+        .unwrap();
+        let opening_evidence = opening_cache.consumer().into_message_evidence_v1().unwrap();
+        let opening_dispatch =
+            crate::remote_decoder_assignment::try_dispatch_group_from_finalized_source_for_test_v1(
+                opening_resolved.source_v1(),
+                &opening_physical,
+                opening_evidence,
+                1,
+                crate::remote_decoder_assignment::RemoteDispatchTestMutationV1::None,
+            );
+        assert_eq!(
+            opening_dispatch.err().unwrap(),
+            crate::remote_decoder_assignment::PhaseAMeasurementDispatchSetupErrorV1::SummaryRuntimeIntern
+        );
+        assert_eq!(
+            crate::remote_runtime_intern::RemoteRuntimeInternAdmissionErrorV1::terminal_kind_v1(
+                crate::remote_runtime_intern::RemoteRuntimeInternAdmissionPhaseV1::Opening,
+            ),
+            crate::remote_runtime_intern::RemoteRuntimeInternTerminalV1::OpeningExhausted
+        );
+        assert_eq!(
+            opening_cache.consumer().into_message_evidence_v1().err(),
+            Some(PhysicalChunkValidationError::SourceClosed)
+        );
+
+        let root_count = u64::try_from(chunks.len()).unwrap();
+        let (mut store, capability) = re_chunk_store::WebRemoteMcapStoreConfigV1::for_test_v1()
+            .into_store_v1(re_log_types::StoreId::random(
+                re_log_types::StoreKind::Recording,
+                "mcap083-runtime-exhaustion-store",
+            ));
+        let mut index = crate::remote_partition_residency::RefetchableRootIndexV1::new_v1(
+            partition.key_v1().session_id_v1(),
+            crate::remote_manifest::RemoteRegistrationCapacityV1 {
+                max_registered_partitions: 1,
+                max_complete_empty_entries: 0,
+                max_root_descriptors: root_count,
+                max_external_origin_bytes: root_count
+                    * re_chunk_store::ExternalRefetchableRootOriginV1::ENCODED_BYTES_V1,
+            },
+            &store,
+            &capability,
+            crate::remote_loaded_coverage::RemoteTemporalCoveragePlanV1::for_test_v1(
+                &[Some((0, 0))],
+                1,
+            ),
+        )
+        .unwrap();
+        index
+            .register_commit_set_v1(&mut store, &capability, vec![registration])
+            .unwrap();
+        let mut db =
+            re_entity_db::EntityDb::from_web_remote_mcap_store_v1(store, &capability).unwrap();
+        let before_store_failure = intern::remote_mcap_runtime_intern_snapshot().unwrap();
+        for chunk in &chunks {
+            let descriptor = index.root_refetch_descriptor_v1(chunk.id()).unwrap();
+            let permit = capability
+                .issue_refetch_v1(db.storage_engine().store(), descriptor)
+                .unwrap();
+            let mismatched = Arc::new(
+                re_chunk::Chunk::builder_with_id(
+                    re_chunk::ChunkId::new(),
+                    "mcap083/store/mismatch",
+                )
+                .with_archetype(
+                    re_chunk::RowId::new(),
+                    re_log_types::TimePoint::STATIC,
+                    &re_sdk_types::archetypes::Points3D::new([[1.0, 2.0, 3.0]]),
+                )
+                .build()
+                .unwrap(),
+            );
+            assert!(
+                db.add_external_refetchable_root_v1(permit, &mismatched)
+                    .is_err()
+            );
+        }
+        assert_eq!(db.num_physical_chunks(), 0);
+        let after_store_failure = intern::remote_mcap_runtime_intern_snapshot().unwrap();
+        assert_eq!(
+            before_store_failure.burned_string_bytes,
+            exhausted.burned_string_bytes
+        );
+        assert_eq!(
+            before_store_failure.burned_entry_bytes,
+            exhausted.burned_entry_bytes
+        );
+        assert_eq!(
+            after_store_failure.burned_string_bytes,
+            before_store_failure.burned_string_bytes
+        );
+        assert_eq!(
+            after_store_failure.burned_entry_bytes,
+            before_store_failure.burned_entry_bytes
+        );
+        assert_eq!(
+            after_store_failure.remote_entries,
+            before_store_failure.remote_entries
+        );
+    }
+
+    #[test]
     fn all_zero_frozen_group_validates_every_owner_before_complete_empty() {
         let fixture = AdversarialMcapFixtureBuilder::new()
             .with_schemas([

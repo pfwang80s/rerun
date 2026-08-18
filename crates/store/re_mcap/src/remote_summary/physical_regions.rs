@@ -410,14 +410,14 @@ impl<'a> ValidatedPhysicalRegions<'a> {
             .and_then(|value| value.checked_add(nested.nested_retained_bytes))
             .ok_or(IndexConsistencyViolation::ArithmeticOverflow)?;
         let prepared = materialized.prepared();
-        let borrowed_backing = u64::try_from(prepared.header_body().len())
-            .ok()
-            .and_then(|value| {
-                u64::try_from(prepared.summary_bytes().len())
-                    .ok()
-                    .and_then(|summary| value.checked_add(summary))
-            })
-            .ok_or(IndexConsistencyViolation::ArithmeticOverflow)?;
+        let borrowed_backing = match (
+            u64::try_from(prepared.header_body().len()).ok(),
+            u64::try_from(prepared.summary_bytes().len()).ok(),
+        ) {
+            (Some(header), Some(summary)) => header.checked_add(summary),
+            _ => None,
+        }
+        .ok_or(IndexConsistencyViolation::ArithmeticOverflow)?;
         let owner_footprint = u64::try_from(
             size_of::<Self>()
                 + size_of::<ValidatedSummaryDefinitions<'a>>()
@@ -425,7 +425,7 @@ impl<'a> ValidatedPhysicalRegions<'a> {
                 + size_of::<Arc<()>>()
                 + size_of::<Mutex<()>>(),
         )
-        .map_err(|_| IndexConsistencyViolation::ArithmeticOverflow)?;
+        .map_err(|_overflow| IndexConsistencyViolation::ArithmeticOverflow)?;
         units
             .checked_add(descriptor)
             .and_then(|v| v.checked_add(records))

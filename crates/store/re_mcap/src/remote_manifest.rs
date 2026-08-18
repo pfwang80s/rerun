@@ -325,6 +325,7 @@ impl ManifestRootDescriptorIssuerV1 {
 pub(crate) struct ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
     source: ResolvedRemotePhysicalSourceRefV1<'a, 'i>,
     groups: ImmutableRemoteChannelGroupsV1<'d, 'i, 's, 'w>,
+    runtime_identifiers: crate::remote_runtime_intern::RemoteRuntimeIdentifiersV1,
     session_id: RemoteMcapSessionIdV1,
     partitions: Box<[ManifestPartitionDescriptorV1]>,
     issuers: Box<[ManifestRootDescriptorIssuerV1]>,
@@ -477,17 +478,26 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
     pub(crate) fn build_v1(
         source: ResolvedRemotePhysicalSourceRefV1<'a, 'i>,
         groups: ImmutableRemoteChannelGroupsV1<'d, 'i, 's, 'w>,
+        runtime_identifiers: crate::remote_runtime_intern::RemoteRuntimeIdentifiersV1,
         limits: RemoteRegistrationLimitsV1,
         budget: &RemoteRegistrationBudgetV1,
     ) -> Result<Self, RemoteManifestErrorV1> {
         let session_id = RemoteMcapSessionIdV1::fresh();
-        Self::build_with_session_v1(source, groups, session_id, limits, budget)
+        Self::build_with_session_v1(
+            source,
+            groups,
+            runtime_identifiers,
+            session_id,
+            limits,
+            budget,
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn build_with_session_v1(
         source: ResolvedRemotePhysicalSourceRefV1<'a, 'i>,
         groups: ImmutableRemoteChannelGroupsV1<'d, 'i, 's, 'w>,
+        runtime_identifiers: crate::remote_runtime_intern::RemoteRuntimeIdentifiersV1,
         session_id: RemoteMcapSessionIdV1,
         limits: RemoteRegistrationLimitsV1,
         budget: &RemoteRegistrationBudgetV1,
@@ -698,6 +708,7 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
         Ok(Self {
             source,
             groups,
+            runtime_identifiers,
             session_id,
             partitions: partitions.into_boxed_slice(),
             issuers: issuers.into_boxed_slice(),
@@ -718,6 +729,12 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
     }
     pub(crate) fn session_id_v1(&self) -> RemoteMcapSessionIdV1 {
         self.session_id
+    }
+
+    pub(crate) const fn runtime_identifiers_v1(
+        &self,
+    ) -> &crate::remote_runtime_intern::RemoteRuntimeIdentifiersV1 {
+        &self.runtime_identifiers
     }
 
     pub(crate) fn session_identity_v1(&self) -> u128 {

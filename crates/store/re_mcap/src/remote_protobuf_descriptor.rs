@@ -18,9 +18,6 @@ use std::sync::Arc;
 use sha2::{Digest as _, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use parking_lot::Mutex;
-use re_sdk_types::reflection::ComponentDescriptorExt as _;
-
 use crate::remote_chunk_scan::{PhysicalChunkSourceBindingV1, RemoteMessageEnvelopeV1};
 use crate::remote_protobuf_projection_boundary::{
     RemoteProtobufProfileScopeV1, RemoteProtobufProjectionEofContinuationV1,
@@ -30,6 +27,7 @@ use crate::remote_ros2_reflection::{
     RemoteMcapSelectedMembershipV1, RemoteRos2ChannelRecognitionV1, RemoteRos2InitializationError,
     RemoteRos2RecognitionIterV1, RemoteViewerScopeState,
 };
+use parking_lot::Mutex;
 
 const REMOTE_PROTOBUF_PROFILE_VERSION_V1: u16 = 1;
 // These are allocation-free projection ceilings, not the eventual production resource profile.
@@ -5800,6 +5798,36 @@ impl RemoteExecutableFactoryV1<'_, '_, '_, '_, '_> {
             .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)
     }
 
+    pub(crate) fn runtime_decoder_identifier_v1(
+        &self,
+    ) -> Result<
+        crate::remote_runtime_intern::RemoteRuntimeDecoderIdentifierV1,
+        RemoteExecutableAdapterErrorV1,
+    > {
+        let archetype_name = match self.owner {
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Ros2Reflection => {
+                self.typed_archetype_name_v1()?
+            }
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Protobuf => {
+                self.protobuf_archetype_name_v1()?.to_owned()
+            }
+            crate::remote_decoder_assignment::RemoteDecoderOwnerV1::Raw => {
+                return Err(RemoteExecutableAdapterErrorV1::UnsupportedSemantic);
+            }
+        };
+        let component = format!(
+            "{}:message",
+            crate::remote_runtime_intern::archetype_short_name_v1(&archetype_name)
+        );
+        Ok(
+            crate::remote_runtime_intern::RemoteRuntimeDecoderIdentifierV1 {
+                topic: self.channel_topic_v1()?.to_owned(),
+                archetype: archetype_name,
+                component,
+            },
+        )
+    }
+
     pub(crate) fn typed_archetype_name_v1(&self) -> Result<String, RemoteExecutableAdapterErrorV1> {
         self.view
             .typed_archetype_name_v1()
@@ -5820,6 +5848,7 @@ impl RemoteExecutableFactoryV1<'_, '_, '_, '_, '_> {
 
     pub(crate) fn typed_output_descriptor_v1(
         &self,
+        runtime_identifiers: &crate::remote_runtime_intern::RemoteRuntimeIdentifiersV1,
     ) -> Result<
         crate::remote_typed_output::RemoteTypedOutputDescriptorV1,
         RemoteExecutableAdapterErrorV1,
@@ -5867,6 +5896,13 @@ impl RemoteExecutableFactoryV1<'_, '_, '_, '_, '_> {
             RemoteDecoderOwnerV1::Protobuf => self.protobuf_archetype_name_v1()?.to_owned(),
             RemoteDecoderOwnerV1::Raw => unreachable!(),
         };
+        let topic = self
+            .view
+            .channel_topic_v1()
+            .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?;
+        let domain = runtime_identifiers
+            .typed_domain_output_v1(topic, Some(archetype_name.as_str()))
+            .map_err(|_| RemoteExecutableAdapterErrorV1::RuntimeIdentifierAdmission)?;
         Ok(crate::remote_typed_output::issue_from_live_factory_v1(
             self.channel_id,
             kind,
@@ -5878,14 +5914,7 @@ impl RemoteExecutableFactoryV1<'_, '_, '_, '_, '_> {
             protobuf_oneofs,
             protobuf_enums,
             protobuf_root_message,
-            self.view
-                .channel_topic_v1()
-                .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?
-                .to_owned(),
-            re_sdk_types::ComponentDescriptor::partial("message").with_builtin_archetype(
-                re_sdk_types::ArchetypeName::try_new(archetype_name)
-                    .map_err(|_| RemoteExecutableAdapterErrorV1::UnsupportedPayloadFeature)?,
-            ),
+            domain,
             self.view
                 .time_type_v1()
                 .map_err(|_| RemoteExecutableAdapterErrorV1::StaleSource)?,
@@ -5897,6 +5926,7 @@ impl RemoteExecutableFactoryV1<'_, '_, '_, '_, '_> {
         num_rows: u64,
         payload_bytes: u64,
         budget: &RemoteExecutableAdapterBudgetV1,
+        _runtime_identifiers: &crate::remote_runtime_intern::RemoteChunkRuntimeIdentifiersV1,
     ) -> Result<RemoteExecutableDecoderAdapterV1<'a>, RemoteExecutableAdapterErrorV1> {
         self.view
             .channel_id_v1()
@@ -5916,6 +5946,7 @@ pub(crate) enum RemoteExecutableAdapterErrorV1 {
     UnsupportedSemantic,
     InvalidPayload,
     UnsupportedPayloadFeature,
+    RuntimeIdentifierAdmission,
 }
 
 /// A small source-owned budget for one executable adapter.  The production route has no

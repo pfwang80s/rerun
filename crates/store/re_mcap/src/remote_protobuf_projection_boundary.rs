@@ -58,7 +58,7 @@ impl<'definitions, 'input, 'source, 'wire>
         >,
         crate::remote_ros2_reflection::RemoteRos2InitializationError,
     > {
-        let index = usize::try_from(channel_record_index).map_err(|_| {
+        let index = usize::try_from(channel_record_index).map_err(|_overflow| {
             crate::remote_ros2_reflection::RemoteRos2InitializationError::ResourceLimitExceeded(
                 crate::remote_ros2_reflection::RemoteRos2ResourceLimit::Arithmetic,
             )

@@ -33,11 +33,12 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Fields};
 use re_byte_size::SizeBytes as _;
-use re_chunk::{Chunk, TimePoint, TimelineName};
+use re_chunk::{Chunk, TimePoint};
 use re_log_types::TimeCell;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RemoteChunkDispatchFailureV1 {
+    RuntimeIdentifier(crate::remote_runtime_intern::RemoteRuntimeInternAdmissionErrorV1),
     StaleSource,
     PlanMismatch,
     Decode(RemoteExecutableAdapterErrorV1),
@@ -45,6 +46,8 @@ pub(crate) enum RemoteChunkDispatchFailureV1 {
     DerivedInsertion(crate::remote_deterministic_insertion::RemoteDerivedChunkResourceLimitV1),
 }
 
+// The complete terminal owns the batch's derived chunks and reservation proofs by design.
+#[expect(clippy::large_enum_variant)]
 pub(crate) enum RemoteChunkTerminalV1 {
     Complete(RemoteTypedPartitionHandoffV1),
     CompleteEmpty,
@@ -60,6 +63,7 @@ pub(crate) struct RemoteTypedPartitionHandoffV1 {
     partition: crate::remote_manifest::ManifestPartitionDescriptorV1,
     chunks: Box<[RemoteTypedChunkHandoffV1]>,
     _reservations: Box<[crate::remote_chunk_validation_count::RemoteTypedOutputReservationV1]>,
+    _runtime_identifiers: crate::remote_runtime_intern::RemoteChunkRuntimeIdentifiersV1,
 }
 
 struct RemoteBuiltChannelChunkV1 {
@@ -1051,7 +1055,8 @@ fn build_ros_scalar_chunk_v1(
     let root = authority
         .issue_root_v1(output_ordinal)
         .map_err(|_| RemoteChunkDispatchFailureV1::PlanMismatch)?;
-    let mut builder = Chunk::builder_with_id(root.root_chunk_id_v1(), descriptor.entity_path_v1());
+    let mut builder =
+        Chunk::builder_with_id(root.root_chunk_id_v1(), descriptor.entity_path_v1().clone());
     let mut messages = plan
         .evidence_v1()
         .message_envelopes_v1()
@@ -1145,7 +1150,7 @@ fn build_ros_scalar_chunk_v1(
         ));
         let timepoint = TimePoint::from([
             (
-                TimelineName::from("message_log_time"),
+                descriptor.timeline_log_time_v1(),
                 TimeCell::new(
                     descriptor.time_type_v1().into(),
                     canonicalize_raw_mcap_time(RawMcapTime::new(message.log_time))
@@ -1153,7 +1158,7 @@ fn build_ros_scalar_chunk_v1(
                 ),
             ),
             (
-                TimelineName::from("message_publish_time"),
+                descriptor.timeline_publish_time_v1(),
                 TimeCell::new(
                     descriptor.time_type_v1().into(),
                     canonicalize_raw_mcap_time(RawMcapTime::new(message.publish_time))
@@ -1218,7 +1223,8 @@ fn build_protobuf_chunk_v1(
     let root = authority
         .issue_root_v1(output_ordinal)
         .map_err(|_| RemoteChunkDispatchFailureV1::PlanMismatch)?;
-    let mut builder = Chunk::builder_with_id(root.root_chunk_id_v1(), descriptor.entity_path_v1());
+    let mut builder =
+        Chunk::builder_with_id(root.root_chunk_id_v1(), descriptor.entity_path_v1().clone());
     let mut messages = plan
         .evidence_v1()
         .message_envelopes_v1()
@@ -1246,7 +1252,7 @@ fn build_protobuf_chunk_v1(
         let value: ArrayRef = std::sync::Arc::new(struct_builder.finish());
         let timepoint = TimePoint::from([
             (
-                TimelineName::from("message_log_time"),
+                descriptor.timeline_log_time_v1(),
                 TimeCell::new(
                     descriptor.time_type_v1().into(),
                     canonicalize_raw_mcap_time(RawMcapTime::new(message.log_time))
@@ -1254,7 +1260,7 @@ fn build_protobuf_chunk_v1(
                 ),
             ),
             (
-                TimelineName::from("message_publish_time"),
+                descriptor.timeline_publish_time_v1(),
                 TimeCell::new(
                     descriptor.time_type_v1().into(),
                     canonicalize_raw_mcap_time(RawMcapTime::new(message.publish_time))
@@ -1309,6 +1315,7 @@ impl RemoteChunkTerminalV1 {
 pub(crate) fn dispatch_admitted_v1(
     dispatches: Box<[RemoteAdmittedChannelDispatchV1<'_>]>,
     plan: &ValidatedChunkDispatchPlanV1<'_, '_, '_, '_, '_, '_>,
+    runtime_identifiers: crate::remote_runtime_intern::RemoteChunkRuntimeIdentifiersV1,
 ) -> RemoteChunkTerminalV1 {
     if let Err(error) = plan.ensure_current_v1() {
         return RemoteChunkTerminalV1::Failed(RemoteChunkDispatchFailureV1::Validation(error));
@@ -1466,6 +1473,7 @@ pub(crate) fn dispatch_admitted_v1(
             partition: authority.partition_v1(),
             chunks: chunks.into_boxed_slice(),
             _reservations: reservations.into_boxed_slice(),
+            _runtime_identifiers: runtime_identifiers,
         })
     }
 }

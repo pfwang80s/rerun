@@ -180,6 +180,10 @@ mod remote_chunk_dispatch;
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
 mod remote_typed_output;
 
+// Summary and Chunk decoding must redeem this MCAP-012 proof before domain construction.
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+mod remote_runtime_intern;
+
 // Bounded ROS 2 reflection initialization remains crate-private and production-disarmed until the
 // remote decoder policy and resource profile are sealed.
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]

@@ -909,6 +909,8 @@ enum RemoteDispatchProbeMutationV1 {
     InvalidateSource,
     #[cfg(test)]
     CrossWireFirstDescriptor,
+    #[cfg(test)]
+    ExhaustChunkRuntimeIdentifier,
 }
 
 #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
@@ -927,6 +929,7 @@ pub(crate) enum PhaseAMeasurementDispatchSetupErrorV1 {
     DecoderAssignment,
     ChannelGroups,
     ChannelAssignment,
+    SummaryRuntimeIntern,
     Manifest,
     TemporalPartition,
     AdapterBudget,
@@ -1030,6 +1033,29 @@ fn dispatch_group_from_finalized_source_disarmed_v1<'input>(
         .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::DecoderEligibility)?;
     let assignments = assign_remote_decoders_v1(eligibility)
         .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::DecoderAssignment)?;
+    let decoder_identifiers = assignments
+        .assignments_for_manifest_v1()
+        .iter()
+        .filter(|assignment| assignment.owner() != RemoteDecoderOwnerV1::Raw)
+        .map(|assignment| {
+            assignments
+                .bind_executable_factory_v1(assignment.channel_id())
+                .and_then(|factory| factory.runtime_decoder_identifier_v1())
+                .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::OutputDescriptor)
+        })
+        .collect::<Result<Vec<_>, PhaseAMeasurementDispatchSetupErrorV1>>()?;
+    let runtime_identifiers =
+        crate::remote_runtime_intern::admit_summary_identifiers_with_decoders_v1(
+            physical.definitions_v1(),
+            &decoder_identifiers,
+        );
+    let runtime_identifiers = match runtime_identifiers {
+        Ok(identifiers) => identifiers,
+        Err(_error) => {
+            physical.close_source_v1();
+            return Err(PhaseAMeasurementDispatchSetupErrorV1::SummaryRuntimeIntern);
+        }
+    };
     let group_budget = crate::remote_channel_group::RemoteChannelGroupBudgetV1::new_for_phase_a_measurement_v1(
         crate::remote_channel_group::UnfrozenRemoteChannelGroupLimitsV1::generous_for_phase_a_measurement_v1(),
         1,
@@ -1056,6 +1082,7 @@ fn dispatch_group_from_finalized_source_disarmed_v1<'input>(
     let manifest = crate::remote_manifest::ImmutableRemoteMcapManifestV1::build_v1(
         source,
         groups,
+        runtime_identifiers,
         registration_limits,
         &registration_budget,
     )
@@ -1113,32 +1140,55 @@ fn dispatch_group_from_finalized_source_disarmed_v1<'input>(
                 .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::ExecutableFactory)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let dispatches = factories
+    let descriptors = factories
         .iter()
         .zip(plan.channels_v1())
-        .zip(&adapter_budgets)
+        .map(|(factory, _channel)| {
+            factory
+                .typed_output_descriptor_v1(manifest.runtime_identifiers_v1())
+                .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::OutputDescriptor)
+        })
+        .collect::<Result<Vec<_>, PhaseAMeasurementDispatchSetupErrorV1>>()?;
+    #[cfg(test)]
+    let descriptors = descriptors
+        .into_iter()
         .enumerate()
-        .map(|(ordinal, ((factory, channel), adapter_budget))| {
-            #[cfg(not(test))]
-            let _ = ordinal;
-            let descriptor = factory
-                .typed_output_descriptor_v1()
-                .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::OutputDescriptor)?;
-            #[cfg(test)]
-            let descriptor = if mutation == RemoteDispatchProbeMutationV1::CrossWireFirstDescriptor
-                && ordinal == 0
-            {
+        .map(|(ordinal, descriptor)| match mutation {
+            RemoteDispatchProbeMutationV1::CrossWireFirstDescriptor if ordinal == 0 => {
                 descriptor.cross_wired_source_and_config_for_dispatch_test_v1()
-            } else {
-                descriptor
-            };
-            #[cfg(not(test))]
-            let descriptor = descriptor;
+            }
+            RemoteDispatchProbeMutationV1::ExhaustChunkRuntimeIdentifier if ordinal == 0 => {
+                descriptor.with_unadmitted_entity_path_for_runtime_intern_test_v1()
+            }
+            _ => descriptor,
+        })
+        .collect::<Vec<_>>();
+    #[cfg(not(test))]
+    let descriptors = descriptors;
+    let chunk_runtime_identifiers =
+        match crate::remote_runtime_intern::admit_chunk_identifiers_v1(descriptors.iter()) {
+            Ok(identifiers) => identifiers,
+            Err(error) => {
+                physical.close_source_v1();
+                return Ok(crate::remote_chunk_dispatch::RemoteChunkTerminalV1::Failed(
+                    crate::remote_chunk_dispatch::RemoteChunkDispatchFailureV1::RuntimeIdentifier(
+                        error,
+                    ),
+                ));
+            }
+        };
+    let dispatches = factories
+        .iter()
+        .zip(descriptors)
+        .zip(plan.channels_v1())
+        .zip(&adapter_budgets)
+        .map(|(((factory, descriptor), channel), adapter_budget)| {
             let adapter = factory
                 .prepare_adapter_v1(
                     channel.message_count_v1(),
                     channel.payload_bytes_v1(),
                     adapter_budget,
+                    &chunk_runtime_identifiers,
                 )
                 .map_err(|_error| PhaseAMeasurementDispatchSetupErrorV1::AdapterPreparation)?;
             Ok(
@@ -1154,7 +1204,9 @@ fn dispatch_group_from_finalized_source_disarmed_v1<'input>(
         source_state.invalidate_for_protobuf_test_v1();
     }
     Ok(crate::remote_chunk_dispatch::dispatch_admitted_v1(
-        dispatches, &plan,
+        dispatches,
+        &plan,
+        chunk_runtime_identifiers,
     ))
 }
 
@@ -1164,6 +1216,7 @@ pub(crate) enum RemoteDispatchTestMutationV1 {
     None,
     InvalidateSource,
     CrossWireFirstDescriptor,
+    ExhaustChunkRuntimeIdentifier,
 }
 
 #[cfg(test)]
@@ -1174,6 +1227,24 @@ pub(crate) fn dispatch_group_from_finalized_source_for_test_v1<'input>(
     channel_id: u16,
     mutation: RemoteDispatchTestMutationV1,
 ) -> crate::remote_chunk_dispatch::RemoteChunkTerminalV1 {
+    try_dispatch_group_from_finalized_source_for_test_v1(
+        source, physical, evidence, channel_id, mutation,
+    )
+    .unwrap_or_else(|error| panic!("phase A dispatch setup failed: {error:?}"))
+}
+
+#[cfg(test)]
+pub(crate) fn try_dispatch_group_from_finalized_source_for_test_v1<'input>(
+    source: crate::remote_physical_resolution::ResolvedRemotePhysicalSourceRefV1<'_, 'input>,
+    physical: &crate::remote_chunk_scan::PhysicalChunkDefinitionsCapabilityV1<'_, 'input>,
+    evidence: crate::remote_chunk_scan::PhysicalChunkMessageEvidenceV1<'input>,
+    channel_id: u16,
+    mutation: RemoteDispatchTestMutationV1,
+) -> Result<
+    crate::remote_chunk_dispatch::RemoteChunkTerminalV1,
+    PhaseAMeasurementDispatchSetupErrorV1,
+> {
+    crate::remote_runtime_intern::ensure_disarmed_test_profile_v1();
     let mutation = match mutation {
         RemoteDispatchTestMutationV1::None => RemoteDispatchProbeMutationV1::None,
         RemoteDispatchTestMutationV1::InvalidateSource => {
@@ -1182,11 +1253,13 @@ pub(crate) fn dispatch_group_from_finalized_source_for_test_v1<'input>(
         RemoteDispatchTestMutationV1::CrossWireFirstDescriptor => {
             RemoteDispatchProbeMutationV1::CrossWireFirstDescriptor
         }
+        RemoteDispatchTestMutationV1::ExhaustChunkRuntimeIdentifier => {
+            RemoteDispatchProbeMutationV1::ExhaustChunkRuntimeIdentifier
+        }
     };
     dispatch_group_from_finalized_source_disarmed_v1(
         source, physical, evidence, channel_id, mutation,
     )
-    .unwrap_or_else(|error| panic!("phase A dispatch setup failed: {error:?}"))
 }
 
 #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
@@ -1196,6 +1269,8 @@ pub(crate) fn execute_group_from_finalized_source_for_phase_a_measurement_v1<'in
     evidence: crate::remote_chunk_scan::PhysicalChunkMessageEvidenceV1<'input>,
     channel_id: u16,
 ) -> Result<Vec<re_chunk::Chunk>, PhaseAMeasurementDispatchErrorV1> {
+    #[cfg(test)]
+    crate::remote_runtime_intern::ensure_disarmed_test_profile_v1();
     match dispatch_group_from_finalized_source_disarmed_v1(
         source,
         physical,

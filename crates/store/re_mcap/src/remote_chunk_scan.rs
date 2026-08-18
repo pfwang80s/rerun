@@ -658,6 +658,11 @@ impl<'definitions, 'input> PhysicalChunkDefinitionsCapabilityV1<'definitions, 'i
         &self.binding
     }
 
+    #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+    pub(crate) fn close_source_v1(&self) {
+        self.binding.close_v1();
+    }
+
     #[cfg(test)]
     pub(crate) fn new_unscanned_for_test_v1(
         definitions: &'definitions ValidatedSummaryDefinitions<'input>,
@@ -2378,7 +2383,7 @@ impl<'a> RecordSequence<'a> {
             return Ok(None);
         }
         let offset = u64::try_from(self.cursor.position())
-            .map_err(|_| PhysicalChunkValidationError::ArithmeticOverflow)?;
+            .map_err(|_overflow| PhysicalChunkValidationError::ArithmeticOverflow)?;
         let opcode = self.cursor.u8()?;
         let body_len = usize::try_from(self.cursor.u64()?)
             .map_err(|_overflow| PhysicalChunkValidationError::ArithmeticOverflow)?;

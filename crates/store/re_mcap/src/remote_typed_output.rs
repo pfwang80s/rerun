@@ -3,6 +3,8 @@
 #![allow(dead_code)]
 #![allow(clippy::map_err_ignore)]
 
+use re_chunk::{EntityPath, TimelineName};
+
 #[derive(PartialEq, Eq)]
 pub(crate) enum RemoteTypedOutputKindV1 {
     Ros2Reflection,
@@ -125,9 +127,21 @@ pub(crate) struct RemoteTypedOutputDescriptorV1 {
     protobuf_oneofs: Box<[RemoteTypedProtobufOneofV1]>,
     protobuf_enums: Box<[RemoteTypedProtobufEnumV1]>,
     protobuf_root_message: Option<u32>,
-    entity_path: String,
+    entity_path: EntityPath,
+    entity_path_raw: String,
     component: re_sdk_types::ComponentDescriptor,
+    timeline_log_time: TimelineName,
+    timeline_publish_time: TimelineName,
     time_type: crate::remote_time::RemoteMcapTimeType,
+}
+
+/// Domain values constructed exclusively from a committed Summary identifier admission.
+pub(crate) struct RemoteTypedDomainOutputV1 {
+    entity_path: EntityPath,
+    entity_path_raw: String,
+    component: re_sdk_types::ComponentDescriptor,
+    timeline_log_time: TimelineName,
+    timeline_publish_time: TimelineName,
 }
 
 impl RemoteTypedOutputDescriptorV1 {
@@ -151,6 +165,8 @@ impl RemoteTypedOutputDescriptorV1 {
             && self.protobuf_root_message == other.protobuf_root_message
             && self.entity_path == other.entity_path
             && self.component == other.component
+            && self.timeline_log_time == other.timeline_log_time
+            && self.timeline_publish_time == other.timeline_publish_time
             && self.time_type == other.time_type
     }
 
@@ -260,8 +276,17 @@ impl RemoteTypedOutputDescriptorV1 {
         })
     }
 
-    pub(crate) fn entity_path_v1(&self) -> &str {
+    pub(crate) fn entity_path_v1(&self) -> &EntityPath {
         &self.entity_path
+    }
+    pub(crate) fn entity_path_raw_v1(&self) -> &str {
+        &self.entity_path_raw
+    }
+    pub(crate) fn timeline_log_time_v1(&self) -> TimelineName {
+        self.timeline_log_time
+    }
+    pub(crate) fn timeline_publish_time_v1(&self) -> TimelineName {
+        self.timeline_publish_time
     }
     pub(crate) fn component_v1(&self) -> &re_sdk_types::ComponentDescriptor {
         &self.component
@@ -271,7 +296,7 @@ impl RemoteTypedOutputDescriptorV1 {
     }
 
     pub(crate) fn retained_metadata_bytes_v1(&self) -> Option<u64> {
-        let mut bytes = u64::try_from(self.entity_path.len()).ok()?;
+        let mut bytes = u64::try_from(self.entity_path_raw.len()).ok()?;
         for field in &self.fields {
             bytes = bytes.checked_add(u64::try_from(field.name.len()).ok()?)?;
         }
@@ -317,8 +342,11 @@ impl RemoteTypedOutputDescriptorV1 {
             protobuf_oneofs: Box::new([]),
             protobuf_enums: Box::new([]),
             protobuf_root_message: Some(root_message),
-            entity_path: "/protobuf".to_owned(),
+            entity_path: EntityPath::from("/protobuf"),
+            entity_path_raw: "/protobuf".to_owned(),
             component: re_sdk_types::ComponentDescriptor::partial("message"),
+            timeline_log_time: TimelineName::from("message_log_time"),
+            timeline_publish_time: TimelineName::from("message_publish_time"),
             time_type: crate::remote_time::RemoteMcapTimeType::TimestampNs,
         }
     }
@@ -343,9 +371,38 @@ impl RemoteTypedOutputDescriptorV1 {
             protobuf_enums: self.protobuf_enums.clone(),
             protobuf_root_message: self.protobuf_root_message,
             entity_path: self.entity_path.clone(),
+            entity_path_raw: self.entity_path_raw.clone(),
             component: self.component.clone(),
+            timeline_log_time: self.timeline_log_time,
+            timeline_publish_time: self.timeline_publish_time,
             time_type: self.time_type,
         }
+    }
+
+    pub(crate) fn with_unadmitted_entity_path_for_runtime_intern_test_v1(&self) -> Self {
+        let mut descriptor = Self {
+            channel_id: self.channel_id,
+            kind: match self.kind {
+                RemoteTypedOutputKindV1::Ros2Reflection => RemoteTypedOutputKindV1::Ros2Reflection,
+                RemoteTypedOutputKindV1::Protobuf => RemoteTypedOutputKindV1::Protobuf,
+            },
+            config_digest: self.config_digest,
+            schema_handle: self.schema_handle,
+            binding: self.binding.clone(),
+            fields: self.fields.clone(),
+            protobuf_fields: self.protobuf_fields.clone(),
+            protobuf_oneofs: self.protobuf_oneofs.clone(),
+            protobuf_enums: self.protobuf_enums.clone(),
+            protobuf_root_message: self.protobuf_root_message,
+            entity_path: self.entity_path.clone(),
+            entity_path_raw: self.entity_path_raw.clone(),
+            component: self.component.clone(),
+            timeline_log_time: self.timeline_log_time,
+            timeline_publish_time: self.timeline_publish_time,
+            time_type: self.time_type,
+        };
+        descriptor.entity_path_raw = "/mcap083/unadmitted/chunk".to_owned();
+        descriptor
     }
 }
 
@@ -369,8 +426,7 @@ pub(super) fn issue_from_live_factory_v1(
     protobuf_oneofs: Box<[RemoteTypedProtobufOneofV1]>,
     protobuf_enums: Box<[RemoteTypedProtobufEnumV1]>,
     protobuf_root_message: Option<u32>,
-    entity_path: String,
-    component: re_sdk_types::ComponentDescriptor,
+    domain: RemoteTypedDomainOutputV1,
     time_type: crate::remote_time::RemoteMcapTimeType,
 ) -> RemoteTypedOutputDescriptorV1 {
     RemoteTypedOutputDescriptorV1 {
@@ -384,9 +440,103 @@ pub(super) fn issue_from_live_factory_v1(
         protobuf_oneofs,
         protobuf_enums,
         protobuf_root_message,
-        entity_path,
-        component,
+        entity_path: domain.entity_path,
+        entity_path_raw: domain.entity_path_raw,
+        component: domain.component,
+        timeline_log_time: domain.timeline_log_time,
+        timeline_publish_time: domain.timeline_publish_time,
         time_type,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn issue_from_live_factory_for_test_v1(
+    channel_id: u16,
+    kind: RemoteTypedOutputKindV1,
+    config_digest: [u8; 16],
+    schema_handle: u16,
+    binding: crate::remote_chunk_scan::PhysicalChunkSourceBindingV1,
+    fields: Box<[RemoteTypedFieldContractV1]>,
+    protobuf_fields: Box<[RemoteTypedProtobufFieldV1]>,
+    protobuf_oneofs: Box<[RemoteTypedProtobufOneofV1]>,
+    protobuf_enums: Box<[RemoteTypedProtobufEnumV1]>,
+    protobuf_root_message: Option<u32>,
+    domain: RemoteTypedDomainOutputV1,
+    time_type: crate::remote_time::RemoteMcapTimeType,
+) -> RemoteTypedOutputDescriptorV1 {
+    issue_from_live_factory_v1(
+        channel_id,
+        kind,
+        config_digest,
+        schema_handle,
+        binding,
+        fields,
+        protobuf_fields,
+        protobuf_oneofs,
+        protobuf_enums,
+        protobuf_root_message,
+        domain,
+        time_type,
+    )
+}
+
+impl crate::remote_runtime_intern::RemoteRuntimeIdentifiersV1 {
+    pub(crate) fn typed_domain_output_v1(
+        &self,
+        topic: &str,
+        archetype_name: Option<&str>,
+    ) -> Result<
+        RemoteTypedDomainOutputV1,
+        crate::remote_runtime_intern::RemoteRuntimeInternAdmissionErrorV1,
+    > {
+        use crate::remote_runtime_intern::RemoteRuntimeInternAdmissionErrorV1;
+
+        let entity_path = self
+            .entity_path(topic)
+            .ok_or(RemoteRuntimeInternAdmissionErrorV1::ProtocolViolation)?;
+        let component_name = archetype_name.map_or_else(
+            || "message".to_owned(),
+            |archetype| {
+                format!(
+                    "{}:message",
+                    crate::remote_runtime_intern::archetype_short_name_v1(archetype)
+                )
+            },
+        );
+        let component = self
+            .component(&component_name)
+            .ok_or(RemoteRuntimeInternAdmissionErrorV1::ProtocolViolation)?;
+        let mut descriptor = re_sdk_types::ComponentDescriptor::partial(component);
+        if let Some(archetype_name) = archetype_name {
+            let archetype = self
+                .archetype(archetype_name)
+                .ok_or(RemoteRuntimeInternAdmissionErrorV1::ProtocolViolation)?;
+            descriptor = descriptor.with_archetype(archetype);
+        }
+        Ok(RemoteTypedDomainOutputV1 {
+            entity_path_raw: topic.to_owned(),
+            entity_path,
+            component: descriptor,
+            timeline_log_time: self
+                .timeline("message_log_time")
+                .ok_or(RemoteRuntimeInternAdmissionErrorV1::ProtocolViolation)?,
+            timeline_publish_time: self
+                .timeline("message_publish_time")
+                .ok_or(RemoteRuntimeInternAdmissionErrorV1::ProtocolViolation)?,
+        })
+    }
+}
+
+#[cfg(test)]
+impl RemoteTypedDomainOutputV1 {
+    fn new_for_test_v1(entity_path: &str, component: re_sdk_types::ComponentDescriptor) -> Self {
+        Self {
+            entity_path: EntityPath::from(entity_path),
+            entity_path_raw: entity_path.to_owned(),
+            component,
+            timeline_log_time: TimelineName::from("message_log_time"),
+            timeline_publish_time: TimelineName::from("message_publish_time"),
+        }
     }
 }
 
@@ -412,8 +562,10 @@ mod tests {
             Box::new([]),
             Box::new([]),
             None,
-            "/test".to_owned(),
-            re_sdk_types::ComponentDescriptor::partial("message"),
+            RemoteTypedDomainOutputV1::new_for_test_v1(
+                "/test",
+                re_sdk_types::ComponentDescriptor::partial("message"),
+            ),
             crate::remote_time::RemoteMcapTimeType::TimestampNs,
         )
     }
