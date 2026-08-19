@@ -56,6 +56,8 @@ mod web_remote_mcap_cpu;
 #[cfg(any(target_arch = "wasm32", test))]
 mod web_remote_mcap_data_query;
 #[cfg(any(target_arch = "wasm32", test))]
+mod web_remote_mcap_failure;
+#[cfg(any(target_arch = "wasm32", test))]
 mod web_remote_mcap_memory;
 #[cfg(any(target_arch = "wasm32", test))]
 mod web_remote_mcap_mutation_arbiter;
