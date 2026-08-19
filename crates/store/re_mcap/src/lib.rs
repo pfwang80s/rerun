@@ -193,6 +193,9 @@ mod remote_seek;
 mod remote_partition_job;
 
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+mod remote_predecessor_backfill;
+
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
 mod remote_root_reload;
 
 // Admitted second-pass dispatch remains crate-private and production-disarmed until the Web
