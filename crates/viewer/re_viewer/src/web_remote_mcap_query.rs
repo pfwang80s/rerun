@@ -329,6 +329,12 @@ pub(crate) enum RemotePresentationTransitionErrorV1 {
     LeaseIdentityExhausted,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteMutationLeaseDrainV1 {
+    NoLiveLeases,
+    WaitingForLiveLeaseDrain,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct PresentationLeaseIdentityV1 {
     counter_generation: u64,
@@ -843,6 +849,97 @@ impl RemotePresentationFacadeV1 {
 
     pub(crate) fn set_query_probe_v1(&self, probe: FacadeRepaintCallback) {
         *self.query_probe.borrow_mut() = probe;
+    }
+
+    pub(crate) fn privileged_set_use_state_v1(
+        &self,
+        use_state: RemoteRecordingUseStateV1,
+    ) -> Result<(), RemotePresentationTransitionErrorV1> {
+        self.set_use_state_v1(use_state).map(|_| ())
+    }
+
+    pub(crate) fn privileged_commit_initial_presentation_v1(
+        &self,
+        committed_time: Option<CommittedPresentationTimeV1>,
+    ) -> Result<(), RemotePresentationTransitionErrorV1> {
+        self.commit_initial_presentation_v1(committed_time)
+            .map(|_| ())
+    }
+
+    pub(crate) fn privileged_commit_presentation_v1(
+        &self,
+        committed_time: Option<CommittedPresentationTimeV1>,
+    ) -> Result<(), RemotePresentationTransitionErrorV1> {
+        self.commit_presentation_v1(committed_time).map(|_| ())
+    }
+
+    pub(crate) fn privileged_begin_query_visible_insertion_v1(
+        &self,
+    ) -> Result<RemoteMutationLeaseDrainV1, RemotePresentationTransitionErrorV1> {
+        self.begin_mutation_v1(RemotePresentationMutationKindV1::QueryVisibleInsertion)
+            .map(|drain_revision| {
+                if drain_revision.is_some() {
+                    RemoteMutationLeaseDrainV1::WaitingForLiveLeaseDrain
+                } else {
+                    RemoteMutationLeaseDrainV1::NoLiveLeases
+                }
+            })
+    }
+
+    pub(crate) fn privileged_finish_query_visible_insertion_v1(
+        &self,
+    ) -> Result<(), RemotePresentationTransitionErrorV1> {
+        self.reopen_after_mutation_v1(false).map(|_| ())
+    }
+
+    pub(crate) fn privileged_begin_garbage_collection_v1(
+        &self,
+    ) -> Result<RemoteMutationLeaseDrainV1, RemotePresentationTransitionErrorV1> {
+        self.begin_mutation_v1(RemotePresentationMutationKindV1::GarbageCollection)
+            .map(|drain_revision| {
+                if drain_revision.is_some() {
+                    RemoteMutationLeaseDrainV1::WaitingForLiveLeaseDrain
+                } else {
+                    RemoteMutationLeaseDrainV1::NoLiveLeases
+                }
+            })
+    }
+
+    pub(crate) fn privileged_finish_garbage_collection_v1(
+        &self,
+        query_visible_deletion: bool,
+    ) -> Result<(), RemotePresentationTransitionErrorV1> {
+        self.reopen_after_mutation_v1(query_visible_deletion)
+            .map(|_| ())
+    }
+
+    pub(crate) fn privileged_terminal_gate_v1(&self) {
+        self.terminal_gate_v1();
+    }
+
+    pub(crate) fn privileged_take_lease_drain_ready_v1(&self) -> bool {
+        self.take_lease_drained_revision_v1().is_some()
+    }
+}
+
+#[cfg(test)]
+impl RemotePresentationFacadeV1 {
+    pub(crate) fn new_for_test_v1(
+        facade_instance: u64,
+        store_id: StoreId,
+        use_state: RemoteRecordingUseStateV1,
+        coverage: RemoteLoadedCoverageV1,
+        max_live_leases: usize,
+        repaint: Rc<dyn Fn()>,
+    ) -> Self {
+        Self::new_initial_presentation_gated_v1(
+            PresentationFacadeInstanceIdV1::from_u64_v1(facade_instance),
+            store_id,
+            use_state,
+            coverage,
+            max_live_leases,
+            repaint,
+        )
     }
 }
 
