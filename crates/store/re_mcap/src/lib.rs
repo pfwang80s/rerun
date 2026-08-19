@@ -180,6 +180,12 @@ mod remote_window_demand;
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
 mod remote_navigation;
 
+// Supersedable/CommitLocked seek ownership, stale-result classification, and the three explicit
+// failure paths for Web remote-MCAP navigation. It remains production-disarmed and owns no Viewer,
+// network transport, or Store mutation.
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+mod remote_seek;
+
 // Generation/job-driven staging and Store insertion consume the bounded window-demand planner,
 // atomic registration, and deterministic insertion contract. It remains absent from native/local
 // MCAP builds and owns no HTTP client or retry transport.
