@@ -756,7 +756,14 @@ impl RemoteSeekCoordinatorV1 {
     pub(crate) fn mark_facade_closed_for_mutation_v1(
         &mut self,
     ) -> Result<&RemoteSeekCoordinatorStateV1, RemoteSeekErrorV1> {
-        self.state.supersedable_mut_v1()?.facade_was_closed = true;
+        let state = self.state.supersedable_mut_v1()?;
+        if state.active_demand_key.is_none() {
+            return Err(RemoteSeekErrorV1::NoActiveDemand);
+        }
+        if state.staging_batches.is_empty() {
+            return Err(RemoteSeekErrorV1::EmptyCommitSet);
+        }
+        state.facade_was_closed = true;
         Ok(self.state_v1())
     }
 
@@ -905,9 +912,6 @@ impl RemoteSeekCoordinatorV1 {
     ) -> Result<&RemoteSeekCoordinatorStateV1, RemoteSeekErrorV1> {
         let supersedable = self.state.supersedable_v1()?.clone();
         validate_supersedable_demand_ownership_v1(&supersedable, ownership)?;
-        if supersedable.initial_presentation {
-            return Err(RemoteSeekErrorV1::NotCommittedPresentation);
-        }
         if supersedable.facade_was_closed {
             return Err(RemoteSeekErrorV1::FacadeClosedForNonPhysicalCommit);
         }
@@ -1940,6 +1944,52 @@ mod tests {
     }
 
     #[test]
+    fn idle_coordinator_cannot_close_facade_for_mutation() {
+        let mut coordinator =
+            RemoteSeekCoordinatorV1::new_committed_v1(navigation()).expect("committed coordinator");
+
+        let error = coordinator
+            .mark_facade_closed_for_mutation_v1()
+            .expect_err("idle facade has no active mutation demand");
+        assert_eq!(error, RemoteSeekErrorV1::NoActiveDemand);
+        assert!(coordinator.state_v1().is_supersedable_v1());
+
+        coordinator
+            .accept_navigation_commands_v1(&seek(30))
+            .expect("unguarded close attempt must not strand a later seek");
+        assert_eq!(
+            coordinator
+                .active_navigation_intent_v1()
+                .map(|intent| intent.canonical_target),
+            Some(TimeInt::new_temporal(30))
+        );
+        assert_eq!(coordinator.pending_navigation_intent_v1(), None);
+    }
+
+    #[test]
+    fn physical_mutation_marker_requires_staged_batches() {
+        let mut coordinator =
+            RemoteSeekCoordinatorV1::new_committed_v1(navigation()).expect("committed coordinator");
+        coordinator
+            .accept_navigation_commands_v1(&seek(30))
+            .expect("seek should be accepted");
+
+        let error = coordinator
+            .mark_facade_closed_for_mutation_v1()
+            .expect_err("empty staging cannot freeze a physical mutation");
+        assert_eq!(error, RemoteSeekErrorV1::EmptyCommitSet);
+        assert!(coordinator.state_v1().is_supersedable_v1());
+
+        let generation = coordinator.generation_v1().expect("generation");
+        coordinator
+            .record_work_result_v1(RemoteSeekWorkResultV1::new_v1(generation, batch_id(1)))
+            .expect("staged batch");
+        coordinator
+            .mark_facade_closed_for_mutation_v1()
+            .expect("non-empty staging should allow facade closure");
+    }
+
+    #[test]
     fn pre_mutation_failure_rejects_unvalidated_closure() {
         let mut coordinator = seeded_supersedable();
 
@@ -2079,6 +2129,52 @@ mod tests {
         assert_eq!(coordinator.reusable_unloaded_count_v1(), 1);
         assert_eq!(coordinator.generation_v1(), Some(generation));
         assert!(!coordinator.physical_mutation_started_v1());
+    }
+
+    #[test]
+    fn initial_presentation_complete_empty_opens_without_physical_mutation() {
+        let initial_intent = PendingNavigationIntentV1::new_v1(
+            TimeInt::new_temporal(0),
+            RemotePlayStateV1::Paused,
+            RemoteNavigationTriggerV1::Seek,
+        )
+        .expect("initial intent");
+        let mut coordinator = RemoteSeekCoordinatorV1::new_initial_presentation_v1(
+            RemoteNavigationAdapterV1::from_extent_v1(canonical_timeline(), extent(), None)
+                .expect("initial navigation"),
+            initial_intent,
+        )
+        .expect("initial coordinator");
+        let old_ownership = ownership(&coordinator);
+        let generation = coordinator.generation_v1().expect("generation");
+        coordinator
+            .record_work_result_v1(RemoteSeekWorkResultV1::new_v1(generation, batch_id(1)))
+            .expect("CompleteEmpty batch should be accepted");
+        let complete_empty_commit_set = commit_set(generation, &[1]);
+
+        coordinator
+            .complete_non_physical_commit_v1(
+                old_ownership,
+                TimeInt::new_temporal(0),
+                &complete_empty_commit_set,
+            )
+            .expect("initial CompleteEmpty presentation should open without physical mutation");
+
+        assert!(coordinator.state_v1().is_supersedable_v1());
+        assert_eq!(coordinator.committed_time_v1(), Some(committed_at(0)));
+        assert_eq!(coordinator.active_navigation_intent_v1(), None);
+        assert_eq!(coordinator.generation_v1(), Some(generation));
+        assert!(!coordinator.physical_mutation_started_v1());
+
+        coordinator
+            .accept_navigation_commands_v1(&seek(20))
+            .expect("opened initial facade should accept a subsequent seek");
+        assert_eq!(
+            coordinator
+                .active_navigation_intent_v1()
+                .map(|intent| intent.canonical_target),
+            Some(TimeInt::new_temporal(20))
+        );
     }
 
     #[test]
