@@ -282,7 +282,7 @@ pub(crate) struct RemoteNavigationAdapterV1 {
     is_background: bool,
     accepted_discrete_command_this_frame: bool,
     suppress_next_preview_dt: bool,
-    preview_update_seen_this_frame: bool,
+    preview_frame_id: Option<u64>,
     background_snapshot: Option<RemoteNavigationBackgroundSnapshotV1>,
     wall_clock_accumulator_ns: u64,
     next_requested_generation: u64,
@@ -343,7 +343,7 @@ impl RemoteNavigationAdapterV1 {
             is_background: false,
             accepted_discrete_command_this_frame: false,
             suppress_next_preview_dt: false,
-            preview_update_seen_this_frame: false,
+            preview_frame_id: None,
             background_snapshot: None,
             wall_clock_accumulator_ns: 0,
             next_requested_generation: 0,
@@ -432,6 +432,7 @@ impl RemoteNavigationAdapterV1 {
         indexed_extent: CanonicalIndexedExtentV1,
         loop_mode: RemoteLoopModeV1,
         clock: RemoteCandidateClockInputV1,
+        frame_id: u64,
     ) -> Result<&RemoteNavigationUiStateV1, RemoteNavigationErrorV1> {
         let mut prospective = self.clone();
         validate_indexed_extent_v1(indexed_extent, prospective.play_state)?;
@@ -442,9 +443,9 @@ impl RemoteNavigationAdapterV1 {
             prospective.committed,
         )?;
 
-        // A successful `preview_update` marks a frame as having been driven. Operations that need
-        // to know whether they still have a remaining preview in the same frame can use this latch.
-        prospective.preview_update_seen_this_frame = false;
+        // Record the frame identity so commits can distinguish "before this frame's preview" from
+        // "after this frame's preview", even when the previous frame already completed a preview.
+        prospective.preview_frame_id = Some(frame_id);
 
         let held = clock.held || prospective.candidate_clock_hold_flags_v1();
         if prospective.accepted_discrete_command_this_frame {
@@ -466,7 +467,6 @@ impl RemoteNavigationAdapterV1 {
             prospective.accumulate_wall_clock_v1(clock.stable_dt)?;
         }
 
-        prospective.preview_update_seen_this_frame = true;
         *self = prospective;
         self.refresh_ui_state_v1(held);
         Ok(self.ui_state_v1())
@@ -476,6 +476,7 @@ impl RemoteNavigationAdapterV1 {
         &mut self,
         committed: Option<CommittedPresentationTimeV1>,
         generation: u64,
+        frame_id: u64,
     ) -> Result<&RemoteNavigationUiStateV1, RemoteNavigationErrorV1> {
         let mut prospective = self.clone();
         validate_committed_time_v1(
@@ -488,13 +489,14 @@ impl RemoteNavigationAdapterV1 {
             return Err(RemoteNavigationErrorV1::StalePresentationCommit);
         }
 
+        let preview_seen_in_frame = prospective.preview_frame_id == Some(frame_id);
         prospective.committed = committed;
         prospective.requested = None;
         prospective.requested_generation_in_flight = false;
         prospective.buffering = false;
         prospective.accepted_discrete_command_this_frame = false;
         prospective.wall_clock_accumulator_ns = 0;
-        prospective.mark_commit_frame_hold_v1();
+        prospective.mark_commit_frame_hold_v1(preview_seen_in_frame);
 
         *self = prospective;
         self.refresh_ui_state_v1(self.candidate_clock_hold_flags_v1());
@@ -599,16 +601,19 @@ impl RemoteNavigationAdapterV1 {
                 self.accepted_discrete_command_this_frame = true;
             }
             RemoteNavigationCommandV1::SetPlayState { play_state, .. } => {
-                self.set_play_state_v1(play_state.remote_play_state_v1()?)?;
-                self.accepted_discrete_command_this_frame = true;
+                if self.set_play_state_v1(play_state.remote_play_state_v1()?)? {
+                    self.accepted_discrete_command_this_frame = true;
+                }
             }
             RemoteNavigationCommandV1::Play { .. } => {
-                self.set_play_state_v1(RemotePlayStateV1::Playing)?;
-                self.accepted_discrete_command_this_frame = true;
+                if self.set_play_state_v1(RemotePlayStateV1::Playing)? {
+                    self.accepted_discrete_command_this_frame = true;
+                }
             }
             RemoteNavigationCommandV1::Pause { .. } => {
-                self.set_play_state_v1(RemotePlayStateV1::Paused)?;
-                self.accepted_discrete_command_this_frame = true;
+                if self.set_play_state_v1(RemotePlayStateV1::Paused)? {
+                    self.accepted_discrete_command_this_frame = true;
+                }
             }
             RemoteNavigationCommandV1::SetPlaybackSpeed { speed, .. } => {
                 if speed <= 0 {
@@ -628,7 +633,10 @@ impl RemoteNavigationAdapterV1 {
     fn set_play_state_v1(
         &mut self,
         play_state: RemotePlayStateV1,
-    ) -> Result<(), RemoteNavigationErrorV1> {
+    ) -> Result<bool, RemoteNavigationErrorV1> {
+        if self.play_state == play_state {
+            return Ok(false);
+        }
         if play_state.is_playing_v1()
             && matches!(
                 self.indexed_extent,
@@ -640,7 +648,7 @@ impl RemoteNavigationAdapterV1 {
         self.play_state = play_state;
         let target = self.step_base_target_v1()?;
         self.set_requested_target_v1(target, RemoteNavigationTriggerV1::PlayStateChange)?;
-        Ok(())
+        Ok(true)
     }
 
     fn set_requested_target_v1(
@@ -752,8 +760,8 @@ impl RemoteNavigationAdapterV1 {
         self.frozen || self.is_background || self.requested_generation_in_flight || self.buffering
     }
 
-    fn mark_commit_frame_hold_v1(&mut self) {
-        if self.preview_update_seen_this_frame {
+    fn mark_commit_frame_hold_v1(&mut self, preview_seen_in_frame: bool) {
+        if preview_seen_in_frame {
             // A commit that lands after this frame's preview has no remaining part of this frame
             // left to hold. The next preview is already the next frame and may integrate once.
             self.suppress_next_preview_dt = false;
@@ -980,7 +988,7 @@ mod tests {
         let requested = adapter.requested_v1();
 
         adapter
-            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(5, true))
+            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(5, true), 0)
             .expect("held preview should succeed");
 
         assert_eq!(adapter.requested_v1(), requested);
@@ -1010,7 +1018,7 @@ mod tests {
         );
 
         adapter
-            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(100, true))
+            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(100, true), 0)
             .expect("held preview should succeed");
         assert_eq!(
             adapter.requested_v1().map(|intent| intent.canonical_target),
@@ -1068,7 +1076,7 @@ mod tests {
         adapter.set_buffering_v1(true);
 
         adapter
-            .commit_presentation_v1(Some(committed_at(30)), generation)
+            .commit_presentation_v1(Some(committed_at(30)), generation, 0)
             .expect("commit should succeed");
 
         assert_eq!(adapter.committed_time_v1(), Some(committed_at(30)));
@@ -1085,7 +1093,7 @@ mod tests {
         adapter.enter_foreground_v1();
 
         adapter
-            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(100, false))
+            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(100, false), 0)
             .expect("first foreground preview should succeed");
         assert_eq!(
             adapter.requested_v1().map(|intent| intent.canonical_target),
@@ -1093,7 +1101,7 @@ mod tests {
         );
 
         adapter
-            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(5, false))
+            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(5, false), 1)
             .expect("second foreground preview should succeed");
         assert_eq!(
             adapter.requested_v1().map(|intent| intent.canonical_target),
@@ -1158,6 +1166,7 @@ mod tests {
                 CanonicalIndexedExtentV1::NoIndexedMessages,
                 RemoteLoopModeV1::Clamp,
                 clock(1, false),
+                0,
             )
             .expect_err("playing without indexed messages should fail");
 
@@ -1169,7 +1178,7 @@ mod tests {
     fn loop_and_clamp_are_checked() {
         let mut adapter = playing_adapter();
         adapter
-            .preview_update_v1(extent(), RemoteLoopModeV1::Loop, clock(95, false))
+            .preview_update_v1(extent(), RemoteLoopModeV1::Loop, clock(95, false), 0)
             .expect("loop preview should succeed");
         assert_eq!(
             adapter.requested_v1().map(|intent| intent.canonical_target),
@@ -1178,7 +1187,7 @@ mod tests {
 
         let mut adapter = playing_adapter();
         adapter
-            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(200, false))
+            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(200, false), 0)
             .expect("clamp preview should succeed");
         assert_eq!(
             adapter.requested_v1().map(|intent| intent.canonical_target),
@@ -1214,7 +1223,7 @@ mod tests {
 
         let before = adapter.clone();
         let error = adapter
-            .commit_presentation_v1(Some(committed_at(30)), stale_generation)
+            .commit_presentation_v1(Some(committed_at(30)), stale_generation, 0)
             .expect_err("stale commit should fail");
         assert_eq!(error, RemoteNavigationErrorV1::StalePresentationCommit);
         assert_eq!(adapter, before);
@@ -1227,7 +1236,7 @@ mod tests {
         assert_eq!(adapter.committed_time_v1(), Some(committed_at(10)));
 
         adapter
-            .commit_presentation_v1(Some(committed_at(40)), current_generation)
+            .commit_presentation_v1(Some(committed_at(40)), current_generation, 0)
             .expect("current generation commit should succeed");
         assert_eq!(adapter.committed_time_v1(), Some(committed_at(40)));
         assert_eq!(adapter.requested_v1(), None);
@@ -1251,6 +1260,7 @@ mod tests {
                 CanonicalIndexedExtentV1::NoIndexedMessages,
                 RemoteLoopModeV1::Clamp,
                 clock(5, false),
+                0,
             )
             .expect_err("accepted-discrete NoIndexedMessages should fail atomically");
 
@@ -1271,7 +1281,7 @@ mod tests {
             .expect("seek should be accepted");
         let before = adapter.clone();
         let error = adapter
-            .preview_update_v1(inverted, RemoteLoopModeV1::Clamp, clock(5, false))
+            .preview_update_v1(inverted, RemoteLoopModeV1::Clamp, clock(5, false), 0)
             .expect_err("inverted extent should fail before auto-advance");
         assert_eq!(error, RemoteNavigationErrorV1::InvalidTarget);
         assert_eq!(adapter, before);
@@ -1279,7 +1289,7 @@ mod tests {
         let mut adapter = uncommitted_playing_adapter();
         let before = adapter.clone();
         let error = adapter
-            .preview_update_v1(inverted, RemoteLoopModeV1::Clamp, clock(5, false))
+            .preview_update_v1(inverted, RemoteLoopModeV1::Clamp, clock(5, false), 0)
             .expect_err("inverted extent should fail before auto-advance");
         assert_eq!(error, RemoteNavigationErrorV1::InvalidTarget);
         assert_eq!(adapter, before);
@@ -1306,7 +1316,7 @@ mod tests {
         assert!(adapter.ui_state_v1().is_loading);
 
         adapter
-            .commit_presentation_v1(Some(committed_at(10)), pause_generation)
+            .commit_presentation_v1(Some(committed_at(10)), pause_generation, 0)
             .expect("pause demand should commit");
         assert!(!adapter.ui_state_v1().is_loading);
 
@@ -1343,14 +1353,14 @@ mod tests {
             .requested_generation_v1()
             .expect("seek creates a generation");
         commit_before_preview
-            .commit_presentation_v1(Some(committed_at(30)), generation)
+            .commit_presentation_v1(Some(committed_at(30)), generation, 0)
             .expect("commit should succeed");
         commit_before_preview
-            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(100, false))
+            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(100, false), 0)
             .expect("same-frame preview should succeed");
         assert_eq!(commit_before_preview.requested_v1(), None);
         commit_before_preview
-            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(5, false))
+            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(5, false), 1)
             .expect("next-frame preview should succeed");
         assert_eq!(
             commit_before_preview
@@ -1370,13 +1380,13 @@ mod tests {
             .requested_generation_v1()
             .expect("seek creates a generation");
         commit_after_preview
-            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(100, false))
+            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(100, false), 0)
             .expect("command-frame preview should succeed");
         commit_after_preview
-            .commit_presentation_v1(Some(committed_at(30)), generation)
+            .commit_presentation_v1(Some(committed_at(30)), generation, 0)
             .expect("commit after preview should succeed");
         commit_after_preview
-            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(5, false))
+            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(5, false), 1)
             .expect("next-frame preview should integrate normally");
         assert_eq!(
             commit_after_preview
@@ -1387,17 +1397,100 @@ mod tests {
     }
 
     #[test]
+    fn commit_before_next_frame_preview_suppresses_after_prior_preview() {
+        let mut adapter = playing_adapter();
+        adapter
+            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(5, false), 0)
+            .expect("first preview should advance");
+        assert_eq!(
+            adapter.requested_v1().map(|intent| intent.canonical_target),
+            Some(TimeInt::new_temporal(15))
+        );
+        let generation = adapter
+            .requested_generation_v1()
+            .expect("playback advance creates a generation");
+
+        adapter
+            .commit_presentation_v1(Some(committed_at(15)), generation, 1)
+            .expect("commit before next frame preview should succeed");
+        adapter
+            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(100, false), 1)
+            .expect("commit-frame preview should suppress the dt");
+        assert_eq!(adapter.requested_v1(), None);
+
+        adapter
+            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(5, false), 2)
+            .expect("next-frame preview should integrate");
+        assert_eq!(
+            adapter.requested_v1().map(|intent| intent.canonical_target),
+            Some(TimeInt::new_temporal(20))
+        );
+    }
+
+    #[test]
+    fn same_play_state_commands_are_idempotent() {
+        let mut adapter = playing_adapter();
+        let before = adapter.clone();
+        adapter
+            .merge_commands_v1(&command(RemoteNavigationCommandV1::Play {
+                timeline: canonical_timeline(),
+            }))
+            .expect("same-state play should be accepted");
+        assert_eq!(adapter, before);
+        assert_eq!(adapter.requested_v1(), None);
+        assert!(!adapter.ui_state_v1().is_loading);
+
+        let mut paused = RemoteNavigationAdapterV1::new_v1(
+            canonical_timeline(),
+            RemotePlayStateV1::Paused,
+            Some(committed_at(10)),
+        )
+        .expect("paused adapter should construct");
+        let before = paused.clone();
+        paused
+            .merge_commands_v1(&command(RemoteNavigationCommandV1::Pause {
+                timeline: canonical_timeline(),
+            }))
+            .expect("same-state pause should be accepted");
+        assert_eq!(paused, before);
+        assert_eq!(paused.requested_v1(), None);
+        assert!(!paused.ui_state_v1().is_loading);
+    }
+
+    #[test]
+    fn no_indexed_messages_pause_returns_ok_without_target_derivation() {
+        let mut no_messages = RemoteNavigationAdapterV1::from_extent_v1(
+            canonical_timeline(),
+            CanonicalIndexedExtentV1::NoIndexedMessages,
+            None,
+        )
+        .expect("no-indexed extent should construct");
+        let before = no_messages.clone();
+
+        no_messages
+            .merge_commands_v1(&command(RemoteNavigationCommandV1::Pause {
+                timeline: canonical_timeline(),
+            }))
+            .expect("pause without a target should be accepted");
+
+        assert_eq!(no_messages, before);
+        assert_eq!(no_messages.play_state_v1(), RemotePlayStateV1::Paused);
+        assert_eq!(no_messages.requested_v1(), None);
+        assert!(!no_messages.ui_state_v1().is_loading);
+    }
+
+    #[test]
     fn frozen_release_suppresses_one_preview_dt() {
         let mut adapter = playing_adapter();
         adapter.set_frozen_v1(true);
         adapter.set_frozen_v1(false);
         adapter
-            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(100, false))
+            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(100, false), 0)
             .expect("recovery preview should succeed");
         assert_eq!(adapter.requested_v1(), None);
 
         adapter
-            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(5, false))
+            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(5, false), 1)
             .expect("post-recovery preview should succeed");
         assert_eq!(
             adapter.requested_v1().map(|intent| intent.canonical_target),
@@ -1411,12 +1504,12 @@ mod tests {
         adapter.set_requested_generation_in_flight_v1(true);
         adapter.set_requested_generation_in_flight_v1(false);
         adapter
-            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(100, false))
+            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(100, false), 0)
             .expect("release preview should succeed");
         assert_eq!(adapter.requested_v1(), None);
 
         adapter
-            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(5, false))
+            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(5, false), 1)
             .expect("post-release preview should succeed");
         assert_eq!(
             adapter.requested_v1().map(|intent| intent.canonical_target),
@@ -1429,7 +1522,7 @@ mod tests {
         let mut adapter = playing_adapter();
         let before = adapter.clone();
         let error = adapter
-            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(-1, false))
+            .preview_update_v1(extent(), RemoteLoopModeV1::Clamp, clock(-1, false), 0)
             .expect_err("negative stable_dt should fail");
         assert_eq!(error, RemoteNavigationErrorV1::InvalidClockDelta);
         assert_eq!(adapter, before);
@@ -1455,6 +1548,7 @@ mod tests {
                     other_timeline(),
                     TimeInt::new_temporal(10),
                 )),
+                0,
                 0,
             )
             .expect_err("wrong committed timeline should fail");
