@@ -175,6 +175,11 @@ mod remote_partition_residency;
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
 mod remote_window_demand;
 
+// Requested/committed navigation state and candidate-clock hold semantics. It remains a pure,
+// production-disarmed `re_mcap` state layer and owns no Viewer command routing or Store mutation.
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+mod remote_navigation;
+
 // Generation/job-driven staging and Store insertion consume the bounded window-demand planner,
 // atomic registration, and deterministic insertion contract. It remains absent from native/local
 // MCAP builds and owns no HTTP client or retry transport.
