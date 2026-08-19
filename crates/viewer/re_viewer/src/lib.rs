@@ -48,6 +48,8 @@ mod ui;
 #[cfg(any(target_arch = "wasm32", test))]
 mod web_remote_mcap_activation;
 #[cfg(any(target_arch = "wasm32", test))]
+mod web_remote_mcap_cache_query;
+#[cfg(any(target_arch = "wasm32", test))]
 mod web_remote_mcap_consumer;
 #[cfg(any(target_arch = "wasm32", test))]
 mod web_remote_mcap_cpu;
