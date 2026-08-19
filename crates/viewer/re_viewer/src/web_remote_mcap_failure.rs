@@ -204,6 +204,7 @@ pub(crate) enum RemotePostMutationFailureReasonV1 {
 pub(crate) enum RemotePreMutationSeekTransitionV1 {
     RollbackToCommittedCursor(RemoteMcapFailureV1),
     InitialPresentationFailed(RemoteMcapFailureV1),
+    SessionFatal(RemoteMcapFailureV1),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -360,10 +361,11 @@ impl RemoteMcapFailureClassifierV1 {
                 RemoteMcapFailurePhaseV1::PhaseBSeek,
                 "remote phase-B HTTP 412",
             ),
-            RemotePhaseBFailureReasonV1::Http416 => RemoteMcapFailureV1::session_fatal_v1(
+            RemotePhaseBFailureReasonV1::Http416 => RemoteMcapFailureV1::current_seek_v1(
                 RemoteMcapFailureClassificationV1::Network,
                 failure_owner,
                 RemoteMcapFailurePhaseV1::PhaseBSeek,
+                RemoteMcapFailureRetryabilityV1::NonRetryable,
                 "remote phase-B HTTP 416",
             ),
             RemotePhaseBFailureReasonV1::ObjectChanged => RemoteMcapFailureV1::session_fatal_v1(
@@ -386,10 +388,14 @@ impl RemoteMcapFailureClassifierV1 {
         reason: RemotePhaseBFailureReasonV1,
     ) -> RemotePreMutationSeekTransitionV1 {
         let failure = Self::classify_phase_b_v1(RemoteMcapDemandOwnerV1::CurrentSeek, reason);
-        if has_committed_cursor {
-            RemotePreMutationSeekTransitionV1::RollbackToCommittedCursor(failure)
-        } else {
-            RemotePreMutationSeekTransitionV1::InitialPresentationFailed(failure)
+        match failure.scope {
+            Some(RemoteMcapFailureScopeV1::SessionFatal) => {
+                RemotePreMutationSeekTransitionV1::SessionFatal(failure)
+            }
+            _ if has_committed_cursor => {
+                RemotePreMutationSeekTransitionV1::RollbackToCommittedCursor(failure)
+            }
+            _ => RemotePreMutationSeekTransitionV1::InitialPresentationFailed(failure),
         }
     }
 
@@ -616,7 +622,7 @@ impl RemoteTerminalLatchV1 {
         self.cause.is_some()
     }
 
-    pub(crate) const fn can_reopen_facade_v1(&self) -> bool {
+    pub(crate) const fn is_terminal_cleanup_complete_v1(&self) -> bool {
         matches!(self.cleanup, RemoteCleanupStateV1::Complete { .. })
     }
 
@@ -868,6 +874,17 @@ mod tests {
                 timeout.retryability,
                 RemoteMcapFailureRetryabilityV1::Retryable
             );
+
+            let http_416 = RemoteMcapFailureClassifierV1::classify_phase_b_v1(
+                owner,
+                RemotePhaseBFailureReasonV1::Http416,
+            );
+            assert_eq!(http_416.owner, owner.into_failure_owner_v1());
+            assert_eq!(http_416.scope, Some(RemoteMcapFailureScopeV1::CurrentSeek));
+            assert_eq!(
+                http_416.retryability,
+                RemoteMcapFailureRetryabilityV1::NonRetryable
+            );
         }
     }
 
@@ -877,7 +894,6 @@ mod tests {
             RemotePhaseBFailureReasonV1::ValidatorViolation,
             RemotePhaseBFailureReasonV1::LengthChanged,
             RemotePhaseBFailureReasonV1::Http412,
-            RemotePhaseBFailureReasonV1::Http416,
             RemotePhaseBFailureReasonV1::ObjectChanged,
             RemotePhaseBFailureReasonV1::IndexCorruption,
         ];
@@ -943,6 +959,30 @@ mod tests {
             initial,
             RemotePreMutationSeekTransitionV1::InitialPresentationFailed(_)
         ));
+
+        for reason in [
+            RemotePhaseBFailureReasonV1::ValidatorViolation,
+            RemotePhaseBFailureReasonV1::LengthChanged,
+            RemotePhaseBFailureReasonV1::Http412,
+            RemotePhaseBFailureReasonV1::ObjectChanged,
+            RemotePhaseBFailureReasonV1::IndexCorruption,
+        ] {
+            let with_cursor =
+                RemoteMcapFailureClassifierV1::classify_pre_mutation_seek_v1(true, reason);
+            assert!(matches!(
+                with_cursor,
+                RemotePreMutationSeekTransitionV1::SessionFatal(failure)
+                    if failure.scope == Some(RemoteMcapFailureScopeV1::SessionFatal)
+            ));
+
+            let without_cursor =
+                RemoteMcapFailureClassifierV1::classify_pre_mutation_seek_v1(false, reason);
+            assert!(matches!(
+                without_cursor,
+                RemotePreMutationSeekTransitionV1::SessionFatal(failure)
+                    if failure.scope == Some(RemoteMcapFailureScopeV1::SessionFatal)
+            ));
+        }
     }
 
     #[test]
@@ -1019,7 +1059,7 @@ mod tests {
             .record_terminal_cause_v1(RemoteTerminalCauseV1::SessionFatal(fatal))
             .expect("record cause");
 
-        assert!(!latch.can_reopen_facade_v1());
+        assert!(!latch.is_terminal_cleanup_complete_v1());
         assert_eq!(
             latch.begin_terminal_cleanup_v1(),
             Ok(RemoteTerminalCleanupProgressV1::WorkClosed)
@@ -1032,24 +1072,24 @@ mod tests {
             after_work_shutdown.cleanup,
             RemoteCleanupStateV1::NotStarted
         );
-        assert!(!latch.can_reopen_facade_v1());
+        assert!(!latch.is_terminal_cleanup_complete_v1());
 
         let token = match latch.begin_terminal_cleanup_v1() {
             Ok(RemoteTerminalCleanupProgressV1::CleanupStarted(token)) => token,
             other => panic!("expected cleanup start, got {other:?}"),
         };
-        assert!(!latch.can_reopen_facade_v1());
+        assert!(!latch.is_terminal_cleanup_complete_v1());
 
         assert_eq!(
             latch.begin_terminal_cleanup_v1(),
             Ok(RemoteTerminalCleanupProgressV1::WaitingForCleanup(token))
         );
-        assert!(!latch.can_reopen_facade_v1());
+        assert!(!latch.is_terminal_cleanup_complete_v1());
 
         latch
             .complete_cleanup_for_test_v1(token)
             .expect("tokenized cleanup completes");
-        assert!(latch.can_reopen_facade_v1());
+        assert!(latch.is_terminal_cleanup_complete_v1());
     }
 
     #[test]
