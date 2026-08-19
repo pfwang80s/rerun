@@ -73,6 +73,7 @@ pub(crate) struct RemoteCandidateClockInputV1 {
 pub(crate) enum RemoteTimeControlErrorV1 {
     UnsupportedRemoteNavigationTimeline { requested: TimelineName },
     UnsupportedRemotePlayState,
+    UnsupportedRemoteLoopMode { requested: LoopMode },
     InvalidRemotePlaybackSpeed,
 }
 
@@ -278,7 +279,8 @@ impl RemoteTimeControlAdapterStateV1 {
             | TimeControlCommand::RemoveTimeSelection
             | TimeControlCommand::SetTimeView(_)
             | TimeControlCommand::ResetTimeView
-            | TimeControlCommand::SetFps(_) => Ok(false),
+            | TimeControlCommand::SetFps(_)
+            | TimeControlCommand::Buffer => Ok(false),
 
             TimeControlCommand::SetActiveTimeline(timeline) => {
                 if timeline != &self.canonical_timeline {
@@ -292,10 +294,15 @@ impl RemoteTimeControlAdapterStateV1 {
                 }
             }
 
-            TimeControlCommand::SetLoopMode(loop_mode) => {
-                self.loop_mode = *loop_mode;
-                Ok(false)
-            }
+            TimeControlCommand::SetLoopMode(loop_mode) => match *loop_mode {
+                LoopMode::Off | LoopMode::All => {
+                    self.loop_mode = *loop_mode;
+                    Ok(false)
+                }
+                LoopMode::Selection => Err(RemoteTimeControlErrorV1::UnsupportedRemoteLoopMode {
+                    requested: *loop_mode,
+                }),
+            },
 
             TimeControlCommand::SetPlayState(play_state) => match *play_state {
                 PlayState::Paused => {
@@ -370,12 +377,54 @@ impl RemoteTimeControlAdapterStateV1 {
                 self.set_target_v1(time.floor(), RemoteNavigationTriggerV1::Seek);
                 Ok(true)
             }
-
-            TimeControlCommand::Buffer => {
-                self.is_buffering = true;
-                Ok(false)
-            }
         }
+    }
+
+    fn validate_command_v1(
+        &self,
+        command: &TimeControlCommand,
+    ) -> Result<(), RemoteTimeControlErrorV1> {
+        match command {
+            TimeControlCommand::SetActiveTimeline(timeline)
+                if timeline != &self.canonical_timeline =>
+            {
+                Err(
+                    RemoteTimeControlErrorV1::UnsupportedRemoteNavigationTimeline {
+                        requested: *timeline,
+                    },
+                )
+            }
+            TimeControlCommand::SetLoopMode(loop_mode) => match *loop_mode {
+                LoopMode::Off | LoopMode::All => Ok(()),
+                LoopMode::Selection => Err(RemoteTimeControlErrorV1::UnsupportedRemoteLoopMode {
+                    requested: *loop_mode,
+                }),
+            },
+            TimeControlCommand::SetPlayState(PlayState::Following)
+            | TimeControlCommand::MoveEndAndFollow => {
+                Err(RemoteTimeControlErrorV1::UnsupportedRemotePlayState)
+            }
+            TimeControlCommand::SetSpeed(speed) if !speed.is_finite() || *speed <= 0.0 => {
+                Err(RemoteTimeControlErrorV1::InvalidRemotePlaybackSpeed)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_committed_presentation_v1(
+        &self,
+        committed: Option<&CommittedPresentationTimeV1>,
+    ) -> Result<(), RemoteTimeControlErrorV1> {
+        if let Some(committed) = committed
+            && committed.timeline != self.canonical_timeline
+        {
+            return Err(
+                RemoteTimeControlErrorV1::UnsupportedRemoteNavigationTimeline {
+                    requested: committed.timeline,
+                },
+            );
+        }
+        Ok(())
     }
 
     fn refresh_ui_state_v1(&mut self) {
@@ -430,6 +479,11 @@ impl RemoteTimeControlAdapterV1 for RemoteTimeControlAdapterStateV1 {
         committed: Option<&CommittedPresentationTimeV1>,
         commands: &[TimeControlCommand],
     ) -> Result<&RemoteNavigationUiStateV1, RemoteTimeControlErrorV1> {
+        self.validate_committed_presentation_v1(committed)?;
+        for command in commands {
+            self.validate_command_v1(command)?;
+        }
+
         self.committed = committed.cloned();
 
         let mut command_created_demand = false;
@@ -450,6 +504,7 @@ impl RemoteTimeControlAdapterV1 for RemoteTimeControlAdapterStateV1 {
         clock: RemoteCandidateClockInputV1,
         extent: &RemoteCanonicalIndexedExtentV1,
     ) -> Result<&RemoteNavigationUiStateV1, RemoteTimeControlErrorV1> {
+        self.validate_committed_presentation_v1(committed)?;
         self.committed = committed.cloned();
         self.candidate_clock_held = clock.held;
 
@@ -464,12 +519,17 @@ impl RemoteTimeControlAdapterV1 for RemoteTimeControlAdapterStateV1 {
                         .unwrap_or_else(|| range.min());
                     let base = clamp_to_range_v1(base, *range);
 
-                    let next = if self.play_state == RemotePlayStateV1::Playing {
-                        add_scaled_duration_v1(base, clock.stable_dt, self.speed)
+                    let (next, trigger) = if self.play_state == RemotePlayStateV1::Playing {
+                        playback_advance_v1(
+                            base,
+                            clock.stable_dt,
+                            self.speed,
+                            *range,
+                            self.loop_mode,
+                        )
                     } else {
-                        base
+                        (base, RemoteNavigationTriggerV1::Seek)
                     };
-                    let next = clamp_to_range_v1(next, *range);
 
                     let Some(demand_key) = self
                         .requested
@@ -478,15 +538,9 @@ impl RemoteTimeControlAdapterV1 for RemoteTimeControlAdapterStateV1 {
                         .map(|intent| Self::make_demand_key_v1(next, intent.play_state))
                     else {
                         if self.requested.is_none() {
-                            self.requested = Some(Self::make_intent_v1(
-                                next,
-                                self.play_state,
-                                if self.play_state == RemotePlayStateV1::Playing {
-                                    RemoteNavigationTriggerV1::PlaybackAdvance
-                                } else {
-                                    RemoteNavigationTriggerV1::Seek
-                                },
-                            ));
+                            self.requested =
+                                Some(Self::make_intent_v1(next, self.play_state, trigger));
+                            self.requested_generation_in_flight = true;
                         }
                         self.refresh_ui_state_v1();
                         return Ok(&self.ui_state);
@@ -494,12 +548,9 @@ impl RemoteTimeControlAdapterV1 for RemoteTimeControlAdapterStateV1 {
 
                     if let Some(intent) = &mut self.requested {
                         intent.canonical_target = next;
-                        intent.trigger = if self.play_state == RemotePlayStateV1::Playing {
-                            RemoteNavigationTriggerV1::PlaybackAdvance
-                        } else {
-                            RemoteNavigationTriggerV1::Seek
-                        };
+                        intent.trigger = trigger;
                         intent.demand_key = demand_key;
+                        self.requested_generation_in_flight = true;
                     }
                 }
             }
@@ -681,11 +732,48 @@ fn add_nanos_v1(time: TimeInt, nanos: i64) -> TimeInt {
     TimeInt::saturated_temporal_i64(time.as_i64().saturating_add(nanos))
 }
 
-fn add_scaled_duration_v1(time: TimeInt, stable_dt: Duration, speed: f32) -> TimeInt {
+fn playback_advance_v1(
+    time: TimeInt,
+    stable_dt: Duration,
+    speed: f32,
+    range: AbsoluteTimeRange,
+    loop_mode: LoopMode,
+) -> (TimeInt, RemoteNavigationTriggerV1) {
     let nanos = stable_dt.as_nanos();
     let scaled = (nanos as f64 * speed as f64).round();
     let scaled = scaled.clamp(i64::MIN as f64, i64::MAX as f64) as i64;
-    add_nanos_v1(time, scaled)
+    let candidate = i128::from(time.as_i64()) + i128::from(scaled);
+
+    let min = i128::from(range.min().as_i64());
+    let max = i128::from(range.max().as_i64());
+    let (target, trigger) = match loop_mode {
+        LoopMode::All => {
+            let length = max
+                .checked_sub(min)
+                .and_then(|length| length.checked_add(1))
+                .expect("canonical indexed extent must fit in i128");
+            let offset = candidate
+                .checked_sub(min)
+                .expect("candidate must fit in i128");
+            let wrapped_offset = offset.rem_euclid(length);
+            let target = min
+                .checked_add(wrapped_offset)
+                .expect("wrapped candidate must fit in i128");
+            let trigger = if target == candidate {
+                RemoteNavigationTriggerV1::PlaybackAdvance
+            } else {
+                RemoteNavigationTriggerV1::LoopJump
+            };
+            (target, trigger)
+        }
+        LoopMode::Off | LoopMode::Selection => (
+            candidate.clamp(min, max),
+            RemoteNavigationTriggerV1::PlaybackAdvance,
+        ),
+    };
+
+    let target = target.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+    (TimeInt::new_temporal(target), trigger)
 }
 
 impl ConsumerStorageFreeV1 for f32 {}
@@ -708,7 +796,12 @@ where
 
 impl ConsumerStorageFreeV1 for RemoteCandidateClockInputV1 where Duration: ConsumerStorageFreeV1 {}
 
-impl ConsumerStorageFreeV1 for RemoteTimeControlErrorV1 where TimelineName: ConsumerStorageFreeV1 {}
+impl ConsumerStorageFreeV1 for RemoteTimeControlErrorV1
+where
+    TimelineName: ConsumerStorageFreeV1,
+    LoopMode: ConsumerStorageFreeV1,
+{
+}
 
 impl ConsumerStorageFreeV1 for RemoteNavigationUiStateV1
 where
@@ -899,6 +992,206 @@ mod tests {
         );
         assert_eq!(adapter.speed_v1(), 1.0);
         assert!(adapter.ui_state.requested.is_none());
+    }
+
+    #[test]
+    fn merge_command_batch_is_atomic_on_late_invalid_command() {
+        let mut adapter = RemoteTimeControlAdapterStateV1::new_v1(
+            canonical_timeline(),
+            RemotePlayStateV1::Paused,
+        );
+        adapter
+            .merge_commands_v1(
+                Some(&committed_time(3)),
+                &[TimeControlCommand::SetSpeed(2.0)],
+            )
+            .expect("valid speed should be accepted");
+
+        let result = adapter.merge_commands_v1(
+            Some(&committed_time(3)),
+            &[
+                TimeControlCommand::SetTime(8i64.into()),
+                TimeControlCommand::SetPlayState(PlayState::Following),
+            ],
+        );
+        assert_eq!(
+            result,
+            Err(RemoteTimeControlErrorV1::UnsupportedRemotePlayState)
+        );
+        assert_eq!(adapter.speed_v1(), 2.0);
+        assert_eq!(adapter.play_state_v1(), RemotePlayStateV1::Paused);
+        assert_eq!(adapter.ui_state.committed, Some(committed_time(3)));
+        assert!(adapter.ui_state.requested.is_none());
+        assert_eq!(adapter.ui_state.target_marker, None);
+
+        let result = adapter.merge_commands_v1(
+            Some(&committed_time(3)),
+            &[
+                TimeControlCommand::SetTime(9i64.into()),
+                TimeControlCommand::SetActiveTimeline(non_canonical_timeline()),
+            ],
+        );
+        assert_eq!(
+            result,
+            Err(
+                RemoteTimeControlErrorV1::UnsupportedRemoteNavigationTimeline {
+                    requested: non_canonical_timeline(),
+                }
+            )
+        );
+        assert_eq!(adapter.speed_v1(), 2.0);
+        assert_eq!(adapter.ui_state.committed, Some(committed_time(3)));
+        assert!(adapter.ui_state.requested.is_none());
+        assert_eq!(adapter.ui_state.target_marker, None);
+    }
+
+    #[test]
+    fn preview_created_and_replaced_demands_latch_in_flight() {
+        let mut adapter = RemoteTimeControlAdapterStateV1::new_v1(
+            canonical_timeline(),
+            RemotePlayStateV1::Playing,
+        );
+
+        let ui = adapter
+            .preview_update_v1(
+                Some(&committed_time(5)),
+                RemoteCandidateClockInputV1 {
+                    stable_dt: Duration::from_nanos(1),
+                    held: false,
+                },
+                &known_extent(),
+            )
+            .expect("preview should create a requested demand");
+        assert!(ui.requested_generation_in_flight);
+        assert_eq!(ui.target_marker, Some(TimeInt::new_temporal(6)));
+
+        adapter.commit_presentation_v1(Some(committed_time(6)));
+        assert!(!adapter.ui_state.requested_generation_in_flight);
+
+        let ui = adapter
+            .preview_update_v1(
+                Some(&committed_time(6)),
+                RemoteCandidateClockInputV1 {
+                    stable_dt: Duration::from_nanos(4),
+                    held: false,
+                },
+                &known_extent(),
+            )
+            .expect("preview should replace the requested demand");
+        assert!(ui.requested_generation_in_flight);
+        assert_eq!(ui.target_marker, Some(TimeInt::new_temporal(10)));
+    }
+
+    #[test]
+    fn all_loop_mode_wraps_with_loop_jump_and_selection_is_rejected() {
+        let mut adapter = RemoteTimeControlAdapterStateV1::new_v1(
+            canonical_timeline(),
+            RemotePlayStateV1::Playing,
+        );
+        adapter
+            .merge_commands_v1(
+                Some(&committed_time(95)),
+                &[TimeControlCommand::SetLoopMode(LoopMode::All)],
+            )
+            .expect("whole recording loop should be supported");
+
+        let ui = adapter
+            .preview_update_v1(
+                Some(&committed_time(95)),
+                RemoteCandidateClockInputV1 {
+                    stable_dt: Duration::from_nanos(10),
+                    held: false,
+                },
+                &known_extent(),
+            )
+            .expect("loop preview should succeed");
+        assert_eq!(ui.target_marker, Some(TimeInt::new_temporal(4)));
+        assert_eq!(
+            ui.requested.as_ref().map(|intent| intent.trigger),
+            Some(RemoteNavigationTriggerV1::LoopJump)
+        );
+        assert!(ui.requested_generation_in_flight);
+
+        let mut adapter = RemoteTimeControlAdapterStateV1::new_v1(
+            canonical_timeline(),
+            RemotePlayStateV1::Paused,
+        );
+        let result = adapter.merge_commands_v1(
+            Some(&committed_time(3)),
+            &[TimeControlCommand::SetLoopMode(LoopMode::Selection)],
+        );
+        assert_eq!(
+            result,
+            Err(RemoteTimeControlErrorV1::UnsupportedRemoteLoopMode {
+                requested: LoopMode::Selection,
+            })
+        );
+        assert_eq!(adapter.loop_mode, LoopMode::Off);
+        assert_eq!(adapter.ui_state.committed, None);
+        assert!(adapter.ui_state.requested.is_none());
+    }
+
+    #[test]
+    fn buffer_command_does_not_set_remote_buffering() {
+        let mut adapter = RemoteTimeControlAdapterStateV1::new_v1(
+            canonical_timeline(),
+            RemotePlayStateV1::Paused,
+        );
+        adapter
+            .merge_commands_v1(Some(&committed_time(3)), &[TimeControlCommand::Buffer])
+            .expect("generic buffer command should be harmless");
+
+        assert!(!adapter.is_buffering);
+        assert!(!adapter.ui_state.is_buffering);
+
+        adapter.set_buffering_v1(true);
+        assert!(adapter.is_buffering);
+        assert!(adapter.ui_state.is_buffering);
+    }
+
+    #[test]
+    fn non_canonical_committed_time_is_rejected_without_state_change() {
+        let mut adapter = RemoteTimeControlAdapterStateV1::new_v1(
+            canonical_timeline(),
+            RemotePlayStateV1::Paused,
+        );
+        let non_canonical_committed = CommittedPresentationTimeV1 {
+            timeline: non_canonical_timeline(),
+            cursor: TimeInt::new_temporal(3),
+        };
+
+        let result = adapter.merge_commands_v1(Some(&non_canonical_committed), &[]);
+        assert_eq!(
+            result,
+            Err(
+                RemoteTimeControlErrorV1::UnsupportedRemoteNavigationTimeline {
+                    requested: non_canonical_timeline(),
+                }
+            )
+        );
+        assert_eq!(adapter.ui_state.committed, None);
+        assert!(adapter.ui_state.requested.is_none());
+        assert_eq!(adapter.ui_state.target_marker, None);
+
+        let result = adapter.preview_update_v1(
+            Some(&non_canonical_committed),
+            RemoteCandidateClockInputV1 {
+                stable_dt: Duration::from_nanos(1),
+                held: false,
+            },
+            &known_extent(),
+        );
+        assert_eq!(
+            result,
+            Err(
+                RemoteTimeControlErrorV1::UnsupportedRemoteNavigationTimeline {
+                    requested: non_canonical_timeline(),
+                }
+            )
+        );
+        assert_eq!(adapter.ui_state.committed, None);
+        assert!(adapter.ui_state.requested.is_none());
+        assert_eq!(adapter.ui_state.target_marker, None);
     }
 
     #[test]
