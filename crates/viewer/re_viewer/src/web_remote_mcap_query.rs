@@ -21,19 +21,19 @@ type FacadeRepaintCallback = Rc<dyn Fn()>;
 pub(crate) struct PresentationEpochV1(u64);
 
 impl PresentationEpochV1 {
-    pub(crate) const fn initial_v1() -> Self {
+    const fn initial_v1() -> Self {
         Self(0)
     }
 
-    pub(crate) const fn from_u64_v1(value: u64) -> Self {
+    const fn from_u64_v1(value: u64) -> Self {
         Self(value)
     }
 
-    pub(crate) const fn get_v1(self) -> u64 {
+    const fn get_v1(self) -> u64 {
         self.0
     }
 
-    pub(crate) const fn next_v1(self) -> Result<Self, RemotePresentationTransitionErrorV1> {
+    const fn next_v1(self) -> Result<Self, RemotePresentationTransitionErrorV1> {
         match self.0.checked_add(1) {
             Some(value) => Ok(Self(value)),
             None => Err(RemotePresentationTransitionErrorV1::PresentationEpochExhausted),
@@ -45,26 +45,26 @@ impl PresentationEpochV1 {
 pub(crate) struct PresentationFacadeInstanceIdV1(u64);
 
 impl PresentationFacadeInstanceIdV1 {
-    pub(crate) const fn from_u64_v1(value: u64) -> Self {
+    const fn from_u64_v1(value: u64) -> Self {
         Self(value)
     }
 
-    pub(crate) const fn get_v1(self) -> u64 {
+    const fn get_v1(self) -> u64 {
         self.0
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RemotePresentationFacadeInstanceAllocatorV1 {
+struct RemotePresentationFacadeInstanceAllocatorV1 {
     next: u64,
 }
 
 impl RemotePresentationFacadeInstanceAllocatorV1 {
-    pub(crate) const fn new_v1(first: u64) -> Self {
+    const fn new_v1(first: u64) -> Self {
         Self { next: first }
     }
 
-    pub(crate) fn allocate_v1(
+    fn allocate_v1(
         &mut self,
     ) -> Result<PresentationFacadeInstanceIdV1, RemotePresentationTransitionErrorV1> {
         let value = self.next;
@@ -80,10 +80,10 @@ impl RemotePresentationFacadeInstanceAllocatorV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct PresentationRevisionV1 {
-    pub(crate) facade_instance: PresentationFacadeInstanceIdV1,
-    pub(crate) store_id: StoreId,
-    pub(crate) epoch: PresentationEpochV1,
+struct PresentationRevisionV1 {
+    facade_instance: PresentationFacadeInstanceIdV1,
+    store_id: StoreId,
+    epoch: PresentationEpochV1,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,14 +94,37 @@ pub(crate) struct CommittedPresentationTimeV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PresentationQuerySnapshotV1 {
-    pub(crate) revision: PresentationRevisionV1,
-    pub(crate) committed_time: Option<CommittedPresentationTimeV1>,
+    revision: PresentationRevisionV1,
+    committed_time: Option<CommittedPresentationTimeV1>,
+}
+
+impl PresentationQuerySnapshotV1 {
+    pub(crate) fn committed_time_v1(&self) -> Option<&CommittedPresentationTimeV1> {
+        self.committed_time.as_ref()
+    }
+
+    fn revision_v1(&self) -> &PresentationRevisionV1 {
+        &self.revision
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RevisionTaggedV1<T> {
-    pub(crate) revision: PresentationRevisionV1,
+    revision: PresentationRevisionV1,
     pub(crate) value: T,
+}
+
+impl<T> RevisionTaggedV1<T> {
+    pub(crate) fn from_snapshot_v1(snapshot: &PresentationQuerySnapshotV1, value: T) -> Self {
+        Self {
+            revision: snapshot.revision.clone(),
+            value,
+        }
+    }
+
+    fn revision_v1(&self) -> &PresentationRevisionV1 {
+        &self.revision
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +138,12 @@ pub(crate) enum CompleteIndexedCoverageV1 {
 pub(crate) enum RemoteCanonicalIndexedExtentV1 {
     NoIndexedMessages,
     Known(AbsoluteTimeRange),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemotePresentationMutationKindV1 {
+    QueryVisibleInsertion,
+    GarbageCollection,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -237,7 +266,7 @@ fn loaded_ranges_cover_extent_v1(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum RemotePresentationStateV1 {
+enum RemotePresentationStateV1 {
     InitialPresentationGated {
         snapshot: PresentationQuerySnapshotV1,
     },
@@ -246,6 +275,7 @@ pub(crate) enum RemotePresentationStateV1 {
     },
     ClosedForMutation {
         snapshot: PresentationQuerySnapshotV1,
+        mutation_kind: RemotePresentationMutationKindV1,
     },
     TerminalGated {
         revision: PresentationRevisionV1,
@@ -257,7 +287,7 @@ impl RemotePresentationStateV1 {
         match self {
             Self::InitialPresentationGated { snapshot }
             | Self::Open { snapshot }
-            | Self::ClosedForMutation { snapshot } => &snapshot.revision,
+            | Self::ClosedForMutation { snapshot, .. } => &snapshot.revision,
             Self::TerminalGated { revision } => revision,
         }
     }
@@ -266,7 +296,7 @@ impl RemotePresentationStateV1 {
         match self {
             Self::InitialPresentationGated { snapshot }
             | Self::Open { snapshot }
-            | Self::ClosedForMutation { snapshot } => Some(snapshot),
+            | Self::ClosedForMutation { snapshot, .. } => Some(snapshot),
             Self::TerminalGated { .. } => None,
         }
     }
@@ -494,23 +524,15 @@ impl RemotePresentationFacadeV1 {
         }
     }
 
-    pub(crate) fn facade_instance_v1(&self) -> PresentationFacadeInstanceIdV1 {
-        self.facade_instance
-    }
-
-    pub(crate) fn store_id_v1(&self) -> &StoreId {
-        &self.store_id
-    }
-
     pub(crate) fn use_state_v1(&self) -> RemoteRecordingUseStateV1 {
         *self.use_state.borrow()
     }
 
-    pub(crate) fn state_v1(&self) -> RemotePresentationStateV1 {
+    fn state_v1(&self) -> RemotePresentationStateV1 {
         self.state.borrow().clone()
     }
 
-    pub(crate) fn snapshot_v1(&self) -> Option<PresentationQuerySnapshotV1> {
+    fn snapshot_v1(&self) -> Option<PresentationQuerySnapshotV1> {
         self.state.borrow().snapshot_v1().cloned()
     }
 
@@ -530,7 +552,7 @@ impl RemotePresentationFacadeV1 {
         self.leases.counter_generation_v1()
     }
 
-    pub(crate) fn take_lease_drained_revision_v1(&self) -> Option<PresentationRevisionV1> {
+    fn take_lease_drained_revision_v1(&self) -> Option<PresentationRevisionV1> {
         self.leases.take_lease_drained_revision_v1()
     }
 
@@ -540,7 +562,7 @@ impl RemotePresentationFacadeV1 {
         self.leases.reinitialize_v1()
     }
 
-    pub(crate) fn set_use_state_v1(
+    fn set_use_state_v1(
         &self,
         use_state: RemoteRecordingUseStateV1,
     ) -> Result<PresentationRevisionV1, RemotePresentationTransitionErrorV1> {
@@ -561,7 +583,7 @@ impl RemotePresentationFacadeV1 {
             .set_opening_static_satisfied_v1(satisfied);
     }
 
-    pub(crate) fn commit_initial_presentation_v1(
+    fn commit_initial_presentation_v1(
         &self,
         committed_time: Option<CommittedPresentationTimeV1>,
     ) -> Result<PresentationRevisionV1, RemotePresentationTransitionErrorV1> {
@@ -577,6 +599,14 @@ impl RemotePresentationFacadeV1 {
             _ => return Err(RemotePresentationTransitionErrorV1::InvalidPresentationState),
         };
 
+        let committed_time = if matches!(
+            self.coverage.borrow().canonical_extent,
+            RemoteCanonicalIndexedExtentV1::NoIndexedMessages
+        ) {
+            None
+        } else {
+            committed_time
+        };
         let revision = self.make_revision_v1(initial_snapshot.revision.epoch.next_v1()?);
         let snapshot = PresentationQuerySnapshotV1 {
             revision: revision.clone(),
@@ -586,7 +616,7 @@ impl RemotePresentationFacadeV1 {
         Ok(revision)
     }
 
-    pub(crate) fn commit_presentation_v1(
+    fn commit_presentation_v1(
         &self,
         committed_time: Option<CommittedPresentationTimeV1>,
     ) -> Result<PresentationRevisionV1, RemotePresentationTransitionErrorV1> {
@@ -604,20 +634,31 @@ impl RemotePresentationFacadeV1 {
         Ok(revision)
     }
 
-    pub(crate) fn begin_mutation_v1(
+    fn begin_mutation_v1(
         &self,
+        mutation_kind: RemotePresentationMutationKindV1,
     ) -> Result<Option<PresentationRevisionV1>, RemotePresentationTransitionErrorV1> {
         let current_snapshot = match &*self.state.borrow() {
             RemotePresentationStateV1::Open { snapshot } => snapshot.clone(),
             _ => return Err(RemotePresentationTransitionErrorV1::InvalidPresentationState),
         };
 
-        let revision = self.make_revision_v1(current_snapshot.revision.epoch.next_v1()?);
+        let revision = match mutation_kind {
+            RemotePresentationMutationKindV1::QueryVisibleInsertion => {
+                self.make_revision_v1(current_snapshot.revision.epoch.next_v1()?)
+            }
+            RemotePresentationMutationKindV1::GarbageCollection => {
+                current_snapshot.revision.clone()
+            }
+        };
         let snapshot = PresentationQuerySnapshotV1 {
             revision: revision.clone(),
             committed_time: current_snapshot.committed_time,
         };
-        *self.state.borrow_mut() = RemotePresentationStateV1::ClosedForMutation { snapshot };
+        *self.state.borrow_mut() = RemotePresentationStateV1::ClosedForMutation {
+            snapshot,
+            mutation_kind,
+        };
 
         if self.leases.live_lease_count_v1() == 0 {
             Ok(None)
@@ -627,25 +668,43 @@ impl RemotePresentationFacadeV1 {
         }
     }
 
-    pub(crate) fn reopen_after_mutation_v1(
+    fn reopen_after_mutation_v1(
         &self,
+        query_visible_deletion: bool,
     ) -> Result<PresentationRevisionV1, RemotePresentationTransitionErrorV1> {
         if self.leases.live_lease_count_v1() != 0 {
             return Err(RemotePresentationTransitionErrorV1::LeasesStillLive);
         }
 
-        let closed_snapshot = match &*self.state.borrow() {
-            RemotePresentationStateV1::ClosedForMutation { snapshot } => snapshot.clone(),
+        let (closed_snapshot, mutation_kind) = match &*self.state.borrow() {
+            RemotePresentationStateV1::ClosedForMutation {
+                snapshot,
+                mutation_kind,
+            } => (snapshot.clone(), *mutation_kind),
             _ => return Err(RemotePresentationTransitionErrorV1::InvalidPresentationState),
         };
-        self.leases.clear_drain_v1();
-        *self.state.borrow_mut() = RemotePresentationStateV1::Open {
-            snapshot: closed_snapshot,
+
+        if query_visible_deletion
+            && mutation_kind != RemotePresentationMutationKindV1::GarbageCollection
+        {
+            return Err(RemotePresentationTransitionErrorV1::InvalidPresentationState);
+        }
+
+        let snapshot = if query_visible_deletion {
+            let revision = self.make_revision_v1(closed_snapshot.revision.epoch.next_v1()?);
+            PresentationQuerySnapshotV1 {
+                revision: revision.clone(),
+                committed_time: closed_snapshot.committed_time.clone(),
+            }
+        } else {
+            closed_snapshot
         };
+        self.leases.clear_drain_v1();
+        *self.state.borrow_mut() = RemotePresentationStateV1::Open { snapshot };
         Ok(self.state.borrow().revision_v1().clone())
     }
 
-    pub(crate) fn terminal_gate_v1(&self) -> PresentationRevisionV1 {
+    fn terminal_gate_v1(&self) -> PresentationRevisionV1 {
         let revision = self.state.borrow().revision_v1().clone();
         *self.state.borrow_mut() = RemotePresentationStateV1::TerminalGated {
             revision: revision.clone(),
@@ -684,12 +743,16 @@ impl RemotePresentationFacadeV1 {
                     },
                 };
             }
-            RemotePresentationStateV1::ClosedForMutation { snapshot } => {
+            RemotePresentationStateV1::ClosedForMutation {
+                snapshot,
+                mutation_kind,
+            } => {
                 *state = RemotePresentationStateV1::ClosedForMutation {
                     snapshot: PresentationQuerySnapshotV1 {
                         revision: next_revision,
                         committed_time: snapshot.committed_time.clone(),
                     },
+                    mutation_kind: *mutation_kind,
                 };
             }
             RemotePresentationStateV1::TerminalGated { .. } => {
@@ -770,8 +833,12 @@ impl RemotePresentationFacadeV1 {
         Ok(PresentationQueryLeaseV1 { snapshot, guard })
     }
 
-    pub(crate) fn is_current_v1(&self, revision: &PresentationRevisionV1) -> bool {
-        self.is_query_ready_v1() && self.state.borrow().revision_v1() == revision
+    pub(crate) fn is_current_v1(&self, snapshot: &PresentationQuerySnapshotV1) -> bool {
+        self.is_query_ready_v1() && self.state.borrow().revision_v1() == snapshot.revision_v1()
+    }
+
+    pub(crate) fn is_current_result_v1<T>(&self, result: &RevisionTaggedV1<T>) -> bool {
+        self.is_query_ready_v1() && self.state.borrow().revision_v1() == result.revision_v1()
     }
 
     pub(crate) fn set_query_probe_v1(&self, probe: FacadeRepaintCallback) {
@@ -787,7 +854,9 @@ pub(crate) trait GatedRecordingQueryFacadeV1 {
         query: &RangeQuery,
     ) -> Result<PresentationQueryLeaseV1<'_>, RemoteRangeQueryUnavailableV1>;
 
-    fn is_current_v1(&self, revision: &PresentationRevisionV1) -> bool;
+    fn is_current_v1(&self, snapshot: &PresentationQuerySnapshotV1) -> bool;
+
+    fn is_current_result_v1<T>(&self, result: &RevisionTaggedV1<T>) -> bool;
 }
 
 impl GatedRecordingQueryFacadeV1 for RemotePresentationFacadeV1 {
@@ -802,8 +871,12 @@ impl GatedRecordingQueryFacadeV1 for RemotePresentationFacadeV1 {
         self.acquire_complete_range_lease_v1(query)
     }
 
-    fn is_current_v1(&self, revision: &PresentationRevisionV1) -> bool {
-        self.is_current_v1(revision)
+    fn is_current_v1(&self, snapshot: &PresentationQuerySnapshotV1) -> bool {
+        self.is_current_v1(snapshot)
+    }
+
+    fn is_current_result_v1<T>(&self, result: &RevisionTaggedV1<T>) -> bool {
+        self.is_current_result_v1(result)
     }
 }
 
@@ -883,6 +956,24 @@ mod tests {
         (facade, repaint_count)
     }
 
+    fn initial_no_indexed_facade(
+        max_live_leases: usize,
+    ) -> (RemotePresentationFacadeV1, Rc<Cell<usize>>) {
+        let (repaint, repaint_count) = repaint_handle();
+        let facade = RemotePresentationFacadeV1::new_initial_presentation_gated_v1(
+            PresentationFacadeInstanceIdV1::from_u64_v1(2),
+            store_id(),
+            RemoteRecordingUseStateV1::Foreground,
+            RemoteLoadedCoverageV1::new_v1(
+                RemoteCanonicalIndexedExtentV1::NoIndexedMessages,
+                false,
+            ),
+            max_live_leases,
+            repaint,
+        );
+        (facade, repaint_count)
+    }
+
     fn open_facade(facade: &RemotePresentationFacadeV1, cursor: i64) {
         facade.set_opening_static_satisfied_v1(true);
         facade
@@ -893,7 +984,7 @@ mod tests {
     #[test]
     fn initial_gate_rejects_leases_and_current_results() {
         let (facade, _) = initial_facade(1);
-        let initial_revision = facade.snapshot_v1().expect("snapshot").revision;
+        let initial_snapshot = facade.snapshot_v1().expect("snapshot");
 
         assert!(matches!(
             facade.try_lease_v1(),
@@ -903,7 +994,7 @@ mod tests {
             facade.try_complete_range_lease_v1(&RangeQuery::new(timeline(), extent())),
             Err(RemoteRangeQueryUnavailableV1::PresentationGated)
         ));
-        assert!(!facade.is_current_v1(&initial_revision));
+        assert!(!facade.is_current_v1(&initial_snapshot));
     }
 
     #[test]
@@ -928,6 +1019,27 @@ mod tests {
     }
 
     #[test]
+    fn no_indexed_messages_initial_open_forces_missing_temporal_cursor() {
+        let (facade, _) = initial_no_indexed_facade(1);
+        facade.set_opening_static_satisfied_v1(true);
+
+        facade
+            .commit_initial_presentation_v1(Some(committed_time(5)))
+            .expect("NoIndexedMessages should open");
+
+        let snapshot = facade.snapshot_v1().expect("snapshot");
+        assert_eq!(snapshot.committed_time, None);
+        assert!(matches!(
+            facade.state_v1(),
+            RemotePresentationStateV1::Open { .. }
+        ));
+
+        let lease = facade.try_lease_v1().expect("static lease");
+        assert_eq!(lease.snapshot.committed_time, None);
+        assert!(facade.is_current_v1(&lease.snapshot));
+    }
+
+    #[test]
     fn open_lease_carries_current_revision_and_frozen_snapshot() {
         let (facade, _) = initial_facade(1);
         open_facade(&facade, 0);
@@ -944,7 +1056,7 @@ mod tests {
             .commit_presentation_v1(Some(committed_time(7)))
             .expect("advance presentation");
         assert_eq!(lease.snapshot, frozen);
-        assert!(!facade.is_current_v1(&frozen.revision));
+        assert!(!facade.is_current_v1(&frozen));
     }
 
     #[test]
@@ -964,24 +1076,25 @@ mod tests {
             facade.try_complete_range_lease_v1(&RangeQuery::new(timeline(), extent())),
             Err(RemoteRangeQueryUnavailableV1::RecordingNotForeground)
         ));
-        assert!(!facade.is_current_v1(&facade.snapshot_v1().expect("snapshot").revision));
+        let snapshot = facade.snapshot_v1().expect("snapshot");
+        assert!(!facade.is_current_v1(&snapshot));
     }
 
     #[test]
     fn foreground_loss_advances_revision_and_invalidates_old_results() {
         let (facade, _) = initial_facade(1);
         open_facade(&facade, 0);
-        let open_revision = facade.snapshot_v1().expect("snapshot").revision;
+        let open_snapshot = facade.snapshot_v1().expect("snapshot");
 
         facade
             .set_use_state_v1(RemoteRecordingUseStateV1::CatalogOnly)
             .expect("leave foreground");
-        assert!(!facade.is_current_v1(&open_revision));
+        assert!(!facade.is_current_v1(&open_snapshot));
 
         facade
             .set_use_state_v1(RemoteRecordingUseStateV1::Foreground)
             .expect("return foreground");
-        assert!(!facade.is_current_v1(&open_revision));
+        assert!(!facade.is_current_v1(&open_snapshot));
     }
 
     #[test]
@@ -996,7 +1109,8 @@ mod tests {
             facade.try_lease_v1(),
             Err(PresentationLeaseUnavailableV1::RecordingNotForeground)
         ));
-        assert!(!facade.is_current_v1(&facade.snapshot_v1().expect("snapshot").revision));
+        let snapshot = facade.snapshot_v1().expect("snapshot");
+        assert!(!facade.is_current_v1(&snapshot));
     }
 
     #[test]
@@ -1024,7 +1138,7 @@ mod tests {
 
         let lease = facade.try_lease_v1().expect("lease");
         let waiting_revision = facade
-            .begin_mutation_v1()
+            .begin_mutation_v1(RemotePresentationMutationKindV1::QueryVisibleInsertion)
             .expect("mutation begins")
             .expect("live lease requires drain");
         assert_eq!(repaint_count.get(), 0);
@@ -1045,7 +1159,7 @@ mod tests {
         let generation = facade.lease_counter_generation_v1();
 
         let waiting_revision = facade
-            .begin_mutation_v1()
+            .begin_mutation_v1(RemotePresentationMutationKindV1::QueryVisibleInsertion)
             .expect("mutation begins")
             .expect("live lease requires drain");
         assert!(matches!(
@@ -1062,14 +1176,90 @@ mod tests {
         );
 
         facade
-            .reopen_after_mutation_v1()
+            .reopen_after_mutation_v1(false)
             .expect("reopen after drain");
         assert_eq!(facade.lease_counter_generation_v1(), generation);
         assert!(matches!(
             facade.state_v1(),
             RemotePresentationStateV1::Open { .. }
         ));
-        assert!(facade.is_current_v1(&waiting_revision));
+        let reopened_snapshot = facade.snapshot_v1().expect("snapshot");
+        assert_eq!(reopened_snapshot.revision, waiting_revision);
+        assert!(facade.is_current_v1(&reopened_snapshot));
+    }
+
+    #[test]
+    fn query_visible_insertion_advances_epoch_when_closing() {
+        let (facade, _) = initial_facade(1);
+        open_facade(&facade, 0);
+        let open_snapshot = facade.snapshot_v1().expect("snapshot");
+
+        facade
+            .begin_mutation_v1(RemotePresentationMutationKindV1::QueryVisibleInsertion)
+            .expect("insertion mutation");
+        let closed_snapshot = facade.snapshot_v1().expect("snapshot");
+        assert!(closed_snapshot.revision.epoch.get_v1() > open_snapshot.revision.epoch.get_v1());
+        assert!(!facade.is_current_v1(&open_snapshot));
+
+        facade
+            .reopen_after_mutation_v1(false)
+            .expect("reopen insertion");
+        assert!(!facade.is_current_v1(&open_snapshot));
+        assert!(facade.is_current_v1(&facade.snapshot_v1().expect("snapshot")));
+    }
+
+    #[test]
+    fn no_op_gc_preserves_epoch_and_reopens_same_publication() {
+        let (facade, _) = initial_facade(1);
+        open_facade(&facade, 0);
+        let open_snapshot = facade.snapshot_v1().expect("snapshot");
+
+        facade
+            .begin_mutation_v1(RemotePresentationMutationKindV1::GarbageCollection)
+            .expect("gc mutation");
+        let closed_snapshot = facade.snapshot_v1().expect("snapshot");
+        assert_eq!(closed_snapshot.revision, open_snapshot.revision);
+        assert!(!facade.is_current_v1(&open_snapshot));
+
+        facade
+            .reopen_after_mutation_v1(false)
+            .expect("reopen no-op gc");
+        assert!(facade.is_current_v1(&open_snapshot));
+    }
+
+    #[test]
+    fn query_visible_gc_deletion_advances_epoch_before_reopen() {
+        let (facade, _) = initial_facade(1);
+        open_facade(&facade, 0);
+        let open_snapshot = facade.snapshot_v1().expect("snapshot");
+
+        facade
+            .begin_mutation_v1(RemotePresentationMutationKindV1::GarbageCollection)
+            .expect("gc mutation");
+        let closed_snapshot = facade.snapshot_v1().expect("snapshot");
+        assert_eq!(closed_snapshot.revision, open_snapshot.revision);
+
+        facade
+            .reopen_after_mutation_v1(true)
+            .expect("reopen query-visible deletion");
+        let reopened_snapshot = facade.snapshot_v1().expect("snapshot");
+        assert!(reopened_snapshot.revision.epoch.get_v1() > open_snapshot.revision.epoch.get_v1());
+        assert!(!facade.is_current_v1(&open_snapshot));
+        assert!(facade.is_current_v1(&reopened_snapshot));
+    }
+
+    #[test]
+    fn query_visible_deletion_requires_gc_mutation() {
+        let (facade, _) = initial_facade(1);
+        open_facade(&facade, 0);
+
+        facade
+            .begin_mutation_v1(RemotePresentationMutationKindV1::QueryVisibleInsertion)
+            .expect("insertion mutation");
+        assert_eq!(
+            facade.reopen_after_mutation_v1(true),
+            Err(RemotePresentationTransitionErrorV1::InvalidPresentationState)
+        );
     }
 
     #[test]
@@ -1107,26 +1297,28 @@ mod tests {
     fn closed_and_terminal_states_reject_queries() {
         let (facade, _) = initial_facade(1);
         open_facade(&facade, 0);
-        let open_revision = facade.snapshot_v1().expect("snapshot").revision;
+        let open_snapshot = facade.snapshot_v1().expect("snapshot");
 
-        facade.begin_mutation_v1().expect("close for mutation");
+        facade
+            .begin_mutation_v1(RemotePresentationMutationKindV1::QueryVisibleInsertion)
+            .expect("close for mutation");
         assert!(matches!(
             facade.try_lease_v1(),
             Err(PresentationLeaseUnavailableV1::PresentationGated)
         ));
-        assert!(!facade.is_current_v1(&open_revision));
+        assert!(!facade.is_current_v1(&open_snapshot));
 
         facade
-            .reopen_after_mutation_v1()
+            .reopen_after_mutation_v1(false)
             .expect("reopen after mutation");
-        assert!(!facade.is_current_v1(&open_revision));
+        assert!(!facade.is_current_v1(&open_snapshot));
 
         facade.terminal_gate_v1();
         assert!(matches!(
             facade.try_lease_v1(),
             Err(PresentationLeaseUnavailableV1::PresentationGated)
         ));
-        assert!(!facade.is_current_v1(&open_revision));
+        assert!(!facade.is_current_v1(&open_snapshot));
     }
 
     #[test]
@@ -1168,7 +1360,7 @@ mod tests {
             .try_complete_range_lease_v1(&RangeQuery::new(timeline(), extent()))
             .expect("complete range lease");
         assert_eq!(facade.live_lease_count_v1(), 1);
-        assert!(facade.is_current_v1(&lease.snapshot.revision));
+        assert!(facade.is_current_v1(&lease.snapshot));
     }
 
     #[test]
