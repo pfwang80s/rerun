@@ -181,6 +181,9 @@ mod remote_window_demand;
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
 mod remote_partition_job;
 
+#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+mod remote_root_reload;
+
 // Admitted second-pass dispatch remains crate-private and production-disarmed until the Web
 // Store mutation arbiter is wired to the complete terminal contract.
 #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
