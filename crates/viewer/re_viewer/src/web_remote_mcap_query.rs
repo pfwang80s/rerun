@@ -17,6 +17,8 @@ use crate::web_remote_mcap_activation::RemoteRecordingUseStateV1;
 
 type FacadeRepaintCallback = Rc<dyn Fn()>;
 
+pub(crate) trait ConsumerStorageFreeV1 {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PresentationEpochV1(u64);
 
@@ -546,7 +548,7 @@ impl RemotePresentationFacadeV1 {
         self.coverage.borrow().clone()
     }
 
-    pub(crate) fn replace_coverage_v1(&self, coverage: RemoteLoadedCoverageV1) {
+    fn replace_coverage_v1(&self, coverage: RemoteLoadedCoverageV1) {
         *self.coverage.borrow_mut() = coverage;
     }
 
@@ -583,7 +585,7 @@ impl RemotePresentationFacadeV1 {
         Ok(self.state.borrow().revision_v1().clone())
     }
 
-    pub(crate) fn set_opening_static_satisfied_v1(&self, satisfied: bool) {
+    fn set_opening_static_satisfied_v1(&self, satisfied: bool) {
         self.coverage
             .borrow_mut()
             .set_opening_static_satisfied_v1(satisfied);
@@ -851,14 +853,14 @@ impl RemotePresentationFacadeV1 {
         *self.query_probe.borrow_mut() = probe;
     }
 
-    pub(crate) fn privileged_set_use_state_v1(
+    fn privileged_set_use_state_v1(
         &self,
         use_state: RemoteRecordingUseStateV1,
     ) -> Result<(), RemotePresentationTransitionErrorV1> {
         self.set_use_state_v1(use_state).map(|_| ())
     }
 
-    pub(crate) fn privileged_commit_initial_presentation_v1(
+    fn privileged_commit_initial_presentation_v1(
         &self,
         committed_time: Option<CommittedPresentationTimeV1>,
     ) -> Result<(), RemotePresentationTransitionErrorV1> {
@@ -866,14 +868,14 @@ impl RemotePresentationFacadeV1 {
             .map(|_| ())
     }
 
-    pub(crate) fn privileged_commit_presentation_v1(
+    fn privileged_commit_presentation_v1(
         &self,
         committed_time: Option<CommittedPresentationTimeV1>,
     ) -> Result<(), RemotePresentationTransitionErrorV1> {
         self.commit_presentation_v1(committed_time).map(|_| ())
     }
 
-    pub(crate) fn privileged_begin_query_visible_insertion_v1(
+    fn privileged_begin_query_visible_insertion_v1(
         &self,
     ) -> Result<RemoteMutationLeaseDrainV1, RemotePresentationTransitionErrorV1> {
         self.begin_mutation_v1(RemotePresentationMutationKindV1::QueryVisibleInsertion)
@@ -886,13 +888,13 @@ impl RemotePresentationFacadeV1 {
             })
     }
 
-    pub(crate) fn privileged_finish_query_visible_insertion_v1(
+    fn privileged_finish_query_visible_insertion_v1(
         &self,
     ) -> Result<(), RemotePresentationTransitionErrorV1> {
         self.reopen_after_mutation_v1(false).map(|_| ())
     }
 
-    pub(crate) fn privileged_begin_garbage_collection_v1(
+    fn privileged_begin_garbage_collection_v1(
         &self,
     ) -> Result<RemoteMutationLeaseDrainV1, RemotePresentationTransitionErrorV1> {
         self.begin_mutation_v1(RemotePresentationMutationKindV1::GarbageCollection)
@@ -905,7 +907,7 @@ impl RemotePresentationFacadeV1 {
             })
     }
 
-    pub(crate) fn privileged_finish_garbage_collection_v1(
+    fn privileged_finish_garbage_collection_v1(
         &self,
         query_visible_deletion: bool,
     ) -> Result<(), RemotePresentationTransitionErrorV1> {
@@ -913,13 +915,276 @@ impl RemotePresentationFacadeV1 {
             .map(|_| ())
     }
 
-    pub(crate) fn privileged_terminal_gate_v1(&self) {
+    fn privileged_terminal_gate_v1(&self) {
         self.terminal_gate_v1();
     }
 
-    pub(crate) fn privileged_take_lease_drain_ready_v1(&self) -> bool {
+    fn privileged_take_lease_drain_ready_v1(&self) -> bool {
         self.take_lease_drained_revision_v1().is_some()
     }
+}
+
+mod privileged_private {
+    pub(crate) struct PrivilegedFrameContextSealV1;
+    pub(crate) struct RemoteStorageCapabilitySealV1;
+}
+
+/// Sealed frame-level authority for creating privileged remote storage capabilities.
+///
+/// There is intentionally no public constructor. Consumer code cannot obtain or name the private
+/// factory token, so it cannot construct this type.
+pub(crate) struct PrivilegedViewerFrameContextV1 {
+    _sealed: privileged_private::PrivilegedFrameContextSealV1,
+}
+
+impl PrivilegedViewerFrameContextV1 {
+    fn new_privileged_viewer_frame_context_v1() -> Self {
+        Self {
+            _sealed: privileged_private::PrivilegedFrameContextSealV1,
+        }
+    }
+
+    pub(crate) fn remote_storage_capability_v1<'a>(
+        &self,
+        facade: &'a RemotePresentationFacadeV1,
+    ) -> PrivilegedRemoteStorageCapabilityV1<'a> {
+        let _ = &self._sealed;
+        PrivilegedRemoteStorageCapabilityV1 {
+            facade,
+            _sealed: privileged_private::RemoteStorageCapabilitySealV1,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_v1() -> Self {
+        Self::new_privileged_viewer_frame_context_v1()
+    }
+}
+
+/// Sealed privileged storage control-plane capability.
+///
+/// Every method returns an owned outcome and never returns a borrow to the facade, an `EntityDb`,
+/// storage engine, or a handle an asynchronous task could retain.
+pub(crate) struct PrivilegedRemoteStorageCapabilityV1<'a> {
+    facade: &'a RemotePresentationFacadeV1,
+    _sealed: privileged_private::RemoteStorageCapabilitySealV1,
+}
+
+impl PrivilegedRemoteStorageCapabilityV1<'_> {
+    pub(crate) fn set_use_state_v1(
+        &self,
+        use_state: RemoteRecordingUseStateV1,
+    ) -> Result<(), RemotePresentationTransitionErrorV1> {
+        self.facade.privileged_set_use_state_v1(use_state)
+    }
+
+    pub(crate) fn set_opening_static_satisfied_v1(&self, satisfied: bool) {
+        self.facade.set_opening_static_satisfied_v1(satisfied);
+    }
+
+    pub(crate) fn replace_loaded_coverage_v1(&self, coverage: RemoteLoadedCoverageV1) {
+        self.facade.replace_coverage_v1(coverage);
+    }
+
+    pub(crate) fn commit_initial_presentation_v1(
+        &self,
+        committed_time: Option<CommittedPresentationTimeV1>,
+    ) -> Result<(), RemotePresentationTransitionErrorV1> {
+        self.facade
+            .privileged_commit_initial_presentation_v1(committed_time)
+    }
+
+    pub(crate) fn commit_presentation_v1(
+        &self,
+        committed_time: Option<CommittedPresentationTimeV1>,
+    ) -> Result<(), RemotePresentationTransitionErrorV1> {
+        self.facade
+            .privileged_commit_presentation_v1(committed_time)
+    }
+
+    pub(crate) fn begin_query_visible_insertion_v1(
+        &self,
+    ) -> Result<RemoteMutationLeaseDrainV1, RemotePresentationTransitionErrorV1> {
+        self.facade.privileged_begin_query_visible_insertion_v1()
+    }
+
+    pub(crate) fn finish_query_visible_insertion_v1(
+        &self,
+    ) -> Result<(), RemotePresentationTransitionErrorV1> {
+        self.facade.privileged_finish_query_visible_insertion_v1()
+    }
+
+    pub(crate) fn begin_garbage_collection_v1(
+        &self,
+    ) -> Result<RemoteMutationLeaseDrainV1, RemotePresentationTransitionErrorV1> {
+        self.facade.privileged_begin_garbage_collection_v1()
+    }
+
+    pub(crate) fn finish_garbage_collection_v1(
+        &self,
+        query_visible_deletion: bool,
+    ) -> Result<(), RemotePresentationTransitionErrorV1> {
+        self.facade
+            .privileged_finish_garbage_collection_v1(query_visible_deletion)
+    }
+
+    pub(crate) fn terminal_gate_v1(&self) {
+        self.facade.privileged_terminal_gate_v1();
+    }
+
+    pub(crate) fn take_lease_drain_ready_v1(&self) -> bool {
+        self.facade.privileged_take_lease_drain_ready_v1()
+    }
+}
+
+impl ConsumerStorageFreeV1 for u64 {}
+impl ConsumerStorageFreeV1 for usize {}
+impl ConsumerStorageFreeV1 for bool {}
+impl ConsumerStorageFreeV1 for StoreId {}
+impl ConsumerStorageFreeV1 for TimelineName {}
+impl ConsumerStorageFreeV1 for TimeInt {}
+impl ConsumerStorageFreeV1 for AbsoluteTimeRange {}
+impl ConsumerStorageFreeV1 for RangeQuery {}
+impl ConsumerStorageFreeV1 for RemoteRecordingUseStateV1 {}
+impl ConsumerStorageFreeV1 for dyn Fn() {}
+
+impl<T: ConsumerStorageFreeV1> ConsumerStorageFreeV1 for Option<T> {}
+impl<T: ConsumerStorageFreeV1> ConsumerStorageFreeV1 for Vec<T> {}
+impl<T: ConsumerStorageFreeV1> ConsumerStorageFreeV1 for RefCell<T> {}
+impl<T: ConsumerStorageFreeV1 + ?Sized> ConsumerStorageFreeV1 for Rc<T> {}
+impl<T: ConsumerStorageFreeV1 + ?Sized> ConsumerStorageFreeV1 for &T {}
+impl<T: ConsumerStorageFreeV1 + ?Sized> ConsumerStorageFreeV1 for &mut T {}
+impl<T: ConsumerStorageFreeV1> ConsumerStorageFreeV1 for BTreeSet<T> {}
+
+impl ConsumerStorageFreeV1 for PresentationEpochV1 {}
+impl ConsumerStorageFreeV1 for PresentationFacadeInstanceIdV1 {}
+impl ConsumerStorageFreeV1 for RemotePresentationFacadeInstanceAllocatorV1 {}
+impl ConsumerStorageFreeV1 for PresentationLeaseUnavailableV1 {}
+impl ConsumerStorageFreeV1 for RemotePresentationTransitionErrorV1 {}
+impl ConsumerStorageFreeV1 for RemoteMutationLeaseDrainV1 {}
+impl ConsumerStorageFreeV1 for CompleteIndexedCoverageV1 {}
+impl ConsumerStorageFreeV1 for RemotePresentationMutationKindV1 {}
+
+impl ConsumerStorageFreeV1 for RemoteCanonicalIndexedExtentV1 where
+    AbsoluteTimeRange: ConsumerStorageFreeV1
+{
+}
+
+impl ConsumerStorageFreeV1 for RemoteLoadedCoverageV1
+where
+    RemoteCanonicalIndexedExtentV1: ConsumerStorageFreeV1,
+    Vec<AbsoluteTimeRange>: ConsumerStorageFreeV1,
+    bool: ConsumerStorageFreeV1,
+{
+}
+
+impl ConsumerStorageFreeV1 for PresentationRevisionV1
+where
+    PresentationFacadeInstanceIdV1: ConsumerStorageFreeV1,
+    StoreId: ConsumerStorageFreeV1,
+    PresentationEpochV1: ConsumerStorageFreeV1,
+{
+}
+
+impl ConsumerStorageFreeV1 for CommittedPresentationTimeV1
+where
+    TimelineName: ConsumerStorageFreeV1,
+    TimeInt: ConsumerStorageFreeV1,
+{
+}
+
+impl ConsumerStorageFreeV1 for PresentationQuerySnapshotV1
+where
+    PresentationRevisionV1: ConsumerStorageFreeV1,
+    Option<CommittedPresentationTimeV1>: ConsumerStorageFreeV1,
+{
+}
+
+impl<T> ConsumerStorageFreeV1 for RevisionTaggedV1<T>
+where
+    PresentationRevisionV1: ConsumerStorageFreeV1,
+    T: ConsumerStorageFreeV1,
+{
+}
+
+impl ConsumerStorageFreeV1 for RemoteRangeQueryUnavailableV1
+where
+    RemoteCanonicalIndexedExtentV1: ConsumerStorageFreeV1,
+    Vec<AbsoluteTimeRange>: ConsumerStorageFreeV1,
+{
+}
+
+impl ConsumerStorageFreeV1 for RemotePresentationStateV1
+where
+    PresentationQuerySnapshotV1: ConsumerStorageFreeV1,
+    RemotePresentationMutationKindV1: ConsumerStorageFreeV1,
+    PresentationRevisionV1: ConsumerStorageFreeV1,
+{
+}
+
+impl ConsumerStorageFreeV1 for PresentationLeaseIdentityV1
+where
+    u64: ConsumerStorageFreeV1,
+    PresentationRevisionV1: ConsumerStorageFreeV1,
+{
+}
+
+impl ConsumerStorageFreeV1 for PresentationLeaseCounterStateV1
+where
+    u64: ConsumerStorageFreeV1,
+    usize: ConsumerStorageFreeV1,
+    BTreeSet<PresentationLeaseIdentityV1>: ConsumerStorageFreeV1,
+    Option<PresentationRevisionV1>: ConsumerStorageFreeV1,
+{
+}
+
+impl ConsumerStorageFreeV1 for PresentationLeaseCounterV1
+where
+    RefCell<PresentationLeaseCounterStateV1>: ConsumerStorageFreeV1,
+    FacadeRepaintCallback: ConsumerStorageFreeV1,
+{
+}
+
+impl<'a> ConsumerStorageFreeV1 for PresentationLeaseGuardV1<'a>
+where
+    &'a PresentationLeaseCounterV1: ConsumerStorageFreeV1,
+    Option<PresentationLeaseIdentityV1>: ConsumerStorageFreeV1,
+{
+}
+
+impl<'a> ConsumerStorageFreeV1 for PresentationQueryLeaseV1<'a>
+where
+    PresentationQuerySnapshotV1: ConsumerStorageFreeV1,
+    PresentationLeaseGuardV1<'a>: ConsumerStorageFreeV1,
+{
+}
+
+impl ConsumerStorageFreeV1 for RemotePresentationFacadeV1
+where
+    PresentationFacadeInstanceIdV1: ConsumerStorageFreeV1,
+    StoreId: ConsumerStorageFreeV1,
+    RefCell<RemoteRecordingUseStateV1>: ConsumerStorageFreeV1,
+    RefCell<RemotePresentationStateV1>: ConsumerStorageFreeV1,
+    PresentationLeaseCounterV1: ConsumerStorageFreeV1,
+    RefCell<RemoteLoadedCoverageV1>: ConsumerStorageFreeV1,
+    FacadeRepaintCallback: ConsumerStorageFreeV1,
+    RefCell<FacadeRepaintCallback>: ConsumerStorageFreeV1,
+{
+}
+
+impl ConsumerStorageFreeV1 for privileged_private::PrivilegedFrameContextSealV1 {}
+impl ConsumerStorageFreeV1 for privileged_private::RemoteStorageCapabilitySealV1 {}
+
+impl ConsumerStorageFreeV1 for PrivilegedViewerFrameContextV1 where
+    privileged_private::PrivilegedFrameContextSealV1: ConsumerStorageFreeV1
+{
+}
+
+impl<'a> ConsumerStorageFreeV1 for PrivilegedRemoteStorageCapabilityV1<'a>
+where
+    &'a RemotePresentationFacadeV1: ConsumerStorageFreeV1,
+    privileged_private::RemoteStorageCapabilitySealV1: ConsumerStorageFreeV1,
+{
 }
 
 #[cfg(test)]

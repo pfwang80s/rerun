@@ -14,21 +14,19 @@ use re_log_types::StoreId;
 
 use crate::web_remote_mcap_activation::RemoteRecordingUseStateV1;
 use crate::web_remote_mcap_query::{
-    CommittedPresentationTimeV1, GatedRecordingQueryFacadeV1, PresentationLeaseUnavailableV1,
-    PresentationQueryLeaseV1, PresentationQuerySnapshotV1, RemoteLoadedCoverageV1,
-    RemoteMutationLeaseDrainV1, RemotePresentationFacadeV1, RemotePresentationTransitionErrorV1,
-    RemoteRangeQueryUnavailableV1,
+    CommittedPresentationTimeV1, ConsumerStorageFreeV1, GatedRecordingQueryFacadeV1,
+    PresentationLeaseUnavailableV1, PresentationQueryLeaseV1, PresentationQuerySnapshotV1,
+    PrivilegedViewerFrameContextV1, RemoteLoadedCoverageV1, RemoteMutationLeaseDrainV1,
+    RemotePresentationFacadeV1, RemoteRangeQueryUnavailableV1,
 };
 
 mod private {
     pub(crate) struct ConsumerContextSealV1;
     pub(crate) struct LocalPassthroughSealV1;
-    pub(crate) struct PrivilegedFrameContextSealV1;
-    pub(crate) struct RemoteStorageCapabilitySealV1;
     pub(crate) trait SealedRecordingQueryV1 {}
 }
 
-trait RecordingLeaseBackendV1 {
+trait RecordingLeaseBackendV1: ConsumerStorageFreeV1 {
     fn try_lease_v1(&self) -> Result<PresentationQueryLeaseV1<'_>, PresentationLeaseUnavailableV1>;
 
     fn try_complete_range_lease_v1(
@@ -57,7 +55,7 @@ impl RecordingLeaseBackendV1 for RemotePresentationFacadeV1 {
 }
 
 /// Opaque recording-query snapshot. The underlying facade instance, `StoreId`, and epoch stay private.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct RecordingQuerySnapshotV1(PresentationQuerySnapshotV1);
 
 impl RecordingQuerySnapshotV1 {
@@ -67,6 +65,15 @@ impl RecordingQuerySnapshotV1 {
 
     fn inner_v1(&self) -> &PresentationQuerySnapshotV1 {
         &self.0
+    }
+}
+
+impl fmt::Debug for RecordingQuerySnapshotV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecordingQuerySnapshotV1")
+            .field("committed_time", &self.committed_time_v1())
+            .finish()
     }
 }
 
@@ -89,7 +96,7 @@ impl fmt::Debug for RecordingQueryLeaseV1<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RecordingQueryLeaseV1")
-            .field("snapshot", &self.snapshot_v1())
+            .field("committed_time", &self.committed_time_v1())
             .finish()
     }
 }
@@ -187,107 +194,31 @@ impl RecordingConsumerQueryV1 for LocalRecordingPassthroughV1<'_> {
     }
 }
 
-/// Sealed frame-level authority for creating privileged remote storage capabilities.
-///
-/// There is intentionally no public constructor. Consumer code cannot obtain or name the private
-/// factory token, so it cannot construct this type.
-pub(crate) struct PrivilegedViewerFrameContextV1 {
-    _sealed: private::PrivilegedFrameContextSealV1,
+impl ConsumerStorageFreeV1 for private::ConsumerContextSealV1 {}
+impl ConsumerStorageFreeV1 for private::LocalPassthroughSealV1 {}
+
+impl ConsumerStorageFreeV1 for RecordingQuerySnapshotV1 where
+    PresentationQuerySnapshotV1: ConsumerStorageFreeV1
+{
 }
 
-impl PrivilegedViewerFrameContextV1 {
-    fn new_privileged_viewer_frame_context_v1() -> Self {
-        Self {
-            _sealed: private::PrivilegedFrameContextSealV1,
-        }
-    }
-
-    pub(crate) fn remote_storage_capability_v1<'a>(
-        &self,
-        facade: &'a RemotePresentationFacadeV1,
-    ) -> PrivilegedRemoteStorageCapabilityV1<'a> {
-        let _ = &self._sealed;
-        PrivilegedRemoteStorageCapabilityV1 {
-            facade,
-            _sealed: private::RemoteStorageCapabilitySealV1,
-        }
-    }
+impl<'a> ConsumerStorageFreeV1 for RecordingQueryLeaseV1<'a> where
+    PresentationQueryLeaseV1<'a>: ConsumerStorageFreeV1
+{
 }
 
-/// Sealed privileged storage control-plane capability.
-///
-/// Every method returns an owned outcome and never returns a borrow to the facade, an `EntityDb`,
-/// storage engine, or a handle an asynchronous task could retain.
-pub(crate) struct PrivilegedRemoteStorageCapabilityV1<'a> {
-    facade: &'a RemotePresentationFacadeV1,
-    _sealed: private::RemoteStorageCapabilitySealV1,
+impl<'a> ConsumerStorageFreeV1 for RecordingConsumerContextV1<'a>
+where
+    &'a dyn RecordingLeaseBackendV1: ConsumerStorageFreeV1,
+    private::ConsumerContextSealV1: ConsumerStorageFreeV1,
+{
 }
 
-impl PrivilegedRemoteStorageCapabilityV1<'_> {
-    pub(crate) fn set_use_state_v1(
-        &self,
-        use_state: RemoteRecordingUseStateV1,
-    ) -> Result<(), RemotePresentationTransitionErrorV1> {
-        self.facade.privileged_set_use_state_v1(use_state)
-    }
-
-    pub(crate) fn set_opening_static_satisfied_v1(&self, satisfied: bool) {
-        self.facade.set_opening_static_satisfied_v1(satisfied);
-    }
-
-    pub(crate) fn replace_loaded_coverage_v1(&self, coverage: RemoteLoadedCoverageV1) {
-        self.facade.replace_coverage_v1(coverage);
-    }
-
-    pub(crate) fn commit_initial_presentation_v1(
-        &self,
-        committed_time: Option<CommittedPresentationTimeV1>,
-    ) -> Result<(), RemotePresentationTransitionErrorV1> {
-        self.facade
-            .privileged_commit_initial_presentation_v1(committed_time)
-    }
-
-    pub(crate) fn commit_presentation_v1(
-        &self,
-        committed_time: Option<CommittedPresentationTimeV1>,
-    ) -> Result<(), RemotePresentationTransitionErrorV1> {
-        self.facade
-            .privileged_commit_presentation_v1(committed_time)
-    }
-
-    pub(crate) fn begin_query_visible_insertion_v1(
-        &self,
-    ) -> Result<RemoteMutationLeaseDrainV1, RemotePresentationTransitionErrorV1> {
-        self.facade.privileged_begin_query_visible_insertion_v1()
-    }
-
-    pub(crate) fn finish_query_visible_insertion_v1(
-        &self,
-    ) -> Result<(), RemotePresentationTransitionErrorV1> {
-        self.facade.privileged_finish_query_visible_insertion_v1()
-    }
-
-    pub(crate) fn begin_garbage_collection_v1(
-        &self,
-    ) -> Result<RemoteMutationLeaseDrainV1, RemotePresentationTransitionErrorV1> {
-        self.facade.privileged_begin_garbage_collection_v1()
-    }
-
-    pub(crate) fn finish_garbage_collection_v1(
-        &self,
-        query_visible_deletion: bool,
-    ) -> Result<(), RemotePresentationTransitionErrorV1> {
-        self.facade
-            .privileged_finish_garbage_collection_v1(query_visible_deletion)
-    }
-
-    pub(crate) fn terminal_gate_v1(&self) {
-        self.facade.privileged_terminal_gate_v1();
-    }
-
-    pub(crate) fn take_lease_drain_ready_v1(&self) -> bool {
-        self.facade.privileged_take_lease_drain_ready_v1()
-    }
+impl<'a> ConsumerStorageFreeV1 for LocalRecordingPassthroughV1<'a>
+where
+    &'a dyn RecordingLeaseBackendV1: ConsumerStorageFreeV1,
+    private::LocalPassthroughSealV1: ConsumerStorageFreeV1,
+{
 }
 
 #[cfg(test)]
@@ -295,10 +226,15 @@ mod tests {
     use std::rc::Rc;
 
     use re_chunk::RangeQuery;
+    use re_entity_db::{EntityDb, StoreBundle};
     use re_log_types::AbsoluteTimeRange;
+    use re_query::StorageEngine;
+    use re_viewer_context::StoreHub;
 
     use super::*;
-    use crate::web_remote_mcap_query::RemoteCanonicalIndexedExtentV1;
+    use crate::web_remote_mcap_query::{
+        ConsumerStorageFreeV1, PrivilegedRemoteStorageCapabilityV1, RemoteCanonicalIndexedExtentV1,
+    };
 
     fn store_id() -> StoreId {
         StoreId::recording("consumer-test-app", "consumer-test-recording")
@@ -331,7 +267,7 @@ mod tests {
     }
 
     fn open_facade(facade: &RemotePresentationFacadeV1) {
-        let frame = PrivilegedViewerFrameContextV1::new_privileged_viewer_frame_context_v1();
+        let frame = PrivilegedViewerFrameContextV1::new_for_test_v1();
         let privileged = frame.remote_storage_capability_v1(facade);
         privileged.set_opening_static_satisfied_v1(true);
         privileged
@@ -345,6 +281,26 @@ mod tests {
         assert!(!type_name.contains("StorageEngine"));
         assert!(!type_name.contains("StoreHub"));
         assert!(!type_name.contains("StoreBundle"));
+    }
+
+    fn assert_storage_free_v1<T: ConsumerStorageFreeV1>() {}
+
+    macro_rules! assert_not_storage_free_v1 {
+        ($type:ty) => {
+            const _: fn() = || {
+                trait AmbiguousIfImpl<A> {
+                    fn some_item() {}
+                }
+
+                impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+
+                struct Invalid;
+
+                impl<T: ?Sized + ConsumerStorageFreeV1> AmbiguousIfImpl<Invalid> for T {}
+
+                let _ = <$type as AmbiguousIfImpl<_>>::some_item;
+            };
+        };
     }
 
     #[test]
@@ -373,7 +329,7 @@ mod tests {
             RemoteLoadedCoverageV1::new_v1(RemoteCanonicalIndexedExtentV1::Known(extent()), true);
         coverage.replace_loaded_ranges_v1([extent()]);
 
-        let frame = PrivilegedViewerFrameContextV1::new_privileged_viewer_frame_context_v1();
+        let frame = PrivilegedViewerFrameContextV1::new_for_test_v1();
         let privileged = frame.remote_storage_capability_v1(&facade);
         privileged.replace_loaded_coverage_v1(coverage);
 
@@ -402,7 +358,7 @@ mod tests {
 
         open_facade(&facade);
 
-        let frame = PrivilegedViewerFrameContextV1::new_privileged_viewer_frame_context_v1();
+        let frame = PrivilegedViewerFrameContextV1::new_for_test_v1();
         let privileged = frame.remote_storage_capability_v1(&facade);
         privileged
             .set_use_state_v1(RemoteRecordingUseStateV1::CatalogOnly)
@@ -451,7 +407,7 @@ mod tests {
         let remote = RecordingConsumerContextV1::from_remote_facade_v1(&facade);
         let _lease = remote.try_lease_v1().expect("lease");
 
-        let frame = PrivilegedViewerFrameContextV1::new_privileged_viewer_frame_context_v1();
+        let frame = PrivilegedViewerFrameContextV1::new_for_test_v1();
         let privileged = frame.remote_storage_capability_v1(&facade);
 
         assert_eq!(
@@ -471,5 +427,39 @@ mod tests {
     fn consumer_type_surface_does_not_mention_storage_handles() {
         assert_consumer_trait_surface::<RecordingConsumerContextV1<'static>>();
         assert_consumer_trait_surface::<LocalRecordingPassthroughV1<'static>>();
+    }
+
+    #[test]
+    fn snapshot_and_lease_debug_do_not_leak_presentation_identity() {
+        let facade = facade(1);
+        open_facade(&facade);
+
+        let remote = RecordingConsumerContextV1::from_remote_facade_v1(&facade);
+        let lease = remote.try_lease_v1().expect("lease");
+        let snapshot = lease.snapshot_v1();
+        let recording_id = store_id().recording_id().as_str().to_owned();
+
+        for rendered in [format!("{snapshot:?}"), format!("{lease:?}")] {
+            assert!(!rendered.contains("PresentationRevision"));
+            assert!(!rendered.contains("PresentationQuerySnapshot"));
+            assert!(!rendered.contains("StoreId"));
+            assert!(!rendered.contains(&recording_id));
+            assert!(!rendered.contains("42"));
+        }
+    }
+
+    #[test]
+    fn consumer_and_privileged_types_are_storage_free_by_structure() {
+        assert_not_storage_free_v1!(EntityDb);
+        assert_not_storage_free_v1!(StoreBundle);
+        assert_not_storage_free_v1!(StoreHub);
+        assert_not_storage_free_v1!(StorageEngine);
+
+        assert_storage_free_v1::<RecordingConsumerContextV1<'static>>();
+        assert_storage_free_v1::<LocalRecordingPassthroughV1<'static>>();
+        assert_storage_free_v1::<RecordingQuerySnapshotV1>();
+        assert_storage_free_v1::<RecordingQueryLeaseV1<'static>>();
+        assert_storage_free_v1::<PrivilegedViewerFrameContextV1>();
+        assert_storage_free_v1::<PrivilegedRemoteStorageCapabilityV1<'static>>();
     }
 }
