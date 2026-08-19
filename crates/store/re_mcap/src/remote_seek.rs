@@ -117,26 +117,68 @@ enum RemoteSeekFacadePriorStateV1 {
     CommittedClosed,
 }
 
+/// The type of work represented by a commit set.
+///
+/// Physical and non-physical commit paths must be distinguishable in the type so a driver cannot
+/// select the non-physical fast path for ordinary physical batches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteSeekCommitKindV1 {
+    Physical,
+    ResidentFastPath,
+    CompleteEmpty,
+}
+
 /// Immutable commit-set identity frozen before the first physical Store insertion.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RemoteSeekCommitSetV1 {
     generation: RemoteSeekGenerationV1,
+    kind: RemoteSeekCommitKindV1,
     batch_ids: BTreeSet<RemoteSeekBatchIdV1>,
 }
 
 impl RemoteSeekCommitSetV1 {
-    pub(crate) fn new_v1(
+    pub(crate) fn physical_v1(
         generation: RemoteSeekGenerationV1,
         batch_ids: BTreeSet<RemoteSeekBatchIdV1>,
-    ) -> Self {
+    ) -> Result<Self, RemoteSeekErrorV1> {
+        if batch_ids.is_empty() {
+            return Err(RemoteSeekErrorV1::EmptyCommitSet);
+        }
+        Ok(Self {
+            generation,
+            kind: RemoteSeekCommitKindV1::Physical,
+            batch_ids,
+        })
+    }
+
+    pub(crate) fn resident_fast_path_v1(generation: RemoteSeekGenerationV1) -> Self {
         Self {
             generation,
-            batch_ids,
+            kind: RemoteSeekCommitKindV1::ResidentFastPath,
+            batch_ids: BTreeSet::new(),
         }
+    }
+
+    pub(crate) fn complete_empty_v1(
+        generation: RemoteSeekGenerationV1,
+        batch_ids: BTreeSet<RemoteSeekBatchIdV1>,
+    ) -> Result<Self, RemoteSeekErrorV1> {
+        if batch_ids.is_empty() {
+            return Err(RemoteSeekErrorV1::EmptyCommitSet);
+        }
+        Ok(Self {
+            generation,
+            kind: RemoteSeekCommitKindV1::CompleteEmpty,
+            batch_ids,
+        })
     }
 
     pub(crate) const fn generation_v1(&self) -> RemoteSeekGenerationV1 {
         self.generation
+    }
+
+    pub(crate) const fn kind_v1(&self) -> RemoteSeekCommitKindV1 {
+        self.kind
     }
 
     pub(crate) fn batch_ids_v1(&self) -> &BTreeSet<RemoteSeekBatchIdV1> {
@@ -163,6 +205,9 @@ impl RemoteSeekCommitLockV1 {
         }
         if commit_set.generation_v1() != generation {
             return Err(RemoteSeekErrorV1::CommitSetGenerationMismatch);
+        }
+        if commit_set.kind_v1() != RemoteSeekCommitKindV1::Physical {
+            return Err(RemoteSeekErrorV1::NonPhysicalCommitSet);
         }
         if commit_set.batch_ids_v1().is_empty() {
             return Err(RemoteSeekErrorV1::EmptyCommitSet);
@@ -438,6 +483,15 @@ pub(crate) enum RemoteSeekErrorV1 {
     #[error("remote seek commit set is empty")]
     EmptyCommitSet,
 
+    #[error("remote seek expected a physical commit set for locked mutation")]
+    NonPhysicalCommitSet,
+
+    #[error("remote seek rejected a physical commit set on the non-physical path")]
+    PhysicalCommitSetForNonPhysicalCommit,
+
+    #[error("remote seek resident fast path requires a committed presentation")]
+    ResidentFastPathRequiresCommittedPresentation,
+
     #[error("remote seek commit set generation does not match its lock")]
     CommitSetGenerationMismatch,
 
@@ -696,12 +750,15 @@ impl RemoteSeekCoordinatorV1 {
         result: RemoteSeekWorkResultV1,
     ) -> Result<RemoteSeekResultDispositionV1, RemoteSeekErrorV1> {
         let state = self.state.supersedable_mut_v1()?;
-        if result.generation == state.generation {
-            state.staging_batches.insert(result.batch_id);
-            Ok(RemoteSeekResultDispositionV1::CurrentGeneration)
-        } else if result.generation < state.generation {
+        if state.active_demand_key.is_none() {
+            return Err(RemoteSeekErrorV1::NoActiveDemand);
+        }
+        if result.generation < state.generation {
             state.cache_only_results.insert(result.batch_id);
             Ok(RemoteSeekResultDispositionV1::SupersededCacheOnly)
+        } else if result.generation == state.generation {
+            state.staging_batches.insert(result.batch_id);
+            Ok(RemoteSeekResultDispositionV1::CurrentGeneration)
         } else {
             Err(RemoteSeekErrorV1::InvalidGeneration)
         }
@@ -713,11 +770,14 @@ impl RemoteSeekCoordinatorV1 {
         batch_id: RemoteSeekBatchIdV1,
     ) -> Result<(), RemoteSeekErrorV1> {
         let state = self.state.supersedable_mut_v1()?;
-        if generation == state.generation {
+        if state.active_demand_key.is_none() {
+            return Err(RemoteSeekErrorV1::NoActiveDemand);
+        }
+        if generation < state.generation {
+            Err(RemoteSeekErrorV1::StaleGeneration)
+        } else if generation == state.generation {
             state.pins.insert(batch_id);
             Ok(())
-        } else if generation < state.generation {
-            Err(RemoteSeekErrorV1::StaleGeneration)
         } else {
             Err(RemoteSeekErrorV1::InvalidGeneration)
         }
@@ -729,6 +789,9 @@ impl RemoteSeekCoordinatorV1 {
         bytes: u64,
     ) -> Result<(), RemoteSeekErrorV1> {
         let state = self.state.supersedable_mut_v1()?;
+        if state.active_demand_key.is_none() {
+            return Err(RemoteSeekErrorV1::NoActiveDemand);
+        }
         if generation < state.generation {
             return Err(RemoteSeekErrorV1::StaleGeneration);
         }
@@ -923,6 +986,24 @@ impl RemoteSeekCoordinatorV1 {
         }
         if commit_set.generation_v1() != supersedable.generation {
             return Err(RemoteSeekErrorV1::CommitSetGenerationMismatch);
+        }
+        match commit_set.kind_v1() {
+            RemoteSeekCommitKindV1::Physical => {
+                return Err(RemoteSeekErrorV1::PhysicalCommitSetForNonPhysicalCommit);
+            }
+            RemoteSeekCommitKindV1::ResidentFastPath => {
+                if supersedable.initial_presentation {
+                    return Err(RemoteSeekErrorV1::ResidentFastPathRequiresCommittedPresentation);
+                }
+                if !commit_set.batch_ids_v1().is_empty() {
+                    return Err(RemoteSeekErrorV1::CommitSetMismatch);
+                }
+            }
+            RemoteSeekCommitKindV1::CompleteEmpty => {
+                if commit_set.batch_ids_v1().is_empty() {
+                    return Err(RemoteSeekErrorV1::EmptyCommitSet);
+                }
+            }
         }
         if commit_set.batch_ids_v1() != &supersedable.staging_batches {
             return Err(RemoteSeekErrorV1::CommitSetMismatch);
@@ -1551,7 +1632,7 @@ mod tests {
     }
 
     fn commit_set(generation: RemoteSeekGenerationV1, batch_ids: &[u64]) -> RemoteSeekCommitSetV1 {
-        RemoteSeekCommitSetV1::new_v1(
+        RemoteSeekCommitSetV1::physical_v1(
             generation,
             batch_ids
                 .iter()
@@ -1559,6 +1640,26 @@ mod tests {
                 .map(RemoteSeekBatchIdV1::from_u64_v1)
                 .collect(),
         )
+        .expect("physical commit set")
+    }
+
+    fn complete_empty_commit_set(
+        generation: RemoteSeekGenerationV1,
+        batch_ids: &[u64],
+    ) -> RemoteSeekCommitSetV1 {
+        RemoteSeekCommitSetV1::complete_empty_v1(
+            generation,
+            batch_ids
+                .iter()
+                .copied()
+                .map(RemoteSeekBatchIdV1::from_u64_v1)
+                .collect(),
+        )
+        .expect("CompleteEmpty commit set")
+    }
+
+    fn resident_fast_path_commit_set(generation: RemoteSeekGenerationV1) -> RemoteSeekCommitSetV1 {
+        RemoteSeekCommitSetV1::resident_fast_path_v1(generation)
     }
 
     fn ownership(coordinator: &RemoteSeekCoordinatorV1) -> RemoteSeekDemandOwnershipV1 {
@@ -1913,6 +2014,90 @@ mod tests {
     }
 
     #[test]
+    fn same_generation_late_work_is_rejected_after_physical_commit() {
+        let mut coordinator =
+            RemoteSeekCoordinatorV1::new_committed_v1(navigation()).expect("committed coordinator");
+        let generation = coordinator
+            .accept_navigation_commands_v1(&seek(30))
+            .expect("seek should be accepted")
+            .generation_v1()
+            .expect("generation");
+        coordinator
+            .record_work_result_v1(RemoteSeekWorkResultV1::new_v1(generation, batch_id(1)))
+            .expect("staged result");
+        coordinator
+            .record_pin_v1(generation, batch_id(1))
+            .expect("pin");
+        coordinator
+            .reserve_bytes_v1(generation, 128)
+            .expect("reservation");
+        coordinator
+            .mark_facade_closed_for_mutation_v1()
+            .expect("facade close marker");
+        let lock = RemoteSeekCommitLockV1::new_v1(
+            generation,
+            TimeInt::new_temporal(30),
+            commit_set(generation, &[1]),
+        )
+        .expect("physical commit lock");
+        coordinator.freeze_commit_v1(lock).expect("freeze commit");
+        coordinator
+            .begin_physical_mutation_v1()
+            .expect("mutation start");
+        coordinator.complete_commit_v1().expect("physical commit");
+
+        let error = coordinator
+            .record_work_result_v1(RemoteSeekWorkResultV1::new_v1(generation, batch_id(2)))
+            .expect_err("late same-generation work result must be rejected");
+        assert_eq!(error, RemoteSeekErrorV1::NoActiveDemand);
+        let error = coordinator
+            .record_pin_v1(generation, batch_id(2))
+            .expect_err("late same-generation pin must be rejected");
+        assert_eq!(error, RemoteSeekErrorV1::NoActiveDemand);
+        let error = coordinator
+            .reserve_bytes_v1(generation, 128)
+            .expect_err("late same-generation reservation must be rejected");
+        assert_eq!(error, RemoteSeekErrorV1::NoActiveDemand);
+        assert_eq!(coordinator.staging_batch_count_v1(), 0);
+        assert_eq!(coordinator.pin_count_v1(), 0);
+        assert_eq!(coordinator.reservation_bytes_v1(), 0);
+    }
+
+    #[test]
+    fn same_generation_late_work_is_rejected_after_non_physical_commit() {
+        let mut coordinator =
+            RemoteSeekCoordinatorV1::new_committed_v1(navigation()).expect("committed coordinator");
+        coordinator
+            .accept_navigation_commands_v1(&seek(30))
+            .expect("seek should be accepted");
+        let generation = coordinator.generation_v1().expect("generation");
+        let old_ownership = ownership(&coordinator);
+        coordinator
+            .complete_non_physical_commit_v1(
+                old_ownership,
+                TimeInt::new_temporal(30),
+                &resident_fast_path_commit_set(generation),
+            )
+            .expect("resident fast path should commit");
+
+        let error = coordinator
+            .record_work_result_v1(RemoteSeekWorkResultV1::new_v1(generation, batch_id(2)))
+            .expect_err("late same-generation work result must be rejected");
+        assert_eq!(error, RemoteSeekErrorV1::NoActiveDemand);
+        let error = coordinator
+            .record_pin_v1(generation, batch_id(2))
+            .expect_err("late same-generation pin must be rejected");
+        assert_eq!(error, RemoteSeekErrorV1::NoActiveDemand);
+        let error = coordinator
+            .reserve_bytes_v1(generation, 128)
+            .expect_err("late same-generation reservation must be rejected");
+        assert_eq!(error, RemoteSeekErrorV1::NoActiveDemand);
+        assert_eq!(coordinator.staging_batch_count_v1(), 0);
+        assert_eq!(coordinator.pin_count_v1(), 0);
+        assert_eq!(coordinator.reservation_bytes_v1(), 0);
+    }
+
+    #[test]
     fn freeze_commit_requires_a_closed_facade() {
         let mut coordinator = seeded_supersedable();
         let generation = coordinator.generation_v1().expect("generation");
@@ -1927,6 +2112,18 @@ mod tests {
             .freeze_commit_v1(lock)
             .expect_err("open facade must not freeze physical mutation");
         assert_eq!(error, RemoteSeekErrorV1::FacadeNotClosedForMutation);
+    }
+
+    #[test]
+    fn physical_commit_lock_rejects_non_physical_commit_set() {
+        let generation = RemoteSeekGenerationV1::initial_v1();
+        let error = RemoteSeekCommitLockV1::new_v1(
+            generation,
+            TimeInt::new_temporal(30),
+            complete_empty_commit_set(generation, &[1]),
+        )
+        .expect_err("physical lock must reject a CompleteEmpty commit set");
+        assert_eq!(error, RemoteSeekErrorV1::NonPhysicalCommitSet);
     }
 
     #[test]
@@ -2091,8 +2288,7 @@ mod tests {
             .expect("seek should be accepted");
         let old_ownership = ownership(&coordinator);
         let generation = coordinator.generation_v1().expect("generation");
-        let empty_commit_set =
-            RemoteSeekCommitSetV1::new_v1(generation, std::collections::BTreeSet::new());
+        let empty_commit_set = resident_fast_path_commit_set(generation);
 
         coordinator
             .complete_non_physical_commit_v1(
@@ -2114,7 +2310,7 @@ mod tests {
         let mut coordinator = seeded_supersedable();
         let old_ownership = ownership(&coordinator);
         let generation = coordinator.generation_v1().expect("generation");
-        let empty_terminal_commit_set = commit_set(generation, &[1]);
+        let empty_terminal_commit_set = complete_empty_commit_set(generation, &[1]);
 
         coordinator
             .complete_non_physical_commit_v1(
@@ -2129,6 +2325,58 @@ mod tests {
         assert_eq!(coordinator.reusable_unloaded_count_v1(), 1);
         assert_eq!(coordinator.generation_v1(), Some(generation));
         assert!(!coordinator.physical_mutation_started_v1());
+    }
+
+    #[test]
+    fn non_physical_commit_rejects_physical_commit_set() {
+        let mut coordinator = seeded_supersedable();
+        let old_ownership = ownership(&coordinator);
+        let generation = coordinator.generation_v1().expect("generation");
+        let physical_commit_set = commit_set(generation, &[1]);
+
+        let error = coordinator
+            .complete_non_physical_commit_v1(
+                old_ownership,
+                TimeInt::new_temporal(30),
+                &physical_commit_set,
+            )
+            .expect_err("physical commit set must not use non-physical completion");
+        assert_eq!(
+            error,
+            RemoteSeekErrorV1::PhysicalCommitSetForNonPhysicalCommit
+        );
+        assert!(coordinator.state_v1().is_supersedable_v1());
+        assert_eq!(coordinator.staging_batch_count_v1(), 1);
+    }
+
+    #[test]
+    fn initial_presentation_rejects_resident_fast_path() {
+        let initial_intent = PendingNavigationIntentV1::new_v1(
+            TimeInt::new_temporal(0),
+            RemotePlayStateV1::Paused,
+            RemoteNavigationTriggerV1::Seek,
+        )
+        .expect("initial intent");
+        let mut coordinator = RemoteSeekCoordinatorV1::new_initial_presentation_v1(
+            RemoteNavigationAdapterV1::from_extent_v1(canonical_timeline(), extent(), None)
+                .expect("initial navigation"),
+            initial_intent,
+        )
+        .expect("initial coordinator");
+        let old_ownership = ownership(&coordinator);
+        let generation = coordinator.generation_v1().expect("generation");
+
+        let error = coordinator
+            .complete_non_physical_commit_v1(
+                old_ownership,
+                TimeInt::new_temporal(0),
+                &resident_fast_path_commit_set(generation),
+            )
+            .expect_err("initial presentation cannot use the committed resident fast path");
+        assert_eq!(
+            error,
+            RemoteSeekErrorV1::ResidentFastPathRequiresCommittedPresentation
+        );
     }
 
     #[test]
@@ -2150,7 +2398,7 @@ mod tests {
         coordinator
             .record_work_result_v1(RemoteSeekWorkResultV1::new_v1(generation, batch_id(1)))
             .expect("CompleteEmpty batch should be accepted");
-        let complete_empty_commit_set = commit_set(generation, &[1]);
+        let complete_empty_commit_set = complete_empty_commit_set(generation, &[1]);
 
         coordinator
             .complete_non_physical_commit_v1(
