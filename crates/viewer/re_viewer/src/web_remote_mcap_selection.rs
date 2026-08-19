@@ -132,11 +132,7 @@ impl RemoteProgrammaticSelectionIntentV1 {
     }
 
     pub(crate) const fn authority_v1(self) -> RemoteSelectionAuthorityV1 {
-        if self.behavior.acquires_initial_selection_authority_v1() {
-            RemoteSelectionAuthorityV1::Programmatic(self)
-        } else {
-            RemoteSelectionAuthorityV1::UserNavigation(self.frozen_user_navigation_revision)
-        }
+        RemoteSelectionAuthorityV1::new_v1(self)
     }
 
     pub(crate) const fn is_stale_for_v1(self, current_revision: UserNavigationRevisionV1) -> bool {
@@ -173,29 +169,36 @@ impl RemoteProgrammaticSelectionIntentV1 {
     }
 }
 
-/// Selection authority.
+/// Frozen selection authority for one remote operation.
 ///
-/// `Programmatic` is present only when an `OpenAndSelect` intent has current selection authority.
-/// `UserNavigation` is a non-programmatic fallback and never turns into an automatic selection.
+/// Every remote operation carries its full intent through this authority, including `Open` and
+/// `Background`. The behavior is not collapsed to `UserNavigation`; effect resolution decides
+/// whether the operation is a programmatic selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RemoteSelectionAuthorityV1 {
-    UserNavigation(UserNavigationRevisionV1),
-    Programmatic(RemoteProgrammaticSelectionIntentV1),
+pub(crate) struct RemoteSelectionAuthorityV1 {
+    intent: RemoteProgrammaticSelectionIntentV1,
 }
 
 impl RemoteSelectionAuthorityV1 {
+    pub(crate) const fn new_v1(intent: RemoteProgrammaticSelectionIntentV1) -> Self {
+        Self { intent }
+    }
+
+    pub(crate) const fn intent_v1(self) -> RemoteProgrammaticSelectionIntentV1 {
+        self.intent
+    }
+
     pub(crate) const fn is_programmatic_v1(self) -> bool {
-        matches!(self, Self::Programmatic(_))
+        self.intent
+            .behavior_v1()
+            .acquires_initial_selection_authority_v1()
     }
 
     pub(crate) fn effect_v1(
         self,
         current_revision: UserNavigationRevisionV1,
     ) -> Result<RemoteSelectionEffectV1, RemoteSelectionErrorV1> {
-        match self {
-            Self::UserNavigation(_) => Ok(RemoteSelectionEffectV1::NoRemoteSelectionEffect),
-            Self::Programmatic(intent) => intent.effect_v1(current_revision),
-        }
+        self.intent.effect_v1(current_revision)
     }
 }
 
@@ -252,13 +255,6 @@ impl RemoteStrictBatchSelectionV1 {
     pub(crate) const fn operation_count_v1(self) -> usize {
         self.operation_count
     }
-}
-
-/// Authority and effect returned by one compatibility remote operation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct RemoteCompatibilitySelectionOutcomeV1 {
-    pub(crate) authority: RemoteSelectionAuthorityV1,
-    pub(crate) effect: RemoteSelectionEffectV1,
 }
 
 /// Selection state machine failures.
@@ -336,34 +332,36 @@ impl RemoteSelectionStateMachineV1 {
 
     /// Freeze one compatibility remote operation at the current synchronous call order.
     ///
-    /// This method intentionally does not advance the user navigation revision.
+    /// This method intentionally does not advance the user navigation revision and does not
+    /// resolve or publish an effect. Effect resolution is deferred to reconciliation.
     pub(crate) fn freeze_compatibility_remote_operation_v1(
-        &mut self,
+        &self,
         operation_id: RemoteSelectionOperationIdV1,
         behavior: RemoteMcapRecordingOpenBehaviorV1,
-    ) -> Result<RemoteCompatibilitySelectionOutcomeV1, RemoteSelectionErrorV1> {
+    ) -> RemoteSelectionAuthorityV1 {
         let intent = RemoteProgrammaticSelectionIntentV1::new_v1(
             operation_id,
             behavior,
             self.user_navigation_revision,
             None,
         );
-        let authority = intent.authority_v1();
-        let effect = intent.effect_v1(self.user_navigation_revision)?;
-
-        if behavior.acquires_initial_selection_authority_v1() {
-            self.selected_programmatic_intent = Some(intent);
-        }
-
-        Ok(RemoteCompatibilitySelectionOutcomeV1 { authority, effect })
+        intent.authority_v1()
     }
 
-    /// Reconcile an already frozen authority without advancing user navigation.
+    /// Reconcile an already frozen authority at activation time.
+    ///
+    /// The effect is resolved against the current user navigation revision, not the freeze-time
+    /// revision. Only a successful [`RemoteSelectionEffectV1::SelectRecording`] updates the
+    /// selected programmatic intent.
     pub(crate) fn reconcile_remote_authority_v1(
-        &self,
+        &mut self,
         authority: RemoteSelectionAuthorityV1,
     ) -> Result<RemoteSelectionEffectV1, RemoteSelectionErrorV1> {
-        authority.effect_v1(self.user_navigation_revision)
+        let effect = authority.effect_v1(self.user_navigation_revision)?;
+        if let RemoteSelectionEffectV1::SelectRecording { .. } = effect {
+            self.selected_programmatic_intent = Some(authority.intent_v1());
+        }
+        Ok(effect)
     }
 
     /// Apply one strict atomic batch and return only the batch-local winner.
@@ -425,7 +423,7 @@ fn select_strict_atomic_batch_winner_v1(
     Ok(winner)
 }
 
-/// Ingress classifier proving nonremote routes do not enter the remote selection state machine.
+/// Ingress kinds that structurally cannot enter the remote selection state machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RemoteSelectionIngressKindV1 {
     Native,
@@ -433,11 +431,26 @@ pub(crate) enum RemoteSelectionIngressKindV1 {
     GrpcMessageProxy,
     Redap,
     NonRemoteCompatibility,
+}
+
+impl RemoteSelectionIngressKindV1 {
+    pub(crate) const fn participates_in_remote_selection_state_machine_v1() -> bool {
+        false
+    }
+}
+
+/// Ingress classifier proving nonremote routes do not enter the remote selection state machine.
+///
+/// Nonremote ingress kinds are nested under a dedicated variant, so they cannot be confused with
+/// the two remote state-machine entry points at the type level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteSelectionIngressV1 {
+    NonRemote(RemoteSelectionIngressKindV1),
     RemoteCompatibility,
     RemoteStrictAtomicBatch,
 }
 
-impl RemoteSelectionIngressKindV1 {
+impl RemoteSelectionIngressV1 {
     pub(crate) const fn participates_in_remote_selection_state_machine_v1(self) -> bool {
         matches!(
             self,
@@ -579,18 +592,18 @@ mod tests {
     #[test]
     fn remote_user_navigation_invalidates_old_programmatic_intent() {
         let mut state = RemoteSelectionStateMachineV1::new_v1(UserNavigationRevisionV1::new_v1(10));
-        let outcome = state
-            .freeze_compatibility_remote_operation_v1(
-                operation(1),
-                RemoteMcapRecordingOpenBehaviorV1::OpenAndSelect,
-            )
-            .unwrap();
+        let authority = state.freeze_compatibility_remote_operation_v1(
+            operation(1),
+            RemoteMcapRecordingOpenBehaviorV1::OpenAndSelect,
+        );
+        assert!(state.selected_programmatic_intent_v1().is_none());
+
         assert_eq!(
-            outcome.effect,
-            RemoteSelectionEffectV1::SelectRecording {
+            state.reconcile_remote_authority_v1(authority),
+            Ok(RemoteSelectionEffectV1::SelectRecording {
                 operation_id: operation(1),
                 frozen_user_navigation_revision: UserNavigationRevisionV1::new_v1(10),
-            }
+            })
         );
         assert!(state.selected_programmatic_intent_v1().is_some());
 
@@ -600,7 +613,7 @@ mod tests {
         );
         assert!(state.selected_programmatic_intent_v1().is_none());
         assert_eq!(
-            state.reconcile_remote_authority_v1(outcome.authority),
+            state.reconcile_remote_authority_v1(authority),
             Err(RemoteSelectionErrorV1::StaleProgrammaticSelectionIntent)
         );
     }
@@ -609,19 +622,17 @@ mod tests {
     fn compatibility_remote_authority_freeze_does_not_advance_user_revision() {
         let mut state = RemoteSelectionStateMachineV1::new_v1(UserNavigationRevisionV1::new_v1(5));
 
-        let outcome = state
-            .freeze_compatibility_remote_operation_v1(
-                operation(7),
-                RemoteMcapRecordingOpenBehaviorV1::OpenAndSelect,
-            )
-            .unwrap();
+        let authority = state.freeze_compatibility_remote_operation_v1(
+            operation(7),
+            RemoteMcapRecordingOpenBehaviorV1::OpenAndSelect,
+        );
 
         assert_eq!(
             state.user_navigation_revision_v1(),
             UserNavigationRevisionV1::new_v1(5)
         );
         assert_eq!(
-            state.reconcile_remote_authority_v1(outcome.authority),
+            state.reconcile_remote_authority_v1(authority),
             Ok(RemoteSelectionEffectV1::SelectRecording {
                 operation_id: operation(7),
                 frozen_user_navigation_revision: UserNavigationRevisionV1::new_v1(5),
@@ -637,33 +648,31 @@ mod tests {
     fn compatibility_open_and_background_do_not_acquire_selection_authority() {
         let mut state = RemoteSelectionStateMachineV1::new_v1(UserNavigationRevisionV1::new_v1(1));
 
-        let open = state
-            .freeze_compatibility_remote_operation_v1(
-                operation(2),
-                RemoteMcapRecordingOpenBehaviorV1::Open,
-            )
-            .unwrap();
-        assert!(!open.authority.is_programmatic_v1());
+        let open = state.freeze_compatibility_remote_operation_v1(
+            operation(2),
+            RemoteMcapRecordingOpenBehaviorV1::Open,
+        );
+        assert!(!open.is_programmatic_v1());
+        assert!(state.selected_programmatic_intent_v1().is_none());
         assert_eq!(
-            open.effect,
-            RemoteSelectionEffectV1::InstallPanelEntry {
+            state.reconcile_remote_authority_v1(open),
+            Ok(RemoteSelectionEffectV1::InstallPanelEntry {
                 operation_id: operation(2),
-            }
+            })
         );
         assert!(state.selected_programmatic_intent_v1().is_none());
 
-        let background = state
-            .freeze_compatibility_remote_operation_v1(
-                operation(3),
-                RemoteMcapRecordingOpenBehaviorV1::Background,
-            )
-            .unwrap();
-        assert!(!background.authority.is_programmatic_v1());
+        let background = state.freeze_compatibility_remote_operation_v1(
+            operation(3),
+            RemoteMcapRecordingOpenBehaviorV1::Background,
+        );
+        assert!(!background.is_programmatic_v1());
+        assert!(state.selected_programmatic_intent_v1().is_none());
         assert_eq!(
-            background.effect,
-            RemoteSelectionEffectV1::InstallCatalogEntry {
+            state.reconcile_remote_authority_v1(background),
+            Ok(RemoteSelectionEffectV1::InstallCatalogEntry {
                 operation_id: operation(3),
-            }
+            })
         );
         assert!(state.selected_programmatic_intent_v1().is_none());
     }
@@ -689,6 +698,15 @@ mod tests {
     #[test]
     fn strict_atomic_batch_without_open_and_select_has_no_winner() {
         let mut state = RemoteSelectionStateMachineV1::new_v1(UserNavigationRevisionV1::new_v1(3));
+        let existing_authority = state.freeze_compatibility_remote_operation_v1(
+            operation(9),
+            RemoteMcapRecordingOpenBehaviorV1::OpenAndSelect,
+        );
+        state
+            .reconcile_remote_authority_v1(existing_authority)
+            .unwrap();
+        let existing_intent = state.selected_programmatic_intent_v1();
+
         let items = [
             item(5, RemoteMcapRecordingOpenBehaviorV1::Open, 1),
             item(6, RemoteMcapRecordingOpenBehaviorV1::Background, 2),
@@ -696,7 +714,45 @@ mod tests {
 
         let result = state.apply_strict_atomic_batch_v1(&items).unwrap();
         assert_eq!(result.winner_v1(), None);
-        assert_eq!(state.selected_programmatic_intent_v1(), None);
+        assert_eq!(state.selected_programmatic_intent_v1(), existing_intent);
+    }
+
+    #[test]
+    fn strict_batch_failures_are_atomic() {
+        let mut empty_state =
+            RemoteSelectionStateMachineV1::new_v1(UserNavigationRevisionV1::new_v1(4));
+        let empty_before = empty_state.clone();
+        assert_eq!(
+            empty_state.apply_strict_atomic_batch_v1(&[]),
+            Err(RemoteSelectionErrorV1::EmptyStrictBatch)
+        );
+        assert_eq!(empty_state, empty_before);
+
+        let mut duplicate_state =
+            RemoteSelectionStateMachineV1::new_v1(UserNavigationRevisionV1::new_v1(5));
+        let duplicate_before = duplicate_state.clone();
+        let duplicate_items = [
+            item(1, RemoteMcapRecordingOpenBehaviorV1::Open, 1),
+            item(1, RemoteMcapRecordingOpenBehaviorV1::OpenAndSelect, 2),
+        ];
+        assert_eq!(
+            duplicate_state.apply_strict_atomic_batch_v1(&duplicate_items),
+            Err(RemoteSelectionErrorV1::DuplicateStrictBatchOperationId)
+        );
+        assert_eq!(duplicate_state, duplicate_before);
+
+        let mut non_monotonic_state =
+            RemoteSelectionStateMachineV1::new_v1(UserNavigationRevisionV1::new_v1(6));
+        let non_monotonic_before = non_monotonic_state.clone();
+        let non_monotonic_items = [
+            item(2, RemoteMcapRecordingOpenBehaviorV1::Open, 2),
+            item(3, RemoteMcapRecordingOpenBehaviorV1::Open, 1),
+        ];
+        assert_eq!(
+            non_monotonic_state.apply_strict_atomic_batch_v1(&non_monotonic_items),
+            Err(RemoteSelectionErrorV1::StrictBatchOrdinalNotMonotonic)
+        );
+        assert_eq!(non_monotonic_state, non_monotonic_before);
     }
 
     #[test]
@@ -708,6 +764,19 @@ mod tests {
     }
 
     #[test]
+    fn user_navigation_overflow_does_not_change_state() {
+        let mut state =
+            RemoteSelectionStateMachineV1::new_v1(UserNavigationRevisionV1::new_v1(u64::MAX));
+        let before = state.clone();
+
+        assert_eq!(
+            state.record_user_navigation_v1(),
+            Err(RemoteSelectionErrorV1::UserNavigationRevisionOverflow)
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
     fn nonremote_ingress_kinds_do_not_participate() {
         for kind in [
             RemoteSelectionIngressKindV1::Native,
@@ -716,17 +785,45 @@ mod tests {
             RemoteSelectionIngressKindV1::Redap,
             RemoteSelectionIngressKindV1::NonRemoteCompatibility,
         ] {
-            assert!(!kind.participates_in_remote_selection_state_machine_v1());
+            assert!(
+                !RemoteSelectionIngressKindV1::participates_in_remote_selection_state_machine_v1()
+            );
+            assert!(
+                !RemoteSelectionIngressV1::NonRemote(kind)
+                    .participates_in_remote_selection_state_machine_v1()
+            );
         }
 
         assert!(
-            RemoteSelectionIngressKindV1::RemoteCompatibility
+            RemoteSelectionIngressV1::RemoteCompatibility
                 .participates_in_remote_selection_state_machine_v1()
         );
         assert!(
-            RemoteSelectionIngressKindV1::RemoteStrictAtomicBatch
+            RemoteSelectionIngressV1::RemoteStrictAtomicBatch
                 .participates_in_remote_selection_state_machine_v1()
         );
+    }
+
+    #[test]
+    fn nonremote_compatibility_completion_edge_cases_are_checked_and_tie_last_wins() {
+        assert_eq!(
+            RemoteCompatibilityCompletionSequenceV1::new_v1(u64::MAX),
+            Err(RemoteSelectionErrorV1::CompatibilityCompletionSequenceOverflow)
+        );
+        assert_eq!(NonRemoteCompatibilitySelectionIdentityV1::new_v1(0), None);
+
+        let mut nonremote = NonRemoteCompatibilitySelectionV1::new_v1();
+        let Some(first) = NonRemoteCompatibilitySelectionIdentityV1::new_v1(1) else {
+            panic!("test identity must be non-zero")
+        };
+        let Some(second) = NonRemoteCompatibilitySelectionIdentityV1::new_v1(2) else {
+            panic!("test identity must be non-zero")
+        };
+
+        nonremote.complete_v1(first, sequence(4));
+        nonremote.complete_v1(second, sequence(4));
+
+        assert_eq!(nonremote.selected_v1(), Some(second));
     }
 
     #[test]
