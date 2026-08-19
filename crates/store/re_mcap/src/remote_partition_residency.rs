@@ -667,9 +667,23 @@ impl RefetchableRootIndexV1 {
         self.roots.get(&root).map(|root| root.external_descriptor)
     }
 
-    #[cfg(test)]
     pub(crate) fn root_load_state_v1(&self, root: ChunkId) -> Option<RefetchableRootLoadStateV1> {
         self.roots.get(&root).map(|root| root.load_state)
+    }
+
+    pub(crate) fn root_manifest_registration_v1(
+        &self,
+        root: ChunkId,
+    ) -> Option<(ManifestRootDescriptorV1, bool)> {
+        self.roots.get(&root).map(|root| {
+            (
+                root.manifest_descriptor,
+                matches!(
+                    root.partition.kind_v1(),
+                    DerivationPartitionKindV1::OpeningStatic
+                ),
+            )
+        })
     }
 
     pub(crate) fn partition_residency_v1(
