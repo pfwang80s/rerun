@@ -171,8 +171,16 @@ impl RemoteLoadedCoverageV1 {
         self.canonical_extent = extent;
     }
 
+    pub(crate) fn canonical_extent_v1(&self) -> &RemoteCanonicalIndexedExtentV1 {
+        &self.canonical_extent
+    }
+
     pub(crate) fn set_opening_static_satisfied_v1(&mut self, satisfied: bool) {
         self.opening_static_satisfied = satisfied;
+    }
+
+    pub(crate) fn opening_static_satisfied_v1(&self) -> bool {
+        self.opening_static_satisfied
     }
 
     pub(crate) fn replace_loaded_ranges_v1(

@@ -56,6 +56,8 @@ mod web_remote_mcap_memory;
 #[cfg(any(target_arch = "wasm32", test))]
 mod web_remote_mcap_query;
 #[cfg(any(target_arch = "wasm32", test))]
+mod web_remote_mcap_time_control;
+#[cfg(any(target_arch = "wasm32", test))]
 mod web_startup;
 
 #[cfg(feature = "analytics")]
