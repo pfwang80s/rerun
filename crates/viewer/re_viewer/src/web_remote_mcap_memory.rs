@@ -777,6 +777,10 @@ pub(crate) enum RemoteMemoryArbiterErrorV1 {
         next_allowed_frame: u64,
     },
     CloseNotAllowedForForeground,
+    UseStateMismatch {
+        facade: RemoteRecordingUseStateV1,
+        requested: RemoteRecordingUseStateV1,
+    },
     NoCloseRequested,
     GcTurnCountOverflow,
     FrameCountOverflow,
@@ -1080,10 +1084,10 @@ impl<'a> RemoteMemoryArbiterV1<'a> {
         slot_token: RemoteMcapSlotTokenV1,
         use_state: RemoteRecordingUseStateV1,
     ) -> Result<RemoteMemoryCloseSubmissionV1, RemoteMemoryArbiterErrorV1> {
+        let mutation_close_id = self.ensure_inactive_close_latch_v1(use_state)?;
         let reclaim = controller
             .request_close_v1(store_id, slot_token)
             .map_err(RemoteMemoryArbiterErrorV1::Reclaim)?;
-        let mutation_close_id = self.ensure_inactive_close_latch_v1(use_state)?;
         Ok(RemoteMemoryCloseSubmissionV1 {
             ticket: reclaim.ticket,
             mutation_close_id,
@@ -1094,8 +1098,15 @@ impl<'a> RemoteMemoryArbiterV1<'a> {
         &mut self,
         use_state: RemoteRecordingUseStateV1,
     ) -> Result<RemoteMutationRequestIdV1, RemoteMemoryArbiterErrorV1> {
-        if use_state == RemoteRecordingUseStateV1::Foreground {
+        let facade_use_state = self.facade.use_state_v1();
+        if facade_use_state == RemoteRecordingUseStateV1::Foreground {
             return Err(RemoteMemoryArbiterErrorV1::CloseNotAllowedForForeground);
+        }
+        if use_state != facade_use_state {
+            return Err(RemoteMemoryArbiterErrorV1::UseStateMismatch {
+                facade: facade_use_state,
+                requested: use_state,
+            });
         }
         if self.state.close_mutation_requested {
             return Ok(self
@@ -1823,7 +1834,7 @@ mod tests {
             .request_inactive_pressure_close_v1(RemoteRecordingUseStateV1::Inactive)
             .expect("inactive close");
         assert_eq!(
-            arbiter.request_inactive_pressure_close_v1(RemoteRecordingUseStateV1::CatalogOnly),
+            arbiter.request_inactive_pressure_close_v1(RemoteRecordingUseStateV1::Inactive),
             Ok(close_id)
         );
         assert!(arbiter.session_ownership_released_v1());
@@ -1874,6 +1885,79 @@ mod tests {
         assert_eq!(
             arbiter.drive_inactive_pressure_close_v1(),
             Ok(RemoteMutationCloseProgressV1::Complete)
+        );
+    }
+
+    #[test]
+    fn inactive_pressure_close_rejects_foreground_facade_atomically() {
+        let facade = open_facade(RemoteRecordingUseStateV1::Foreground);
+        let mut arbiter = memory_arbiter(&facade);
+        let mut controller = controller(true);
+
+        let result = arbiter.request_inactive_tokenized_pressure_close_v1(
+            &mut controller,
+            store_id(),
+            RemoteMcapSlotTokenV1(17),
+            RemoteRecordingUseStateV1::Inactive,
+        );
+
+        assert_eq!(
+            result.err(),
+            Some(RemoteMemoryArbiterErrorV1::CloseNotAllowedForForeground)
+        );
+        assert!(
+            controller
+                .purge_outcome_v1(0)
+                .pending_remote_reclaim
+                .is_none()
+        );
+        assert!(!arbiter.session_ownership_released_v1());
+
+        assert_eq!(
+            arbiter
+                .request_inactive_pressure_close_v1(RemoteRecordingUseStateV1::CatalogOnly)
+                .err(),
+            Some(RemoteMemoryArbiterErrorV1::CloseNotAllowedForForeground)
+        );
+        assert!(
+            controller
+                .purge_outcome_v1(0)
+                .pending_remote_reclaim
+                .is_none()
+        );
+        assert!(!arbiter.session_ownership_released_v1());
+    }
+
+    #[test]
+    fn inactive_pressure_close_rejects_facade_use_state_mismatch_without_mutation() {
+        let facade = open_facade(RemoteRecordingUseStateV1::CatalogOnly);
+        let mut arbiter = memory_arbiter(&facade);
+        let mut controller = controller(true);
+
+        let result = arbiter.request_inactive_tokenized_pressure_close_v1(
+            &mut controller,
+            store_id(),
+            RemoteMcapSlotTokenV1(17),
+            RemoteRecordingUseStateV1::Inactive,
+        );
+
+        assert_eq!(
+            result.err(),
+            Some(RemoteMemoryArbiterErrorV1::UseStateMismatch {
+                facade: RemoteRecordingUseStateV1::CatalogOnly,
+                requested: RemoteRecordingUseStateV1::Inactive,
+            })
+        );
+        assert!(
+            controller
+                .purge_outcome_v1(0)
+                .pending_remote_reclaim
+                .is_none()
+        );
+        assert!(!arbiter.session_ownership_released_v1());
+        assert_eq!(
+            arbiter.drive_inactive_pressure_close_v1().err(),
+            Some(RemoteMemoryArbiterErrorV1::NoCloseRequested)
         );
     }
 
