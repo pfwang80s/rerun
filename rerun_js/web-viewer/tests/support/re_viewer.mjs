@@ -18,10 +18,6 @@ class FakeWebHandle {
   async start_with_requests(canvas, specs) {
     state.calls.push(["start_with_requests", canvas, specs]);
     if (state.startWithRequestsError) {
-      // `WebViewer` still runs normal failed-start teardown after this throw.
-      // Keep that teardown out of the shared strict call trace so the wire
-      // envelope test observes handoff side effects without counting cleanup.
-      this.startWithRequestsFailure = true;
       throw state.startWithRequestsError;
     }
     return state.startWithRequestsResult;
@@ -109,12 +105,10 @@ class FakeWebHandle {
   }
 
   destroy() {
-    if (this.startWithRequestsFailure) return;
     state.calls.push(["destroy"]);
   }
 
   free() {
-    if (this.startWithRequestsFailure) return;
     state.calls.push(["free"]);
   }
 

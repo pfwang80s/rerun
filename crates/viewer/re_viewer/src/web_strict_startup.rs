@@ -155,7 +155,7 @@ pub(crate) fn validate_strict_startup_spec_v1(
             failed_index,
         ));
     }
-    let authority_end = validate_http_url_v1(&url, failed_index)?;
+    let parsed_url = validate_http_url_v1(&url, failed_index)?;
 
     let topic_filter = canonicalize_string_collection_v1(&options.topic_filter, failed_index)?;
     validate_string_collection_v1(&options.decoder_selector, failed_index)?;
@@ -205,12 +205,7 @@ pub(crate) fn validate_strict_startup_spec_v1(
         }
     }
 
-    validate_strict_http_path_v1(
-        &url,
-        authority_end,
-        options.allow_extensionless_sniff,
-        failed_index,
-    )?;
+    validate_strict_http_path_v1(&parsed_url, options.allow_extensionless_sniff, failed_index)?;
 
     Ok(ValidatedStrictStartupSpecV1 {
         url,
@@ -225,46 +220,43 @@ pub(crate) fn validate_strict_startup_spec_v1(
 fn validate_http_url_v1(
     url: &str,
     failed_index: Option<u32>,
-) -> Result<usize, RedactedStrictStartupErrorV1> {
-    let bytes = url.as_bytes();
-    let scheme_end = if starts_with_ignore_ascii_case_v1(bytes, b"https://") {
-        8
-    } else if starts_with_ignore_ascii_case_v1(bytes, b"http://") {
-        7
-    } else {
+) -> Result<url::Url, RedactedStrictStartupErrorV1> {
+    let parsed = url::Url::parse(url).map_err(|_parse_error| {
+        RedactedStrictStartupErrorV1::new(
+            RedactedStrictStartupErrorCodeV1::InvalidUrl,
+            failed_index,
+        )
+    })?;
+
+    if !matches!(parsed.scheme(), "http" | "https") {
         return Err(RedactedStrictStartupErrorV1::new(
             RedactedStrictStartupErrorCodeV1::UnsupportedStrictOpenRoute,
             failed_index,
         ));
-    };
+    }
 
-    let authority_end = url[scheme_end..]
-        .find(['/', '?', '#'])
-        .map_or(url.len(), |offset| scheme_end + offset);
-    let authority = &url[scheme_end..authority_end];
-    if authority.is_empty() || authority.contains('@') {
+    let has_userinfo = !parsed.username().is_empty()
+        || parsed
+            .password()
+            .is_some_and(|password| !password.is_empty());
+    if parsed.host_str().is_none() || parsed.host_str() == Some("") || has_userinfo {
         return Err(RedactedStrictStartupErrorV1::new(
             RedactedStrictStartupErrorCodeV1::InvalidUrl,
             failed_index,
         ));
     }
-    Ok(authority_end)
+    Ok(parsed)
 }
 
 fn validate_strict_http_path_v1(
-    url: &str,
-    authority_end: usize,
+    parsed: &url::Url,
     allow_extensionless_sniff: Option<bool>,
     failed_index: Option<u32>,
 ) -> Result<(), RedactedStrictStartupErrorV1> {
-    let path_end = url[authority_end..]
-        .find(['?', '#'])
-        .map_or(url.len(), |offset| authority_end + offset);
-    let path = &url[authority_end..path_end];
-
-    // `URL.pathname` is used by the sealed TypeScript preflight. The raw path
-    // before the first `?` or `#` is equivalent for the HTTP(S) forms admitted
-    // above and keeps this boundary independent of the browser URL parser.
+    // The TypeScript preflight routes on `URL.pathname`. Use the Rust `url`
+    // parser for the same WHATWG-style backslash and dot-segment normalization,
+    // while retaining the original caller URL for later transport.
+    let path = parsed.path();
     let explicit_mcap = path.to_ascii_lowercase().ends_with(".mcap");
     if !explicit_mcap {
         let last_segment = path.rsplit('/').next().unwrap_or(path);
@@ -382,10 +374,6 @@ fn parse_canonical_u64_v1(
             failed_index,
         )
     })
-}
-
-fn starts_with_ignore_ascii_case_v1(haystack: &[u8], prefix: &[u8]) -> bool {
-    haystack.len() >= prefix.len() && haystack[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -767,5 +755,42 @@ mod tests {
             RedactedStrictStartupErrorCodeV1::UnsupportedFormat
         );
         assert_eq!(dotted.failed_index, Some(1));
+    }
+
+    #[test]
+    fn whatwg_pathname_normalization_matches_typescript_route_decisions() {
+        let mut opted_in = options();
+        opted_in.allow_extensionless_sniff = Some(true);
+
+        let backslash_mcap = validate_strict_startup_spec_v1(
+            "https://example.invalid\\secret.mcap".to_owned(),
+            &options(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(backslash_mcap.url, "https://example.invalid\\secret.mcap");
+
+        let backslash_dotted = validate_strict_startup_spec_v1(
+            "https://example.invalid\\archive.tar.gz".to_owned(),
+            &opted_in,
+            1,
+        )
+        .unwrap_err();
+        assert_eq!(
+            backslash_dotted.code,
+            RedactedStrictStartupErrorCodeV1::UnsupportedFormat
+        );
+        assert_eq!(backslash_dotted.failed_index, Some(1));
+
+        let dot_segment_extensionless = validate_strict_startup_spec_v1(
+            "https://example.invalid/a.mcap/..".to_owned(),
+            &opted_in,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            dot_segment_extensionless.url,
+            "https://example.invalid/a.mcap/.."
+        );
     }
 }

@@ -735,8 +735,8 @@ test("startWithRequests maps a Rust wire-envelope failure and retries the same i
   assert.equal(viewer.ready, false);
   assert.equal(strictCache(viewer).operation_count, 0);
   assert.equal(callsNamed("add_receiver").length, 0);
-  assert.equal(callsNamed("destroy").length, 0);
-  assert.equal(callsNamed("free").length, 0);
+  assert.equal(callsNamed("destroy").length, 1);
+  assert.equal(callsNamed("free").length, 1);
 
   await assert.rejects(
     viewer.startWithRequests(specs, document.body, null),
@@ -748,6 +748,8 @@ test("startWithRequests maps a Rust wire-envelope failure and retries the same i
     },
   );
   assert.equal(callsNamed("start_with_requests").length, 2);
+  assert.equal(callsNamed("destroy").length, 2);
+  assert.equal(callsNamed("free").length, 2);
 
   await viewer.start(null, document.body, null);
   assert.equal(viewer.ready, true);
