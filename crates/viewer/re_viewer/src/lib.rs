@@ -71,6 +71,9 @@ mod web_remote_mcap_selection;
 mod web_remote_mcap_time_control;
 #[cfg(any(target_arch = "wasm32", test))]
 mod web_remote_mcap_ui;
+#[rustfmt::skip]
+#[cfg(any(target_arch = "wasm32", test))]
+mod web_remote_mcap_metrics;
 #[cfg(any(target_arch = "wasm32", test))]
 mod web_startup;
 #[cfg(any(target_arch = "wasm32", test))]
