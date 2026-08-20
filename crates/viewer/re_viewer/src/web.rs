@@ -28,6 +28,7 @@ use crate::web_startup::{
     CompatibilityRemoteMcapControlV1, CompatibilityUrlDispatchOutcomeV1,
     dispatch_compatibility_url_v1,
 };
+use crate::web_startup_visibility::{StartupVisibilityBootstrapGuard, StartupVisibilityOutcome};
 use crate::web_tools::{Callback, JsResultExt as _, StringOrStringArray};
 
 #[global_allocator]
@@ -246,6 +247,8 @@ impl WebHandle {
                 })?
         };
 
+        let bootstrap_visibility = StartupVisibilityBootstrapGuard::install()?;
+
         let app_options = self.app_options.clone();
         let web_options = eframe::WebOptions {
             wgpu_options: crate::wgpu_options(app_options.render_backend.as_deref()),
@@ -255,7 +258,8 @@ impl WebHandle {
         };
 
         let connection_registry = self.connection_registry.clone();
-        self.runner
+        let prepared_app = self
+            .runner
             .prepare_app(
                 canvas,
                 web_options,
@@ -268,8 +272,20 @@ impl WebHandle {
                     )?))
                 }),
             )
-            .await?
-            .activate()?;
+            .await?;
+
+        let startup_visibility_outcome = bootstrap_visibility.final_reconcile();
+        match startup_visibility_outcome {
+            StartupVisibilityOutcome::VisibleStartupAllowed => {
+                re_log::debug!("Remote MCAP startup visibility bootstrap allowed publication");
+            }
+            StartupVisibilityOutcome::RemoteStartupPublishDenied => {
+                re_log::debug!("Remote MCAP startup visibility bootstrap denied publication");
+            }
+        }
+        drop(bootstrap_visibility);
+
+        prepared_app.activate()?;
 
         re_log::debug!("Web app started.");
 

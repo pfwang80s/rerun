@@ -192,12 +192,16 @@ wasm-bindgen-futures.workspace = true
 wasm-bindgen = "=0.2.117" # ⚠️ read above notice before touching this!
 web-sys = { workspace = true, features = [
   "Crypto",
+  "Document",
+  "Event",
+  "EventTarget",
   "File",
   "History",
   "PopStateEvent",
   "Storage",
   "StorageEvent",
   "UrlSearchParams",
+  "VisibilityState",
   "Window",
 ] }
 
