@@ -70,6 +70,8 @@ mod web_remote_mcap_selection;
 #[cfg(any(target_arch = "wasm32", test))]
 mod web_remote_mcap_time_control;
 #[cfg(any(target_arch = "wasm32", test))]
+mod web_remote_mcap_ui;
+#[cfg(any(target_arch = "wasm32", test))]
 mod web_startup;
 #[cfg(any(target_arch = "wasm32", test))]
 mod web_startup_visibility;
