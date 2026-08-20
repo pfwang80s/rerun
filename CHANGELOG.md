@@ -6,16 +6,49 @@
 
 `WebViewer.start` and `WebViewer.open` attempt compatibility URL items independently in input order.
 An item failure emits a warning and does not throw, stop the Viewer, or roll back earlier or later items.
+Only an explicit HTTP(S) URL whose path ends in `.mcap` enters the remote-MCAP lane.
+Extensionless compatibility URLs and every non-MCAP route continue through the existing dispatcher with zero new remote-MCAP probe or slot ownership.
 
 ### Web Viewer strict remote-MCAP API
 
-Added additive `WebViewer.openRequest` and `openBatch` contracts with typed HTTP remote-MCAP options, opaque lifecycle handles, and redacted request-local errors.
+Added additive `WebViewer.openRequest`, `openBatch`, and `startWithRequests` contracts with typed HTTP remote-MCAP options, opaque lifecycle handles, and redacted request-local errors.
+The strict lane accepts only HTTP(S) remote-MCAP sources.
+Explicit `.mcap` URLs are admitted directly.
+Extensionless URLs require `allow_extensionless_sniff: true` and use a bounded 8-byte format sniff.
+`openRequest` is a singleton transaction and `openBatch` is all-or-nothing.
+`startWithRequests` resolves only after the Viewer and remote operation handoff are safely published.
+It does not resolve when a recording becomes presentation-ready.
+Strict rejection codes and phases include `UnsupportedStrictOpenRoute`, `UnsupportedFormat`, `CapabilityUnavailable`, `ExistingSourceOptionsConflict`, and `BatchTooLarge`.
 The strict lane rejects non-MCAP and non-HTTP routes without falling back to the compatibility dispatcher.
 The release-Wasm remote-MCAP capability is not installed yet, so valid strict requests return `CapabilityUnavailable` before allocating wrappers or scheduling work.
 
-Exact remote-MCAP recording controls now have a typed opaque contract for the installed capability.
+### Web Viewer remote-MCAP handles and lifecycle
+
+The same canonical URL may share a source only when the complete frozen `RemoteMcapSemanticConfig` is exact-equal and actual consistency satisfies the requested policy.
+Each operation keeps independent `RecordingOpenBehavior`, selection intent, ready state, and disposal.
+The behavior modes are `open`, `open_and_select`, and `background`.
+`background` creates a separate discoverable and closeable metadata catalog card and is not equivalent to an existing StoreHub preview.
+Behavior effects are monotonic, and a strict atomic batch uses only its last `open_and_select` item for batch-local initial selection authority.
+`OpenRequestHandle.close()` closes the operation's shared source.
+`RecordingHandle.close()` closes only one exact recording publication.
+`dispose()` on either handle releases subscriptions and tombstone retention without closing the source or publication.
+The `FinalizationRegistry` is only a best-effort fallback that uses the same internal cleanup token as explicit `dispose()`.
+An already-active alias replays the current presentation snapshot independently.
+Public handles never expose a Store ID, recording ID, URL, lifecycle token, or secret.
+
+### Web Viewer remote-MCAP limits and page execution
+
+Remote URL and option strings are bounded and redacted.
+No raw URL, query, ETag, topic, entity path, Store ID, generation, or internal token is exposed by a public handle, error, event, metric, or debug output.
+Exact remote-MCAP recording controls use typed opaque contracts for the installed capability.
 `RecordingHandle` uses exact publication identity for `select`, canonical `seek`, paused/playing `play`, and exact `close` operations.
-Operation and recording `dispose()` release only subscriptions and tombstone retention, and remain independent from `close()`.
+`seek` accepts only `timestamp_ns` or `duration_ns` plus a canonical decimal value.
+The public API does not provide `timestamp_offset_ns` or guess Unix epoch or boot-relative semantics.
+`ChromePageExecutionController` is a remote-MCAP-only page manager orthogonal to the Viewer frame driver.
+Hidden state suspends only remote-MCAP owners and work.
+`pagehide` and `freeze` synchronously tear down remote-MCAP owners while keeping the Viewer, canvas, and non-MCAP stores and receivers alive.
+Returning from BFCache requires an explicit reopen, and old remote tokens or generations are not revived.
+RRD, legacy HTTP/RRD, `rerun+http(s)` gRPC/message proxy, Redap, raw-event, native Viewer, local MCAP, drag-and-drop MCAP, and other non-remote Web routes remain unchanged.
 
 ## [0.35.0](https://github.com/rerun-io/rerun/compare/0.34.1...0.35.0) - 2026-07-23
 

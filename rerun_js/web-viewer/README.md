@@ -31,9 +31,6 @@ This means that:
 The entrypoint for this packages is the [`WebViewer`](https://ref.rerun.io/docs/js/0.35.0/web-viewer/classes/WebViewer.html) class.
 The web viewer is an object which manages a canvas element:
 
-Remote-MCAP page execution is tracked independently from the Viewer frame driver.
-`ChromePageExecutionController` exposes typed visible, hidden, revalidating, and terminating states for integrations that need to coordinate remote-MCAP work with browser lifecycle signals.
-
 ```js
 import { WebViewer } from "@rerun-io/web-viewer";
 
@@ -46,22 +43,72 @@ await viewer.start(rrd, parentElement, { width: "800px", height: "600px" });
 viewer.stop();
 ```
 
+## Remote-MCAP contracts
+
+Remote-MCAP page execution is tracked independently from the Viewer frame driver.
+`ChromePageExecutionController` is a remote-MCAP-only page manager.
+It exposes typed visible, hidden, revalidating, and terminating states for integrations that need to coordinate remote-MCAP work with browser lifecycle signals.
+Hidden state suspends only remote-MCAP owners and work.
+It does not pause the Viewer frame driver, canvas, or non-MCAP stores and receivers.
+`pagehide` and `freeze` synchronously tear down remote-MCAP owners while keeping the Viewer, canvas, and non-MCAP stores and receivers alive.
+Returning from BFCache requires an explicit reopen, and old remote tokens and generations are not revived.
+
+### Compatibility lane
+
 Compatibility URLs passed to `start` or `open` are attempted independently in input order.
-If one item fails, the Viewer emits a warning and continues with later items without throwing, stopping the Viewer, or rolling back earlier successful items.
+An item failure emits a warning and does not throw, stop the Viewer, or roll back earlier or later items.
+Only an explicit HTTP(S) URL whose path ends in `.mcap` enters the remote-MCAP lane.
+Extensionless compatibility URLs and every non-MCAP route continue through the existing dispatcher.
+They create zero new remote-MCAP probe or slot ownership.
 
-The additive `openRequest` and `openBatch` APIs provide strict HTTP(S) remote-MCAP admission, typed options, structured request-local errors, and stable opaque operation handles.
-`openBatch` is all-or-nothing and preserves input order.
-Explicit `.mcap` URLs are accepted directly, while extensionless URLs require `allow_extensionless_sniff: true` and use a bounded format sniff when the remote transport capability is installed.
-Non-HTTP routes, gRPC/message proxy URLs, Redap URLs, RRD files, and other formats are rejected by the strict APIs and are never handed to the compatibility importer.
-Until the measured release-Wasm remote-MCAP capability is installed, valid strict requests reject with `StrictOpenError` code `CapabilityUnavailable` before creating handles or scheduling work.
+### Strict lane
 
-When the capability is installed, each opaque `RecordingHandle` targets one exact remote Store publication.
-Its `select()`, `seek({time_type, value})`, `play("paused" | "playing")`, and `close()` methods return a synchronous redacted `StrictRecordingControlResult`.
-`seek` accepts only `timestamp_ns` or `duration_ns` and a canonical decimal value.
-`OpenRequestHandle.close()` closes the operation's shared source, while `RecordingHandle.close()` closes only its exact publication.
+`openRequest`, `openBatch`, and `startWithRequests` are additive strict APIs.
+They accept only HTTP(S) remote-MCAP sources.
+Explicit `.mcap` URLs are admitted directly.
+Extensionless URLs require `allow_extensionless_sniff: true` and use a bounded 8-byte format sniff.
+`openRequest` is a singleton transaction.
+`openBatch` is all-or-nothing.
+`startWithRequests` resolves only after the Viewer and remote operation handoff are safely published.
+It does not resolve when a recording becomes presentation-ready.
+Strict failures are redacted `StrictOpenError` values with fixed codes and phases.
+Relevant codes include `UnsupportedStrictOpenRoute`, `UnsupportedFormat`, `CapabilityUnavailable`, `ExistingSourceOptionsConflict`, and `BatchTooLarge`.
+Valid strict requests reject with `CapabilityUnavailable` while the release-Wasm remote-MCAP capability is not installed.
+
+### Handles and lifecycle
+
+Each `OpenRequestHandle` owns one strict operation, and each `RecordingHandle` targets one exact remote Store publication.
+`OpenRequestHandle.close()` closes the shared source owned by the operation.
+`RecordingHandle.close()` closes only one exact recording publication.
 `dispose()` on either handle releases subscriptions, pending promises, wrapper retention, and removed tombstones without closing the source or publication.
-The `FinalizationRegistry` is only a best-effort fallback that invokes the same internal cleanup token as explicit `dispose()`.
-Neither handle exposes a Store ID, recording ID, URL, or lifecycle token.
+The `FinalizationRegistry` is only a best-effort fallback.
+It invokes the same internal cleanup token as explicit `dispose()`.
+Lifecycle events are ordered from accepted through recording activated, behavior effect, request-ready, presentation-ready, source terminal, and recording removed.
+Omitted stages are allowed, but the remaining order is never reversed.
+An already-active alias replays the current presentation snapshot independently.
+Public handles never expose a Store ID, recording ID, URL, lifecycle token, or secret.
+
+### Semantic reuse and behavior
+
+The same canonical URL may share a source only when the complete frozen `RemoteMcapSemanticConfig` is exact-equal and actual consistency satisfies the requested policy.
+Each operation keeps independent `RecordingOpenBehavior`, selection intent, ready state, and disposal.
+The three behavior values are `open`, `open_and_select`, and `background`, corresponding to the `Open`, `OpenAndSelect`, and `Background` contract modes.
+`background` creates a separate discoverable and closeable metadata catalog card.
+It is not equivalent to an existing StoreHub preview.
+Behavior effects are monotonic.
+A strict atomic batch uses only its last `open_and_select` item for batch-local initial selection authority.
+
+### Limits and redaction
+
+Remote URL and option strings are bounded and redacted.
+No raw URL, query, ETag, topic, entity path, Store ID, generation, or internal token is exposed by a public handle, error, event, metric, or debug output.
+`seek` accepts only `timestamp_ns` or `duration_ns` plus a canonical decimal value.
+The public API does not provide `timestamp_offset_ns`.
+It does not guess Unix epoch or boot-relative semantics from time values.
+
+### Unchanged routes
+
+RRD, legacy HTTP/RRD, `rerun+http(s)` gRPC/message proxy, Redap, raw-event, native Viewer, local MCAP, drag-and-drop MCAP, and other non-remote Web routes remain unchanged.
 
 ```ts
 const handles = await viewer.openBatch([
