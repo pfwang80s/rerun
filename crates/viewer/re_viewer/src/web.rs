@@ -127,7 +127,7 @@ pub struct WebHandle {
 
     /// Compatibility `.mcap` ingress seam.  The remote capability remains disarmed until its
     /// measured production profile is installed; disarmed dispatch falls back to `ViewerOpenUrl`.
-    compatibility_remote_mcap: RefCell<CompatibilityRemoteMcapSingletonV1>,
+    compatibility_remote_mcap: Rc<RefCell<CompatibilityRemoteMcapSingletonV1>>,
 
     /// A dedicated smart channel used by the [`WebHandle::add_rrd_from_bytes`] API.
     ///
@@ -159,9 +159,9 @@ impl WebHandle {
 
         Ok(Self {
             runner: eframe::WebRunner::new(),
-            compatibility_remote_mcap: RefCell::new(
+            compatibility_remote_mcap: Rc::new(RefCell::new(
                 CompatibilityRemoteMcapSingletonV1::new_disarmed_v1(),
-            ),
+            )),
             log_senders: Default::default(),
             connection_registry,
             app_options: app_options.unwrap_or_default(),
@@ -258,6 +258,7 @@ impl WebHandle {
         };
 
         let connection_registry = self.connection_registry.clone();
+        let compatibility_remote_mcap = self.compatibility_remote_mcap.clone();
         let prepared_app = self
             .runner
             .prepare_app(
@@ -269,6 +270,7 @@ impl WebHandle {
                         cc,
                         connection_registry,
                         app_options,
+                        compatibility_remote_mcap,
                     )?))
                 }),
             )
@@ -880,6 +882,7 @@ fn create_app(
     cc: &eframe::CreationContext<'_>,
     connection_registry: re_redap_client::ConnectionRegistryHandle,
     app_options: AppOptions,
+    compatibility_remote_mcap: Rc<RefCell<CompatibilityRemoteMcapSingletonV1>>,
 ) -> Result<crate::App, re_renderer::RenderContextError> {
     let build_info = re_build_info::build_info!();
 
@@ -990,7 +993,22 @@ fn create_app(
     }
 
     if let Some(urls) = url {
-        crate::web_startup::dispatch_hidden_startup_urls(urls, &app.egui_ctx, &app.command_sender);
+        crate::web_startup::dispatch_hidden_startup_urls(
+            urls,
+            &app.egui_ctx,
+            &app.command_sender,
+            || match compatibility_remote_mcap.borrow_mut().dispatch_v1() {
+                CompatibilityRemoteMcapDispatchV1::ExistingDispatcher => {
+                    CompatibilityRemoteMcapControlV1::ExistingDispatcher
+                }
+                CompatibilityRemoteMcapDispatchV1::RemoteAccepted { .. } => {
+                    CompatibilityRemoteMcapControlV1::RemoteAccepted
+                }
+                CompatibilityRemoteMcapDispatchV1::RemoteSessionLimitReached => {
+                    CompatibilityRemoteMcapControlV1::RemoteSessionLimitReached
+                }
+            },
+        );
     }
 
     Ok(app)

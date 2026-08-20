@@ -129,18 +129,20 @@ pub(crate) fn dispatch_hidden_startup_urls(
     urls: StringOrStringArray,
     egui_ctx: &egui::Context,
     command_sender: &CommandSender,
+    mut remote_dispatch: impl FnMut() -> CompatibilityRemoteMcapControlV1,
 ) {
     for url in urls.into_inner() {
-        match url.parse::<open_url::ViewerOpenUrl>() {
-            Ok(url) => {
-                url.open(
-                    egui_ctx,
-                    &open_url::OpenUrlOptions {
-                        recording_open_behavior: RecordingOpenBehavior::OpenAndSelect,
-                        show_loader: true,
-                    },
-                    command_sender,
+        match dispatch_compatibility_url_v1(&url, egui_ctx, command_sender, &mut remote_dispatch) {
+            Ok(CompatibilityUrlDispatchOutcomeV1::ExistingDispatcher) => {}
+            Ok(CompatibilityUrlDispatchOutcomeV1::RemoteAccepted) => {
+                // The production remote capability is installed by a later, measured bridge.
+                // Keep this branch side-effect free until then.
+                re_log::debug!(
+                    "Remote MCAP compatibility capability accepted hidden startup input"
                 );
+            }
+            Ok(CompatibilityUrlDispatchOutcomeV1::RemoteSessionLimitReached) => {
+                re_log::warn!("Remote MCAP compatibility session limit reached; continuing");
             }
             Err(err) => {
                 re_log::warn!(?url, "Failed to open URL: {err}");
@@ -289,6 +291,7 @@ mod tests {
         let log_rx = re_log::add_log_msg_receiver(re_log::LevelFilter::WARN);
         re_log::setup_logging();
         let (sender, receiver) = command_channel();
+        let mut remote_calls = 0;
 
         dispatch_hidden_startup_urls(
             vec![
@@ -299,7 +302,13 @@ mod tests {
             .into(),
             &egui::Context::default(),
             &sender,
+            || {
+                remote_calls += 1;
+                CompatibilityRemoteMcapControlV1::ExistingDispatcher
+            },
         );
+
+        assert_eq!(remote_calls, 0);
 
         let commands: Vec<_> =
             std::iter::from_fn(|| receiver.recv_system().map(|(_, command)| command)).collect();
@@ -334,6 +343,116 @@ mod tests {
             warnings
                 .iter()
                 .any(|warning| warning.message.contains("Failed to open URL"))
+        );
+    }
+
+    #[test]
+    fn hidden_startup_explicit_mcap_uses_remote_seam_and_falls_back_to_existing_dispatcher() {
+        let raw_url = "https://example.test/data.mcap";
+        let (sender, receiver) = command_channel();
+        let mut remote_calls = 0;
+
+        dispatch_hidden_startup_urls(
+            vec![raw_url.to_owned()].into(),
+            &egui::Context::default(),
+            &sender,
+            || {
+                remote_calls += 1;
+                CompatibilityRemoteMcapControlV1::ExistingDispatcher
+            },
+        );
+
+        assert_eq!(remote_calls, 1);
+        let actual_trace = command_debug_trace(&receiver);
+        let (expected_sender, expected_receiver) = command_channel();
+        raw_url
+            .parse::<super::ViewerOpenUrl>()
+            .expect("baseline parser accepts route")
+            .open(
+                &egui::Context::default(),
+                &re_viewer_context::open_url::OpenUrlOptions {
+                    recording_open_behavior: re_log_channel::RecordingOpenBehavior::OpenAndSelect,
+                    show_loader: true,
+                },
+                &expected_sender,
+            );
+        let expected_trace = command_debug_trace(&expected_receiver);
+        assert_eq!(actual_trace, expected_trace);
+    }
+
+    #[test]
+    fn hidden_startup_remote_accepted_has_no_compatibility_command() {
+        let (sender, receiver) = command_channel();
+        let mut remote_calls = 0;
+
+        dispatch_hidden_startup_urls(
+            vec!["https://example.test/data.mcap".to_owned()].into(),
+            &egui::Context::default(),
+            &sender,
+            || {
+                remote_calls += 1;
+                CompatibilityRemoteMcapControlV1::RemoteAccepted
+            },
+        );
+
+        assert_eq!(remote_calls, 1);
+        assert!(command_debug_trace(&receiver).is_empty());
+    }
+
+    #[test]
+    fn hidden_startup_remote_session_limit_continues_without_rollback() {
+        let first = "https://example.test/first.rrd";
+        let last = "https://example.test/last.rrd";
+        let log_rx = re_log::add_log_msg_receiver(re_log::LevelFilter::WARN);
+        re_log::setup_logging();
+        let (sender, receiver) = command_channel();
+        let mut remote_calls = 0;
+
+        dispatch_hidden_startup_urls(
+            vec![
+                first.to_owned(),
+                "https://example.test/limited.mcap".to_owned(),
+                last.to_owned(),
+            ]
+            .into(),
+            &egui::Context::default(),
+            &sender,
+            || {
+                remote_calls += 1;
+                CompatibilityRemoteMcapControlV1::RemoteSessionLimitReached
+            },
+        );
+
+        assert_eq!(remote_calls, 1);
+        let commands: Vec<_> =
+            std::iter::from_fn(|| receiver.recv_system().map(|(_, command)| command)).collect();
+        assert!(matches!(
+            &commands[0],
+            SystemCommand::SetRoute(Route::Loading(source))
+                if **source == (LogSource::HttpStream { url: first.to_owned() })
+        ));
+        assert!(matches!(
+            &commands[1],
+            SystemCommand::LoadDataSource(LogDataSource::HttpUrl { url })
+                if url.as_str() == first
+        ));
+        assert!(matches!(
+            &commands[2],
+            SystemCommand::SetRoute(Route::Loading(source))
+                if **source == (LogSource::HttpStream { url: last.to_owned() })
+        ));
+        assert!(matches!(
+            &commands[3],
+            SystemCommand::LoadDataSource(LogDataSource::HttpUrl { url })
+                if url.as_str() == last
+        ));
+        assert_eq!(commands.len(), 4);
+
+        let warnings: Vec<_> = log_rx.try_iter().collect();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.message.contains("session limit reached"))
         );
     }
 
