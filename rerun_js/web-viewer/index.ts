@@ -517,6 +517,86 @@ const strict_open_error_messages: Record<StrictOpenErrorCode, string> = {
   ProtocolViolation: "strict open handoff protocol violation",
 };
 
+type StrictStartupWireEnvelope = {
+  version?: unknown;
+  class?: unknown;
+  code?: unknown;
+  failed_index_decimal?: unknown;
+  retryable?: unknown;
+  message?: unknown;
+};
+
+function strict_startup_wire_code_to_error_code(
+  code: string,
+): StrictOpenErrorCode {
+  switch (code) {
+    case "viewer_stopped":
+      return "ViewerStopped";
+    case "invalid_request_shape":
+      return "InvalidRequestShape";
+    case "invalid_url":
+      return "InvalidUrl";
+    case "unsupported_strict_open_route":
+      return "UnsupportedStrictOpenRoute";
+    case "unsupported_format":
+      return "UnsupportedFormat";
+    case "batch_too_large":
+      return "BatchTooLarge";
+    case "resource_limit_exceeded":
+      return "ResourceLimitExceeded";
+    case "capability_unavailable":
+      return "CapabilityUnavailable";
+    case "handoff_cancelled":
+      return "HandoffCancelled";
+    case "handoff_state_changed":
+      return "HandoffStateChanged";
+    default:
+      return "ProtocolViolation";
+  }
+}
+
+function strict_startup_wire_phase(
+  value: unknown,
+): StrictOpenErrorPhase {
+  if (value === "admission") return "admission";
+  if (value === "opening") return "opening";
+  if (value === "lifecycle") return "lifecycle";
+  return "handoff";
+}
+
+function strict_startup_error_from_wire(value: unknown): StrictOpenError {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return new StrictOpenError("ProtocolViolation", "handoff");
+  }
+  const envelope = value as StrictStartupWireEnvelope;
+  const raw_code = envelope.code;
+  const raw_class = envelope.class;
+  if (typeof raw_code !== "string" || typeof raw_class !== "string") {
+    return new StrictOpenError("ProtocolViolation", "handoff");
+  }
+  const failed_index = envelope.failed_index_decimal;
+  if (failed_index !== undefined && failed_index !== null && typeof failed_index !== "string") {
+    return new StrictOpenError("ProtocolViolation", "handoff");
+  }
+  const retryable = envelope.retryable;
+  if (retryable !== undefined && retryable !== null && typeof retryable !== "boolean") {
+    return new StrictOpenError("ProtocolViolation", "handoff");
+  }
+  return new StrictOpenError(
+    strict_startup_wire_code_to_error_code(raw_code),
+    strict_startup_wire_phase(raw_class),
+    { retryable: retryable ?? false, index: failed_index == null ? null : Number(failed_index) },
+  );
+}
+
+function looks_like_strict_startup_wire(value: unknown): boolean {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && typeof (value as StrictStartupWireEnvelope).class === "string"
+    && typeof (value as StrictStartupWireEnvelope).code === "string";
+}
+
 /** A redacted, request-local strict-open failure. */
 export class StrictOpenError extends Error {
   readonly code: StrictOpenErrorCode;
@@ -1031,6 +1111,27 @@ export class WebViewer {
     }
   }
 
+  /**
+   * Start the Viewer with one strict, atomic remote-MCAP request batch.
+   *
+   * The returned handles represent accepted installation only. A recording may
+   * become presentation-ready later through its own lifecycle events.
+   */
+  async startWithRequests(
+    specs: readonly HttpOpenRequestSpec[],
+    parent?: HTMLElement | null,
+    options?: WebViewerOptions | null,
+  ): Promise<readonly OpenRequestHandle[]> {
+    try {
+      return await this.#start_with_requests_inner(specs, parent, options);
+    } catch (error) {
+      if (this.#state !== "stopped") {
+        try { this.#fail("Failed to start", String(error)); } catch {} finally { this.#cleanup_failed_start(); }
+      }
+      throw error;
+    }
+  }
+
   async #start_inner(
     rrd: string | string[] | null,
     parent: HTMLElement | null,
@@ -1184,6 +1285,139 @@ export class WebViewer {
     check_for_panic();
 
     return;
+  }
+
+  async #start_with_requests_inner(
+    specs: readonly HttpOpenRequestSpec[],
+    parent: HTMLElement | null | undefined,
+    options: WebViewerOptions | null | undefined,
+  ): Promise<readonly OpenRequestHandle[]> {
+    this._validate_strict_batch_shape(specs);
+    parent ??= document.body;
+    options ??= {};
+    options = options ? { ...options } : options;
+
+    this.#allow_fullscreen = options.allow_fullscreen || false;
+
+    if (this.#state !== "stopped") return [];
+    // A strict startup is its own Viewer instance. Reuse the same startup
+    // installation path as `start`, then hand the prepared batch boundary to
+    // the Wasm handle before any compatibility URL dispatch.
+    this._strict_dispatcher.reset();
+    this.#strict_open_cache.begin_viewer_instance();
+    this.#state = "starting";
+    this.#page_execution?.dispose();
+    this.#page_execution = new ChromePageExecutionController();
+    this.#clearLoader();
+
+    this.#canvas = document.createElement("canvas");
+    this.#canvas.style.width = options.width ?? "640px";
+    this.#canvas.style.height = options.height ?? "360px";
+    parent.append(this.#canvas);
+
+    this.#loader = document.createElement("div");
+    this.#loader.innerHTML = `
+      <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; background-color: #1c1c1c; font-family: sans-serif; color: white;">
+        <div style="margin-bottom: 16px;">Loading Rerun\u2026</div>
+        <div style="width: 200px;">
+          <div style="background: #333; border-radius: 4px; height: 6px; overflow: hidden;">
+            <div class="rerun-progress-bar" style="background: white; height: 100%; width: 0%; transition: width 0.2s;"></div>
+          </div>
+          <div class="rerun-progress-text" style="margin-top: 6px; font-size: 12px; color: #999;"></div>
+        </div>
+      </div>
+    `;
+    this.#loader.style.position = "absolute";
+    this.#loader.style.inset = "0";
+    parent.style.position = "relative";
+    parent.append(this.#loader);
+
+    const progress_bar = this.#loader.querySelector(".rerun-progress-bar") as HTMLElement;
+    const progress_text = this.#loader.querySelector(".rerun-progress-text") as HTMLElement;
+
+    const on_progress = (received: number, total: number | null) => {
+      if (total != null && total > 0) {
+        const pct = Math.min((received / total) * 100, 100);
+        progress_bar.style.width = pct.toFixed(1) + "%";
+        progress_text.textContent = `${Math.round(pct)}%`;
+      } else {
+        progress_text.textContent = format_mib(received);
+      }
+    };
+
+    await delay(0);
+
+    let base_url: string | undefined = (options as any)?.base_url;
+    if (base_url) {
+      delete (options as any).base_url;
+    }
+
+    let WebHandle_class: typeof wasm_bindgen.WebHandle;
+    try {
+      WebHandle_class = await load(base_url, on_progress);
+    } catch (e) {
+      try { this.#fail("Failed to load rerun", String(e)); } catch {} finally { this.#cleanup_failed_start(); }
+      throw e;
+    }
+    if (this.#state !== "starting") {
+      this.#clearLoader();
+      return [];
+    }
+
+    const fullscreen = this.#allow_fullscreen
+      ? {
+        get_state: () => this.#fullscreen,
+        on_toggle: () => this.toggle_fullscreen(),
+      }
+      : undefined;
+
+    const on_viewer_event = (event_json: string) => {
+      this.#dispatch_raw_event(event_json);
+      let event: ViewerEvent = JSON.parse(event_json);
+      this.#dispatch_event(event.type as any, event);
+    }
+
+    const login = options.login
+      ? {
+          signed_in_url: resolveAbsoluteUrl(options.login.signed_in_url),
+          signed_out_url: resolveAbsoluteUrl(options.login.signed_out_url),
+        }
+      : undefined;
+
+    try {
+      this.#handle = new WebHandle_class({
+        ...options,
+        login,
+        fullscreen,
+        on_viewer_event,
+      });
+      const remote_handle = this.#handle as any;
+      this.#wasm_page_owner_release = this.#page_execution?.register_remote_owner({
+        on_hidden: (epoch) => remote_handle.remote_page_hidden_v1?.(epoch),
+        on_resume: (from, to, nonce) => remote_handle.remote_page_resume_v1?.(from, to, nonce),
+        on_visible_deadline: (deadline) => remote_handle.remote_page_deadline_v1?.(this.#page_execution?.epoch ?? 0, deadline),
+        on_terminate: (_reason, epoch) => remote_handle.remote_page_terminate_v1?.(epoch),
+      }) ?? null;
+
+      const start_with_requests = remote_handle.start_with_requests;
+      if (typeof start_with_requests !== "function") {
+        throw new StrictOpenError("CapabilityUnavailable", "handoff");
+      }
+      const result = await start_with_requests.call(remote_handle, this.#canvas, specs);
+      if (looks_like_strict_startup_wire(result)) {
+        throw strict_startup_error_from_wire(result);
+      }
+      // The production artifact is disarmed and has no success wire codec.
+      // Any non-envelope return is therefore an ABI shape violation, not a
+      // signal that an accepted handle was installed.
+      throw new StrictOpenError("ProtocolViolation", "handoff");
+    } catch (e) {
+      const startup_error = looks_like_strict_startup_wire(e)
+        ? strict_startup_error_from_wire(e)
+        : e;
+      try { this.#fail("Failed to start", String(startup_error)); } catch {} finally { this.#cleanup_failed_start(); }
+      throw startup_error;
+    }
   }
 
   #raw_events: Set<(event_json: string) => void> = new Set();
@@ -1368,6 +1602,10 @@ export class WebViewer {
     if (this.#state !== "ready" || !this.#handle) {
       throw new StrictOpenError("ViewerStopped", "admission");
     }
+    this._validate_strict_batch_shape(specs);
+  }
+
+  private _validate_strict_batch_shape(specs: unknown): void {
     try {
       if (!Array.isArray(specs) || specs.length === 0) {
         throw new StrictOpenError("InvalidRequestShape", "admission");

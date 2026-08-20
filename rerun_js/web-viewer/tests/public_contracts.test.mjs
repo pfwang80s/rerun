@@ -663,13 +663,52 @@ test("strict request preflight seals fields, indexes sparse batches, and rejects
   viewer.stop();
 });
 
-test("strict handle classes and deferred startup API are not public before capability install", async () => {
+test("strict handle classes stay opaque while startWithRequests is public but disarmed", async () => {
   const module = await import("../index.js");
   assert.equal("OpenRequestHandle" in module, false);
   assert.equal("RecordingHandle" in module, false);
-  const viewer = await startViewer();
-  assert.equal("startWithRequests" in viewer, false);
+  const viewer = new WebViewer();
+  assert.equal("startWithRequests" in viewer, true);
+
+  await assert.rejects(
+    viewer.startWithRequests(
+      [{ url: "https://example.test/secret.mcap?token=opaque" }],
+      document.body,
+      null,
+    ),
+    (error) => {
+      assert.ok(error instanceof StrictOpenError);
+      assert.equal(error.code, "CapabilityUnavailable");
+      assert.equal(error.phase, "handoff");
+      assert.doesNotMatch(String(error), /example|secret|token/);
+      return true;
+    },
+  );
+  assert.equal(viewer.ready, false);
+  assert.equal(strictCache(viewer).operation_count, 0);
+  assert.equal(callsNamed("add_receiver").length, 0);
+  assert.equal(callsNamed("start").length, 0);
+
+  await viewer.start(null, document.body, null);
+  assert.equal(viewer.ready, true);
   viewer.stop();
+});
+
+test("startWithRequests validates shape before creating Viewer owners", async () => {
+  const viewer = new WebViewer();
+  await assert.rejects(
+    viewer.startWithRequests(null, document.body, null),
+    (error) => {
+      assert.ok(error instanceof StrictOpenError);
+      assert.equal(error.code, "InvalidRequestShape");
+      assert.equal(error.phase, "admission");
+      return true;
+    },
+  );
+  assert.equal(viewer.ready, false);
+  assert.equal(callsNamed("construct").length, 0);
+  assert.equal(callsNamed("add_receiver").length, 0);
+  assert.equal(strictCache(viewer).operation_count, 0);
 });
 
 test("strict preflight does not fold raw query or duplicate semantic inputs", async () => {

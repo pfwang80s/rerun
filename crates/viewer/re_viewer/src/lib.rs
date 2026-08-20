@@ -73,6 +73,8 @@ mod web_remote_mcap_time_control;
 mod web_startup;
 #[cfg(any(target_arch = "wasm32", test))]
 mod web_startup_visibility;
+#[cfg(any(target_arch = "wasm32", test))]
+mod web_strict_startup;
 
 #[cfg(feature = "analytics")]
 mod viewer_analytics;

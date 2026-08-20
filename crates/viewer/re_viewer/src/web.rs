@@ -141,6 +141,34 @@ pub struct WebHandle {
     app_options: AppOptions,
 }
 
+fn resolve_canvas_element(canvas: JsValue) -> Result<web_sys::HtmlCanvasElement, JsValue> {
+    if let Some(canvas_id) = canvas.as_string() {
+        // For backwards compatibility with old JS/HTML written before 2024-08-30
+        let document = web_sys::window()
+            .ok_or_else(|| "Failed to get window. Are we not in a browser?".to_owned())?
+            .document()
+            .ok_or_else(|| "Failed to get window.document. Are we not in a browser?".to_owned())?;
+        let element = document
+            .get_element_by_id(&canvas_id)
+            .ok_or_else(|| format!("Canvas element '{canvas_id}' not found."))?;
+        Ok(element
+            .dyn_into::<web_sys::HtmlCanvasElement>()
+            .map_err(|element| {
+                JsValue::from(format!(
+                    "Expected a canvas element or canvas id, got {element:?}"
+                ))
+            })?)
+    } else {
+        Ok(canvas
+            .dyn_into::<web_sys::HtmlCanvasElement>()
+            .map_err(|element| {
+                JsValue::from(format!(
+                    "Expected a canvas element or canvas id, got {element:?}"
+                ))
+            })?)
+    }
+}
+
 #[wasm_bindgen]
 impl WebHandle {
     #[allow(
@@ -222,30 +250,7 @@ impl WebHandle {
     #[wasm_bindgen]
     pub async fn start(&self, canvas: JsValue) -> Result<(), wasm_bindgen::JsValue> {
         let main_thread_token = crate::MainThreadToken::i_promise_i_am_on_the_main_thread();
-
-        let canvas = if let Some(canvas_id) = canvas.as_string() {
-            // For backwards compatibility with old JS/HTML written before 2024-08-30
-            let document = web_sys::window()
-                .ok_or_else(|| "Failed to get window. Are we not in a browser?".to_owned())?
-                .document()
-                .ok_or_else(|| {
-                    "Failed to get window.document. Are we not in a browser?".to_owned()
-                })?;
-            let element = document
-                .get_element_by_id(&canvas_id)
-                .ok_or_else(|| format!("Canvas element '{canvas_id}' not found."))?;
-            element
-                .dyn_into::<web_sys::HtmlCanvasElement>()
-                .map_err(|element| {
-                    format!("Expected a canvas element or canvas id, got {element:?}")
-                })?
-        } else {
-            canvas
-                .dyn_into::<web_sys::HtmlCanvasElement>()
-                .map_err(|element| {
-                    format!("Expected a canvas element or canvas id, got {element:?}")
-                })?
-        };
+        let canvas = resolve_canvas_element(canvas)?;
 
         let bootstrap_visibility = StartupVisibilityBootstrapGuard::install()?;
 
@@ -292,6 +297,43 @@ impl WebHandle {
         re_log::debug!("Web app started.");
 
         Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub async fn start_with_requests(
+        &self,
+        canvas: JsValue,
+        specs: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let main_thread_token = crate::MainThreadToken::i_promise_i_am_on_the_main_thread();
+        let _canvas = resolve_canvas_element(canvas)?;
+
+        let specs = match crate::web_strict_startup::preflight_strict_startup_specs_v1(specs) {
+            Ok(specs) => specs,
+            Err(error) => {
+                return crate::web_strict_startup::strict_startup_error_envelope_to_js_v1(&error);
+            }
+        };
+        drop(specs);
+
+        // The measured remote-MCAP capability is not installed in this artifact.
+        // Strict startup therefore stops after bounded shape conversion and returns
+        // a redacted capability-unavailable envelope before creating an App,
+        // installing visibility/RAF/observer owners, or touching terminal state.
+        let _ = main_thread_token;
+        match crate::web_strict_startup::strict_startup_capability_gate_v1() {
+            crate::web_strict_startup::StrictStartupCapabilityGateV1::Disarmed => {
+                crate::web_strict_startup::strict_startup_capability_unavailable_js_v1()
+            }
+            crate::web_strict_startup::StrictStartupCapabilityGateV1::Armed => {
+                // Not reachable until the measured capability bridge lands. The
+                // armed path then runs the shared strict batch prepare, the
+                // startup visibility bootstrap, the two-phase eframe
+                // `prepare_app`, the strict startup handoff, and only then
+                // `activate`.
+                crate::web_strict_startup::strict_startup_capability_unavailable_js_v1()
+            }
+        }
     }
 
     #[wasm_bindgen]

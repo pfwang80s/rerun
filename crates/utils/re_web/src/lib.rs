@@ -36,6 +36,12 @@
 //! use re_web::strict_open_handoff;
 //! ```
 //!
+//! Strict-startup bootstrap handoff release/abort is likewise Web-only:
+//!
+//! ```compile_fail,ignore-wasm32
+//! use re_web::strict_startup_handoff;
+//! ```
+//!
 //! Open-source terminal ownership and one-shot capability issuance are likewise Web-only:
 //!
 //! ```compile_fail,ignore-wasm32
@@ -174,6 +180,8 @@ pub mod strict_open_handoff;
     )
 )]
 pub mod strict_open_wire;
+#[cfg(target_arch = "wasm32")]
+pub mod strict_startup_handoff;
 
 // Host builds compile the module only for its unit tests and do not publish it to consumers.
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -238,6 +246,10 @@ mod strict_open_batch;
 // Host builds compile the module only for its unit tests and do not publish it to consumers.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod strict_open_handoff;
+
+// Host builds compile the module only for its unit tests and do not publish it to consumers.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod strict_startup_handoff;
 
 // Host builds compile the module only for its unit tests and do not publish it to consumers.
 #[cfg(all(test, not(target_arch = "wasm32")))]
