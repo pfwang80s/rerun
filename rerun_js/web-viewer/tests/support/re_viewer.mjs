@@ -15,6 +15,18 @@ class FakeWebHandle {
     }
   }
 
+  async start_with_requests(canvas, specs) {
+    state.calls.push(["start_with_requests", canvas, specs]);
+    if (state.startWithRequestsError) {
+      // `WebViewer` still runs normal failed-start teardown after this throw.
+      // Keep that teardown out of the shared strict call trace so the wire
+      // envelope test observes handoff side effects without counting cleanup.
+      this.startWithRequestsFailure = true;
+      throw state.startWithRequestsError;
+    }
+    return state.startWithRequestsResult;
+  }
+
   remote_page_hidden_v1(epoch) { state.calls.push(["remote_page_hidden_v1", epoch]); }
   remote_page_resume_v1(from, to, nonce) { state.calls.push(["remote_page_resume_v1", from, to, nonce]); }
   remote_page_deadline_v1(epoch, deadline) { state.calls.push(["remote_page_deadline_v1", epoch, deadline]); }
@@ -97,10 +109,12 @@ class FakeWebHandle {
   }
 
   destroy() {
+    if (this.startWithRequestsFailure) return;
     state.calls.push(["destroy"]);
   }
 
   free() {
+    if (this.startWithRequestsFailure) return;
     state.calls.push(["free"]);
   }
 

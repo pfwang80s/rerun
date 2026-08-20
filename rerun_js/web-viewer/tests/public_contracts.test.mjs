@@ -79,6 +79,8 @@ function resetState() {
     addReceiverCalls: 0,
     addReceiverErrorAt: -1,
     startError: null,
+    startWithRequestsError: null,
+    startWithRequestsResult: null,
     activeRecordingId: null,
     activeTimeline: null,
     currentTime: null,
@@ -670,12 +672,55 @@ test("strict handle classes stay opaque while startWithRequests is public but di
   const viewer = new WebViewer();
   assert.equal("startWithRequests" in viewer, true);
 
+  const loadFakeBindgen = (await import("./support/re_viewer.mjs")).default;
+  const FakeWebHandle = loadFakeBindgen().WebHandle;
+  const originalStartWithRequests = FakeWebHandle.prototype.start_with_requests;
+  delete FakeWebHandle.prototype.start_with_requests;
+  try {
+    await assert.rejects(
+      viewer.startWithRequests(
+        [{ url: "https://example.test/secret.mcap?token=opaque" }],
+        document.body,
+        null,
+      ),
+      (error) => {
+        assert.ok(error instanceof StrictOpenError);
+        assert.equal(error.code, "CapabilityUnavailable");
+        assert.equal(error.phase, "handoff");
+        assert.doesNotMatch(String(error), /example|secret|token/);
+        return true;
+      },
+    );
+  } finally {
+    FakeWebHandle.prototype.start_with_requests = originalStartWithRequests;
+  }
+  assert.equal(viewer.ready, false);
+  assert.equal(strictCache(viewer).operation_count, 0);
+  assert.equal(callsNamed("add_receiver").length, 0);
+  assert.equal(callsNamed("start").length, 0);
+
+  await viewer.start(null, document.body, null);
+  assert.equal(viewer.ready, true);
+  viewer.stop();
+});
+
+test("startWithRequests maps a Rust wire-envelope failure and retries the same instance", async () => {
+  const state = globalThis.__rerun_web_viewer_test_state;
+  const envelope = Object.freeze({
+    version: 1,
+    class: "handoff",
+    code: "capability_unavailable",
+    failed_index_decimal: null,
+    retryable: null,
+    message: "strict remote-MCAP capability is unavailable",
+  });
+  state.startWithRequestsError = envelope;
+
+  const viewer = new WebViewer();
+  const specs = [{ url: "https://example.test/secret.mcap?token=opaque" }];
+
   await assert.rejects(
-    viewer.startWithRequests(
-      [{ url: "https://example.test/secret.mcap?token=opaque" }],
-      document.body,
-      null,
-    ),
+    viewer.startWithRequests(specs, document.body, null),
     (error) => {
       assert.ok(error instanceof StrictOpenError);
       assert.equal(error.code, "CapabilityUnavailable");
@@ -684,10 +729,25 @@ test("strict handle classes stay opaque while startWithRequests is public but di
       return true;
     },
   );
+
+  assert.equal(callsNamed("start_with_requests").length, 1);
+  assert.equal(callsNamed("start").length, 0);
   assert.equal(viewer.ready, false);
   assert.equal(strictCache(viewer).operation_count, 0);
   assert.equal(callsNamed("add_receiver").length, 0);
-  assert.equal(callsNamed("start").length, 0);
+  assert.equal(callsNamed("destroy").length, 0);
+  assert.equal(callsNamed("free").length, 0);
+
+  await assert.rejects(
+    viewer.startWithRequests(specs, document.body, null),
+    (error) => {
+      assert.ok(error instanceof StrictOpenError);
+      assert.equal(error.code, "CapabilityUnavailable");
+      assert.equal(error.phase, "handoff");
+      return true;
+    },
+  );
+  assert.equal(callsNamed("start_with_requests").length, 2);
 
   await viewer.start(null, document.body, null);
   assert.equal(viewer.ready, true);

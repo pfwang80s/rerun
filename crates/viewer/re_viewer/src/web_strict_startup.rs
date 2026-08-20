@@ -51,6 +51,7 @@ pub(crate) enum RedactedStrictStartupErrorCodeV1 {
     InvalidRequestShape,
     InvalidUrl,
     UnsupportedStrictOpenRoute,
+    UnsupportedFormat,
     ResourceLimitExceeded,
     BatchTooLarge,
     CapabilityUnavailable,
@@ -62,6 +63,7 @@ impl RedactedStrictStartupErrorCodeV1 {
             Self::InvalidRequestShape => "invalid_request_shape",
             Self::InvalidUrl => "invalid_url",
             Self::UnsupportedStrictOpenRoute => "unsupported_strict_open_route",
+            Self::UnsupportedFormat => "unsupported_format",
             Self::ResourceLimitExceeded => "resource_limit_exceeded",
             Self::BatchTooLarge => "batch_too_large",
             Self::CapabilityUnavailable => "capability_unavailable",
@@ -73,6 +75,7 @@ impl RedactedStrictStartupErrorCodeV1 {
             Self::InvalidRequestShape => "strict open request shape is invalid",
             Self::InvalidUrl => "strict open URL is invalid",
             Self::UnsupportedStrictOpenRoute => "strict open route is unsupported",
+            Self::UnsupportedFormat => "strict open format is unsupported",
             Self::ResourceLimitExceeded => "strict open resource limit was exceeded",
             Self::BatchTooLarge => "strict open batch exceeds its item limit",
             Self::CapabilityUnavailable => "strict remote-MCAP capability is unavailable",
@@ -152,7 +155,7 @@ pub(crate) fn validate_strict_startup_spec_v1(
             failed_index,
         ));
     }
-    validate_http_url_v1(&url, failed_index)?;
+    let authority_end = validate_http_url_v1(&url, failed_index)?;
 
     let topic_filter = canonicalize_string_collection_v1(&options.topic_filter, failed_index)?;
     validate_string_collection_v1(&options.decoder_selector, failed_index)?;
@@ -202,10 +205,12 @@ pub(crate) fn validate_strict_startup_spec_v1(
         }
     }
 
-    // The `allow_extensionless_sniff` opt-in is enforced by the TS preflight.
-    // Rust only confirms the field reached this boundary; the armed batch
-    // prepare reclassifies the URL route independently.
-    let _ = options.allow_extensionless_sniff;
+    validate_strict_http_path_v1(
+        &url,
+        authority_end,
+        options.allow_extensionless_sniff,
+        failed_index,
+    )?;
 
     Ok(ValidatedStrictStartupSpecV1 {
         url,
@@ -220,7 +225,7 @@ pub(crate) fn validate_strict_startup_spec_v1(
 fn validate_http_url_v1(
     url: &str,
     failed_index: Option<u32>,
-) -> Result<(), RedactedStrictStartupErrorV1> {
+) -> Result<usize, RedactedStrictStartupErrorV1> {
     let bytes = url.as_bytes();
     let scheme_end = if starts_with_ignore_ascii_case_v1(bytes, b"https://") {
         8
@@ -242,6 +247,39 @@ fn validate_http_url_v1(
             RedactedStrictStartupErrorCodeV1::InvalidUrl,
             failed_index,
         ));
+    }
+    Ok(authority_end)
+}
+
+fn validate_strict_http_path_v1(
+    url: &str,
+    authority_end: usize,
+    allow_extensionless_sniff: Option<bool>,
+    failed_index: Option<u32>,
+) -> Result<(), RedactedStrictStartupErrorV1> {
+    let path_end = url[authority_end..]
+        .find(['?', '#'])
+        .map_or(url.len(), |offset| authority_end + offset);
+    let path = &url[authority_end..path_end];
+
+    // `URL.pathname` is used by the sealed TypeScript preflight. The raw path
+    // before the first `?` or `#` is equivalent for the HTTP(S) forms admitted
+    // above and keeps this boundary independent of the browser URL parser.
+    let explicit_mcap = path.to_ascii_lowercase().ends_with(".mcap");
+    if !explicit_mcap {
+        let last_segment = path.rsplit('/').next().unwrap_or(path);
+        if last_segment.contains('.') {
+            return Err(RedactedStrictStartupErrorV1::new(
+                RedactedStrictStartupErrorCodeV1::UnsupportedFormat,
+                failed_index,
+            ));
+        }
+        if !allow_extensionless_sniff.unwrap_or(false) {
+            return Err(RedactedStrictStartupErrorV1::new(
+                RedactedStrictStartupErrorCodeV1::UnsupportedFormat,
+                failed_index,
+            ));
+        }
     }
     Ok(())
 }
@@ -368,6 +406,7 @@ mod wasm {
     };
 
     #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct StrictStartupSpecInputWireV1 {
         url: String,
         #[serde(default)]
@@ -375,6 +414,7 @@ mod wasm {
     }
 
     #[derive(Default, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct StrictStartupOptionsInputWireV1 {
         #[serde(default)]
         topic_filter: Option<StringOrStringArray>,
@@ -431,6 +471,12 @@ mod wasm {
                 None,
             )
         })?;
+        if wire_specs.is_empty() {
+            return Err(RedactedStrictStartupErrorV1::new(
+                RedactedStrictStartupErrorCodeV1::InvalidRequestShape,
+                None,
+            ));
+        }
         if wire_specs.len() > STRICT_STARTUP_MAX_BATCH_ITEMS_V1 {
             return Err(RedactedStrictStartupErrorV1::new(
                 RedactedStrictStartupErrorCodeV1::BatchTooLarge,
@@ -561,6 +607,7 @@ mod tests {
             RedactedStrictStartupErrorCodeV1::InvalidRequestShape,
             RedactedStrictStartupErrorCodeV1::InvalidUrl,
             RedactedStrictStartupErrorCodeV1::UnsupportedStrictOpenRoute,
+            RedactedStrictStartupErrorCodeV1::UnsupportedFormat,
             RedactedStrictStartupErrorCodeV1::ResourceLimitExceeded,
             RedactedStrictStartupErrorCodeV1::BatchTooLarge,
             RedactedStrictStartupErrorCodeV1::CapabilityUnavailable,
@@ -680,5 +727,45 @@ mod tests {
             error.code,
             RedactedStrictStartupErrorCodeV1::InvalidRequestShape
         );
+    }
+
+    #[test]
+    fn extensionless_route_requires_opt_in_and_rejects_dotted_non_mcap_paths() {
+        let error = validate_strict_startup_spec_v1(
+            "https://example.invalid/no-extension".to_owned(),
+            &options(),
+            2,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code,
+            RedactedStrictStartupErrorCodeV1::UnsupportedFormat
+        );
+        assert_eq!(error.failed_index, Some(2));
+
+        let mut opted_in = options();
+        opted_in.allow_extensionless_sniff = Some(true);
+        let validated = validate_strict_startup_spec_v1(
+            "https://example.invalid/no-extension?token=secret".to_owned(),
+            &opted_in,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            validated.url,
+            "https://example.invalid/no-extension?token=secret"
+        );
+
+        let dotted = validate_strict_startup_spec_v1(
+            "https://example.invalid/archive.tar.gz".to_owned(),
+            &opted_in,
+            1,
+        )
+        .unwrap_err();
+        assert_eq!(
+            dotted.code,
+            RedactedStrictStartupErrorCodeV1::UnsupportedFormat
+        );
+        assert_eq!(dotted.failed_index, Some(1));
     }
 }
