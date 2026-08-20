@@ -232,8 +232,9 @@ impl RemoteResourceLimitsV1 {
 }
 
 /// A successful checked resource acquisition.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RemoteResourceReservationV1 {
+    id: u64,
     class: RemoteResourceClassV1,
     bytes: RemoteAccountableBytesV1,
     revision: u64,
@@ -251,6 +252,14 @@ impl RemoteResourceReservationV1 {
     pub(crate) const fn revision_v1(self) -> u64 {
         self.revision
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RemoteResourceReservationRecordV1 {
+    id: u64,
+    class: RemoteResourceClassV1,
+    bytes: RemoteAccountableBytesV1,
+    revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -281,6 +290,8 @@ pub(crate) enum RemoteResourceRegistryErrorV1 {
         current: u64,
         attempted: u64,
     },
+    ReservationIdOverflow,
+    StaleReservation,
     ReleaseCountUnderflow,
     ReleaseBytesUnderflow,
     ReleaseTotalCountUnderflow,
@@ -329,6 +340,8 @@ pub(crate) struct RemoteResourceRegistryV1 {
     total_count: u64,
     total_bytes: u64,
     classes: [RemoteResourceUsageV1; RemoteResourceClassV1::COUNT],
+    active_reservations: Vec<RemoteResourceReservationRecordV1>,
+    next_reservation_id: u64,
 }
 
 impl RemoteResourceRegistryV1 {
@@ -338,6 +351,8 @@ impl RemoteResourceRegistryV1 {
             total_count: 0,
             total_bytes: 0,
             classes: [RemoteResourceUsageV1::ZERO; RemoteResourceClassV1::COUNT],
+            active_reservations: Vec::new(),
+            next_reservation_id: 0,
         }
     }
 
@@ -370,6 +385,11 @@ impl RemoteResourceRegistryV1 {
             return Err(RemoteResourceRegistryErrorV1::UnknownClass { index });
         }
 
+        let reservation_id = self.next_reservation_id;
+        let next_reservation_id = self
+            .next_reservation_id
+            .checked_add(1)
+            .ok_or(RemoteResourceRegistryErrorV1::ReservationIdOverflow)?;
         let class_index = class.index_v1();
         let usage = self.classes[class_index];
         let next_count = usage
@@ -429,19 +449,45 @@ impl RemoteResourceRegistryV1 {
         self.total_count = next_total_count;
         self.total_bytes = next_total_bytes;
         self.revision = next_revision;
+        self.next_reservation_id = next_reservation_id;
+        self.active_reservations.push(RemoteResourceReservationRecordV1 {
+            id: reservation_id,
+            class,
+            bytes,
+            revision: next_revision,
+        });
 
         Ok(RemoteResourceReservationV1 {
+            id: reservation_id,
             class,
             bytes,
             revision: next_revision,
         })
     }
 
+    #[expect(clippy::needless_pass_by_value)]
     pub(crate) fn release_reservation_v1(
         &mut self,
         reservation: RemoteResourceReservationV1,
     ) -> Result<(), RemoteResourceRegistryErrorV1> {
-        let class_index = reservation.class.index_v1();
+        let RemoteResourceReservationV1 {
+            id,
+            class,
+            bytes,
+            revision,
+        } = reservation;
+        let active_index = self
+            .active_reservations
+            .iter()
+            .position(|active| active.id == id)
+            .ok_or(RemoteResourceRegistryErrorV1::StaleReservation)?;
+        let active = self.active_reservations[active_index];
+        if active.class != class || active.bytes != bytes || active.revision != revision
+        {
+            return Err(RemoteResourceRegistryErrorV1::StaleReservation);
+        }
+
+        let class_index = class.index_v1();
         let usage = self.classes[class_index];
         let next_count = usage
             .current_count
@@ -449,7 +495,7 @@ impl RemoteResourceRegistryV1 {
             .ok_or(RemoteResourceRegistryErrorV1::ReleaseCountUnderflow)?;
         let next_bytes = usage
             .current_bytes
-            .checked_sub(reservation.bytes.get_v1())
+            .checked_sub(bytes.get_v1())
             .ok_or(RemoteResourceRegistryErrorV1::ReleaseBytesUnderflow)?;
         let next_total_count = self
             .total_count
@@ -457,7 +503,7 @@ impl RemoteResourceRegistryV1 {
             .ok_or(RemoteResourceRegistryErrorV1::ReleaseTotalCountUnderflow)?;
         let next_total_bytes = self
             .total_bytes
-            .checked_sub(reservation.bytes.get_v1())
+            .checked_sub(bytes.get_v1())
             .ok_or(RemoteResourceRegistryErrorV1::ReleaseTotalBytesUnderflow)?;
         let next_revision = self
             .revision
@@ -473,6 +519,7 @@ impl RemoteResourceRegistryV1 {
         self.total_count = next_total_count;
         self.total_bytes = next_total_bytes;
         self.revision = next_revision;
+        self.active_reservations.swap_remove(active_index);
         Ok(())
     }
 
@@ -825,12 +872,14 @@ impl RemotePageSuspensionRegistryV1 {
         count: &mut u64,
         duration_micros: u64,
     ) -> Result<(), RemotePageSuspensionErrorV1> {
-        *total = total
+        let next_total = total
             .checked_add(duration_micros)
             .ok_or(RemotePageSuspensionErrorV1::ArithmeticOverflow)?;
-        *count = count
+        let next_count = count
             .checked_add(1)
             .ok_or(RemotePageSuspensionErrorV1::CountOverflow)?;
+        *total = next_total;
+        *count = next_count;
         Ok(())
     }
 }
@@ -841,8 +890,9 @@ pub(crate) enum RemotePageSuspensionErrorV1 {
     ArithmeticOverflow,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RemoteInternCandidateReservationV1 {
+    id: u64,
     bytes: RemoteAccountableBytesV1,
 }
 
@@ -853,10 +903,18 @@ impl RemoteInternCandidateReservationV1 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RemoteInternCandidateReservationRecordV1 {
+    id: u64,
+    bytes: RemoteAccountableBytesV1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RemoteInternBurnErrorV1 {
     ArithmeticOverflow,
     RevisionOverflow,
     ReservationUnderflow,
+    CandidateReservationIdOverflow,
+    StaleCandidateReservation,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -908,6 +966,8 @@ pub(crate) struct RemoteInternBurnV1 {
     coordination_revision: u64,
     candidate_peak_bytes: u64,
     candidate_peak_high_water_bytes: u64,
+    active_candidate_reservations: Vec<RemoteInternCandidateReservationRecordV1>,
+    next_candidate_reservation_id: u64,
     allocation_rejections: u64,
     capacity_rejections: u64,
     zero_partial_assertions: u64,
@@ -926,6 +986,8 @@ impl RemoteInternBurnV1 {
             coordination_revision: 0,
             candidate_peak_bytes: 0,
             candidate_peak_high_water_bytes: 0,
+            active_candidate_reservations: Vec::new(),
+            next_candidate_reservation_id: 0,
             allocation_rejections: 0,
             capacity_rejections: 0,
             zero_partial_assertions: 0,
@@ -1000,23 +1062,47 @@ impl RemoteInternBurnV1 {
         &mut self,
         bytes: RemoteAccountableBytesV1,
     ) -> Result<RemoteInternCandidateReservationV1, RemoteInternBurnErrorV1> {
+        let reservation_id = self.next_candidate_reservation_id;
+        let next_reservation_id = self
+            .next_candidate_reservation_id
+            .checked_add(1)
+            .ok_or(RemoteInternBurnErrorV1::CandidateReservationIdOverflow)?;
         let next = self
             .candidate_peak_bytes
             .checked_add(bytes.get_v1())
             .ok_or(RemoteInternBurnErrorV1::ArithmeticOverflow)?;
         self.candidate_peak_bytes = next;
         self.candidate_peak_high_water_bytes = self.candidate_peak_high_water_bytes.max(next);
-        Ok(RemoteInternCandidateReservationV1 { bytes })
+        self.next_candidate_reservation_id = next_reservation_id;
+        self.active_candidate_reservations
+            .push(RemoteInternCandidateReservationRecordV1 {
+                id: reservation_id,
+                bytes,
+            });
+        Ok(RemoteInternCandidateReservationV1 {
+            id: reservation_id,
+            bytes,
+        })
     }
 
+    #[expect(clippy::needless_pass_by_value)]
     pub(crate) fn release_candidate_peak_v1(
         &mut self,
         reservation: RemoteInternCandidateReservationV1,
     ) -> Result<(), RemoteInternBurnErrorV1> {
-        self.candidate_peak_bytes = self
+        let RemoteInternCandidateReservationV1 { id, bytes } = reservation;
+        let active_index = self
+            .active_candidate_reservations
+            .iter()
+            .position(|active| active.id == id && active.bytes == bytes)
+            .ok_or(RemoteInternBurnErrorV1::StaleCandidateReservation)?;
+        let next_candidate_peak_bytes = self
             .candidate_peak_bytes
-            .checked_sub(reservation.bytes.get_v1())
+            .checked_sub(bytes.get_v1())
             .ok_or(RemoteInternBurnErrorV1::ReservationUnderflow)?;
+        self.candidate_peak_bytes = next_candidate_peak_bytes;
+        self.active_candidate_reservations
+            .swap_remove(active_index);
         Ok(())
     }
 
@@ -1185,18 +1271,23 @@ impl RemotePresentationGcRegistryV1 {
         duration_micros: u64,
     ) -> Result<(), RemotePresentationGcErrorV1> {
         let index = RemotePresentationGcCounterV1::CloseLatency.index_v1();
-        self.counters[index] = self.counters[index]
+        let next_counter = self.counters[index]
             .checked_add(1)
             .ok_or(RemotePresentationGcErrorV1::CountOverflow)?;
-        self.close_latency_total_micros = self
+        let next_total = self
             .close_latency_total_micros
             .checked_add(duration_micros)
             .ok_or(RemotePresentationGcErrorV1::LatencyTotalOverflow)?;
-        self.close_latency_count = self
+        let next_count = self
             .close_latency_count
             .checked_add(1)
             .ok_or(RemotePresentationGcErrorV1::CountOverflow)?;
-        self.close_latency_max_micros = self.close_latency_max_micros.max(duration_micros);
+        let next_max = self.close_latency_max_micros.max(duration_micros);
+
+        self.counters[index] = next_counter;
+        self.close_latency_total_micros = next_total;
+        self.close_latency_count = next_count;
+        self.close_latency_max_micros = next_max;
         Ok(())
     }
 
@@ -1733,7 +1824,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_registry_release_keeps_high_water_and_checks_underflow() {
+    fn resource_registry_release_keeps_high_water_and_rejects_replay() {
         let mut registry = RemoteResourceRegistryV1::new_disarmed_v1();
         let limits = RemoteResourceLimitsV1::new_v1(u64::MAX, u64::MAX, u64::MAX, u64::MAX);
         let reservation = registry
@@ -1743,6 +1834,10 @@ mod tests {
                 limits,
             )
             .expect("client acquisition should fit");
+        let reservation_id = reservation.id;
+        let reservation_class = reservation.class;
+        let reservation_bytes = reservation.bytes;
+        let reservation_revision = reservation.revision;
         registry
             .release_reservation_v1(reservation)
             .expect("release should succeed");
@@ -1752,10 +1847,103 @@ mod tests {
         assert_eq!(usage.current_bytes_v1(), 0);
         assert_eq!(usage.high_water_count_v1(), 1);
         assert_eq!(usage.high_water_bytes_v1(), 25);
+        assert_eq!(registry.revision_v1(), 2);
+
+        let replayed = RemoteResourceReservationV1 {
+            id: reservation_id,
+            class: reservation_class,
+            bytes: reservation_bytes,
+            revision: reservation_revision,
+        };
         assert!(matches!(
-            registry.release_reservation_v1(reservation),
-            Err(RemoteResourceRegistryErrorV1::ReleaseCountUnderflow)
+            registry.release_reservation_v1(replayed),
+            Err(RemoteResourceRegistryErrorV1::StaleReservation)
         ));
+    }
+
+    #[test]
+    fn resource_registry_rejects_stale_release_while_another_reservation_is_live() {
+        let mut registry = RemoteResourceRegistryV1::new_disarmed_v1();
+        let limits = RemoteResourceLimitsV1::new_v1(u64::MAX, u64::MAX, u64::MAX, u64::MAX);
+        let stale = registry
+            .acquire_v1(
+                RemoteResourceClassV1::Slot,
+                RemoteAccountableBytesV1::new_v1(10),
+                limits,
+            )
+            .expect("first acquisition should fit");
+        let stale_id = stale.id;
+        let stale_class = stale.class;
+        let stale_bytes = stale.bytes;
+        let stale_revision = stale.revision;
+
+        registry
+            .release_reservation_v1(stale)
+            .expect("first reservation should release");
+        let live = registry
+            .acquire_v1(
+                RemoteResourceClassV1::Slot,
+                RemoteAccountableBytesV1::new_v1(5),
+                limits,
+            )
+            .expect("second acquisition should fit");
+        let before = registry.snapshot_v1();
+        let stale = RemoteResourceReservationV1 {
+            id: stale_id,
+            class: stale_class,
+            bytes: stale_bytes,
+            revision: stale_revision,
+        };
+
+        assert!(matches!(
+            registry.release_reservation_v1(stale),
+            Err(RemoteResourceRegistryErrorV1::StaleReservation)
+        ));
+        assert_eq!(registry.snapshot_v1(), before);
+
+        registry
+            .release_reservation_v1(live)
+            .expect("live reservation should release");
+        assert_eq!(
+            registry
+                .usage_v1(RemoteResourceClassV1::Slot)
+                .current_bytes_v1(),
+            0
+        );
+    }
+
+    #[test]
+    fn resource_registry_rejects_duplicate_release_without_changing_snapshot() {
+        let mut registry = RemoteResourceRegistryV1::new_disarmed_v1();
+        let limits = RemoteResourceLimitsV1::new_v1(u64::MAX, u64::MAX, u64::MAX, u64::MAX);
+        let reservation = registry
+            .acquire_v1(
+                RemoteResourceClassV1::Client,
+                RemoteAccountableBytesV1::new_v1(25),
+                limits,
+            )
+            .expect("client acquisition should fit");
+        let reservation_id = reservation.id;
+        let reservation_class = reservation.class;
+        let reservation_bytes = reservation.bytes;
+        let reservation_revision = reservation.revision;
+
+        registry
+            .release_reservation_v1(reservation)
+            .expect("first release should succeed");
+        let before = registry.snapshot_v1();
+        let duplicate = RemoteResourceReservationV1 {
+            id: reservation_id,
+            class: reservation_class,
+            bytes: reservation_bytes,
+            revision: reservation_revision,
+        };
+
+        assert!(matches!(
+            registry.release_reservation_v1(duplicate),
+            Err(RemoteResourceRegistryErrorV1::StaleReservation)
+        ));
+        assert_eq!(registry.snapshot_v1(), before);
     }
 
     #[test]
@@ -1765,6 +1953,8 @@ mod tests {
             total_count: 0,
             total_bytes: 0,
             classes: [RemoteResourceUsageV1::ZERO; RemoteResourceClassV1::COUNT],
+            active_reservations: Vec::new(),
+            next_reservation_id: 0,
         };
         registry.classes[RemoteResourceClassV1::Operation.index_v1()] = RemoteResourceUsageV1 {
             current_count: u64::MAX,
@@ -1784,6 +1974,67 @@ mod tests {
             Err(RemoteResourceRegistryErrorV1::CountOverflow)
         ));
         assert_eq!(registry.revision_v1(), 0);
+    }
+
+    #[test]
+    fn page_suspension_checked_total_overflow_errors_leave_snapshot_unchanged() {
+        let mut registry = RemotePageSuspensionRegistryV1::new_disarmed_v1();
+        registry.discarded_dt_total_micros = u64::MAX;
+        registry.discarded_dt_count = 0;
+        let before = registry.snapshot_v1();
+
+        assert!(matches!(
+            registry.record_discarded_dt_v1(1),
+            Err(RemotePageSuspensionErrorV1::ArithmeticOverflow)
+        ));
+        assert_eq!(registry.snapshot_v1(), before);
+
+        registry.discarded_dt_total_micros = 0;
+        registry.discarded_dt_count = u64::MAX;
+        let before = registry.snapshot_v1();
+
+        assert!(matches!(
+            registry.record_discarded_dt_v1(1),
+            Err(RemotePageSuspensionErrorV1::CountOverflow)
+        ));
+        assert_eq!(registry.snapshot_v1(), before);
+    }
+
+    #[test]
+    fn presentation_gc_close_latency_overflow_errors_leave_snapshot_unchanged() {
+        let mut registry = RemotePresentationGcRegistryV1::new_disarmed_v1();
+        registry.close_latency_total_micros = u64::MAX;
+        registry.close_latency_count = 0;
+        registry.counters[RemotePresentationGcCounterV1::CloseLatency.index_v1()] = 0;
+        let before = registry.snapshot_v1();
+
+        assert!(matches!(
+            registry.record_close_latency_v1(1),
+            Err(RemotePresentationGcErrorV1::LatencyTotalOverflow)
+        ));
+        assert_eq!(registry.snapshot_v1(), before);
+
+        registry.close_latency_total_micros = 0;
+        registry.close_latency_count = u64::MAX;
+        registry.counters[RemotePresentationGcCounterV1::CloseLatency.index_v1()] = 0;
+        let before = registry.snapshot_v1();
+
+        assert!(matches!(
+            registry.record_close_latency_v1(1),
+            Err(RemotePresentationGcErrorV1::CountOverflow)
+        ));
+        assert_eq!(registry.snapshot_v1(), before);
+
+        registry.close_latency_total_micros = 0;
+        registry.close_latency_count = 0;
+        registry.counters[RemotePresentationGcCounterV1::CloseLatency.index_v1()] = u64::MAX;
+        let before = registry.snapshot_v1();
+
+        assert!(matches!(
+            registry.record_close_latency_v1(1),
+            Err(RemotePresentationGcErrorV1::CountOverflow)
+        ));
+        assert_eq!(registry.snapshot_v1(), before);
     }
 
     #[test]
@@ -1874,6 +2125,40 @@ mod tests {
             after.remote_side_map_string_burn_bytes_v1(),
             permanent_before.remote_side_map_string_burn_bytes_v1()
         );
+    }
+
+    #[test]
+    fn intern_candidate_peak_rejects_double_release_while_another_reservation_is_live() {
+        let mut intern = RemoteInternBurnV1::new_disarmed_v1();
+        let first = intern
+            .reserve_candidate_peak_v1(RemoteAccountableBytesV1::new_v1(64))
+            .expect("first candidate reservation should fit");
+        let second = intern
+            .reserve_candidate_peak_v1(RemoteAccountableBytesV1::new_v1(32))
+            .expect("second candidate reservation should fit");
+        let first_id = first.id;
+        let first_bytes = first.bytes;
+
+        intern
+            .release_candidate_peak_v1(first)
+            .expect("first candidate reservation should release");
+        let before = intern.snapshot_v1();
+        let duplicate = RemoteInternCandidateReservationV1 {
+            id: first_id,
+            bytes: first_bytes,
+        };
+
+        assert!(matches!(
+            intern.release_candidate_peak_v1(duplicate),
+            Err(RemoteInternBurnErrorV1::StaleCandidateReservation)
+        ));
+        assert_eq!(intern.snapshot_v1(), before);
+        assert_eq!(before.candidate_peak_bytes_v1(), 32);
+
+        intern
+            .release_candidate_peak_v1(second)
+            .expect("second candidate reservation should release");
+        assert_eq!(intern.snapshot_v1().candidate_peak_bytes_v1(), 0);
     }
 
     #[test]
