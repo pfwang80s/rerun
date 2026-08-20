@@ -256,7 +256,7 @@ impl WebHandle {
 
         let connection_registry = self.connection_registry.clone();
         self.runner
-            .start(
+            .prepare_app(
                 canvas,
                 web_options,
                 Box::new(move |cc| {
@@ -268,7 +268,8 @@ impl WebHandle {
                     )?))
                 }),
             )
-            .await?;
+            .await?
+            .activate()?;
 
         re_log::debug!("Web app started.");
 
