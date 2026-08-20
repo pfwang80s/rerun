@@ -72,7 +72,8 @@ Extensionless URLs require `allow_extensionless_sniff: true` and use a bounded 8
 `startWithRequests` resolves only after the Viewer and remote operation handoff are safely published.
 It does not resolve when a recording becomes presentation-ready.
 Strict failures are redacted `StrictOpenError` values with fixed codes and phases.
-Relevant codes include `UnsupportedStrictOpenRoute`, `UnsupportedFormat`, `CapabilityUnavailable`, `ExistingSourceOptionsConflict`, and `BatchTooLarge`.
+`StrictOpenErrorCode` is `ViewerStopped`, `InvalidRequestShape`, `InvalidUrl`, `UnsupportedStrictOpenRoute`, `UnsupportedFormat`, `ExistingSourceOptionsConflict`, `BatchTooLarge`, `ResourceLimitExceeded`, `CapabilityUnavailable`, `HandoffCancelled`, `HandoffStateChanged`, or `ProtocolViolation`.
+`StrictOpenErrorPhase` is `admission`, `handoff`, `opening`, or `lifecycle`.
 Valid strict requests reject with `CapabilityUnavailable` while the release-Wasm remote-MCAP capability is not installed.
 
 ### Handles and lifecycle
@@ -83,8 +84,8 @@ Each `OpenRequestHandle` owns one strict operation, and each `RecordingHandle` t
 `dispose()` on either handle releases subscriptions, pending promises, wrapper retention, and removed tombstones without closing the source or publication.
 The `FinalizationRegistry` is only a best-effort fallback.
 It invokes the same internal cleanup token as explicit `dispose()`.
-Lifecycle events are ordered from accepted through recording activated, behavior effect, request-ready, presentation-ready, source terminal, and recording removed.
-Omitted stages are allowed, but the remaining order is never reversed.
+Lifecycle events are the exported `StrictOpenLifecycleEvent` values `accepted`, `activated`, `behavior_ready`, `presentation_ready`, `terminal`, and `removed`, in that order.
+Lifecycle transitions are contiguous and non-reversing: each transition moves to the immediately following event.
 An already-active alias replays the current presentation snapshot independently.
 Public handles never expose a Store ID, recording ID, URL, lifecycle token, or secret.
 
@@ -101,7 +102,8 @@ A strict atomic batch uses only its last `open_and_select` item for batch-local 
 ### Limits and redaction
 
 Remote URL and option strings are bounded and redacted.
-No raw URL, query, ETag, topic, entity path, Store ID, generation, or internal token is exposed by a public handle, error, event, metric, or debug output.
+Strict public handles, `StrictOpenError`, strict lifecycle events, remote-MCAP metrics, and remote-MCAP-owned debug output do not expose a raw URL, query, ETag, topic, entity path, Store ID, generation, or internal token.
+The compatibility `.mcap` fallback can still emit a raw URL in debug output.
 `seek` accepts only `timestamp_ns` or `duration_ns` plus a canonical decimal value.
 The public API does not provide `timestamp_offset_ns`.
 It does not guess Unix epoch or boot-relative semantics from time values.
@@ -111,6 +113,9 @@ It does not guess Unix epoch or boot-relative semantics from time values.
 RRD, legacy HTTP/RRD, `rerun+http(s)` gRPC/message proxy, Redap, raw-event, native Viewer, local MCAP, drag-and-drop MCAP, and other non-remote Web routes remain unchanged.
 
 ```ts
+const viewer = new WebViewer();
+await viewer.start(null, document.body, null);
+
 const handles = await viewer.openBatch([
   { url: "https://example.test/first.mcap" },
   {

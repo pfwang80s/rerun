@@ -28,6 +28,9 @@ await viewer.start(["https://example.test/bad", "https://example.test/good"], pa
 They accept HTTP(S) remote-MCAP sources only and expose typed options, opaque handles, and redacted request-local errors.
 
 ```ts
+const viewer = new WebViewer();
+await viewer.start(null, document.body, null);
+
 // Strict singleton open.
 const operation = await viewer.openRequest({
   url: "https://example.test/recording.mcap",
@@ -45,9 +48,12 @@ const operations = await viewer.openBatch([
     options: { allow_extensionless_sniff: true },
   },
 ]);
+```
 
+```ts
 // Strict startup uses the same atomic request transaction.
-const startupOperations = await viewer.startWithRequests(
+const startupViewer = new WebViewer();
+const startupOperations = await startupViewer.startWithRequests(
   [{ url: "https://example.test/first.mcap" }],
   parent,
   options,
@@ -68,7 +74,7 @@ Extensionless compatibility URLs continue through the existing dispatcher and do
 // Compatibility extensionless routing is unchanged.
 await viewer.start("https://example.test/recording", parent, options);
 
-// Strict extensionless routing requires an explicit opt-in.
+// Strict extensionless routing requires an already-started Viewer and an explicit opt-in.
 await viewer.openRequest({
   url: "https://example.test/recording",
   options: { allow_extensionless_sniff: true },
@@ -108,6 +114,7 @@ Until the measured release-Wasm remote-MCAP capability is installed, valid stric
 This rejection happens before handles or work are created.
 
 ```ts
+// `openRequest` requires an already-started Viewer, as shown in the strict open example above.
 try {
   await viewer.openRequest({ url: "https://example.test/recording.mcap" });
 } catch (error) {

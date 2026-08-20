@@ -18,7 +18,8 @@ Extensionless URLs require `allow_extensionless_sniff: true` and use a bounded 8
 `openRequest` is a singleton transaction and `openBatch` is all-or-nothing.
 `startWithRequests` resolves only after the Viewer and remote operation handoff are safely published.
 It does not resolve when a recording becomes presentation-ready.
-Strict rejection codes and phases include `UnsupportedStrictOpenRoute`, `UnsupportedFormat`, `CapabilityUnavailable`, `ExistingSourceOptionsConflict`, and `BatchTooLarge`.
+`StrictOpenErrorCode` is `ViewerStopped`, `InvalidRequestShape`, `InvalidUrl`, `UnsupportedStrictOpenRoute`, `UnsupportedFormat`, `ExistingSourceOptionsConflict`, `BatchTooLarge`, `ResourceLimitExceeded`, `CapabilityUnavailable`, `HandoffCancelled`, `HandoffStateChanged`, or `ProtocolViolation`.
+`StrictOpenErrorPhase` is `admission`, `handoff`, `opening`, or `lifecycle`.
 The strict lane rejects non-MCAP and non-HTTP routes without falling back to the compatibility dispatcher.
 The release-Wasm remote-MCAP capability is not installed yet, so valid strict requests return `CapabilityUnavailable` before allocating wrappers or scheduling work.
 
@@ -39,7 +40,8 @@ Public handles never expose a Store ID, recording ID, URL, lifecycle token, or s
 ### Web Viewer remote-MCAP limits and page execution
 
 Remote URL and option strings are bounded and redacted.
-No raw URL, query, ETag, topic, entity path, Store ID, generation, or internal token is exposed by a public handle, error, event, metric, or debug output.
+Strict public handles, `StrictOpenError`, strict lifecycle events, remote-MCAP metrics, and remote-MCAP-owned debug output do not expose a raw URL, query, ETag, topic, entity path, Store ID, generation, or internal token.
+The compatibility `.mcap` fallback can still emit a raw URL in debug output.
 Exact remote-MCAP recording controls use typed opaque contracts for the installed capability.
 `RecordingHandle` uses exact publication identity for `select`, canonical `seek`, paused/playing `play`, and exact `close` operations.
 `seek` accepts only `timestamp_ns` or `duration_ns` plus a canonical decimal value.
