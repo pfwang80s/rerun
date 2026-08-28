@@ -14,6 +14,25 @@
 //! use re_mcap::remote_fixed_layout;
 //! ```
 //!
+//! Remote physical handoff contracts are absent from the native production API:
+//!
+//! ```compile_fail,ignore-wasm32
+//! use re_mcap::remote_physical_contract::RemotePhysicalOperationV1;
+//! ```
+//!
+//! On Web targets, downstream callers still cannot construct operations or results from scalar
+//! identities or empty values:
+//!
+//! ```compile_fail
+//! use re_mcap::remote_physical_contract::RemotePhysicalOperationV1;
+//! let _ = RemotePhysicalOperationV1::from_scalars(1, 2, 3, 0..4);
+//! ```
+//!
+//! ```compile_fail
+//! use re_mcap::remote_physical_contract::RemotePhysicalOperationResultV1;
+//! let _ = RemotePhysicalOperationResultV1 {};
+//! ```
+//!
 //! Remote Summary preparation remains sealed inside `re_mcap` on every target:
 //!
 //! ```compile_fail
@@ -62,7 +81,7 @@
 //! cannot be used by a downstream crate to construct or rebind the sealed capability:
 //!
 //! ```compile_fail
-//! let raw_summary: mcap::Summary = todo!();
+//! let raw_summary: mcap::Summary = todo!("compile-fail raw summary placeholder");
 //! let raw_schema: &[u8] = b"int32 value";
 //! let policy_claim = true;
 //! let generation = 1_u64;
@@ -81,10 +100,18 @@ const RECORD_HEADER_LEN: usize = 1 + std::mem::size_of::<u64>();
 #[cfg(any(target_arch = "wasm32", test))]
 pub mod web_body_handoff;
 
-#[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+#[cfg(any(test, all(target_arch = "wasm32", rerun_mcap_phase_a_proof_v1)))]
 pub use remote_physical_resolution::phase_a_measurement;
 
+#[cfg(target_arch = "wasm32")]
+pub mod remote_physical_contract;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod remote_physical_contract;
+
 pub mod decoders;
+#[cfg(test)]
+mod remote_physical_core;
+
 mod error;
 mod file;
 mod info;

@@ -1127,7 +1127,7 @@ git diff --cached --quiet
 | 工作项 | 内容 | 状态 | commit | Dafee review | 证据 |
 |---|---|---|---|---|---|
 | 1 | Git 边界、模块图、四 profile baseline | baseline complete — review required; gates failed as recorded | — | FAIL — corrections recorded | `/data/tools/refact-20260828-work-item-01/`; `handoff/william-refact-work-item-01-baseline.md`; `handoff/william-refact-work-item-01-baseline-fix.md` |
-| 2 | 纯 opaque cross-crate contract | pending | — | pending | — |
+| 2 | 纯 opaque cross-crate contract | implemented — bounded contract validations pass; locked verifier baseline and host clippy remain failed on pre-existing `re_string_interner`/dormant-graph issues; review required | — | pending | `/data/tools/mcap114-work-item-02-final/`; `handoff/william-refact-work-item-02-lint-validation-fix.md` |
 | 3 | trusted producer 与 non-forgeable token | pending | — | pending | — |
 | 4 | re_mcap physical graph profile 拆分 | pending | — | pending | — |
 | 5 | Viewer common/Phase A/locked adapter 隔离 | pending | — | pending | — |
