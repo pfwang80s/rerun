@@ -306,7 +306,8 @@ impl BoundChromeRangeRequest<'_> {
     }
 
     /// Returns the exact object capability against which this range was checked.
-    pub fn object(&self) -> &BoundChromeRangeObject {
+    #[cfg(test)]
+    pub(crate) fn object(&self) -> &BoundChromeRangeObject {
         self.object
     }
 }
@@ -320,7 +321,7 @@ impl BoundChromeRangeObject {
         self.representation.consistency()
     }
 
-    pub fn validator(&self) -> &RemoteObjectValidator {
+    pub(crate) fn validator(&self) -> &RemoteObjectValidator {
         self.representation.validator()
     }
 
@@ -418,6 +419,7 @@ fn validate_bound_validator(
 mod web {
     use std::fmt;
     use std::future::Future;
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
     use std::ops::Range;
 
     use js_sys::{Function, JsString, Reflect};
@@ -436,7 +438,7 @@ mod web {
         BoundedPrefixBody, ExactLengthBodyCompletion, ExactLengthByobPumpConfig,
         ExactLengthByobPumpControl, ExactLengthByobPumpControlError, ExactLengthRangeBody,
         PreparedExactLengthRangeBodyPump, prepare_exact_range_body_pump,
-        read_bounded_prefix_body_prepared, read_exact_range_body, read_exact_range_body_prepared,
+        read_bounded_prefix_body_prepared, read_exact_range_body_prepared,
         read_exact_range_body_prepared_with_completion,
     };
     use crate::range_retry::ChromeRangeAttemptAbortController;
@@ -1167,21 +1169,21 @@ mod web {
     }
 
     /// A successfully probed body and the validator/length capability bound by its headers.
-    pub struct ProbedChromeRangeBody {
+    pub(crate) struct ProbedChromeRangeBody {
         body: ExactLengthRangeBody,
         object: BoundChromeRangeObject,
     }
 
     impl ProbedChromeRangeBody {
-        pub fn body(&self) -> &ExactLengthRangeBody {
+        pub(crate) fn body(&self) -> &ExactLengthRangeBody {
             &self.body
         }
 
-        pub fn object(&self) -> &BoundChromeRangeObject {
+        pub(crate) fn object(&self) -> &BoundChromeRangeObject {
             &self.object
         }
 
-        pub fn into_parts(self) -> (ExactLengthRangeBody, BoundChromeRangeObject) {
+        pub(crate) fn into_parts(self) -> (ExactLengthRangeBody, BoundChromeRangeObject) {
             (self.body, self.object)
         }
     }
@@ -1191,7 +1193,7 @@ mod web {
         clippy::too_many_arguments,
         reason = "the transport boundary keeps every capability and policy input explicit"
     )]
-    pub async fn probe_exact_range<T, C>(
+    pub(crate) async fn probe_exact_range<T, C>(
         url: &SecretUrl,
         request_range: ChromeRangeRequest,
         consistency_policy: RepresentationConsistencyPolicy,
