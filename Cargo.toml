@@ -84,6 +84,7 @@ re_log_channel = { path = "crates/store/re_log_channel", version = "=0.36.0-alph
 re_log_encoding = { path = "crates/store/re_log_encoding", version = "=0.36.0-alpha.1", default-features = false }
 re_log_types = { path = "crates/store/re_log_types", version = "=0.36.0-alpha.1", default-features = false }
 re_mcap = { path = "crates/store/re_mcap", version = "=0.36.0-alpha.1", default-features = false }
+re_mcap_web_contract = { path = "crates/store/re_mcap_web_contract", version = "=0.36.0-alpha.1", default-features = false }
 re_mp4_reader = { path = "crates/store/re_mp4_reader", version = "=0.36.0-alpha.1", default-features = false }
 re_parquet = { path = "crates/store/re_parquet", version = "=0.36.0-alpha.1", default-features = false }
 re_protos = { path = "crates/store/re_protos", version = "=0.36.0-alpha.1", default-features = false }

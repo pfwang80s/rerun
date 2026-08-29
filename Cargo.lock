@@ -9587,6 +9587,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "re_mcap_web_contract"
+version = "0.36.0-alpha.1+dev"
+dependencies = [
+ "static_assertions",
+]
+
+[[package]]
 name = "re_memory"
 version = "0.36.0-alpha.1+dev"
 dependencies = [
