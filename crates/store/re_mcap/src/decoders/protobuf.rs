@@ -617,6 +617,7 @@ impl MessageDecoder for McapProtobufDecoder {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod unit_tests {
     use arrow::array::{Array as _, ArrayBuilder, StringBuilder, StructBuilder};
     use arrow::datatypes::{DataType, Field, Fields};
@@ -650,6 +651,7 @@ mod unit_tests {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod integration_tests {
     use std::io;
 

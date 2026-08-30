@@ -4,6 +4,7 @@
 //! binding. It has no HTTP types and cannot inspect validator wire bytes.
 
 use std::alloc::Layout;
+use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -174,10 +175,12 @@ impl RemoteObjectReadIssuerV1 {
 }
 
 impl<'a> BoundRemoteObjectReadV1<'a> {
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     fn offset(&self) -> u64 {
         self.slice.offset()
     }
 
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     fn bytes(&self) -> &'a [u8] {
         self.slice.bytes()
     }
@@ -208,6 +211,7 @@ impl Drop for RemotePhysicalObjectLifetimeV1 {
 struct RemotePhysicalSourceRegistryStateV1;
 
 struct RemotePhysicalSourceRegistryLeaseV1 {
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     state: Arc<RemotePhysicalSourceRegistryStateV1>,
 }
 
@@ -586,6 +590,7 @@ impl<ValidatorOwner> PreparedBoundRemotePhysicalSourceV1<ValidatorOwner, ()> {
         let read_issuer = RemoteObjectReadIssuerV1 {
             object: Arc::clone(&state),
         };
+        #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
         let registry = Arc::new(RemotePhysicalSourceRegistryStateV1);
         // Install the object owner before the first Header/Footer parser sees any bytes.
         let initial_read = read_issuer.issue_v1(initial_read)?.into_slice_v1(&lower)?;
@@ -593,6 +598,7 @@ impl<ValidatorOwner> PreparedBoundRemotePhysicalSourceV1<ValidatorOwner, ()> {
         let authority = RemotePhysicalEvidenceAuthorityV1 {
             object: lower,
             registry: RemotePhysicalSourceRegistryLeaseV1 {
+                #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
                 state: Arc::clone(&registry),
             },
             profile,
@@ -726,7 +732,7 @@ impl<'a, ValidatorOwner> BoundPreparedPhysicalSourceResolutionV1<'a, ValidatorOw
             Ok(inner) => Ok(BoundResolvedPhysicalSourceAuthorityV1 {
                 inner,
                 object_lifetime,
-                validator_owner,
+                validator_owner: PhantomData,
             }),
             Err(error) => {
                 drop(object_lifetime);
@@ -740,7 +746,7 @@ impl<'a, ValidatorOwner> BoundPreparedPhysicalSourceResolutionV1<'a, ValidatorOw
 pub struct BoundResolvedPhysicalSourceAuthorityV1<'a, ValidatorOwner> {
     inner: ResolvedPhysicalSourceAuthorityV1<'a>,
     object_lifetime: RemotePhysicalObjectLifetimeV1,
-    validator_owner: ValidatorOwner,
+    validator_owner: PhantomData<ValidatorOwner>,
 }
 
 impl<ValidatorOwner> BoundResolvedPhysicalSourceAuthorityV1<'_, ValidatorOwner> {
@@ -826,13 +832,17 @@ impl ResolvedRemotePhysicalSourceUnitRefV1<'_, '_> {
             .source
             .authority
             .physical_region_v1(self.canonical_ordinal)?;
+        #[cfg(not(re_mcap_locked_remote_wasm_allocator_v1))]
+        let _ = region;
         Some(ResolvedRemotePhysicalSourceUnitMetadataRefV1 {
             binding: &self.source.source_binding,
             definitions: self
                 .source
                 .authority
                 .definitions_capability_for_remote_assignment_v1(),
+            #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
             canonical_ordinal: self.canonical_ordinal,
+            #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
             region,
         })
     }
@@ -848,21 +858,34 @@ impl ResolvedRemotePhysicalSourceUnitRefV1<'_, '_> {
 pub(crate) struct ResolvedRemotePhysicalSourceUnitMetadataRefV1<'a> {
     binding: &'a PhysicalChunkSourceBindingV1,
     definitions: PhysicalChunkDefinitionsCapabilityV1<'a, 'a>,
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     canonical_ordinal: usize,
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     region: crate::remote_summary::physical_regions::CanonicalPhysicalRegion<'a>,
 }
 
 pub(crate) enum ResolvedDefinitionDescriptorV1<'a> {
+    #[cfg(not(re_mcap_locked_remote_wasm_allocator_v1))]
+    #[doc(hidden)]
+    _Phantom(std::marker::PhantomData<&'a ()>),
     Schema {
+        #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
         id: u16,
+        #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
         name: &'a str,
+        #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
         encoding: &'a str,
+        #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
         data: &'a [u8],
     },
     Channel {
+        #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
         id: u16,
+        #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
         schema_id: u16,
+        #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
         topic: &'a str,
+        #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
         message_encoding: &'a str,
     },
 }
@@ -878,38 +901,47 @@ impl ResolvedRemotePhysicalSourceUnitMetadataRefV1<'_> {
         self.definitions.clone()
     }
 
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     pub(crate) fn canonical_ordinal_v1(&self) -> usize {
         self.canonical_ordinal
     }
 
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     pub(crate) fn chunk_range_v1(&self) -> std::ops::Range<u64> {
         self.region.chunk_range()
     }
 
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     pub(crate) fn message_index_region_v1(&self) -> std::ops::Range<u64> {
         self.region.message_index_region()
     }
 
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     pub(crate) fn unit_range_v1(&self) -> std::ops::Range<u64> {
         self.region.unit_range()
     }
 
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     pub(crate) fn compression_v1(&self) -> &str {
         &self.region.raw_descriptor().compression
     }
 
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     pub(crate) fn compressed_size_v1(&self) -> u64 {
         self.region.raw_descriptor().compressed_size
     }
 
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     pub(crate) fn uncompressed_size_v1(&self) -> u64 {
         self.region.raw_descriptor().uncompressed_size
     }
 
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     pub(crate) fn message_index_offsets_v1(&self) -> &std::collections::BTreeMap<u16, u64> {
         &self.region.raw_descriptor().message_index_offsets
     }
 
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     pub(crate) fn source_is_current_v1(&self) -> bool {
         self.binding.ensure_current_v1().is_ok()
     }
@@ -933,10 +965,16 @@ impl ResolvedRemotePhysicalSourceUnitMetadataRefV1<'_> {
                         .definitions
                         .definitions_v1()
                         .schema_at_record(record_index)?;
+                    #[cfg(not(re_mcap_locked_remote_wasm_allocator_v1))]
+                    let _ = (id, record_index, &schema);
                     Some(ResolvedDefinitionDescriptorV1::Schema {
+                        #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
                         id,
+                        #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
                         name: &schema.header.name,
+                        #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
                         encoding: &schema.header.encoding,
+                        #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
                         data: schema.data,
                     })
                 }
@@ -948,10 +986,16 @@ impl ResolvedRemotePhysicalSourceUnitMetadataRefV1<'_> {
                         .definitions
                         .definitions_v1()
                         .channel_at_record(record_index)?;
+                    #[cfg(not(re_mcap_locked_remote_wasm_allocator_v1))]
+                    let _ = (id, record_index, &channel);
                     Some(ResolvedDefinitionDescriptorV1::Channel {
+                        #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
                         id,
+                        #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
                         schema_id: channel.schema_id,
+                        #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
                         topic: &channel.topic,
+                        #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
                         message_encoding: &channel.message_encoding,
                     })
                 }
@@ -1092,12 +1136,14 @@ impl ResolvedCanonicalPhysicalLayoutV1 {
     }
 }
 
+#[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
 #[derive(Clone, Copy, Debug)]
 pub struct PhysicalSourceResolutionLimitsV1 {
     max_canonical_chunks: u64,
     max_retained_bytes: u64,
 }
 
+#[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
 impl PhysicalSourceResolutionLimitsV1 {
     #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
     pub const fn new_for_sealed_profile_v1(
@@ -1111,6 +1157,7 @@ impl PhysicalSourceResolutionLimitsV1 {
     }
 }
 
+#[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PhysicalSourceResolutionUsageV1 {
     active: u64,
@@ -1118,6 +1165,7 @@ struct PhysicalSourceResolutionUsageV1 {
     retained_bytes: u64,
 }
 
+#[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
 struct PhysicalSourceResolutionBudgetStateV1 {
     limits: PhysicalSourceResolutionLimitsV1,
     max_active: u64,
@@ -1133,6 +1181,7 @@ struct PhysicalSourceResolutionCensusV1 {
 }
 
 impl PhysicalSourceResolutionCensusV1 {
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     fn aggregate_peak_bytes_v1(
         self,
         authority_slot_bytes: u64,
@@ -1205,6 +1254,7 @@ fn locked_owned_layout_footprint_v1<T>() -> Result<u64, PhysicalSourceResolution
     locked_allocation_footprint_v1(Layout::new::<T>())
 }
 
+#[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
 pub struct PhysicalSourceResolutionBudgetV1 {
     state: Arc<PhysicalSourceResolutionBudgetStateV1>,
 }
@@ -1315,10 +1365,12 @@ struct AggregateResolutionReservationV1 {
 pub(crate) struct AggregateResolutionTransactionV1 {
     reservation: AggregateResolutionReservationV1,
     authority_claim: PreparedPhysicalChunkAuthorityClaimV1,
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     census: FullResolutionAdmissionCensusV1,
 }
 
 impl AggregateResolutionTransactionV1 {
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     pub(crate) fn census_v1(&self) -> FullResolutionAdmissionCensusV1 {
         self.census
     }
@@ -1399,6 +1451,7 @@ impl AggregateResolutionBudgetRootV1 {
         Ok(AggregateResolutionTransactionV1 {
             reservation,
             authority_claim,
+            #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
             census,
         })
     }
@@ -1416,12 +1469,14 @@ impl AggregateResolutionBudgetRootV1 {
     }
 }
 
+#[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
 struct PhysicalSourceResolutionReservationV1 {
     state: Arc<PhysicalSourceResolutionBudgetStateV1>,
     canonical_chunks: u64,
     retained_bytes: u64,
 }
 
+#[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
 impl Drop for PhysicalSourceResolutionReservationV1 {
     fn drop(&mut self) {
         let mut usage = self.state.usage.lock();
@@ -1431,6 +1486,7 @@ impl Drop for PhysicalSourceResolutionReservationV1 {
     }
 }
 
+#[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
 impl PhysicalSourceResolutionBudgetV1 {
     #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
     pub(crate) fn new_for_sealed_profile_v1(
@@ -1493,7 +1549,10 @@ impl PhysicalSourceResolutionBudgetV1 {
 
 /// Sealed lease-bound result of the complete MCAP-025 scan chain.
 pub struct AmbiguousPhysicalExtentResolutionV1<'a> {
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     scan: ValidatedPhysicalChunkScan<'a>,
+    #[cfg(not(re_mcap_locked_remote_wasm_allocator_v1))]
+    _marker: std::marker::PhantomData<&'a ()>,
     binding: PhysicalChunkSourceBindingV1,
     canonical_ordinal: usize,
     extent: ValidatedPhysicalChunkExtent,
@@ -1521,8 +1580,13 @@ impl<'a> AmbiguousPhysicalExtentResolutionV1<'a> {
                 return Err(PhysicalSourceResolutionErrorV1::AmbiguousExtentNotZero);
             }
         }
+        #[cfg(not(re_mcap_locked_remote_wasm_allocator_v1))]
+        let _scan = scan;
         Ok(Self {
+            #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
             scan,
+            #[cfg(not(re_mcap_locked_remote_wasm_allocator_v1))]
+            _marker: std::marker::PhantomData,
             binding,
             canonical_ordinal,
             extent,
@@ -1926,6 +1990,7 @@ pub struct ResolvedPhysicalSourceAuthorityV1<'a> {
 }
 
 impl<'a> ResolvedPhysicalSourceAuthorityV1<'a> {
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     pub(crate) fn layout_v1(&self) -> &ResolvedCanonicalPhysicalLayoutV1 {
         &self.layout
     }
@@ -2008,6 +2073,7 @@ fn try_filled<T: Clone>(count: usize, value: T) -> Result<Vec<T>, PhysicalSource
 pub mod phase_a_measurement;
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use std::{num::NonZeroU64, sync::Arc};
 
@@ -2035,6 +2101,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     fn object(fixture: &AdversarialMcapFixture) -> RemotePhysicalObjectBindingV1 {
         RemotePhysicalObjectBindingV1::issue_for_test(
             NonZeroU64::new(u64::try_from(fixture.bytes.len()).unwrap()).unwrap(),

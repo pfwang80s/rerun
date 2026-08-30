@@ -132,6 +132,7 @@ fn attachments_batches(
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use std::borrow::Cow;
     use std::io;

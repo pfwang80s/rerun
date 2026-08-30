@@ -152,12 +152,14 @@ impl<'a> DecoderContext<'a> {
 }
 
 /// An emitter to use in tests and pass to [`Decoder::process`]
+#[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 pub struct TestEmitter {
     rx: std::sync::mpsc::Receiver<Chunk>,
     emitter: Box<dyn Fn(Chunk) + Send + Sync>,
 }
 
+#[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 impl Default for TestEmitter {
     fn default() -> Self {
@@ -170,6 +172,7 @@ impl Default for TestEmitter {
     }
 }
 
+#[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 impl std::ops::Deref for TestEmitter {
     type Target = dyn Fn(Chunk) + Send + Sync;
@@ -180,6 +183,7 @@ impl std::ops::Deref for TestEmitter {
     }
 }
 
+#[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 impl TestEmitter {
     pub fn finish(self) -> Vec<Chunk> {
@@ -905,6 +909,7 @@ impl DecoderRegistry {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use std::io;
 

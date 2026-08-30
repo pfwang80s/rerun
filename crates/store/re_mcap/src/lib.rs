@@ -157,91 +157,148 @@ mod remote_physical_resolution;
 
 // Neutral compile-time boundary between the ROS 2 initializer and the future protobuf initializer.
 // It can own only the opaque post-EOF authority and is not a descendant of either implementation.
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 mod remote_protobuf_projection_boundary;
 
 // Bounded protobuf descriptor initialization is a sibling of the neutral post-EOF boundary.
 // The boundary exposes only opaque operations, so the initializer can retain, but never detach,
 // the exact ROS/source/policy authority established by MCAP-026.
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 mod remote_protobuf_descriptor;
 
 // Deterministic assignment consumes only the sealed combined initializer owner and remains
 // production-disarmed until the immutable manifest and executable decoder contracts are sealed.
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 mod remote_decoder_assignment;
 
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 mod remote_deterministic_insertion;
 
 // Immutable Channel groups consume the complete assignment owner and remain production-disarmed
 // until the full manifest and remote resource profile are sealed.
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 mod remote_channel_group;
 
 // Exact validation/count plans consume a physical scan and immutable Channel-group owner while
 // remaining production-disarmed until decoder resource admission is implemented.
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 mod remote_chunk_validation_count;
 
 // Immutable manifest and partition/root identity authority. Kept disarmed until the Web
 // production adapter is enabled; native and ordinary local MCAP paths never compile this module.
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 mod remote_manifest;
 
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 mod remote_loaded_coverage;
 
 // Partition/root registration consumes only sealed manifest identities and the capability-gated
 // Web remote-MCAP Store origin API. It remains absent from native production builds.
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 mod remote_partition_residency;
 
 // Bounded three-layer window planner and production-disarmed demand ownership. It remains
 // independent of metadata-opening retry owners and is absent from native/local MCAP builds.
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 mod remote_window_demand;
 
 // Requested/committed navigation state and candidate-clock hold semantics. It remains a pure,
 // production-disarmed `re_mcap` state layer and owns no Viewer command routing or Store mutation.
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 mod remote_navigation;
 
 // Supersedable/CommitLocked seek ownership, stale-result classification, and the three explicit
 // failure paths for Web remote-MCAP navigation. It remains production-disarmed and owns no Viewer,
 // network transport, or Store mutation.
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 mod remote_seek;
 
 // Generation/job-driven staging and Store insertion consume the bounded window-demand planner,
 // atomic registration, and deterministic insertion contract. It remains absent from native/local
 // MCAP builds and owns no HTTP client or retry transport.
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 mod remote_partition_job;
 
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 mod remote_predecessor_backfill;
 
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 mod remote_root_reload;
 
 // Admitted second-pass dispatch remains crate-private and production-disarmed until the Web
 // Store mutation arbiter is wired to the complete terminal contract.
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 mod remote_chunk_dispatch;
 
 // Sealed typed output contracts bridge bounded initializer state to the remote Chunk builder.
 // They remain absent from native/local MCAP APIs and ordinary Viewer code.
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 mod remote_typed_output;
 
 // Summary and Chunk decoding must redeem this MCAP-012 proof before domain construction.
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 mod remote_runtime_intern;
 
 // Bounded ROS 2 reflection initialization remains crate-private and production-disarmed until the
 // remote decoder policy and resource profile are sealed.
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 mod remote_ros2_reflection;
 
 pub(crate) mod parsers;

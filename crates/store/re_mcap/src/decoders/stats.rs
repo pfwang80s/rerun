@@ -73,6 +73,7 @@ fn from_statistics(stats: &::mcap::records::Statistics) -> McapStatistics {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use std::io;
 

@@ -589,6 +589,7 @@ pub(crate) fn validated_physical_regions_for_test(
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod tests {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::borrow::Cow;

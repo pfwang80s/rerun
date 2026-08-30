@@ -404,6 +404,7 @@ fn channel_to_static(channel: &Channel<'_>) -> Channel<'static> {
 }
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use std::io;
 
