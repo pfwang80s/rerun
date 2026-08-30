@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use re_mcap_web_contract::{McapCorrelationMaterialV1, McapCorrelationPermitV1};
+
 use crate::remote_chunk_scan::{
     PendingHeaderValidation, PhysicalChunkReadLease, PhysicalChunkScanCacheEntry,
 };
@@ -33,6 +35,7 @@ pub struct WebPhysicalBodyPhaseAProfileV1 {
     pub max_full_record_bytes: u64,
     pub max_destination_bytes: u64,
     pub max_simultaneous_overlap_bytes: u64,
+
     /// A benchmark target only.
     ///
     /// This value is telemetry metadata and must never participate in admission or correctness.
@@ -160,15 +163,23 @@ impl Drop for WebPhysicalCopyOverlapReservationV1 {
     }
 }
 
-pub struct WebPendingPhysicalChunkReadV1<'a> {
+/// Move-only physical authority issued from a live canonical MCAP read lease.
+pub struct WebPhysicalReceiptV1<'a> {
     lease: Option<PhysicalChunkReadLease<'a, PendingHeaderValidation>>,
+    profile: WebPhysicalBudgetProfileV1,
+    material: Option<McapCorrelationMaterialV1>,
 }
 
-impl<'a> WebPendingPhysicalChunkReadV1<'a> {
-    pub(crate) fn from_lease_v1(
+impl<'a> WebPhysicalReceiptV1<'a> {
+    pub(crate) fn issue_from_lease_v1(
         lease: PhysicalChunkReadLease<'a, PendingHeaderValidation>,
+        permit: McapCorrelationPermitV1,
     ) -> Self {
-        Self { lease: Some(lease) }
+        Self {
+            lease: Some(lease),
+            profile: WebPhysicalBudgetProfileV1::UnfrozenPhaseACandidate,
+            material: Some(permit.into_material_v1()),
+        }
     }
 
     pub fn identity_v1(
@@ -180,7 +191,7 @@ impl<'a> WebPendingPhysicalChunkReadV1<'a> {
             .ok_or(WebPhysicalCompletionBindErrorV1::StaleLease)?;
         let (source_generation, read_generation, canonical_ordinal, full_range) = lease
             .web_completion_identity_parts_v1()
-            .map_err(|_error| WebPhysicalCompletionBindErrorV1::StaleLease)?;
+            .map_err(|_err| WebPhysicalCompletionBindErrorV1::StaleLease)?;
         Ok(WebPhysicalPendingIdentityV1 {
             source_generation,
             read_generation,
@@ -188,15 +199,22 @@ impl<'a> WebPendingPhysicalChunkReadV1<'a> {
                 .map_err(|_overflow| WebPhysicalCompletionBindErrorV1::IdentityOverflow)?,
             full_range_start: full_range.start,
             full_range_end_exclusive: full_range.end,
-            budget_profile: WebPhysicalBudgetProfileV1::UnfrozenPhaseACandidate,
+            budget_profile: self.profile,
         })
     }
 
-    pub fn bind_borrowed_exact_body_v1<'body>(
-        self,
+    /// Consumes the receipt, validates a body for physical processing, and surfaces the
+    /// non-authority MCAP correlation material for the future adapter match step.
+    pub fn bind_exact_body_v1<'body>(
+        mut self,
         body: &'body [u8],
-        profile: WebPhysicalBudgetProfileV1,
-    ) -> Result<WebBorrowedPhysicalChunkBodyV1<'a, 'body>, WebPhysicalCompletionBindErrorV1> {
+    ) -> Result<
+        (
+            WebBorrowedPhysicalChunkBodyV1<'a, 'body>,
+            McapCorrelationMaterialV1,
+        ),
+        WebPhysicalCompletionBindErrorV1,
+    > {
         let identity = self.identity_v1()?;
         let expected_len = identity
             .full_range_end_exclusive
@@ -204,16 +222,45 @@ impl<'a> WebPendingPhysicalChunkReadV1<'a> {
             .ok_or(WebPhysicalCompletionBindErrorV1::IdentityOverflow)?;
         let actual_len = u64::try_from(body.len())
             .map_err(|_overflow| WebPhysicalCompletionBindErrorV1::IdentityOverflow)?;
-        if profile != identity.budget_profile || actual_len != expected_len {
+        if actual_len != expected_len {
             return Err(WebPhysicalCompletionBindErrorV1::CrossCombination);
         }
-        Ok(WebBorrowedPhysicalChunkBodyV1 {
-            pending: self,
-            body,
-            identity,
-        })
+        let material = self
+            .material
+            .take()
+            .expect("a live physical receipt retains its correlation material");
+        Ok((
+            WebBorrowedPhysicalChunkBodyV1 {
+                receipt: self,
+                body,
+                identity,
+            },
+            material,
+        ))
+    }
+
+    pub fn bind_borrowed_exact_body_v1<'body>(
+        self,
+        body: &'body [u8],
+        profile: WebPhysicalBudgetProfileV1,
+    ) -> Result<WebBorrowedPhysicalChunkBodyV1<'a, 'body>, WebPhysicalCompletionBindErrorV1> {
+        if profile != self.profile {
+            return Err(WebPhysicalCompletionBindErrorV1::CrossCombination);
+        }
+        self.bind_exact_body_v1(body).map(|(body, _material)| body)
+    }
+
+    pub(crate) fn from_lease_v1(
+        lease: PhysicalChunkReadLease<'a, PendingHeaderValidation>,
+        permit: McapCorrelationPermitV1,
+    ) -> Self {
+        Self::issue_from_lease_v1(lease, permit)
     }
 }
+
+/// Compatibility alias retained until the coordinated R3 consumer migration removes the legacy
+/// concrete handoff boundary.
+pub type WebPendingPhysicalChunkReadV1<'a> = WebPhysicalReceiptV1<'a>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WebPhysicalBudgetProfileV1 {
@@ -257,7 +304,7 @@ impl WebPhysicalPendingIdentityV1 {
 /// Opaque borrowed processing boundary created only after the pending lease validates exact length
 /// and typed budget profile. The transport owner remains in the upper Viewer adapter.
 pub struct WebBorrowedPhysicalChunkBodyV1<'a, 'body> {
-    pending: WebPendingPhysicalChunkReadV1<'a>,
+    receipt: WebPhysicalReceiptV1<'a>,
     body: &'body [u8],
     identity: WebPhysicalPendingIdentityV1,
 }
@@ -268,7 +315,7 @@ impl<'a> WebBorrowedPhysicalChunkBodyV1<'a, '_> {
         overlap_budget: &WebPhysicalCopyOverlapBudgetV1,
         mut revalidate: impl FnMut(WebPhysicalBodySafePointV1) -> Result<(), ()>,
     ) -> Result<CompletedWebPhysicalBodyHandoffV1<'a>, WebPhysicalBodyHandoffErrorV1> {
-        process_zero_copy_body_v1(self.pending, self.body, overlap_budget, |point| {
+        process_zero_copy_body_v1(self.receipt, self.body, overlap_budget, |point| {
             let _identity = self.identity;
             revalidate(point)
         })
@@ -279,7 +326,7 @@ impl<'a> WebBorrowedPhysicalChunkBodyV1<'a, '_> {
         overlap_budget: &WebPhysicalCopyOverlapBudgetV1,
         mut revalidate: impl FnMut(WebPhysicalBodySafePointV1) -> Result<(), ()>,
     ) -> Result<CompletedWebPhysicalBodyHandoffV1<'a>, WebPhysicalBodyHandoffErrorV1> {
-        process_explicit_copy_body_v1(self.pending, self.body, overlap_budget, |point| {
+        process_explicit_copy_body_v1(self.receipt, self.body, overlap_budget, |point| {
             let _identity = self.identity;
             revalidate(point)
         })
@@ -347,7 +394,7 @@ impl<'a> WebPhysicalScanCacheEntryV1<'a> {
         self.inner
             .consumer()
             .into_message_evidence_v1()
-            .map_err(|_error| WebPhysicalBodyHandoffErrorV1::PhysicalScanFailed)
+            .map_err(|_err| WebPhysicalBodyHandoffErrorV1::PhysicalScanFailed)
     }
 
     #[cfg(test)]
@@ -357,7 +404,7 @@ impl<'a> WebPhysicalScanCacheEntryV1<'a> {
 }
 
 pub(crate) fn process_zero_copy_body_v1<'a>(
-    mut pending: WebPendingPhysicalChunkReadV1<'a>,
+    mut receipt: WebPhysicalReceiptV1<'a>,
     full_record: &[u8],
     overlap_budget: &WebPhysicalCopyOverlapBudgetV1,
     mut revalidate: impl FnMut(WebPhysicalBodySafePointV1) -> Result<(), ()>,
@@ -369,38 +416,38 @@ pub(crate) fn process_zero_copy_body_v1<'a>(
         WebPhysicalBodySafePointV1::BeforeHeaderValidation,
         &mut revalidate,
     )?;
-    let lease = pending
+    let lease = receipt
         .lease
         .take()
         .expect("a pending Web physical read retains its lease");
     let validated =
         crate::remote_chunk_scan::validate_borrowed_physical_chunk_header_v1(lease, full_record)
-            .map_err(|_error| WebPhysicalBodyHandoffErrorV1::HeaderValidationFailed)?;
+            .map_err(|_err| WebPhysicalBodyHandoffErrorV1::HeaderValidationFailed)?;
     let full_record_bytes = u64::try_from(full_record.len())
         .map_err(|_overflow| WebPhysicalBodyHandoffErrorV1::ResourceLimitExceeded)?;
     let destination_bytes = validated.uncompressed_size_v1();
     let overlap = overlap_budget.reserve_v1(full_record_bytes, destination_bytes)?;
     let compressed =
         crate::remote_chunk_scan::install_borrowed_header_validated_payload_zero_copy_v1(validated)
-            .map_err(|_error| WebPhysicalBodyHandoffErrorV1::PayloadInstallFailed)?;
+            .map_err(|_err| WebPhysicalBodyHandoffErrorV1::PayloadInstallFailed)?;
     checkpoint(
         WebPhysicalBodySafePointV1::AfterPayloadTransfer,
         &mut revalidate,
     )?;
     let decompressed = crate::remote_decompression::decompress_exact_chunk_borrowed(compressed)
-        .map_err(|_error| WebPhysicalBodyHandoffErrorV1::DecompressionFailed)?;
+        .map_err(|_err| WebPhysicalBodyHandoffErrorV1::DecompressionFailed)?;
     checkpoint(
         WebPhysicalBodySafePointV1::AfterExactDecompression,
         &mut revalidate,
     )?;
     let scan = crate::remote_chunk_scan::scan_decompressed_physical_chunk(decompressed)
-        .map_err(|_error| WebPhysicalBodyHandoffErrorV1::PhysicalScanFailed)?;
+        .map_err(|_err| WebPhysicalBodyHandoffErrorV1::PhysicalScanFailed)?;
     checkpoint(
         WebPhysicalBodySafePointV1::AfterPhysicalScan,
         &mut revalidate,
     )?;
     let cache = PhysicalChunkScanCacheEntry::new(scan)
-        .map_err(|_error| WebPhysicalBodyHandoffErrorV1::CacheInstallFailed)?;
+        .map_err(|_err| WebPhysicalBodyHandoffErrorV1::CacheInstallFailed)?;
     checkpoint(
         WebPhysicalBodySafePointV1::BeforeCachePublication,
         &mut revalidate,
@@ -412,7 +459,7 @@ pub(crate) fn process_zero_copy_body_v1<'a>(
 }
 
 pub(crate) fn process_explicit_copy_body_v1<'a>(
-    mut pending: WebPendingPhysicalChunkReadV1<'a>,
+    mut receipt: WebPhysicalReceiptV1<'a>,
     full_record: &[u8],
     overlap_budget: &WebPhysicalCopyOverlapBudgetV1,
     mut revalidate: impl FnMut(WebPhysicalBodySafePointV1) -> Result<(), ()>,
@@ -424,13 +471,13 @@ pub(crate) fn process_explicit_copy_body_v1<'a>(
         WebPhysicalBodySafePointV1::BeforeHeaderValidation,
         &mut revalidate,
     )?;
-    let lease = pending
+    let lease = receipt
         .lease
         .take()
         .expect("a pending Web physical read retains its lease");
     let validated =
         crate::remote_chunk_scan::validate_borrowed_physical_chunk_header_v1(lease, full_record)
-            .map_err(|_error| WebPhysicalBodyHandoffErrorV1::HeaderValidationFailed)?;
+            .map_err(|_err| WebPhysicalBodyHandoffErrorV1::HeaderValidationFailed)?;
     let full_record_bytes = u64::try_from(full_record.len())
         .map_err(|_overflow| WebPhysicalBodyHandoffErrorV1::ResourceLimitExceeded)?;
     let destination_bytes = u64::try_from(validated.payload_len_v1())
@@ -438,25 +485,25 @@ pub(crate) fn process_explicit_copy_body_v1<'a>(
     let overlap = overlap_budget.reserve_v1(full_record_bytes, destination_bytes)?;
     let compressed =
         crate::remote_chunk_scan::install_borrowed_header_validated_payload_copy_v1(validated)
-            .map_err(|_error| WebPhysicalBodyHandoffErrorV1::PayloadInstallFailed)?;
+            .map_err(|_err| WebPhysicalBodyHandoffErrorV1::PayloadInstallFailed)?;
     checkpoint(
         WebPhysicalBodySafePointV1::AfterPayloadCopy,
         &mut revalidate,
     )?;
     let decompressed = crate::remote_decompression::decompress_exact_chunk(compressed)
-        .map_err(|_error| WebPhysicalBodyHandoffErrorV1::DecompressionFailed)?;
+        .map_err(|_err| WebPhysicalBodyHandoffErrorV1::DecompressionFailed)?;
     checkpoint(
         WebPhysicalBodySafePointV1::AfterExactDecompression,
         &mut revalidate,
     )?;
     let scan = crate::remote_chunk_scan::scan_decompressed_physical_chunk(decompressed)
-        .map_err(|_error| WebPhysicalBodyHandoffErrorV1::PhysicalScanFailed)?;
+        .map_err(|_err| WebPhysicalBodyHandoffErrorV1::PhysicalScanFailed)?;
     checkpoint(
         WebPhysicalBodySafePointV1::AfterPhysicalScan,
         &mut revalidate,
     )?;
     let cache = PhysicalChunkScanCacheEntry::new(scan)
-        .map_err(|_error| WebPhysicalBodyHandoffErrorV1::CacheInstallFailed)?;
+        .map_err(|_err| WebPhysicalBodyHandoffErrorV1::CacheInstallFailed)?;
     checkpoint(
         WebPhysicalBodySafePointV1::BeforeCachePublication,
         &mut revalidate,

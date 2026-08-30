@@ -378,10 +378,14 @@ impl PhaseAMeasurementResolvedSourceV1<'_> {
         crate::web_body_handoff::WebPendingPhysicalChunkReadV1<'_>,
         PhysicalSourceResolutionErrorV1,
     > {
-        self.owner
-            .inner
-            .issue_lease_v1(0)
-            .map(crate::web_body_handoff::WebPendingPhysicalChunkReadV1::from_lease_v1)
+        self.owner.inner.issue_lease_v1(0).map(|lease| {
+            // Phase-A mints a fresh correlation pair and uses only the MCAP permit. The
+            // unused pair and Web permit are discarded; unused correlation material is
+            // non-authority and grants no Web, MCAP, cache, or operation capability.
+            let (_pair, _web, mcap) =
+                re_mcap_web_contract::CorrelationFactoryV1::new_operation_v1();
+            crate::web_body_handoff::WebPendingPhysicalChunkReadV1::from_lease_v1(lease, mcap)
+        })
     }
 
     pub fn bytes_v1(&self) -> &[u8] {

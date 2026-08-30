@@ -9540,6 +9540,7 @@ dependencies = [
  "re_int",
  "re_log",
  "re_log_types",
+ "re_mcap_web_contract",
  "re_quota_channel",
  "re_ros_msg",
  "re_sdk_types",
