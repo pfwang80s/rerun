@@ -51,6 +51,10 @@ const _: ReViewerRemoteRos2GeneratedCapabilityV1 = RE_VIEWER_REMOTE_ROS2_GENERAT
 /// entry point, with callstack tracking checked again at admission time.
 #[cfg(rerun_remote_ros2_artifact_probe_v1)]
 #[used]
+#[expect(
+    unsafe_code,
+    reason = "the locked verifier artifact carries this exact allocator identity section"
+)]
 #[unsafe(link_section = ".custom_section.rerun_remote_ros2_allocator_contract_v1")]
 static REMOTE_ROS2_ALLOCATOR_CONTRACT_V1: [u8; 49] =
     *b"AccountingAllocator<System>;tracking=admission-v1";
@@ -61,28 +65,30 @@ static REMOTE_ROS2_ALLOCATOR_CONTRACT_V1: [u8; 49] =
 /// and requires this function's own direct-call graph to reach the locked Wasm allocator.
 #[cfg(rerun_remote_ros2_artifact_probe_v1)]
 #[inline(never)]
+#[expect(
+    unsafe_code,
+    reason = "the locked verifier calls this fixed exported allocator probe"
+)]
 #[unsafe(no_mangle)]
 pub extern "C" fn rerun_remote_ros2_accounting_allocator_artifact_probe_v1() -> u32 {
     let _capability = RE_VIEWER_REMOTE_ROS2_GENERATED_CAPABILITY_V1;
-    use std::alloc::GlobalAlloc as _;
+    let _accounting_allocator = &GLOBAL;
 
-    let Ok(layout) = std::alloc::Layout::from_size_align(4_096, 16) else {
+    // SAFETY: the verifier-only artifact calls this fixed function in isolation. Growing linear
+    // memory by one page is the exact Wasm allocator primitive that the release contract audits.
+    let previous_pages = core::arch::wasm32::memory_grow(0, 1);
+    if previous_pages == usize::MAX {
         return 1;
-    };
-    // SAFETY: `layout` is valid, a null result is checked, and the allocation is returned to the
-    // same allocator with the same layout before this function returns.
-    let allocation = unsafe { GLOBAL.alloc(layout) };
-    if allocation.is_null() {
-        return 2;
     }
-    std::hint::black_box(allocation);
-    // SAFETY: `allocation` was allocated by `GLOBAL` with this exact `layout` above.
-    unsafe { GLOBAL.dealloc(allocation, layout) };
     0
 }
 
 /// Executable final-artifact proof for the remote ROS 2 parser and allocator call path.
 #[cfg(rerun_remote_ros2_artifact_probe_v1)]
+#[expect(
+    unsafe_code,
+    reason = "the locked verifier calls this fixed exported ROS 2 probe"
+)]
 #[unsafe(no_mangle)]
 pub extern "C" fn rerun_remote_ros2_initializer_artifact_probe_v1() -> u32 {
     let _capability = RE_VIEWER_REMOTE_ROS2_GENERATED_CAPABILITY_V1;
@@ -93,16 +99,28 @@ pub extern "C" fn rerun_remote_ros2_initializer_artifact_probe_v1() -> u32 {
     if allocator_status != 0 {
         return allocator_status;
     }
+    #[expect(
+        unsafe_code,
+        reason = "the locked verifier links this fixed private ROS 2 probe symbol"
+    )]
     unsafe extern "C" {
         fn rerun_remote_ros2_initializer_artifact_probe_v1_impl() -> u32;
     }
-    // SAFETY: the symbol is defined by the exact locked `re_mcap` dependency in this final Wasm
-    // artifact, takes no arguments, and has the same C ABI and return type.
-    unsafe { rerun_remote_ros2_initializer_artifact_probe_v1_impl() }
+    #[expect(
+        unsafe_code,
+        reason = "the locked verifier calls the fixed private ROS 2 probe symbol"
+    )]
+    unsafe {
+        rerun_remote_ros2_initializer_artifact_probe_v1_impl()
+    }
 }
 
 /// Executable final-artifact proof for the chained remote protobuf initializer.
 #[cfg(rerun_remote_ros2_artifact_probe_v1)]
+#[expect(
+    unsafe_code,
+    reason = "the locked verifier calls this fixed exported protobuf probe"
+)]
 #[unsafe(no_mangle)]
 pub extern "C" fn rerun_remote_protobuf_initializer_artifact_probe_v1() -> u32 {
     let _capability = RE_VIEWER_REMOTE_ROS2_GENERATED_CAPABILITY_V1;
@@ -113,19 +131,27 @@ pub extern "C" fn rerun_remote_protobuf_initializer_artifact_probe_v1() -> u32 {
     if allocator_status != 0 {
         return allocator_status;
     }
+    #[expect(
+        unsafe_code,
+        reason = "the locked verifier links this fixed private protobuf probe symbol"
+    )]
     unsafe extern "C" {
         fn rerun_remote_protobuf_initializer_artifact_probe_v1_impl() -> u32;
     }
-    // SAFETY: the symbol is defined by the exact locked `re_mcap` dependency in this final Wasm
-    // artifact, takes no arguments, and has the same C ABI and return type.
-    unsafe { rerun_remote_protobuf_initializer_artifact_probe_v1_impl() }
+    #[expect(
+        unsafe_code,
+        reason = "the locked verifier calls the fixed private protobuf probe symbol"
+    )]
+    unsafe {
+        rerun_remote_protobuf_initializer_artifact_probe_v1_impl()
+    }
 }
 
 #[wasm_bindgen]
 pub struct WebHandle {
     runner: eframe::WebRunner,
 
-    /// Compatibility `.mcap` ingress seam.  The remote capability remains disarmed until its
+    /// Compatibility `.mcap` ingress seam. The remote capability remains disarmed until its
     /// measured production profile is installed; disarmed dispatch falls back to `ViewerOpenUrl`.
     compatibility_remote_mcap: Rc<RefCell<CompatibilityRemoteMcapSingletonV1>>,
 
@@ -310,8 +336,8 @@ impl WebHandle {
 
         let specs = match crate::web_strict_startup::preflight_strict_startup_specs_v1(specs) {
             Ok(specs) => specs,
-            Err(error) => {
-                return crate::web_strict_startup::strict_startup_error_envelope_to_js_v1(&error);
+            Err(err) => {
+                return crate::web_strict_startup::strict_startup_error_envelope_to_js_v1(&err);
             }
         };
         drop(specs);

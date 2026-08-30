@@ -458,8 +458,8 @@ fn module_preceding_cfg(text_before_module: &str) -> Option<&str> {
 }
 
 fn trim_cfg_attribute(line: &str) -> Option<&str> {
-    line.strip_prefix("#[cfg(")
-        .and_then(|cfg| cfg.strip_suffix(")]"))
+    let cfg = line.strip_prefix("#[cfg(")?;
+    cfg.strip_suffix(")]")
 }
 
 fn is_rust_item_start(line: &str) -> bool {

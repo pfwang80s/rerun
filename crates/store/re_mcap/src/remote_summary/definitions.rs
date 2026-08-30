@@ -163,7 +163,7 @@ impl<'a> ValidatedSummaryDefinitions<'a> {
     /// This takes no input and cannot mint capability for caller-controlled records. The special
     /// storage variant does not exist in ordinary Wasm consumers or the product artifact.
     #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
-    pub(crate) fn for_remote_ros2_artifact_probe() -> ValidatedSummaryDefinitions<'static> {
+    pub(crate) fn for_remote_ros2_artifact_probe() -> Self {
         use std::borrow::Cow;
         use std::collections::BTreeMap;
 

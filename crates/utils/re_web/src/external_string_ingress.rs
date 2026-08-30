@@ -1,6 +1,6 @@
 //! Bounded strict remote-MCAP external string ingress.
 //!
-//! The browser adapter performs the JavaScript primitive/UTF-16 check before calling into Wasm.
+//! The browser adapter performs the `JavaScript` primitive/UTF-16 check before calling into Wasm.
 //! This module is the second gate: it accepts only an opaque, already-copied UTF-8 value and
 //! reserves the complete retained object graph before constructing semantic identifiers.
 
@@ -57,8 +57,10 @@ impl<'a> OpaqueJsString<'a> {
     }
 
     pub fn from_utf8(bytes: &'a [u8]) -> Result<Self, ExternalStringIngressError> {
-        let value =
-            std::str::from_utf8(bytes).map_err(|_| ExternalStringIngressError::InvalidUtf8)?;
+        let value = std::str::from_utf8(bytes).map_err(|err| {
+            let _ = err;
+            ExternalStringIngressError::InvalidUtf8
+        })?;
         let units = value.encode_utf16().count() as u64;
         let bytes_len = bytes.len() as u64;
         if units > MAX_FIELD_UTF16 || bytes_len > MAX_FIELD_UTF8 {
@@ -91,7 +93,13 @@ pub struct CombinedCopyPermit {
     object_graph_bytes: NonZeroU64,
 }
 
-#[allow(dead_code, reason = "accessors consumed by the future Wasm handoff adapter")]
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    expect(
+        dead_code,
+        reason = "accessors consumed by the future Wasm handoff adapter"
+    )
+)]
 impl CombinedCopyPermit {
     pub const fn fields(&self) -> u32 {
         self.fields

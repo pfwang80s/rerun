@@ -392,6 +392,7 @@ impl PhaseAMeasurementResolvedSourceV1<'_> {
         self.bytes
     }
 
+    #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
     pub fn run_dispatch_decode_v1(
         &self,
         cache: crate::web_body_handoff::WebPhysicalScanCacheEntryV1<'_>,
@@ -402,6 +403,7 @@ impl PhaseAMeasurementResolvedSourceV1<'_> {
             .map(|(measurement, _chunks)| measurement)
     }
 
+    #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
     pub fn run_dispatch_from_validation_stage_v1(
         &self,
         validation: PhaseAPhysicalValidationStageOwnerV1<'_>,

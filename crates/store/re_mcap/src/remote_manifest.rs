@@ -515,6 +515,7 @@ impl<'d, 'i, 's, 'w> ManifestTemporalPartitionAuthorityV1<'_, '_, 'd, 'i, 's, 'w
 }
 
 impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
+    #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
     pub(crate) fn build_v1(
         source: ResolvedRemotePhysicalSourceRefV1<'a, 'i>,
         groups: ImmutableRemoteChannelGroupsV1<'d, 'i, 's, 'w>,
@@ -533,7 +534,7 @@ impl<'a, 'd, 'i, 's, 'w> ImmutableRemoteMcapManifestV1<'a, 'd, 'i, 's, 'w> {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
     pub(crate) fn build_with_session_v1(
         source: ResolvedRemotePhysicalSourceRefV1<'a, 'i>,
         groups: ImmutableRemoteChannelGroupsV1<'d, 'i, 's, 'w>,

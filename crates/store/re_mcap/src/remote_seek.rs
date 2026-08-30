@@ -14,8 +14,8 @@ use re_log_types::{Duration, TimeInt};
 use crate::remote_navigation::{
     CommittedPresentationTimeV1, PendingNavigationIntentV1, RemoteCandidateClockInputV1,
     RemoteLoopModeV1, RemoteNavigationAdapterV1, RemoteNavigationCommandV1,
-    RemoteNavigationDemandKeyV1, RemoteNavigationErrorV1, RemoteNavigationTriggerV1,
-    RemoteNavigationUiStateV1, RemotePlayStateV1,
+    RemoteNavigationDemandKeyV1, RemoteNavigationErrorV1, RemoteNavigationUiStateV1,
+    RemotePlayStateV1,
 };
 
 /// Opaque generation identity for one remote navigation demand.
@@ -1589,6 +1589,7 @@ fn adapter_with_pending_intent_v1(
 
 #[cfg(test)]
 mod tests {
+    use crate::remote_navigation::RemoteNavigationTriggerV1;
     use re_log_types::{AbsoluteTimeRange, TimeType, Timeline};
 
     use super::*;

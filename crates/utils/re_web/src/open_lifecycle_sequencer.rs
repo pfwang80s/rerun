@@ -1,7 +1,7 @@
 //! Production-disarmed public lifecycle sequencer for strict Web open.
 //!
 //! This module freezes the normative public event ordering for strict Web MCAP open.
-//! It does not dispatch events, touch TypeScript, or change the existing compatibility
+//! It does not dispatch events, touch `TypeScript`, or change the existing compatibility
 //! `recording_open` event path.
 
 use std::collections::{BTreeMap, BTreeSet};

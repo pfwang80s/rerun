@@ -214,10 +214,7 @@ mod tests {
             .prepare_batch_v1(
                 vec![
                     crate::strict_open_batch::StrictOpenRequestSpecV1::HttpRemoteMcapCandidate {
-                        url: "https://example.invalid/a.mcap"
-                            .as_bytes()
-                            .to_vec()
-                            .into_boxed_slice(),
+                        url: (*b"https://example.invalid/a.mcap").into(),
                         ingress: crate::secret_url::HttpUrlIngress::DirectExternal,
                         semantic: semantic(),
                     },

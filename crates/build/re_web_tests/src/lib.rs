@@ -10,3 +10,5 @@ pub mod mcap_range_server;
 pub mod phase_a_audit;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod phase_a_evidence;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod release_gate_audit;

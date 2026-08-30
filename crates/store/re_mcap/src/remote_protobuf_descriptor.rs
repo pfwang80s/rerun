@@ -54,8 +54,12 @@ const LOCKED_REMOTE_PROTOBUF_FRAME_SPILL_CEILING_V1: u64 = 16 * 1024;
 
 macro_rules! remote_protobuf_artifact_stage_anchor {
     ($name:ident, $identity:literal) => {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", re_mcap_locked_remote_wasm_allocator_v1))]
         #[inline(never)]
+        #[expect(
+            unsafe_code,
+            reason = "the locked verifier calls this fixed protobuf stage anchor"
+        )]
         #[unsafe(no_mangle)]
         pub(crate) extern "C" fn $name() -> u32 {
             std::hint::black_box($identity)

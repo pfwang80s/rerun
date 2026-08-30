@@ -1,8 +1,8 @@
 //! Page-hidden ownership for remote-MCAP insertion and GC turns.
 //!
-//! This is a deliberately small, production-disarmed seam.  It models the ownership transfer
+//! This is a deliberately small, production-disarmed seam. It models the ownership transfer
 //! performed by the remote Store arbiter without changing the native or ordinary Store mutation
-//! schedulers.  In particular, hiding a page moves an in-flight safe-point turn into a suspended
+//! schedulers. In particular, hiding a page moves an in-flight safe-point turn into a suspended
 //! owner; it never treats the turn as stale work and drops it.
 
 use std::fmt;
@@ -14,6 +14,13 @@ pub enum RemoteMutationKindV1 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    expect(
+        dead_code,
+        reason = "reserved safe points are consumed by the future remote mutation arbiter"
+    )
+)]
 pub enum RemoteMutationSafePointV1 {
     RunningAddChunk,
     RunningGc,
@@ -126,6 +133,13 @@ impl RemoteMutationOwnershipV1 {
         }
     }
 
+    #[cfg_attr(
+        not(target_arch = "wasm32"),
+        expect(
+            dead_code,
+            reason = "consumed by the future remote mutation acknowledgement path"
+        )
+    )]
     pub fn acknowledged(&self) -> bool {
         self.acked
     }
@@ -194,21 +208,27 @@ impl RemoteMutationSuspensionV1 {
         true
     }
 
+    #[cfg_attr(
+        not(target_arch = "wasm32"),
+        expect(
+            dead_code,
+            reason = "consumed by the future visible remote mutation path"
+        )
+    )]
     pub fn begin_visible_v1(&mut self, owner: RemoteMutationOwnershipV1) -> bool {
         self.begin_v1(owner)
     }
 
     /// Records that a synchronous physical add/delete has started before a page signal.
     pub fn mark_physical_mutation_started_v1(&mut self) -> bool {
-        let owner = match &mut self.state {
-            RemoteMutationStateV1::Active { owner, .. } => owner,
-            _ => return false,
+        let RemoteMutationStateV1::Active { owner, .. } = &mut self.state else {
+            return false;
         };
         owner.mark_physical_mutation_started();
         true
     }
 
-    pub fn hide_v1(&mut self, resulting_epoch: u64) -> bool {
+    pub fn hide_v1(&self, resulting_epoch: u64) -> bool {
         let RemoteMutationStateV1::Active { epoch, .. } = self.state else {
             return false;
         };
@@ -221,7 +241,7 @@ impl RemoteMutationSuspensionV1 {
         owner_safe_point(&self.state)
     }
 
-    /// Move the active owner to page-hidden storage.  Only explicit safe points are suspendable.
+    /// Move the active owner to page-hidden storage. Only explicit safe points are suspendable.
     pub fn suspend_v1(&mut self, resulting_epoch: u64, resume_nonce: u64) -> bool {
         let state = std::mem::replace(
             &mut self.state,
@@ -255,7 +275,7 @@ impl RemoteMutationSuspensionV1 {
         &mut self,
         expected_epoch: u64,
         resume_nonce: u64,
-        facade: RemoteFacadeSnapshotV1,
+        facade: &RemoteFacadeSnapshotV1,
     ) -> RemoteMutationResumeResultV1 {
         let state = std::mem::replace(
             &mut self.state,
@@ -282,17 +302,17 @@ impl RemoteMutationSuspensionV1 {
             return RemoteMutationResumeResultV1::Rejected;
         }
         self.last_resume_nonce = resume_nonce;
-        if owner.facade != facade {
+        if owner.facade != *facade {
             if owner.physical_mutation_started() {
                 self.state = RemoteMutationStateV1::Poisoned { epoch, owner };
                 return RemoteMutationResumeResultV1::Poisoned;
             }
             // Before the first physical mutation the staged ownership can be terminally
-            // discarded.  We do not reopen the old facade or publish an acknowledgement.
+            // discarded. We do not reopen the old facade or publish an acknowledgement.
             self.state = RemoteMutationStateV1::Terminated { epoch };
             return RemoteMutationResumeResultV1::Rejected;
         }
-        // Rebind the complete move-only owner.  The caller can continue the turn or terminate it;
+        // Rebind the complete move-only owner. The caller can continue the turn or terminate it;
         // pins, reservations, frozen commit set and effects are not dropped at the page boundary.
         self.state = RemoteMutationStateV1::Active { epoch, owner };
         RemoteMutationResumeResultV1::Rebound
@@ -363,14 +383,14 @@ mod tests {
         assert!(arbiter.suspended_owner_v1().is_some());
         let facade = arbiter.suspended_owner_v1().unwrap().facade.clone();
         assert_eq!(
-            arbiter.resume_v1(1, 7, facade.clone()),
+            arbiter.resume_v1(1, 7, &facade.clone()),
             RemoteMutationResumeResultV1::Rebound
         );
         assert!(arbiter.suspended_owner_v1().is_some());
         assert!(arbiter.terminate_v1(2));
         assert!(arbiter.suspended_owner_v1().is_none());
         assert_eq!(
-            arbiter.resume_v1(1, 7, facade),
+            arbiter.resume_v1(1, 7, &facade),
             RemoteMutationResumeResultV1::Rejected
         );
     }
@@ -389,7 +409,7 @@ mod tests {
             protection_revision: 5,
         };
         assert_eq!(
-            arbiter.resume_v1(1, 8, facade),
+            arbiter.resume_v1(1, 8, &facade),
             RemoteMutationResumeResultV1::Poisoned
         );
         assert!(arbiter.is_poisoned_v1());

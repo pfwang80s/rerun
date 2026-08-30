@@ -87,8 +87,12 @@ static NEXT_REMOTE_SEMANTIC_CONFIG_IDENTITY_V1: AtomicU64 = AtomicU64::new(1);
 
 macro_rules! remote_ros2_artifact_stage_anchor {
     ($name:ident, $identity:literal) => {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", re_mcap_locked_remote_wasm_allocator_v1))]
         #[inline(never)]
+        #[expect(
+            unsafe_code,
+            reason = "the locked verifier calls this fixed ROS 2 stage anchor"
+        )]
         #[unsafe(no_mangle)]
         pub(crate) extern "C" fn $name() -> u32 {
             std::hint::black_box($identity)
@@ -5616,6 +5620,12 @@ fn census_one_schema(
             RemoteRos2ResourceLimit::FieldCount,
         )?;
         increment_limited(
+            &mut census.output_nodes,
+            summary.actual_fields,
+            limits.max_fields,
+            RemoteRos2ResourceLimit::FieldCount,
+        )?;
+        increment_limited(
             &mut census.constants,
             summary.constants,
             limits.max_constants,
@@ -5854,7 +5864,6 @@ pub(crate) fn prepare_remote_ros2_census_v1<'definitions, 'input, 'source, 'wire
         census_one_schema(definitions, schema, &limits, &mut census, steps, scratch)
     })?;
     census.census_steps = census_steps.consumed;
-    census.output_nodes = census.fields;
     census.output_roots = census.schemas;
     compute_arena_peak(&mut census, &limits)?;
 
@@ -6083,7 +6092,21 @@ impl CountingMaterializationSink {
         {
             Ok(())
         } else {
-            remote_ros2_fatal_invariant("dry-run record counts differ from grammar census")
+            panic!(
+                "Fatal remote ROS 2 initializer invariant: dry-run record counts differ from grammar census: schemas={}/{} specifications={}/{} members={}/{} resolutions={}/{} output_nodes={}/{} output_roots={}/{}",
+                self.schemas,
+                checked_usize(census.schemas)?,
+                self.specifications,
+                checked_usize(census.specifications)?,
+                self.members,
+                checked_usize(census.members)?,
+                self.resolutions,
+                checked_usize(census.dependency_edges)?,
+                self.output_nodes,
+                checked_usize(census.fields)?,
+                self.output_roots,
+                checked_usize(census.schemas)?,
+            )
         }
     }
 }
@@ -6514,7 +6537,11 @@ fn materialize_remote_ros2_definitions_v1_with_gate<'definitions, 'input, 'sourc
 /// This deliberately exercises the same primitive-schema parser, exact-step owner, fixed arenas,
 /// `Vec::try_reserve_exact` allocation path, and installed accounting allocator as production.
 /// It is not exported through wasm-bindgen and has no Viewer or source side effects.
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", re_mcap_locked_remote_wasm_allocator_v1))]
+#[expect(
+    unsafe_code,
+    reason = "the locked verifier calls this fixed ROS 2 initializer probe"
+)]
 #[unsafe(no_mangle)]
 pub(crate) extern "C" fn rerun_remote_ros2_initializer_artifact_probe_v1_impl() -> u32 {
     let definitions = ValidatedSummaryDefinitions::for_remote_ros2_artifact_probe();
@@ -6677,7 +6704,11 @@ pub(crate) extern "C" fn rerun_remote_ros2_initializer_artifact_probe_v1_impl() 
 }
 
 /// Release-Wasm executable probe for the chained ROS 2 → protobuf initializer ownership path.
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", re_mcap_locked_remote_wasm_allocator_v1))]
+#[expect(
+    unsafe_code,
+    reason = "the locked verifier calls this fixed protobuf initializer probe"
+)]
 #[unsafe(no_mangle)]
 pub(crate) extern "C" fn rerun_remote_protobuf_initializer_artifact_probe_v1_impl() -> u32 {
     let definitions = ValidatedSummaryDefinitions::for_remote_ros2_artifact_probe();
@@ -7372,7 +7403,8 @@ mod tests {
         let physical_b = PhysicalChunkAssignmentEvidenceHarnessV1::new(&fixture_b, 0).unwrap();
         let definitions_a = physical_a.definitions_capability_v1();
         let definitions_b = physical_b.definitions_capability_v1();
-        let source = source_state();
+        let mut source = source_state();
+        source.physical_source = physical_a.source_binding_v1();
         let wire_a = canonical_policy_wire();
         let budget_a = budget(&source, &wire_a, generous_limits());
         let policy_a = freeze_remote_decoder_policy_v1(&wire_a).unwrap();

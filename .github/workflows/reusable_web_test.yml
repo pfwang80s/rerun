@@ -114,6 +114,22 @@ jobs:
           pixi run web-test --browser chrome --package re_mcap_chrome_test
           pixi run web-test --browser chrome --package re_web
 
+      - name: Run Chrome MCAP correctness release gate
+        run: |
+          mkdir -p target/mcap114-chrome-correctness
+          set -o pipefail
+          pixi run web-test --browser chrome --package re_mcap_chrome_correctness 2>&1 \
+            | tee target/mcap114-chrome-correctness/web-test.log
+
+      - name: Upload MCAP-114 Chrome correctness diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mcap114-chrome-correctness-diagnostics
+          path: target/mcap114-chrome-correctness/web-test.log
+          if-no-files-found: warn
+
+
       - name: Build release-Wasm MCAP Phase A proof
         run: pixi run mcap-phase-a-proof-build
 

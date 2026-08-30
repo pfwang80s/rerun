@@ -8,7 +8,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::mem::size_of;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, Mac as _};
 use re_log_types::TimeType;
 use sha2::Sha256;
 
@@ -70,6 +70,7 @@ impl RemoteMcapSemanticConfigV1 {
     pub(crate) fn topic_filter_bytes_v1(&self) -> &[u8] {
         &self.topic_filter_canonical_bytes
     }
+
     pub fn new_v1(
         topic_filter_canonical_bytes: Box<[u8]>,
         decoder_allowlist_version: u64,
@@ -230,8 +231,8 @@ impl<P: SourceReuseFingerprintPolicyV1> SourceReuseRegistryV1<P> {
         let source_token = self.allocate_source_token_v1()?;
         let entry = SourceReuseEntryV1 {
             source_token,
-            semantic,
             url,
+            semantic,
         };
         self.retained_bytes = next_retained_bytes;
         self.buckets.entry(fingerprint).or_default().push(entry);
@@ -241,25 +242,23 @@ impl<P: SourceReuseFingerprintPolicyV1> SourceReuseRegistryV1<P> {
     pub fn remove_by_source_token_v1(&mut self, source_token: OpenSourceToken) -> bool {
         let mut removed_bytes = 0usize;
         let mut removed = false;
-        let mut empty_buckets = Vec::new();
-
-        for (fingerprint, bucket) in &mut self.buckets {
-            if let Some(index) = bucket
+        let fingerprint = self.buckets.iter().find_map(|(fingerprint, bucket)| {
+            bucket
                 .iter()
                 .position(|entry| entry.source_token == source_token)
-            {
-                let entry = bucket.remove(index);
-                removed_bytes = entry.retained_bytes_v1();
-                removed = true;
-                if bucket.is_empty() {
-                    empty_buckets.push(*fingerprint);
-                }
-                break;
+                .map(|index| (*fingerprint, index))
+        });
+        if let Some((fingerprint, index)) = fingerprint {
+            let bucket = self
+                .buckets
+                .get_mut(&fingerprint)
+                .expect("fingerprint bucket remains present");
+            let entry = bucket.remove(index);
+            removed_bytes = entry.retained_bytes_v1();
+            removed = true;
+            if bucket.is_empty() {
+                self.buckets.remove(&fingerprint);
             }
-        }
-
-        for fingerprint in empty_buckets {
-            self.buckets.remove(&fingerprint);
         }
 
         if removed {

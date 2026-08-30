@@ -40,7 +40,7 @@ pub struct PreparedStrictOpenOperationV1 {
     pub route: PreparedStrictOpenRouteV1,
     pub url: SecretUrl,
     pub semantic: RemoteMcapSemanticConfigV1,
-    #[allow(dead_code, reason = "retained by the future handoff release adapter")]
+    #[expect(dead_code, reason = "retained by the future handoff release adapter")]
     pub(crate) ingress_permit: CombinedCopyPermit,
 }
 
@@ -51,10 +51,12 @@ impl fmt::Debug for PreparedStrictOpenOperationV1 {
             .field("operation_id", &self.operation_id)
             .field("public_request_id", &self.public_request_id)
             .field("public_recording_id", &self.public_recording_id)
-            .field("source_token", &self.source_token)
+            .field("status_owner", &"<owned>")
             .field("route", &self.route)
             .field("url", &"<redacted>")
-            .finish()
+            .field("semantic", &"<owned>")
+            .field("ingress_permit", &"<owned>")
+            .finish_non_exhaustive()
     }
 }
 
@@ -111,11 +113,11 @@ impl StrictOpenBatchPrepareContextV1 {
                 } => {
                     let route = classify_http_remote_mcap_route_v1(&url)
                         .map_err(|code| admission_error_v1(code, index))?;
-                    let url_string = OpaqueJsString::from_utf8(&url).map_err(|_| {
+                    let url_string = OpaqueJsString::from_utf8(&url).map_err(|_err| {
                         admission_error_v1(StrictOpenAdmissionCodeV1::ResourceLimitExceeded, index)
                     })?;
                     let topic_string = OpaqueJsString::from_utf8(semantic.topic_filter_bytes_v1())
-                        .map_err(|_| {
+                        .map_err(|_err| {
                             admission_error_v1(
                                 StrictOpenAdmissionCodeV1::ResourceLimitExceeded,
                                 index,
@@ -133,7 +135,7 @@ impl StrictOpenBatchPrepareContextV1 {
                         })?;
                     let ingress_permit =
                         CombinedCopyPermit::prepare([url_string, topic_string], graph_bytes)
-                            .map_err(|_| {
+                            .map_err(|_err| {
                                 admission_error_v1(
                                     StrictOpenAdmissionCodeV1::ResourceLimitExceeded,
                                     index,
@@ -236,7 +238,7 @@ fn classify_http_remote_mcap_route_v1(
         .iter()
         .rposition(|byte| *byte == b'/')
         .map_or(path, |index| &path[index + 1..]);
-    if last_segment.iter().any(|byte| *byte == b'.') {
+    if last_segment.contains(&b'.') {
         return Err(StrictOpenAdmissionCodeV1::UnsupportedStrictOpenRoute);
     }
     Ok(PreparedStrictOpenRouteV1::ExtensionlessSniff)

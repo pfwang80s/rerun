@@ -323,6 +323,7 @@ impl ChromeFormatSniffer {
         self.coordinator.range_count()
     }
 
+    /// Starts the initial format-sniff operation.
     pub(crate) fn start_initial<T, C>(
         &mut self,
         execution: ActiveVisibleExecutionBinding,
@@ -330,6 +331,7 @@ impl ChromeFormatSniffer {
         timeout: T,
     ) -> Result<
         StartedChromeFormatSniff<
+            // Keep the future output type opaque and tied to the caller's control values.
             impl Future<Output = Result<ChromeFormatSniffTransportOutcome, ChromeRangeError>>
             + use<T, C>,
         >,
@@ -377,6 +379,7 @@ impl ChromeFormatSniffer {
         self.coordinator.project_retry_turn(turn)
     }
 
+    /// Starts a retry of the format-sniff operation on a visible turn.
     pub(crate) fn start_retry_on_turn<T, C>(
         &mut self,
         turn: &mut VisibleRetryTurnPermit<'_>,
@@ -384,6 +387,7 @@ impl ChromeFormatSniffer {
         timeout: T,
     ) -> Result<
         StartedChromeFormatSniff<
+            // Keep the future output type opaque and tied to the caller's control values.
             impl Future<Output = Result<ChromeFormatSniffTransportOutcome, ChromeRangeError>>
             + use<T, C>,
         >,
@@ -590,7 +594,7 @@ impl<Payload> StartedChromeFormatSniff<Payload> {
             Poll::Ready(Ok(attempt)) => {
                 Poll::Ready(Ok(SettledChromeFormatSniff { identity, attempt }))
             }
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -1411,10 +1415,10 @@ mod tests {
             .reserve_v1(sniffer)
             .expect("first pending sniff reserves");
         assert_eq!(registry.pending_count_v1(), 1);
-        assert_eq!(
+        assert!(matches!(
             registry.reserve_v1(prepared_sniffer(1, 2).0),
             Err(PendingFormatSniffRegistryErrorV1::CapacityReached)
-        );
+        ));
         drop(reservation);
         assert_eq!(registry.pending_count_v1(), 0);
         assert!(registry.reserve_v1(prepared_sniffer(1, 2).0).is_ok());

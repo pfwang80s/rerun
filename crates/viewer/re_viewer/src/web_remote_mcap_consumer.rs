@@ -9,15 +9,22 @@
 
 use std::fmt;
 
-use re_chunk::{RangeQuery, TimeInt, TimelineName};
+use re_chunk::RangeQuery;
+#[cfg(test)]
+use re_chunk::{TimeInt, TimelineName};
+#[cfg(test)]
 use re_log_types::StoreId;
 
+#[cfg(test)]
 use crate::web_remote_mcap_activation::RemoteRecordingUseStateV1;
 use crate::web_remote_mcap_query::{
     CommittedPresentationTimeV1, ConsumerStorageFreeV1, GatedRecordingQueryFacadeV1,
     PresentationLeaseUnavailableV1, PresentationQueryLeaseV1, PresentationQuerySnapshotV1,
-    PrivilegedViewerFrameContextV1, RemoteLoadedCoverageV1, RemoteMutationLeaseDrainV1,
     RemotePresentationFacadeV1, RemoteRangeQueryUnavailableV1,
+};
+#[cfg(test)]
+use crate::web_remote_mcap_query::{
+    PrivilegedViewerFrameContextV1, RemoteLoadedCoverageV1, RemoteMutationLeaseDrainV1,
 };
 
 mod private {

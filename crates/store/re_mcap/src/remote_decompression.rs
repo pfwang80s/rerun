@@ -691,8 +691,10 @@ impl<'a> ExactOutputChunk<'a> {
     }
 
     pub(crate) fn has_matching_lease_profile(&self) -> bool {
-        let PhysicalChunkReadIdentity::Lease(lease) = self.identity() else {
-            return false;
+        let lease = match self.identity() {
+            PhysicalChunkReadIdentity::Lease(lease) => lease,
+            #[cfg(test)]
+            PhysicalChunkReadIdentity::CodecUnit { .. } => return false,
         };
         Arc::ptr_eq(
             &lease.decompression_budget().state,

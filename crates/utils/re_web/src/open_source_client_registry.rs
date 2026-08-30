@@ -5,11 +5,10 @@
 //! It does not hook into the native viewer or the existing compatibility `open()` / `close()`
 //! paths.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::{Rc, Weak};
-use std::sync::Mutex;
 
 use crate::open_source_terminal::{
     OpenSourceStatusOwnerV1, OpenSourceStatusV1, OpenSourceTerminalCauseV1, OpenSourceToken,
@@ -32,7 +31,8 @@ pub enum OpenSourceClientRegistryErrorV1 {
 
 pub struct OpenSourceClientOpeningHandleV1 {
     source_token: OpenSourceToken,
-    registry: Weak<Mutex<OpenSourceClientRegistryInnerV1>>,
+    registry: Weak<RefCell<OpenSourceClientRegistryInnerV1>>,
+    active: bool,
 }
 
 impl OpenSourceClientOpeningHandleV1 {
@@ -51,6 +51,9 @@ impl OpenSourceClientOpeningHandleV1 {
 
 impl Drop for OpenSourceClientOpeningHandleV1 {
     fn drop(&mut self) {
+        if self.active {
+            return;
+        }
         let Some(registry) = self.registry.upgrade() else {
             return;
         };
@@ -119,20 +122,18 @@ impl OpenSourceClientRegistryInnerV1 {
 }
 
 pub struct OpenSourceClientRegistryV1 {
-    inner: Rc<Mutex<OpenSourceClientRegistryInnerV1>>,
+    inner: Rc<RefCell<OpenSourceClientRegistryInnerV1>>,
 }
 
 impl OpenSourceClientRegistryV1 {
     pub fn new_v1() -> Self {
         Self {
-            inner: Rc::new(Mutex::new(OpenSourceClientRegistryInnerV1::new_v1())),
+            inner: Rc::new(RefCell::new(OpenSourceClientRegistryInnerV1::new_v1())),
         }
     }
 
-    fn lock_inner_v1(&self) -> std::sync::MutexGuard<'_, OpenSourceClientRegistryInnerV1> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn lock_inner_v1(&self) -> std::cell::RefMut<'_, OpenSourceClientRegistryInnerV1> {
+        self.inner.borrow_mut()
     }
 
     pub fn state_v1(&self, source_token: OpenSourceToken) -> OpenSourceClientPhaseV1 {
@@ -170,6 +171,7 @@ impl OpenSourceClientRegistryV1 {
         Ok(OpenSourceClientOpeningHandleV1 {
             source_token,
             registry: Rc::downgrade(&self.inner),
+            active: false,
         })
     }
 
@@ -188,7 +190,9 @@ impl OpenSourceClientRegistryV1 {
         }
 
         entry.phase = OpenSourceClientPhaseV1::Active;
-        std::mem::forget(opening);
+        drop(inner);
+        let mut opening = opening;
+        opening.active = true;
         Ok(OpenSourceClientGuardV1 {
             source_token,
             registry: Rc::downgrade(&self.inner),
@@ -253,7 +257,7 @@ impl fmt::Debug for OpenSourceClientRegistryV1 {
 
 pub struct OpenSourceClientGuardV1 {
     source_token: OpenSourceToken,
-    registry: Weak<Mutex<OpenSourceClientRegistryInnerV1>>,
+    registry: Weak<RefCell<OpenSourceClientRegistryInnerV1>>,
 }
 
 impl OpenSourceClientGuardV1 {

@@ -1,6 +1,6 @@
 //! Production-disarmed Rust-side lifecycle delivery permits for strict Web open.
 //!
-//! The delivery queue state machine is isolated from TypeScript and from the existing Viewer
+//! The delivery queue state machine is isolated from `TypeScript` and from the existing Viewer
 //! event dispatcher.
 
 use std::collections::BTreeMap;

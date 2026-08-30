@@ -1,7 +1,7 @@
 const SCHEMA = "rerun-mcap-phase-a-evidence-v1";
 const WARMUP_ITERATIONS = 2;
 const SAMPLE_ITERATIONS = 5;
-const STAGES = ["byob_copy", "opening_parse", "message_index_parse", "physical_validation", "dispatch_decode"];
+const STAGES = ["byob_copy", "opening_parse", "message_index_parse", "physical_validation"];
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -106,7 +106,7 @@ export async function runMcapPhaseABenchmark() {
     provenance: {
       fixture: "fixed-mcap-phase-a-v1",
       transport: "controlled-range-byob-v1",
-      pipeline: "re_viewer-production-disarmed-v1",
+      pipeline: "re_viewer-transport-physical-pipeline-proof-v1",
     },
     build: {
       wasm_sha256: config.phase_a_build.wasm_sha256,

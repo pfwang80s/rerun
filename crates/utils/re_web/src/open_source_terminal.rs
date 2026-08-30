@@ -21,7 +21,7 @@ impl OpenSourceToken {
     pub fn fresh_v1() -> Self {
         let mut current = NEXT_OPEN_SOURCE_TOKEN.load(Ordering::Relaxed);
         loop {
-            let Some(token) = OpenSourceToken::new_v1(current) else {
+            let Some(token) = Self::new_v1(current) else {
                 panic!("OpenSourceToken allocator exhausted");
             };
             let next = current.checked_add(1).unwrap_or(0);
@@ -460,6 +460,8 @@ impl fmt::Debug for OpenSourceTerminalRegistryV1 {
             .debug_struct("OpenSourceTerminalRegistryV1")
             .field("max_entries", &self.max_entries)
             .field("max_bytes", &self.max_bytes)
+            .field("_max_diagnostics", &self._max_diagnostics)
+            .field("_max_diagnostic_bytes", &self._max_diagnostic_bytes)
             .field("entries", &self.entries.len())
             .field("retained_bytes", &self.retained_bytes)
             .finish()

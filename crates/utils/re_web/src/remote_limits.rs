@@ -8961,6 +8961,10 @@ pub(crate) mod tests {
         let mut expected_drained = initial;
         expected_drained.0.revision = drained.0.revision;
         expected_drained.0.next_reservation_sequence = drained.0.next_reservation_sequence;
+        expected_drained.0.phase_a_byte_ledger.high_water_bytes =
+            drained.0.phase_a_byte_ledger.high_water_bytes;
+        expected_drained.0.phase_a_byte_ledger.overflowed =
+            drained.0.phase_a_byte_ledger.overflowed;
         assert_eq!(drained, expected_drained);
     }
 
@@ -9009,6 +9013,10 @@ pub(crate) mod tests {
         let mut expected_drained = initial;
         expected_drained.0.revision = drained.0.revision;
         expected_drained.0.next_reservation_sequence = drained.0.next_reservation_sequence;
+        expected_drained.0.phase_a_byte_ledger.high_water_bytes =
+            drained.0.phase_a_byte_ledger.high_water_bytes;
+        expected_drained.0.phase_a_byte_ledger.overflowed =
+            drained.0.phase_a_byte_ledger.overflowed;
         assert_eq!(drained, expected_drained);
     }
 

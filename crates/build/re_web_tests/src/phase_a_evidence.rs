@@ -6,12 +6,11 @@ use serde::{Deserialize, Serialize};
 pub const PHASE_A_EVIDENCE_SCHEMA_V1: &str = "rerun-mcap-phase-a-evidence-v1";
 pub const PHASE_A_WARMUP_ITERATIONS_V1: u32 = 2;
 pub const PHASE_A_SAMPLE_ITERATIONS_V1: u32 = 5;
-pub const REQUIRED_PHASE_A_STAGES_V1: [&str; 5] = [
+pub const REQUIRED_PHASE_A_STAGES_V1: [&str; 4] = [
     "byob_copy",
     "opening_parse",
     "message_index_parse",
     "physical_validation",
-    "dispatch_decode",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,7 +80,7 @@ impl PhaseAEvidenceV1 {
             || self.sample_iterations != PHASE_A_SAMPLE_ITERATIONS_V1
             || self.provenance.fixture != "fixed-mcap-phase-a-v1"
             || self.provenance.transport != "controlled-range-byob-v1"
-            || self.provenance.pipeline != "re_viewer-production-disarmed-v1"
+            || self.provenance.pipeline != "re_viewer-transport-physical-pipeline-proof-v1"
         {
             bail!("Phase A evidence provenance or sample schedule is invalid");
         }
@@ -95,7 +94,7 @@ impl PhaseAEvidenceV1 {
             bail!("Phase A build or browser evidence is invalid");
         }
         if self.stages.len() != REQUIRED_PHASE_A_STAGES_V1.len() {
-            bail!("Phase A evidence must contain exactly five stages");
+            bail!("Phase A evidence must contain exactly four stages");
         }
         let mut names = BTreeSet::new();
         for (stage, expected_name) in self.stages.iter().zip(REQUIRED_PHASE_A_STAGES_V1) {
@@ -147,7 +146,7 @@ mod tests {
             provenance: PhaseAProvenanceV1 {
                 fixture: "fixed-mcap-phase-a-v1".to_owned(),
                 transport: "controlled-range-byob-v1".to_owned(),
-                pipeline: "re_viewer-production-disarmed-v1".to_owned(),
+                pipeline: "re_viewer-transport-physical-pipeline-proof-v1".to_owned(),
             },
             build: PhaseABuildEvidenceV1 {
                 wasm_sha256: "1".repeat(64),
@@ -220,6 +219,13 @@ mod tests {
             mutate(&mut invalid.stages[0]);
             assert!(invalid.validate_v1().is_err());
         }
+    }
+
+    #[test]
+    fn removed_dispatch_decode_stage_is_rejected() {
+        let mut invalid = valid();
+        invalid.stages[0].name = "dispatch_decode".to_owned();
+        assert!(invalid.validate_v1().is_err());
     }
 
     #[test]

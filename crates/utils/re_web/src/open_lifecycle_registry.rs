@@ -363,9 +363,11 @@ impl fmt::Debug for OpenLifecycleRegistryV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OpenLifecycleRegistryV1")
+            .field("limits", &self.limits)
             .field("sources", &self.sources.len())
             .field("operations", &self.operations.len())
             .field("recordings", &self.recordings.len())
+            .field("store_reverse", &self.store_reverse.len())
             .field("removed_tombstones", &self.removed_tombstone_count_v1())
             .finish()
     }

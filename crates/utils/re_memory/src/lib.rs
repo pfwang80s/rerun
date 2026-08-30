@@ -58,6 +58,7 @@ use backtrace_web::Backtrace;
 
 pub use self::accounting_allocator::{
     AccountingAllocator, InstantaneousAllocationByteLedgerV1, TrackingStatistics,
+    is_tracking_callstacks,
 };
 pub use self::allocation_tracker::{CallstackStatistics, ReadableBacktrace};
 pub use self::memory_limit::MemoryLimit;

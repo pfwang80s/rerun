@@ -34,8 +34,12 @@ const LOCKED_WASM_DLMALLOC_PAGE_V1: u64 = 64 * 1024;
 // V1 deliberately certifies no semantic ROS 2 parser/config.
 const EXACT_SAFE_SEMANTIC_ROS2_TABLE_V1: [RemoteSemanticParserIdentityV1; 0] = [];
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", re_mcap_locked_remote_wasm_allocator_v1))]
 #[inline(never)]
+#[expect(
+    unsafe_code,
+    reason = "the locked verifier calls this fixed decoder-assignment stage anchor"
+)]
 #[unsafe(no_mangle)]
 pub(crate) extern "C" fn rerun_remote_decoder_assignment_stage_v1() -> u32 {
     std::hint::black_box(0x2801_u32)

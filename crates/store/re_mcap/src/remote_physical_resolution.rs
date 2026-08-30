@@ -3,12 +3,10 @@
 //! This is production-disarmed until the Web opening adapter supplies an artifact-issued object
 //! binding. It has no HTTP types and cannot inspect validator wire bytes.
 
-#![allow(dead_code)]
-
 use std::alloc::Layout;
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use parking_lot::Mutex;
 use re_log_types::TimeInt;
@@ -85,15 +83,17 @@ impl std::fmt::Debug for RemotePhysicalObjectBindingV1 {
 }
 
 impl RemotePhysicalObjectBindingV1 {
-    #[cfg(test)]
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
     fn issue(
         content_length: NonZeroU64,
         consistency: RemoteObjectConsistencyClassV1,
     ) -> Result<Self, PhysicalSourceResolutionErrorV1> {
         let generation = NEXT_REMOTE_OBJECT_GENERATION_V1
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |current| current.checked_add(1),
+            )
             .map_err(|_current| PhysicalSourceResolutionErrorV1::GenerationExhausted)
             .and_then(|value| {
                 NonZeroU64::new(value).ok_or(PhysicalSourceResolutionErrorV1::GenerationExhausted)
@@ -1326,7 +1326,7 @@ impl Drop for AggregateResolutionReservationV1 {
 }
 
 impl AggregateResolutionBudgetRootV1 {
-    #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
     pub(crate) fn new_for_sealed_profile_v1(max_active: u64, max_retained_bytes: u64) -> Self {
         Self {
             state: Arc::new(AggregateResolutionBudgetStateV1 {

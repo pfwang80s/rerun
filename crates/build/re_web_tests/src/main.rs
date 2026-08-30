@@ -31,6 +31,10 @@ struct Args {
     /// write validated MCAP Phase A evidence JSON to this path.
     #[argh(option)]
     phase_a_artifact_out: Option<PathBuf>,
+
+    /// run the production-disarmed MCAP-114 preflight and require release evidence.
+    #[argh(switch)]
+    release_gate_audit: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +131,12 @@ async fn main() -> ExitCode {
 
 async fn run() -> anyhow::Result<()> {
     let args: Args = argh::from_env();
+
+    if args.release_gate_audit {
+        let report = re_web_tests::release_gate_audit::run_release_gate_audit_v1()?;
+        report.validate_release_acceptance_v1()?;
+        eprintln!("MCAP-114 release-gate audit passed");
+    }
 
     let packages = discover_packages(args.package.as_deref())?;
     if packages.is_empty() {

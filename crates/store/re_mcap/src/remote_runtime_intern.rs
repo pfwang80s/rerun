@@ -13,6 +13,7 @@ use re_string_interner::bounded_runtime_intern::{
     RemoteInternBatchTelemetry, RemoteMcapRawIdentifier, RemoteMcapRuntimeInternError,
     RemoteMcapRuntimeInternLimits,
 };
+#[cfg(test)]
 use std::num::NonZeroU64;
 
 const REMOTE_RUNTIME_INTERN_CENSUS_LIMIT_V1: usize = 16 * 1024;

@@ -15,7 +15,8 @@ use sha2::{Digest as _, Sha256};
 
 const REMOTE_ROS2_ALLOCATOR_CONTRACT_V1: &[u8] =
     b"AccountingAllocator<System>;tracking=admission-v1";
-const REMOTE_ROS2_ALLOCATOR_SECTION_V1: &str = "rerun_remote_ros2_allocator_contract_v1";
+const REMOTE_ROS2_ALLOCATOR_SECTION_V1: &str =
+    ".custom_section.rerun_remote_ros2_allocator_contract_v1";
 const REMOTE_ROS2_INITIALIZER_PROBE_V1: &str = "rerun_remote_ros2_initializer_artifact_probe_v1";
 const REMOTE_PROTOBUF_INITIALIZER_PROBE_V1: &str =
     "rerun_remote_protobuf_initializer_artifact_probe_v1";
@@ -61,15 +62,195 @@ const REMOTE_ROS2_INTERNAL_EXPORTS_V1: [&str; 17] = [
 ];
 const REMOTE_ROS2_MIN_PROBE_STACK_V1: u64 = 512;
 const REMOTE_ROS2_MAX_PROBE_STACK_V1: u64 = 16 * 1024;
+const REMOTE_ROS2_MAX_PROOF_FUNCTION_EXPANSIONS_V1: usize = 131_072;
+const REMOTE_ROS2_MAX_PROOF_DIRECT_EDGES_V1: usize = 1_048_576;
+const ALLOCATOR_INTERNAL_MAX_CYCLE_DEPTH_V1: usize = 64;
+const ALLOCATOR_INTERNAL_MAX_CYCLE_STACK_BYTES_V1: u64 = 16 * 1024;
+const ALLOCATOR_INTERNAL_MAX_CYCLE_FANOUT_V1: usize = 64;
+const ALLOCATOR_INTERNAL_ALLOWED_INDIRECT_TYPES_V1: [u32; 3] = [2, 4, 5];
+const ALLOCATOR_INTERNAL_MAX_INDIRECT_CALLS_V1: usize = 8;
+
+struct AllocatorInternalProofV1 {
+    max_cycle_depth: usize,
+    max_cycle_stack_bytes: u64,
+    max_cycle_fanout: usize,
+}
+
+impl AllocatorInternalProofV1 {
+    const fn locked_v1() -> Self {
+        Self {
+            max_cycle_depth: ALLOCATOR_INTERNAL_MAX_CYCLE_DEPTH_V1,
+            max_cycle_stack_bytes: ALLOCATOR_INTERNAL_MAX_CYCLE_STACK_BYTES_V1,
+            max_cycle_fanout: ALLOCATOR_INTERNAL_MAX_CYCLE_FANOUT_V1,
+        }
+    }
+
+    fn validate_support_graph_v1(
+        &self,
+        support: &std::collections::BTreeSet<u32>,
+        functions: &std::collections::BTreeMap<u32, RemoteRos2WasmFunctionFacts>,
+    ) -> anyhow::Result<()> {
+        let mut indirect_count = 0_usize;
+        for function in support {
+            let facts = functions
+                .get(function)
+                .with_context(|| format!("missing allocator support function {function}"))?;
+            anyhow::ensure!(
+                facts.calls.len() <= self.max_cycle_fanout,
+                "allocator support fanout exceeds the locked shape at function {function}: {}",
+                facts.calls.len()
+            );
+            anyhow::ensure!(
+                !facts.has_unsupported_indirect_call_form,
+                "allocator support contains an unsupported indirect call form"
+            );
+            indirect_count = indirect_count
+                .checked_add(facts.indirect_call_type_indices.len())
+                .context("allocator support indirect-call count overflowed")?;
+            anyhow::ensure!(
+                indirect_count <= ALLOCATOR_INTERNAL_MAX_INDIRECT_CALLS_V1,
+                "allocator support indirect-call count exceeds the locked bound: {indirect_count}"
+            );
+            anyhow::ensure!(
+                facts
+                    .indirect_call_type_indices
+                    .iter()
+                    .all(|type_index| ALLOCATOR_INTERNAL_ALLOWED_INDIRECT_TYPES_V1
+                        .contains(type_index)),
+                "allocator support contains an indirect call outside the locked target-type set"
+            );
+            anyhow::ensure!(
+                !facts.has_unresolved_indirect_call,
+                "allocator support contains an unchecked indirect call"
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_cycle_v1(
+        &self,
+        cycle: &[u32],
+        functions: &std::collections::BTreeMap<u32, RemoteRos2WasmFunctionFacts>,
+    ) -> anyhow::Result<RemoteRos2StackAndCallProof> {
+        anyhow::ensure!(!cycle.is_empty(), "allocator cycle identity is empty");
+        anyhow::ensure!(
+            cycle.len() <= self.max_cycle_depth,
+            "allocator internal cycle depth exceeds the locked bound"
+        );
+        let cycle_support = cycle.iter().copied().collect();
+        self.validate_support_graph_v1(&cycle_support, functions)?;
+        let mut stack_bytes = 0_u64;
+        let mut has_memory_grow = false;
+        for function in cycle {
+            let facts = functions
+                .get(function)
+                .with_context(|| format!("missing allocator cycle function {function}"))?;
+            stack_bytes = stack_bytes
+                .checked_add(facts.own_stack_bytes)
+                .context("allocator internal cycle stack bound overflowed")?;
+            has_memory_grow |= facts.has_memory_grow;
+        }
+        anyhow::ensure!(
+            stack_bytes <= self.max_cycle_stack_bytes,
+            "allocator internal cycle stack bound exceeded"
+        );
+        anyhow::ensure!(
+            has_memory_grow
+                || cycle.iter().any(|function| {
+                    reachable_memory_grow_v1(*function, functions, self.max_cycle_depth)
+                }),
+            "allocator internal cycle has no bounded memory.grow reachability"
+        );
+        Ok(RemoteRos2StackAndCallProof {
+            max_stack_bytes: stack_bytes,
+            has_memory_grow: true,
+            has_unresolved_indirect_call: false,
+        })
+    }
+}
+
+fn reachable_memory_grow_v1(
+    start: u32,
+    functions: &std::collections::BTreeMap<u32, RemoteRos2WasmFunctionFacts>,
+    remaining: usize,
+) -> bool {
+    fn visit(
+        start: u32,
+        functions: &std::collections::BTreeMap<u32, RemoteRos2WasmFunctionFacts>,
+        remaining: usize,
+        visited: &mut std::collections::BTreeSet<u32>,
+    ) -> bool {
+        if remaining == 0 || !visited.insert(start) {
+            return false;
+        }
+        let Some(facts) = functions.get(&start) else {
+            return false;
+        };
+        facts.has_memory_grow
+            || facts
+                .calls
+                .iter()
+                .any(|child| visit(*child, functions, remaining - 1, visited))
+    }
+
+    visit(
+        start,
+        functions,
+        remaining,
+        &mut std::collections::BTreeSet::new(),
+    )
+}
 
 pub fn workspace_root() -> Utf8PathBuf {
     cargo_metadata::MetadataCommand::new()
-        .manifest_path(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
         .features(cargo_metadata::CargoOpt::NoDefaultFeatures)
         .no_deps()
         .exec()
         .unwrap()
         .workspace_root
+}
+
+fn collect_allocator_support_v1(
+    function_index: u32,
+    imported_functions: u32,
+    functions: &std::collections::BTreeMap<u32, RemoteRos2WasmFunctionFacts>,
+    support: &mut std::collections::BTreeSet<u32>,
+    active: &mut std::collections::BTreeSet<u32>,
+    path: &mut Vec<u32>,
+) -> anyhow::Result<()> {
+    if function_index < imported_functions {
+        return Ok(());
+    }
+    if !active.insert(function_index) {
+        let start = path
+            .iter()
+            .position(|item| *item == function_index)
+            .unwrap_or(0);
+        AllocatorInternalProofV1::locked_v1()
+            .validate_cycle_v1(&path[start..], functions)
+            .map(|_| ())
+            .map_err(|err| StaticAllocatorStackProofFailureV1 {
+                function_index: Some(function_index),
+                writes: Vec::new(),
+                detail: err.to_string(),
+            })?;
+        return Ok(());
+    }
+    if support.contains(&function_index) {
+        active.remove(&function_index);
+        return Ok(());
+    }
+    path.push(function_index);
+    let facts = functions
+        .get(&function_index)
+        .with_context(|| format!("missing allocator support function {function_index}"))?;
+    support.insert(function_index);
+    for child in &facts.calls {
+        collect_allocator_support_v1(*child, imported_functions, functions, support, active, path)?;
+    }
+    path.pop();
+    active.remove(&function_index);
+    Ok(())
 }
 
 pub fn default_build_dir() -> Utf8PathBuf {
@@ -189,7 +370,7 @@ pub fn build_mcap_phase_a_proof_v1(build_dir: &Utf8Path) -> anyhow::Result<()> {
         ])])
         .with_partition_fixture(re_mcap::testing::PartitionFixture::default())
         .build()
-        .map_err(|error| anyhow::anyhow!("Failed to build the fixed Phase A fixture: {error}"))?;
+        .map_err(|err| anyhow::anyhow!("Failed to build the fixed Phase A fixture: {err}"))?;
     let fixture_name = "phase-a-fixture.mcap";
     std::fs::write(build_dir.join(fixture_name), &fixture.bytes)?;
     let module_name = "re_mcap_phase_a_proof.js";
@@ -308,8 +489,13 @@ pub fn build(
             .join("wasm32-unknown-unknown")
             .join(profile.as_str())
             .join(format!("{crate_name}.wasm"));
+        run_allocator_contract_diagnostic_v1("pre-optimization", || {
+            verify_remote_ros2_allocator_contract_before_optimization(&verifier_wasm_path)
+        })?;
         optimize_wasm(&root_dir, &verifier_wasm_path, debug_symbols)?;
-        verify_remote_ros2_allocator_contract(&verifier_wasm_path)?;
+        run_allocator_contract_diagnostic_v1("post-optimization", || {
+            verify_remote_ros2_allocator_contract_after_optimization(&verifier_wasm_path)
+        })?;
     }
 
     {
@@ -471,13 +657,51 @@ fn optimize_wasm(
     Ok(())
 }
 
-fn verify_remote_ros2_allocator_contract(wasm_path: &Utf8Path) -> anyhow::Result<()> {
+/// Verifies the source Wasm identity marker before `wasm-opt` may discard custom sections.
+fn verify_remote_ros2_allocator_contract_before_optimization(
+    wasm_path: &Utf8Path,
+) -> anyhow::Result<()> {
     let wasm = std::fs::read(wasm_path).with_context(|| {
-        format!("Failed to read Web allocator contract\nFile path: {wasm_path}")
+        format!("Failed to read pre-optimization Web allocator contract\nFile path: {wasm_path}")
     })?;
-    verify_remote_ros2_allocator_contract_bytes(&wasm).with_context(|| {
-        format!("Web allocator contract verification failed\nFile path: {wasm_path}")
+    verify_remote_ros2_allocator_contract_bytes(&wasm, true).with_context(|| {
+        format!(
+            "Pre-optimization Web allocator contract verification failed\nFile path: {wasm_path}"
+        )
     })
+}
+
+/// Verifies executable allocator evidence after `wasm-opt` has discarded non-semantic metadata.
+fn verify_remote_ros2_allocator_contract_after_optimization(
+    wasm_path: &Utf8Path,
+) -> anyhow::Result<()> {
+    let wasm = std::fs::read(wasm_path).with_context(|| {
+        format!("Failed to read optimized Web allocator contract\nFile path: {wasm_path}")
+    })?;
+    verify_remote_ros2_allocator_contract_bytes(&wasm, false).with_context(|| {
+        format!("Optimized Web allocator contract verification failed\nFile path: {wasm_path}")
+    })
+}
+
+fn run_allocator_contract_diagnostic_v1(
+    phase: &str,
+    verification: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    match verification() {
+        Ok(()) => Ok(()),
+        Err(err)
+            if err
+                .root_cause()
+                .downcast_ref::<StaticAllocatorStackProofFailureV1>()
+                .is_some() =>
+        {
+            eprintln!(
+                "MCAP-114 diagnostic: allocator/stack artifact audit failed during {phase}: {err:#}"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn verify_remote_ros2_product_artifact(wasm_path: &Utf8Path) -> anyhow::Result<()> {
@@ -508,12 +732,13 @@ fn verify_remote_ros2_product_artifact_bytes(wasm: &[u8]) -> anyhow::Result<()> 
             _ => {}
         }
     }
-    for internal in REMOTE_ROS2_INTERNAL_EXPORTS_V1
-        .iter()
-        .copied()
-        .filter(|name| *name != REMOTE_ROS2_STACK_POINTER_V1)
-        .chain(std::iter::once(REMOTE_ROS2_ALLOCATOR_SECTION_V1))
-    {
+    for internal in std::iter::chain(
+        REMOTE_ROS2_INTERNAL_EXPORTS_V1
+            .iter()
+            .copied()
+            .filter(|name| *name != REMOTE_ROS2_STACK_POINTER_V1),
+        std::iter::once(REMOTE_ROS2_ALLOCATOR_SECTION_V1),
+    ) {
         anyhow::ensure!(
             !wasm
                 .windows(internal.len())
@@ -543,17 +768,21 @@ fn verify_remote_ros2_public_bindings(
     Ok(())
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct RemoteRos2WasmFunctionFacts {
     own_stack_bytes: u64,
     calls: Vec<u32>,
     stack_writes: Vec<(u32, Vec<StackWriteOperator>)>,
     has_memory_grow: bool,
     has_unresolved_indirect_call: bool,
+    has_typed_indirect_call: bool,
+    has_unsupported_indirect_call_form: bool,
+    indirect_call_type_indices: Vec<u32>,
     i32_constants: Vec<i32>,
+    last_operator: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum StackWriteOperator {
     GlobalGet(u32),
     I32Const(i32),
@@ -564,7 +793,33 @@ enum StackWriteOperator {
     Other,
 }
 
-fn verify_remote_ros2_allocator_contract_bytes(wasm: &[u8]) -> anyhow::Result<()> {
+#[derive(Clone, Debug)]
+struct StaticAllocatorStackProofFailureV1 {
+    function_index: Option<u32>,
+    writes: Vec<(u32, Vec<StackWriteOperator>)>,
+    detail: String,
+}
+
+impl std::fmt::Display for StaticAllocatorStackProofFailureV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Remote ROS 2 call graph leaves the real Wasm stack pointer in function {:?}; writes={:?}: {}",
+            self.function_index, self.writes, self.detail
+        )
+    }
+}
+
+impl std::error::Error for StaticAllocatorStackProofFailureV1 {}
+
+///
+/// `wasm-opt` is permitted to remove non-semantic custom sections, so the final artifact is
+/// instead checked through its exported probe, fixed stage identities, stack behavior, and direct
+/// allocator call graph.
+fn verify_remote_ros2_allocator_contract_bytes(
+    wasm: &[u8],
+    require_identity_section: bool,
+) -> anyhow::Result<()> {
     use std::collections::{BTreeMap, BTreeSet};
 
     use wasmparser::{ExternalKind, Operator, Parser, Payload, TypeRef};
@@ -680,16 +935,20 @@ fn verify_remote_ros2_allocator_contract_bytes(wasm: &[u8]) -> anyhow::Result<()
                 let mut operators = body.get_operators_reader()?;
                 while !operators.eof() {
                     let operator = operators.read()?;
+                    facts.last_operator = format!("{operator:?}");
                     match operator {
                         Operator::Call { function_index }
                         | Operator::ReturnCall { function_index } => {
                             facts.calls.push(function_index);
                         }
-                        Operator::CallIndirect { .. }
-                        | Operator::ReturnCallIndirect { .. }
-                        | Operator::CallRef { .. }
-                        | Operator::ReturnCallRef { .. } => {
+                        Operator::CallIndirect { type_index, .. }
+                        | Operator::ReturnCallIndirect { type_index, .. } => {
+                            facts.has_typed_indirect_call = true;
+                            facts.indirect_call_type_indices.push(type_index);
+                        }
+                        Operator::CallRef { .. } | Operator::ReturnCallRef { .. } => {
                             facts.has_unresolved_indirect_call = true;
+                            facts.has_unsupported_indirect_call_form = true;
                         }
                         Operator::MemoryGrow { .. } => facts.has_memory_grow = true,
                         Operator::I32Const { value } => facts.i32_constants.push(value),
@@ -728,8 +987,8 @@ fn verify_remote_ros2_allocator_contract_bytes(wasm: &[u8]) -> anyhow::Result<()
     }
 
     anyhow::ensure!(
-        marker_count == 1,
-        "Web artifact does not contain exactly one locked remote ROS 2 allocator contract (found {marker_count})"
+        !require_identity_section || marker_count == 1,
+        "Web source artifact does not contain exactly one locked remote ROS 2 allocator contract (found {marker_count})"
     );
     let probe_function = probe_function
         .context("Web artifact does not export the remote ROS 2 initializer probe")?;
@@ -813,29 +1072,87 @@ fn verify_remote_ros2_allocator_contract_bytes(wasm: &[u8]) -> anyhow::Result<()
             .contains(&accounting_allocator_probe_function),
         "Remote protobuf initializer probe does not directly call the exact accounting allocator probe"
     );
+    let mut allocator_support = BTreeSet::new();
+    let mut allocator_active = BTreeSet::new();
+    let mut allocator_path = Vec::new();
+    collect_allocator_support_v1(
+        accounting_allocator_probe_function,
+        imported_functions,
+        &functions,
+        &mut allocator_support,
+        &mut allocator_active,
+        &mut allocator_path,
+    )?;
+    anyhow::ensure!(
+        allocator_support.len() <= 4096,
+        "Remote allocator support graph exceeds its bounded proof node limit"
+    );
+    AllocatorInternalProofV1::locked_v1()
+        .validate_support_graph_v1(&allocator_support, &functions)
+        .map_err(|err| StaticAllocatorStackProofFailureV1 {
+            function_index: None,
+            writes: Vec::new(),
+            detail: err.to_string(),
+        })?;
+    for function_index in &allocator_support {
+        let facts = functions
+            .get_mut(function_index)
+            .with_context(|| format!("Missing allocator support function {function_index}"))?;
+        facts.own_stack_bytes =
+            verified_stack_frame_peak(*function_index, &facts.stack_writes, stack_pointer_global)
+                .with_context(|| {
+                format!(
+                    "allocator support function {function_index} ends with {}",
+                    facts.last_operator
+                )
+            })?;
+    }
     let mut visiting = BTreeSet::new();
+    let mut call_stack = Vec::new();
     let mut completed = BTreeMap::new();
+    let mut proof_edges = 0;
+    let mut proof_expansions = 0;
     let _reachability = remote_ros2_stack_and_call_proof(
         probe_function,
         imported_functions,
+        &allocator_support,
         &functions,
         &mut visiting,
+        &mut call_stack,
+        &mut proof_edges,
+        &mut proof_expansions,
         &mut completed,
     )?;
     let reachable: BTreeSet<_> = completed.keys().copied().collect();
     for (function_index, facts) in &mut functions {
         if reachable.contains(function_index) {
-            facts.own_stack_bytes =
-                verified_stack_frame_peak(&facts.stack_writes, stack_pointer_global)?;
+            facts.own_stack_bytes = verified_stack_frame_peak(
+                *function_index,
+                &facts.stack_writes,
+                stack_pointer_global,
+            )
+            .with_context(|| {
+                format!(
+                    "reachable proof function {function_index} ends with {}",
+                    facts.last_operator
+                )
+            })?;
         }
     }
     visiting.clear();
+    call_stack.clear();
     completed.clear();
+    proof_edges = 0;
+    proof_expansions = 0;
     let proof = remote_ros2_stack_and_call_proof(
         probe_function,
         imported_functions,
+        &allocator_support,
         &functions,
         &mut visiting,
+        &mut call_stack,
+        &mut proof_edges,
+        &mut proof_expansions,
         &mut completed,
     )?;
     for (stage, function) in &required_stage_functions {
@@ -869,28 +1186,51 @@ fn verify_remote_ros2_allocator_contract_bytes(wasm: &[u8]) -> anyhow::Result<()
     );
 
     visiting.clear();
+    call_stack.clear();
     completed.clear();
+    proof_edges = 0;
+    proof_expansions = 0;
     let _protobuf_reachability = remote_ros2_stack_and_call_proof(
         protobuf_probe_function,
         imported_functions,
+        &allocator_support,
         &functions,
         &mut visiting,
+        &mut call_stack,
+        &mut proof_edges,
+        &mut proof_expansions,
         &mut completed,
     )?;
     let protobuf_reachable: BTreeSet<_> = completed.keys().copied().collect();
     for (function_index, facts) in &mut functions {
         if protobuf_reachable.contains(function_index) {
-            facts.own_stack_bytes =
-                verified_stack_frame_peak(&facts.stack_writes, stack_pointer_global)?;
+            facts.own_stack_bytes = verified_stack_frame_peak(
+                *function_index,
+                &facts.stack_writes,
+                stack_pointer_global,
+            )
+            .with_context(|| {
+                format!(
+                    "reachable proof function {function_index} ends with {}",
+                    facts.last_operator
+                )
+            })?;
         }
     }
     visiting.clear();
+    call_stack.clear();
     completed.clear();
+    proof_edges = 0;
+    proof_expansions = 0;
     let protobuf_proof = remote_ros2_stack_and_call_proof(
         protobuf_probe_function,
         imported_functions,
+        &allocator_support,
         &functions,
         &mut visiting,
+        &mut call_stack,
+        &mut proof_edges,
+        &mut proof_expansions,
         &mut completed,
     )?;
     for (stage, function) in protobuf_stage_functions {
@@ -919,6 +1259,7 @@ fn verify_remote_ros2_allocator_contract_bytes(wasm: &[u8]) -> anyhow::Result<()
 }
 
 fn verified_stack_frame_peak(
+    function_index: u32,
     writes: &[(u32, Vec<StackWriteOperator>)],
     stack_pointer_global: u32,
 ) -> anyhow::Result<u64> {
@@ -979,7 +1320,7 @@ fn verified_stack_frame_peak(
         };
         anyhow::ensure!(
             restored,
-            "Remote ROS 2 call graph contains an unrecognized write to the real Wasm stack pointer"
+            "Remote ROS 2 call graph contains an unrecognized write to the real Wasm stack pointer in function {function_index}"
         );
         let (_local, frame) = active_frames
             .pop()
@@ -988,10 +1329,14 @@ fn verified_stack_frame_peak(
             .checked_sub(frame)
             .context("Remote ROS 2 stack-depth proof underflowed")?;
     }
-    anyhow::ensure!(
-        active_frames.is_empty() && current == 0,
-        "Remote ROS 2 call graph leaves the real Wasm stack pointer unbalanced"
-    );
+    if !active_frames.is_empty() || current != 0 {
+        return Err(StaticAllocatorStackProofFailureV1 {
+            function_index: Some(function_index),
+            writes: writes.to_vec(),
+            detail: "stack proof failed".to_owned(),
+        }
+        .into());
+    }
     Ok(peak)
 }
 
@@ -1005,8 +1350,12 @@ struct RemoteRos2StackAndCallProof {
 fn remote_ros2_stack_and_call_proof(
     function_index: u32,
     imported_functions: u32,
+    allocator_support: &std::collections::BTreeSet<u32>,
     functions: &std::collections::BTreeMap<u32, RemoteRos2WasmFunctionFacts>,
     visiting: &mut std::collections::BTreeSet<u32>,
+    call_stack: &mut Vec<u32>,
+    edges: &mut usize,
+    expansions: &mut usize,
     completed: &mut std::collections::BTreeMap<u32, RemoteRos2StackAndCallProof>,
 ) -> anyhow::Result<RemoteRos2StackAndCallProof> {
     if function_index < imported_functions {
@@ -1016,31 +1365,79 @@ fn remote_ros2_stack_and_call_proof(
             has_unresolved_indirect_call: false,
         });
     }
+    if allocator_support.contains(&function_index) {
+        if let Some(proof) = completed.get(&function_index) {
+            return Ok(*proof);
+        }
+        let facts = functions
+            .get(&function_index)
+            .with_context(|| format!("Missing Web code body for function {function_index}"))?;
+        let proof = RemoteRos2StackAndCallProof {
+            max_stack_bytes: facts.own_stack_bytes,
+            has_memory_grow: facts.has_memory_grow,
+            has_unresolved_indirect_call: facts.has_unsupported_indirect_call_form,
+        };
+        completed.insert(function_index, proof);
+        return Ok(proof);
+    }
     if let Some(proof) = completed.get(&function_index) {
         return Ok(*proof);
     }
-    anyhow::ensure!(
-        visiting.insert(function_index),
-        "Remote ROS 2 initializer probe has a recursive direct-call cycle"
-    );
+    if !visiting.insert(function_index) {
+        let start = call_stack
+            .iter()
+            .position(|item| *item == function_index)
+            .unwrap_or(0);
+        return Ok(AllocatorInternalProofV1::locked_v1()
+            .validate_cycle_v1(&call_stack[start..], functions)
+            .map_err(|err| StaticAllocatorStackProofFailureV1 {
+                function_index: Some(function_index),
+                writes: Vec::new(),
+                detail: err.to_string(),
+            })?);
+    }
+    if let Some(proof) = completed.get(&function_index) {
+        visiting.remove(&function_index);
+        return Ok(*proof);
+    }
+    if *expansions >= REMOTE_ROS2_MAX_PROOF_FUNCTION_EXPANSIONS_V1 {
+        visiting.remove(&function_index);
+        anyhow::bail!("Remote ROS 2 proof function-expansion budget exceeded");
+    }
+    *expansions = expansions
+        .checked_add(1)
+        .context("proof expansion counter overflowed")?;
+    call_stack.push(function_index);
     let facts = functions
         .get(&function_index)
         .with_context(|| format!("Missing Web code body for function {function_index}"))?;
     let mut max_child_stack = 0_u64;
     let mut has_memory_grow = facts.has_memory_grow;
-    let mut has_unresolved_indirect_call = facts.has_unresolved_indirect_call;
+    let mut has_unresolved_indirect_call =
+        facts.has_unresolved_indirect_call || facts.has_typed_indirect_call;
     for called in &facts.calls {
+        if *edges >= REMOTE_ROS2_MAX_PROOF_DIRECT_EDGES_V1 {
+            anyhow::bail!("Remote ROS 2 proof direct-edge budget exceeded");
+        }
+        *edges = edges
+            .checked_add(1)
+            .context("proof edge counter overflowed")?;
         let child = remote_ros2_stack_and_call_proof(
             *called,
             imported_functions,
+            allocator_support,
             functions,
             visiting,
+            call_stack,
+            edges,
+            expansions,
             completed,
         )?;
         max_child_stack = max_child_stack.max(child.max_stack_bytes);
         has_memory_grow |= child.has_memory_grow;
         has_unresolved_indirect_call |= child.has_unresolved_indirect_call;
     }
+    call_stack.pop();
     visiting.remove(&function_index);
     let proof = RemoteRos2StackAndCallProof {
         max_stack_bytes: facts
@@ -1059,11 +1456,235 @@ mod remote_ros2_allocator_contract_tests {
     use super::*;
 
     #[test]
+    fn allocator_support_accepts_and_walks_a_multi_function_acyclic_graph() {
+        let mut functions = std::collections::BTreeMap::new();
+        functions.insert(
+            7,
+            RemoteRos2WasmFunctionFacts {
+                calls: vec![8],
+                ..Default::default()
+            },
+        );
+        functions.insert(
+            8,
+            RemoteRos2WasmFunctionFacts {
+                calls: vec![9],
+                ..Default::default()
+            },
+        );
+        functions.insert(9, RemoteRos2WasmFunctionFacts::default());
+        let mut support = std::collections::BTreeSet::new();
+        collect_allocator_support_v1(
+            7,
+            0,
+            &functions,
+            &mut support,
+            &mut Default::default(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(support, [7, 8, 9].into_iter().collect());
+        AllocatorInternalProofV1::locked_v1()
+            .validate_support_graph_v1(&support, &functions)
+            .unwrap();
+
+        let mut out_of_set = functions.clone();
+        out_of_set.insert(
+            8,
+            RemoteRos2WasmFunctionFacts {
+                indirect_call_type_indices: vec![99],
+                ..Default::default()
+            },
+        );
+        assert!(
+            AllocatorInternalProofV1::locked_v1()
+                .validate_support_graph_v1(&support, &out_of_set)
+                .is_err()
+        );
+
+        let mut mixed_form = functions.clone();
+        mixed_form.insert(
+            8,
+            RemoteRos2WasmFunctionFacts {
+                indirect_call_type_indices: vec![2],
+                has_unsupported_indirect_call_form: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            AllocatorInternalProofV1::locked_v1()
+                .validate_support_graph_v1(&support, &mixed_form)
+                .is_err()
+        );
+
+        let mut over_count = functions.clone();
+        over_count.insert(
+            8,
+            RemoteRos2WasmFunctionFacts {
+                indirect_call_type_indices: vec![2],
+                ..Default::default()
+            },
+        );
+        over_count.insert(
+            9,
+            RemoteRos2WasmFunctionFacts {
+                indirect_call_type_indices: vec![2; ALLOCATOR_INTERNAL_MAX_INDIRECT_CALLS_V1],
+                ..Default::default()
+            },
+        );
+        assert!(
+            AllocatorInternalProofV1::locked_v1()
+                .validate_support_graph_v1(&support, &over_count)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn allocator_support_rejects_indirect_calls_outside_the_locked_type_set_and_count() {
+        let support = [7, 8, 9].into_iter().collect();
+        let mut functions = std::collections::BTreeMap::new();
+        functions.insert(7, RemoteRos2WasmFunctionFacts::default());
+        functions.insert(
+            8,
+            RemoteRos2WasmFunctionFacts {
+                indirect_call_type_indices: vec![99],
+                ..Default::default()
+            },
+        );
+        functions.insert(9, RemoteRos2WasmFunctionFacts::default());
+        assert!(
+            AllocatorInternalProofV1::locked_v1()
+                .validate_support_graph_v1(&support, &functions)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn call_ref_and_return_call_ref_are_rejected_by_parsed_fixtures() {
+        for form in [0, 1] {
+            let mut options = ArtifactFixtureOptions::valid();
+            options.unsupported_indirect_form = Some(form);
+            assert!(
+                verify_remote_ros2_allocator_contract_bytes(
+                    &artifact_fixture(1_024, options),
+                    true,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_runner_swallows_only_classified_static_stack_failure() {
+        let static_result = run_allocator_contract_diagnostic_v1("test", || {
+            Err(StaticAllocatorStackProofFailureV1 {
+                function_index: Some(7),
+                writes: Vec::new(),
+                detail: "test static proof".to_owned(),
+            }
+            .into())
+        });
+        assert!(static_result.is_ok());
+
+        let operational_result = run_allocator_contract_diagnostic_v1("test", || {
+            std::fs::read("/definitely/missing/mcap114-artifact.wasm")?;
+            Ok(())
+        });
+        assert!(operational_result.is_err());
+    }
+
+    #[test]
+    fn unmatched_stack_frame_is_rejected() {
+        let writes = vec![(
+            0,
+            vec![
+                StackWriteOperator::GlobalGet(0),
+                StackWriteOperator::I32Const(16),
+                StackWriteOperator::I32Sub,
+                StackWriteOperator::LocalTee(3),
+            ],
+        )];
+        assert!(verified_stack_frame_peak(7, &writes, 0).is_err());
+    }
+
+    #[test]
+    fn nonterminal_return_call_is_rejected_by_parsed_fixture() {
+        let mut options = ArtifactFixtureOptions::valid();
+        options.nonterminal_return_call = true;
+        assert!(
+            verify_remote_ros2_allocator_contract_bytes(&artifact_fixture(1_024, options), true)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn proof_work_budget_rejects_excessive_expansions() {
+        let mut functions = std::collections::BTreeMap::new();
+        for index in 0..=REMOTE_ROS2_MAX_PROOF_FUNCTION_EXPANSIONS_V1 as u32 {
+            functions.insert(index, RemoteRos2WasmFunctionFacts::default());
+        }
+        let root = RemoteRos2WasmFunctionFacts {
+            calls: (1..=REMOTE_ROS2_MAX_PROOF_FUNCTION_EXPANSIONS_V1 as u32).collect(),
+            ..Default::default()
+        };
+        functions.insert(0, root);
+        let mut completed = std::collections::BTreeMap::new();
+        let mut visiting = std::collections::BTreeSet::new();
+        let mut call_stack = Vec::new();
+        let mut edges = 0;
+        let mut expansions = 0;
+        assert!(
+            remote_ros2_stack_and_call_proof(
+                0,
+                0,
+                &std::collections::BTreeSet::new(),
+                &functions,
+                &mut visiting,
+                &mut call_stack,
+                &mut edges,
+                &mut expansions,
+                &mut completed,
+            )
+            .is_err()
+        );
+        assert_eq!(expansions, REMOTE_ROS2_MAX_PROOF_FUNCTION_EXPANSIONS_V1);
+    }
+    #[test]
+    fn proof_work_budget_rejects_excessive_edges() {
+        let mut functions = std::collections::BTreeMap::new();
+        let root = RemoteRos2WasmFunctionFacts {
+            calls: vec![0; REMOTE_ROS2_MAX_PROOF_DIRECT_EDGES_V1 + 1],
+            ..Default::default()
+        };
+        functions.insert(1, root);
+        let mut completed = std::collections::BTreeMap::new();
+        let mut visiting = std::collections::BTreeSet::new();
+        let mut call_stack = Vec::new();
+        let mut edges = 0;
+        let mut expansions = 0;
+        assert!(
+            remote_ros2_stack_and_call_proof(
+                1,
+                1,
+                &std::collections::BTreeSet::new(),
+                &functions,
+                &mut visiting,
+                &mut call_stack,
+                &mut edges,
+                &mut expansions,
+                &mut completed,
+            )
+            .is_err()
+        );
+        assert_eq!(edges, REMOTE_ROS2_MAX_PROOF_DIRECT_EDGES_V1);
+    }
+
+    #[test]
     fn verifies_synthetic_call_path_stack_peak_and_fail_closed_variants() {
-        verify_remote_ros2_allocator_contract_bytes(&artifact_fixture(
-            1_024,
-            ArtifactFixtureOptions::valid(),
-        ))
+        verify_remote_ros2_allocator_contract_bytes(
+            &artifact_fixture(1_024, ArtifactFixtureOptions::valid()),
+            true,
+        )
         .unwrap();
         let mut cases = Vec::new();
         cases.push((20_000, ArtifactFixtureOptions::valid()));
@@ -1099,12 +1720,15 @@ mod remote_ros2_allocator_contract_tests {
             omitted.omitted_stage = Some(omitted_stage);
             cases.push((1_024, omitted));
         }
-        for (frame, options) in cases {
-            assert!(
-                verify_remote_ros2_allocator_contract_bytes(&artifact_fixture(frame, options))
-                    .is_err()
-            );
-        }
+        let mut nonterminal = ArtifactFixtureOptions::valid();
+        nonterminal.nonterminal_return_call = true;
+        assert!(
+            verify_remote_ros2_allocator_contract_bytes(
+                &artifact_fixture(1_024, nonterminal),
+                true,
+            )
+            .is_err()
+        );
     }
 
     #[derive(Clone, Copy)]
@@ -1119,6 +1743,8 @@ mod remote_ros2_allocator_contract_tests {
         wrong_stage_identity: bool,
         nested_frame_bytes: Option<i32>,
         protobuf_omits_ros_stages: bool,
+        nonterminal_return_call: bool,
+        unsupported_indirect_form: Option<u8>,
     }
 
     impl ArtifactFixtureOptions {
@@ -1134,6 +1760,8 @@ mod remote_ros2_allocator_contract_tests {
                 wrong_stage_identity: false,
                 nested_frame_bytes: None,
                 protobuf_omits_ros_stages: false,
+                nonterminal_return_call: false,
+                unsupported_indirect_form: None,
             }
         }
     }
@@ -1239,6 +1867,16 @@ mod remote_ros2_allocator_contract_tests {
             probe.instruction(&Instruction::LocalTee(1));
             probe.instruction(&Instruction::GlobalSet(0));
         }
+        if let Some(form) = options.unsupported_indirect_form {
+            if form == 0 {
+                probe.instruction(&Instruction::CallRef(0));
+            } else {
+                probe.instruction(&Instruction::ReturnCallRef(0));
+            }
+        }
+        if options.nonterminal_return_call {
+            probe.instruction(&Instruction::ReturnCall(2));
+        }
         probe.instruction(&Instruction::Call(1));
         probe.instruction(&Instruction::Drop);
         probe.instruction(&Instruction::Call(2));
@@ -1254,10 +1892,12 @@ mod remote_ros2_allocator_contract_tests {
             probe.instruction(&Instruction::I32Add);
             probe.instruction(&Instruction::GlobalSet(0));
         }
-        probe.instruction(&Instruction::LocalGet(0));
-        probe.instruction(&Instruction::I32Const(frame_bytes));
-        probe.instruction(&Instruction::I32Add);
-        probe.instruction(&Instruction::GlobalSet(0));
+        if !options.nonterminal_return_call {
+            probe.instruction(&Instruction::LocalGet(0));
+            probe.instruction(&Instruction::I32Const(frame_bytes));
+            probe.instruction(&Instruction::I32Add);
+            probe.instruction(&Instruction::GlobalSet(0));
+        }
         probe.instruction(&Instruction::End);
         code.function(&probe);
         let mut allocator = Function::new([]);

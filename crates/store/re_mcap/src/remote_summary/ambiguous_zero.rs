@@ -1001,36 +1001,63 @@ fn stage2_values(census: AmbiguousZeroStage2Census) -> [u64; 7] {
     ]
 }
 
-#[cfg(test)]
+#[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
 fn scale_stage1(value: AmbiguousZeroStage1Census, scale: u64) -> AmbiguousZeroStage1Census {
     AmbiguousZeroStage1Census {
-        ambiguous_chunks: value.ambiguous_chunks.checked_mul(scale).unwrap(),
-        message_index_bytes: value.message_index_bytes.checked_mul(scale).unwrap(),
+        ambiguous_chunks: value
+            .ambiguous_chunks
+            .checked_mul(scale)
+            .expect("Phase A ambiguous-zero census scale overflow"),
+        message_index_bytes: value
+            .message_index_bytes
+            .checked_mul(scale)
+            .expect("Phase A ambiguous-zero census scale overflow"),
         message_index_entries_upper: value
             .message_index_entries_upper
             .checked_mul(scale)
-            .unwrap(),
+            .expect("Phase A ambiguous-zero census scale overflow"),
         message_index_range_requests: value
             .message_index_range_requests
             .checked_mul(scale)
-            .unwrap(),
+            .expect("Phase A ambiguous-zero census scale overflow"),
         classification_retained_bytes: value
             .classification_retained_bytes
             .checked_mul(scale)
-            .unwrap(),
+            .expect("Phase A ambiguous-zero census scale overflow"),
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
 fn scale_stage2(value: AmbiguousZeroStage2Census, scale: u64) -> AmbiguousZeroStage2Census {
     AmbiguousZeroStage2Census {
-        unresolved_chunks: value.unresolved_chunks.checked_mul(scale).unwrap(),
-        chunk_range_bytes: value.chunk_range_bytes.checked_mul(scale).unwrap(),
-        compressed_bytes: value.compressed_bytes.checked_mul(scale).unwrap(),
-        uncompressed_bytes: value.uncompressed_bytes.checked_mul(scale).unwrap(),
-        chunk_range_requests: value.chunk_range_requests.checked_mul(scale).unwrap(),
-        scan_bytes: value.scan_bytes.checked_mul(scale).unwrap(),
-        scan_records_upper: value.scan_records_upper.checked_mul(scale).unwrap(),
+        unresolved_chunks: value
+            .unresolved_chunks
+            .checked_mul(scale)
+            .expect("Phase A ambiguous-zero census scale overflow"),
+        chunk_range_bytes: value
+            .chunk_range_bytes
+            .checked_mul(scale)
+            .expect("Phase A ambiguous-zero census scale overflow"),
+        compressed_bytes: value
+            .compressed_bytes
+            .checked_mul(scale)
+            .expect("Phase A ambiguous-zero census scale overflow"),
+        uncompressed_bytes: value
+            .uncompressed_bytes
+            .checked_mul(scale)
+            .expect("Phase A ambiguous-zero census scale overflow"),
+        chunk_range_requests: value
+            .chunk_range_requests
+            .checked_mul(scale)
+            .expect("Phase A ambiguous-zero census scale overflow"),
+        scan_bytes: value
+            .scan_bytes
+            .checked_mul(scale)
+            .expect("Phase A ambiguous-zero census scale overflow"),
+        scan_records_upper: value
+            .scan_records_upper
+            .checked_mul(scale)
+            .expect("Phase A ambiguous-zero census scale overflow"),
     }
 }
 

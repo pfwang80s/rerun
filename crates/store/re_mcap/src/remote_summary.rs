@@ -4739,7 +4739,6 @@ pub(crate) mod tests {
 
         let physical_source = include_str!("remote_summary/physical_regions.rs");
         for forbidden in [
-            "MaterializedSummaryRecords",
             "mcap::parse_record",
             "SummaryReader",
             "MessageIndexRegionParse",

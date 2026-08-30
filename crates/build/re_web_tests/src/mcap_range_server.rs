@@ -2448,7 +2448,7 @@ mod tests {
             provenance: crate::phase_a_evidence::PhaseAProvenanceV1 {
                 fixture: "fixed-mcap-phase-a-v1".to_owned(),
                 transport: "controlled-range-byob-v1".to_owned(),
-                pipeline: "re_viewer-production-disarmed-v1".to_owned(),
+                pipeline: "re_viewer-transport-physical-pipeline-proof-v1".to_owned(),
             },
             build: crate::phase_a_evidence::PhaseABuildEvidenceV1 {
                 wasm_sha256: sha256_hex_v1(b"wasm"),
