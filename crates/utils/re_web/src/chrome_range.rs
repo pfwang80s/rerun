@@ -419,7 +419,7 @@ fn validate_bound_validator(
 mod web {
     use std::fmt;
     use std::future::Future;
-    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    #[cfg(rerun_mcap_phase_a_proof_v1)]
     use std::ops::Range;
 
     use js_sys::{Function, JsString, Reflect};
@@ -778,6 +778,7 @@ mod web {
     }
 
     /// Sealed pre-Fetch owner for a strict metadata probe.
+    #[cfg(test)]
     pub(crate) struct PreparedChromeProbeRangeAttempt {
         transport: PreparedChromeRangeTransport,
         consistency_policy: RepresentationConsistencyPolicy,
@@ -948,6 +949,7 @@ mod web {
         }
     }
 
+    #[cfg(test)]
     impl fmt::Debug for PreparedChromeProbeRangeAttempt {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter
@@ -958,6 +960,7 @@ mod web {
         }
     }
 
+    #[cfg(test)]
     impl PreparedChromeRangeIdentity<ChromeRangeAttemptAbortController>
         for PreparedChromeProbeRangeAttempt
     {
@@ -982,6 +985,7 @@ mod web {
     }
 
     /// Completes all fallible Request/Header/output/reservation preparation without starting Fetch.
+    #[cfg(test)]
     #[expect(
         clippy::too_many_arguments,
         reason = "the transport boundary keeps every capability and policy input explicit"
@@ -1011,6 +1015,7 @@ mod web {
         })
     }
 
+    #[cfg(test)]
     impl PreparedChromeProbeRangeAttempt {
         /// Consumes the sealed owner and synchronously crosses the irreversible Fetch boundary.
         pub(crate) fn start<T, C>(
@@ -1179,6 +1184,7 @@ mod web {
             &self.body
         }
 
+        #[cfg(test)]
         pub(crate) fn object(&self) -> &BoundChromeRangeObject {
             &self.object
         }
@@ -1189,6 +1195,7 @@ mod web {
     }
 
     /// Performs one strict probe Range and atomically binds its object length and validator.
+    #[cfg(test)]
     #[expect(
         clippy::too_many_arguments,
         reason = "the transport boundary keeps every capability and policy input explicit"
