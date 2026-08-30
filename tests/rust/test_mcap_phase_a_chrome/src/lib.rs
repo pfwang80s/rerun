@@ -64,7 +64,7 @@ pub async fn run_phase_a_sample_v1(
         return Err(JsValue::from_str("the Phase A fixture length is zero"));
     }
     if stage == "byob_copy" {
-        let (body, retained_high_water_bytes, overflowed) =
+        let (body, _retained_high_water_bytes, overflowed) =
             fetch_exact(fixture_url, 0..fixture_length).await?;
         let bytes = u64::try_from(body.len())
             .map_err(|error| js_error("Phase A BYOB length overflow", error))?;
@@ -94,9 +94,6 @@ pub async fn run_phase_a_sample_v1(
         "message_index_parse" => production_remote_mcap_cpu::RemoteCpuWorkKindV1::MessageIndexParse,
         "physical_validation" => {
             production_remote_mcap_cpu::RemoteCpuWorkKindV1::PhysicalChunkValidation
-        }
-        "dispatch_decode" => {
-            production_remote_mcap_cpu::RemoteCpuWorkKindV1::PhysicalChunkDispatchDecode
         }
         _ => return Err(JsValue::from_str("unknown Phase A CPU stage")),
     };
@@ -172,68 +169,39 @@ pub async fn run_phase_a_sample_v1(
                 .and_then(|chunk| full.checked_add(chunk))
         })
         .ok_or_else(|| JsValue::from_str("Phase A physical input length overflow"))?;
-    let pending = source
-        .issue_pending_v1()
-        .map_err(|error| js_error("Phase A physical pending lease failed", error))?;
-    let result =
-        if kind == production_remote_mcap_cpu::RemoteCpuWorkKindV1::PhysicalChunkValidation {
-            production_remote_mcap_cpu::drive_phase_a_measurement_work_v1(
-                kind,
-                retained_input_bytes,
-                MAX_PHASE_A_OUTPUT_BYTES_V1,
-                move || {
-                    let cache =
-                        production_remote_mcap_cpu::execute_phase_a_physical_body_adapter_v1(
-                            chunk_body, pending,
-                        )
-                        .map_err(|_error| {
-                            production_remote_mcap_cpu::RemoteCpuExecutionErrorV1::BoundViolation
-                        })?;
-                    let owner = re_mcap::phase_a_measurement::complete_physical_validation_stage_v1(
-                    cache,
-                )
+    let (_pair, web_permit, mcap_permit) =
+        re_mcap_web_contract::CorrelationFactoryV1::new_operation_v1();
+    let transport_receipt =
+        re_web::transport_receipt::issue_transport_receipt_v1(chunk_body, web_permit);
+    let physical_receipt = source
+        .resolved_authority_v1()
+        .issue_physical_receipt_v1(0, mcap_permit)
+        .map_err(|error| js_error("Phase A physical receipt issue failed", error))?;
+    let result = production_remote_mcap_cpu::drive_phase_a_measurement_work_v1(
+        kind,
+        retained_input_bytes,
+        MAX_PHASE_A_OUTPUT_BYTES_V1,
+        move || {
+            let cache = re_mcap_web_adapter::phase_a::initiate_operation_v1(
+                transport_receipt,
+                physical_receipt,
+            )
+            .run_v1()
+            .map_err(|_error| {
+                production_remote_mcap_cpu::RemoteCpuExecutionErrorV1::BoundViolation
+            })?
+            .into_cache_v1();
+            let owner = re_mcap::phase_a_measurement::complete_physical_validation_stage_v1(cache)
                 .map_err(|_error| {
                     production_remote_mcap_cpu::RemoteCpuExecutionErrorV1::BoundViolation
                 })?;
-                    let measurement = owner.measurement_v1().map_err(|_error| {
-                        production_remote_mcap_cpu::RemoteCpuExecutionErrorV1::BoundViolation
-                    })?;
-                    Ok((measurement, owner))
-                },
-            )
-        } else {
-            production_remote_mcap_cpu::drive_phase_a_validation_dispatch_measurement_v1(
-                retained_input_bytes,
-                MAX_PHASE_A_OUTPUT_BYTES_V1,
-                MAX_PHASE_A_OUTPUT_BYTES_V1,
-                move || {
-                    let cache =
-                        production_remote_mcap_cpu::execute_phase_a_physical_body_adapter_v1(
-                            chunk_body, pending,
-                        )
-                        .map_err(|_error| {
-                            production_remote_mcap_cpu::RemoteCpuExecutionErrorV1::BoundViolation
-                        })?;
-                    let owner =
-                        re_mcap::phase_a_measurement::complete_physical_validation_stage_v1(cache)
-                            .map_err(|_error| {
-                                production_remote_mcap_cpu::RemoteCpuExecutionErrorV1::BoundViolation
-                            })?;
-                    let measurement = owner.measurement_v1().map_err(|_error| {
-                        production_remote_mcap_cpu::RemoteCpuExecutionErrorV1::BoundViolation
-                    })?;
-                    Ok((measurement, owner))
-                },
-                move |validation| {
-                    source
-                        .run_dispatch_from_validation_stage_v1(validation, 1)
-                        .map_err(|_error| {
-                            production_remote_mcap_cpu::RemoteCpuExecutionErrorV1::BoundViolation
-                        })
-                },
-            )
-        }
-        .map_err(|error| js_error("Phase A physical CPU driver failed", error))?;
+            let measurement = owner.measurement_v1().map_err(|_error| {
+                production_remote_mcap_cpu::RemoteCpuExecutionErrorV1::BoundViolation
+            })?;
+            Ok((measurement, owner))
+        },
+    )
+    .map_err(|error| js_error("Phase A physical CPU driver failed", error))?;
     let retained_high_water_bytes = u64::try_from(allocation_ledger.high_water_bytes())
         .map_err(|error| js_error("Phase A allocation high-water overflow", error))?;
     serialize_driver(result, retained_high_water_bytes)

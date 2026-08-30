@@ -9575,6 +9575,8 @@ dependencies = [
  "parking_lot",
  "re_build_tools",
  "re_mcap",
+ "re_mcap_web_adapter",
+ "re_mcap_web_contract",
  "re_memory",
  "re_web",
  "re_web_tests",
@@ -9584,6 +9586,16 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-time",
+]
+
+[[package]]
+name = "re_mcap_web_adapter"
+version = "0.36.0-alpha.1+dev"
+dependencies = [
+ "re_mcap",
+ "re_mcap_web_contract",
+ "re_web",
+ "static_assertions",
 ]
 
 [[package]]

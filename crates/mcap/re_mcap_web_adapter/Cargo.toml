@@ -1,0 +1,32 @@
+[package]
+name = "re_mcap_web_adapter"
+description = "Sole trusted cross-layer producer for Web remote-MCAP operations"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+include.workspace = true
+license.workspace = true
+publish = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+consumer_contract = []
+phase_a = ["consumer_contract", "dep:re_web", "dep:re_mcap"]
+locked = ["consumer_contract", "dep:re_web", "dep:re_mcap"]
+
+[dependencies]
+re_mcap_web_contract.workspace = true
+
+# Optional, declared unconditionally so host --all-features compiles; the
+# consumer_contract profile excludes them by feature.
+re_web = { workspace = true, optional = true }
+re_mcap = { workspace = true, optional = true }
+
+[dev-dependencies]
+static_assertions.workspace = true

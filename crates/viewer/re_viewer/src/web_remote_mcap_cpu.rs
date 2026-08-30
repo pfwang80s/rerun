@@ -3,12 +3,8 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::marker::PhantomData;
 use std::sync::Arc;
-
-#[cfg(target_arch = "wasm32")]
-use std::cell::Cell;
-#[cfg(target_arch = "wasm32")]
-use std::rc::Rc;
 
 use parking_lot::Mutex;
 
@@ -176,6 +172,9 @@ struct DisarmedCpuExecutionV1<'work> {
 }
 
 struct SealedCpuWorkV1<'work> {
+    // Keep the work lifetime in the production-disarmed typestate even when the capability
+    // branch contains no executable closure.
+    _work_lifetime: PhantomData<&'work ()>,
     identity: RemoteWorkIdentityV1,
     input_bytes: u64,
     expected_output_bytes: u64,
@@ -311,6 +310,7 @@ macro_rules! declare_cpu_phase {
                 run: impl FnOnce() + 'static,
             ) -> Self {
                 Self(SealedCpuWorkV1 {
+                    _work_lifetime: PhantomData,
                     identity,
                     input_bytes: retained_input_bytes,
                     expected_output_bytes,
@@ -346,6 +346,7 @@ macro_rules! declare_cpu_phase {
                 + 'work,
             ) -> Self {
                 Self(SealedCpuWorkV1 {
+                    _work_lifetime: PhantomData,
                     identity,
                     input_bytes: retained_input_bytes,
                     expected_output_bytes,
@@ -1013,9 +1014,9 @@ impl<'work> RemoteMcapCpuDriverV1<'work> {
                 let duration_micros = u64::try_from(started.elapsed().as_micros()).ok();
                 let (result, input_bytes) = match result {
                     Ok(result) => result,
-                    Err(error) => {
+                    Err(err) => {
                         self.registered_work.remove(&identity);
-                        return RemoteCpuDriveOutcomeV1::WorkFailed { kind, error };
+                        return RemoteCpuDriveOutcomeV1::WorkFailed { kind, error: err };
                     }
                 };
                 let output_bytes = result.output_bytes_v1();
@@ -1194,10 +1195,10 @@ where
         .map_err(|()| RemoteCpuExecutionErrorV1::BoundViolation)?;
     driver
         .enqueue_from_fetch_callback_v1(RemoteFetchCompletionV1::Cpu(work), || {})
-        .map_err(|_error| RemoteCpuExecutionErrorV1::BoundViolation)?;
+        .map_err(|_err| RemoteCpuExecutionErrorV1::BoundViolation)?;
     match driver.drive_cpu_v1(1) {
         RemoteCpuDriveOutcomeV1::Completed { .. } => {}
-        RemoteCpuDriveOutcomeV1::WorkFailed { error, .. } => return Err(error),
+        RemoteCpuDriveOutcomeV1::WorkFailed { error: err, .. } => return Err(err),
         _ => return Err(RemoteCpuExecutionErrorV1::BoundViolation),
     }
     drop(driver.pop_ready_v1());
@@ -1302,10 +1303,10 @@ where
         .map_err(|()| RemoteCpuExecutionErrorV1::BoundViolation)?;
     driver
         .enqueue_from_fetch_callback_v1(RemoteFetchCompletionV1::Cpu(validation_work), || {})
-        .map_err(|_error| RemoteCpuExecutionErrorV1::BoundViolation)?;
+        .map_err(|_err| RemoteCpuExecutionErrorV1::BoundViolation)?;
     match driver.drive_cpu_v1(1) {
         RemoteCpuDriveOutcomeV1::Completed { .. } => {}
-        RemoteCpuDriveOutcomeV1::WorkFailed { error, .. } => return Err(error),
+        RemoteCpuDriveOutcomeV1::WorkFailed { error: err, .. } => return Err(err),
         _ => return Err(RemoteCpuExecutionErrorV1::BoundViolation),
     }
     let token = driver
@@ -1320,6 +1321,7 @@ where
     } = token;
     let dispatch_work = RemoteCpuWorkV1::PhysicalChunkDispatchDecode(
         RemotePhysicalChunkDispatchDecodeWorkV1(SealedCpuWorkV1 {
+            _work_lifetime: PhantomData,
             identity: successor_identity,
             input_bytes: retained_input_bytes,
             expected_output_bytes: dispatch_expected_output_bytes,
@@ -1332,10 +1334,10 @@ where
         .map_err(|()| RemoteCpuExecutionErrorV1::BoundViolation)?;
     driver
         .enqueue_from_fetch_callback_v1(RemoteFetchCompletionV1::Cpu(dispatch_work), || {})
-        .map_err(|_error| RemoteCpuExecutionErrorV1::BoundViolation)?;
+        .map_err(|_err| RemoteCpuExecutionErrorV1::BoundViolation)?;
     match driver.drive_cpu_v1(2) {
         RemoteCpuDriveOutcomeV1::Completed { .. } => {}
-        RemoteCpuDriveOutcomeV1::WorkFailed { error, .. } => return Err(error),
+        RemoteCpuDriveOutcomeV1::WorkFailed { error: err, .. } => return Err(err),
         _ => return Err(RemoteCpuExecutionErrorV1::BoundViolation),
     }
     drop(driver.pop_ready_v1());
@@ -1351,209 +1353,6 @@ where
         max_duration_micros: metrics.max_duration_micros.max(1),
         overflowed: metrics.overflowed,
     })
-}
-
-#[cfg(target_arch = "wasm32")]
-pub(crate) struct WasmPhysicalFetchCompletionOwnerV1<'a> {
-    // Field order is normative: transport backing drops before the pending lower lease.
-    body: Option<re_web::chrome_byob::ExactLengthRangeBody>,
-    pending: Option<re_mcap::web_body_handoff::WebPendingPhysicalChunkReadV1<'a>>,
-    authority: RemoteRangeCompletionAuthorityV1,
-}
-
-#[cfg(target_arch = "wasm32")]
-struct RemoteRangeAuthorityStateV1 {
-    current: Cell<Option<RemoteWorkIdentityV1>>,
-}
-
-/// Registry-side authority which remains live while an attempt/completion may be accepted.
-#[cfg(target_arch = "wasm32")]
-pub(crate) struct RemoteRangeOperationGuardV1 {
-    state: Rc<RemoteRangeAuthorityStateV1>,
-}
-
-/// Move-only authority owned by the Range operation until exactly one completion is accepted.
-#[cfg(target_arch = "wasm32")]
-pub(crate) struct RemoteRangeAttemptAuthorityV1 {
-    state: Rc<RemoteRangeAuthorityStateV1>,
-    identity: RemoteWorkIdentityV1,
-}
-
-/// Move-only completion authority consumed by the upper body owner.
-#[cfg(target_arch = "wasm32")]
-pub(crate) struct RemoteRangeCompletionAuthorityV1 {
-    state: Rc<RemoteRangeAuthorityStateV1>,
-    identity: RemoteWorkIdentityV1,
-}
-
-#[cfg(target_arch = "wasm32")]
-impl RemoteRangeAttemptAuthorityV1 {
-    #[cfg(rerun_mcap_phase_a_proof_v1)]
-    fn for_phase_a_measurement_v1(
-        identity: RemoteWorkIdentityV1,
-    ) -> (RemoteRangeOperationGuardV1, Self) {
-        let state = Rc::new(RemoteRangeAuthorityStateV1 {
-            current: Cell::new(Some(identity)),
-        });
-        (
-            RemoteRangeOperationGuardV1 {
-                state: Rc::clone(&state),
-            },
-            Self { state, identity },
-        )
-    }
-
-    fn settle_success_v1(self) -> Result<RemoteRangeCompletionAuthorityV1, ()> {
-        if self.state.current.get() != Some(self.identity) {
-            return Err(());
-        }
-        Ok(RemoteRangeCompletionAuthorityV1 {
-            state: self.state,
-            identity: self.identity,
-        })
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl Drop for RemoteRangeOperationGuardV1 {
-    fn drop(&mut self) {
-        self.state.current.set(None);
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl RemoteRangeCompletionAuthorityV1 {
-    fn identity_v1(&self) -> RemoteWorkIdentityV1 {
-        self.identity
-    }
-
-    fn ensure_current_v1(&self) -> Result<(), ()> {
-        (self.state.current.get() == Some(self.identity))
-            .then_some(())
-            .ok_or(())
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-pub(crate) struct WasmPhysicalBodyOwnerAdapterV1<'a> {
-    owner: WasmPhysicalFetchCompletionOwnerV1<'a>,
-    overlap_budget: re_mcap::web_body_handoff::WebPhysicalCopyOverlapBudgetV1,
-}
-
-#[cfg(target_arch = "wasm32")]
-pub(crate) enum WasmPhysicalBodyAdapterErrorV1 {
-    Bind(re_mcap::web_body_handoff::WebPhysicalCompletionBindErrorV1),
-    Handoff(re_mcap::web_body_handoff::WebPhysicalBodyHandoffErrorV1),
-}
-
-#[cfg(target_arch = "wasm32")]
-impl<'a> WasmPhysicalBodyOwnerAdapterV1<'a> {
-    /// The unique upper adapter owns the transport body and opaque lower pending lease together.
-    pub(crate) fn new_disarmed_v1(
-        body: re_web::chrome_byob::ExactLengthRangeBody,
-        pending: re_mcap::web_body_handoff::WebPendingPhysicalChunkReadV1<'a>,
-        authority: RemoteRangeCompletionAuthorityV1,
-    ) -> Result<Self, re_mcap::web_body_handoff::WebPhysicalCompletionBindErrorV1> {
-        let identity = authority.identity_v1();
-        let pending_identity = pending.identity_v1()?;
-        let (range_start, range_end_exclusive) = pending_identity.full_range_v1();
-        if identity.driver.source_generation != pending_identity.source_generation_v1()
-            || identity.read_generation != pending_identity.read_generation_v1()
-            || identity.canonical_ordinal != pending_identity.canonical_ordinal_v1()
-            || identity.full_range
-                != (RemoteByteRangeV1 {
-                    start: range_start,
-                    end_exclusive: range_end_exclusive,
-                })
-            || identity.budget_profile != RemoteBudgetProfileV1::UnfrozenPhaseACandidate
-            || pending_identity.budget_profile_v1()
-                != re_mcap::web_body_handoff::WebPhysicalBudgetProfileV1::UnfrozenPhaseACandidate
-        {
-            return Err(
-                re_mcap::web_body_handoff::WebPhysicalCompletionBindErrorV1::CrossCombination,
-            );
-        }
-        Ok(Self {
-            owner: WasmPhysicalFetchCompletionOwnerV1 {
-                body: Some(body),
-                pending: Some(pending),
-                authority,
-            },
-            overlap_budget:
-                re_mcap::web_body_handoff::WebPhysicalCopyOverlapBudgetV1::new_unfrozen_phase_a_v1(),
-        })
-    }
-
-    pub(crate) fn execute_v1(
-        self,
-    ) -> Result<
-        re_mcap::web_body_handoff::WebPhysicalScanCacheEntryV1<'a>,
-        WasmPhysicalBodyAdapterErrorV1,
-    > {
-        let WasmPhysicalFetchCompletionOwnerV1 {
-            mut body,
-            mut pending,
-            authority,
-        } = self.owner;
-        let body = body
-            .take()
-            .expect("a live upper completion owner retains its exact body");
-        let borrowed = pending
-            .take()
-            .expect("a live upper completion owner retains its pending lease")
-            .bind_borrowed_exact_body_v1(
-                body.as_slice(),
-                re_mcap::web_body_handoff::WebPhysicalBudgetProfileV1::UnfrozenPhaseACandidate,
-            )
-            .map_err(WasmPhysicalBodyAdapterErrorV1::Bind)?;
-        let completed = borrowed
-            .process_zero_copy_v1(&self.overlap_budget, |_safe_point| {
-                authority.ensure_current_v1()
-            })
-            .map_err(WasmPhysicalBodyAdapterErrorV1::Handoff)?;
-        drop(body);
-        Ok(completed.into_cache_after_body_drop_v1())
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", rerun_mcap_phase_a_proof_v1))]
-pub(crate) fn execute_phase_a_physical_body_adapter_v1<'a>(
-    body: re_web::chrome_byob::ExactLengthRangeBody,
-    pending: re_mcap::web_body_handoff::WebPendingPhysicalChunkReadV1<'a>,
-) -> Result<
-    re_mcap::web_body_handoff::WebPhysicalScanCacheEntryV1<'a>,
-    WasmPhysicalBodyAdapterErrorV1,
-> {
-    let pending_identity = pending
-        .identity_v1()
-        .map_err(WasmPhysicalBodyAdapterErrorV1::Bind)?;
-    let (start, end_exclusive) = pending_identity.full_range_v1();
-    let identity = RemoteWorkIdentityV1 {
-        driver: RemoteDriverIdentityV1 {
-            source_generation: pending_identity.source_generation_v1(),
-            activity_epoch: 1,
-        },
-        operation: RemoteOperationIdentityV1 {
-            operation_nonce: 1,
-            attempt_generation: 1,
-        },
-        read_generation: pending_identity.read_generation_v1(),
-        canonical_ordinal: pending_identity.canonical_ordinal_v1(),
-        full_range: RemoteByteRangeV1 {
-            start,
-            end_exclusive,
-        },
-        budget_profile: RemoteBudgetProfileV1::UnfrozenPhaseACandidate,
-        phase_generation: 1,
-    };
-    let (_operation_guard, attempt) =
-        RemoteRangeAttemptAuthorityV1::for_phase_a_measurement_v1(identity);
-    let authority = attempt.settle_success_v1().map_err(|()| {
-        WasmPhysicalBodyAdapterErrorV1::Bind(
-            re_mcap::web_body_handoff::WebPhysicalCompletionBindErrorV1::StaleLease,
-        )
-    })?;
-    WasmPhysicalBodyOwnerAdapterV1::new_disarmed_v1(body, pending, authority)?.execute_v1()
 }
 
 #[cfg(test)]
@@ -1582,6 +1381,7 @@ mod tests {
     ) -> RemoteFetchCompletionV1<'static> {
         let core = |constructor: fn(SealedCpuWorkV1<'static>) -> RemoteCpuWorkV1<'static>| {
             constructor(SealedCpuWorkV1 {
+                _work_lifetime: PhantomData,
                 identity,
                 input_bytes: retained_input_bytes,
                 expected_output_bytes,

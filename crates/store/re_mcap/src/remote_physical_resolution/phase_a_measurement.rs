@@ -374,22 +374,29 @@ impl PhaseAMeasurementResolvedSourceV1<'_> {
 
     pub fn issue_pending_v1(
         &self,
-    ) -> Result<
-        crate::web_body_handoff::WebPendingPhysicalChunkReadV1<'_>,
-        PhysicalSourceResolutionErrorV1,
-    > {
+    ) -> Result<crate::web_body_handoff::WebPhysicalReceiptV1<'_>, PhysicalSourceResolutionErrorV1>
+    {
         self.owner.inner.issue_lease_v1(0).map(|lease| {
             // Phase-A mints a fresh correlation pair and uses only the MCAP permit. The
             // unused pair and Web permit are discarded; unused correlation material is
             // non-authority and grants no Web, MCAP, cache, or operation capability.
             let (_pair, _web, mcap) =
                 re_mcap_web_contract::CorrelationFactoryV1::new_operation_v1();
-            crate::web_body_handoff::WebPendingPhysicalChunkReadV1::from_lease_v1(lease, mcap)
+            crate::web_body_handoff::WebPhysicalReceiptV1::from_lease_v1(lease, mcap)
         })
     }
 
     pub fn bytes_v1(&self) -> &[u8] {
         self.bytes
+    }
+
+    /// Exposes the resolved physical source authority for the Web adapter's
+    /// `issue_physical_receipt_v1` seam (wasm-only Phase-A path).
+    #[cfg(target_arch = "wasm32")]
+    pub fn resolved_authority_v1(
+        &self,
+    ) -> &crate::remote_physical_resolution::ResolvedPhysicalSourceAuthorityV1<'_> {
+        self.owner.resolved_authority_v1()
     }
 
     #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
@@ -565,10 +572,6 @@ mod tests {
             assert_eq!(range.end as usize, fixture.layout.chunks[0].record.end);
             let pending = source.issue_pending_v1().unwrap();
             let identity = pending.identity_v1().unwrap();
-            assert_eq!(
-                identity.source_generation_v1(),
-                source.source_generation_v1()
-            );
             assert_eq!(identity.full_range_v1(), (range.start, range.end));
         })
         .unwrap();

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/build/*",
+  "crates/mcap/*",
   "crates/store/*",
   "crates/top/*",
   "crates/utils/*",
@@ -66,6 +67,9 @@ re_build_tools = { path = "crates/build/re_build_tools", version = "=0.36.0-alph
 re_dev_tools = { path = "crates/build/re_dev_tools", version = "=0.36.0-alpha.1", default-features = false }
 re_protos_builder = { path = "crates/build/re_protos_builder", version = "=0.36.0-alpha.1", default-features = false }
 re_types_builder = { path = "crates/build/re_types_builder", version = "=0.36.0-alpha.1", default-features = false }
+
+# crates/mcap:
+re_mcap_web_adapter = { path = "crates/mcap/re_mcap_web_adapter", version = "=0.36.0-alpha.1", default-features = false }
 
 # crates/store:
 re_lenses_core = { path = "crates/store/re_lenses_core", version = "=0.36.0-alpha.1", default-features = false }

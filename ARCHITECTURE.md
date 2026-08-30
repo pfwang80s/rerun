@@ -250,6 +250,7 @@ Update instructions:
 | re_log_channel       | An in-memory channel of Rerun data messages                                                   |
 | re_mcap              | Convert MCAP into Rerun-compatible data.                                                      |
 | re_mcap_web_contract | Dependency-neutral non-authority correlation material for remote-MCAP Web operations.       |
+| re_mcap_web_adapter  | Sole trusted cross-layer producer for Web remote-MCAP operations.                          |
 | re_memory            | Run-time memory tracking and profiling.                                                       |
 | re_mutex             | A wrapper around `parking_lot::Mutex` useful for debugging deadlocks.                         |
 | re_perf_telemetry    | In and out of process performance profiling utilities for Rerun & Redap                       |

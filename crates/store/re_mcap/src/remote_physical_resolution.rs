@@ -25,6 +25,7 @@ use crate::remote_summary::{
     PreparedAmbiguousZeroResolutionSeed,
 };
 use crate::remote_time::{RawMcapTime, canonicalize_raw_mcap_time};
+use re_mcap_web_contract::McapCorrelationPermitV1;
 
 static NEXT_REMOTE_OBJECT_GENERATION_V1: AtomicU64 = AtomicU64::new(1);
 
@@ -746,6 +747,21 @@ impl<ValidatorOwner> BoundResolvedPhysicalSourceAuthorityV1<'_, ValidatorOwner> 
     pub(crate) fn source_v1(&self) -> ResolvedRemotePhysicalSourceRefV1<'_, '_> {
         let _keep_object_open = &self.object_lifetime;
         ResolvedRemotePhysicalSourceRefV1 { inner: &self.inner }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl<'a, ValidatorOwner> BoundResolvedPhysicalSourceAuthorityV1<'a, ValidatorOwner> {
+    /// Exposes the resolved physical source authority for the Web adapter's
+    /// `issue_physical_receipt_v1` seam.
+    ///
+    /// The lease and selector types remain `pub(crate)`; this exposes only the
+    /// receipt-issuing authority handle. The returned borrow keeps the bound object
+    /// lifetime alive, so the remote object stays open while the authority is held.
+    #[cfg(target_arch = "wasm32")]
+    pub fn resolved_authority_v1(&self) -> &ResolvedPhysicalSourceAuthorityV1<'a> {
+        let _keep_object_open = &self.object_lifetime;
+        &self.inner
     }
 }
 
@@ -1929,6 +1945,23 @@ impl<'a> ResolvedPhysicalSourceAuthorityV1<'a> {
         self.authority
             .issue(selector)
             .map_err(PhysicalSourceResolutionErrorV1::Physical)
+    }
+
+    /// Issues a producer-issued physical receipt for one canonical chunk read.
+    ///
+    /// The adapter-facing seam revalidates the live object/source binding, selects the
+    /// canonical chunk by ordinal, and issues a live read lease before consuming the MCAP
+    /// correlation permit. The returned [`crate::web_body_handoff::WebPhysicalReceiptV1`]
+    /// keeps the lease and the physical identity private, so the adapter never names the
+    /// lease, the selector, the raw body, the cache, the reservation, or the scalar identity.
+    pub fn issue_physical_receipt_v1(
+        &self,
+        ordinal: usize,
+        permit: McapCorrelationPermitV1,
+    ) -> Result<crate::web_body_handoff::WebPhysicalReceiptV1<'a>, PhysicalSourceResolutionErrorV1>
+    {
+        let lease = self.issue_lease_v1(ordinal)?;
+        Ok(crate::web_body_handoff::WebPhysicalReceiptV1::from_lease_v1(lease, permit))
     }
 }
 
@@ -4292,5 +4325,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0, 2]
         );
+    }
+
+    #[test]
+    fn resolved_authority_issues_physical_receipt_and_surfaces_matching_material() {
+        use re_mcap_web_contract::CorrelationFactoryV1;
+
+        let fixture = fixture([FixtureChunk::single(FixtureMessage::new(1, 1, 0))]);
+        let budget = layout_budget(1, retained_layout_bytes(1).unwrap());
+        let prepared = prepare(&fixture, budget);
+        let resolved = prepared.finalize_v1().unwrap();
+
+        let (_pair, _web, mcap_permit) = CorrelationFactoryV1::new_operation_v1();
+        let receipt = resolved
+            .inner
+            .issue_physical_receipt_v1(0, mcap_permit)
+            .unwrap();
+
+        let record = fixture.layout.chunks[0].record;
+        let body = &fixture.bytes[record.start..record.end];
+        let (_borrowed, material) = receipt.bind_exact_body_v1(body).unwrap();
+        let _ = material;
     }
 }

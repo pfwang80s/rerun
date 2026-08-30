@@ -3023,16 +3023,15 @@ mod tests {
     #[test]
     fn web_explicit_copy_handoff_revalidates_every_safe_point_and_releases_after_body_drop() {
         use crate::web_body_handoff::{
-            WEB_PHYSICAL_BODY_PHASE_A_CANDIDATE_PROFILE_V1, WebPendingPhysicalChunkReadV1,
-            WebPhysicalBodyProfileStatusV1, WebPhysicalBodySafePointV1, WebPhysicalBodyStrategyV1,
-            WebPhysicalCopyOverlapBudgetV1, process_explicit_copy_body_v1,
+            WEB_PHYSICAL_BODY_PHASE_A_CANDIDATE_PROFILE_V1, WebPhysicalBodyProfileStatusV1,
+            WebPhysicalBodySafePointV1, WebPhysicalBodyStrategyV1, WebPhysicalCopyOverlapBudgetV1,
+            WebPhysicalReceiptV1, process_explicit_copy_body_v1,
         };
 
         let fixture = web_handoff_fixture();
         let authority = build_authority(&fixture);
         let body = full_record(&fixture, 0);
-        let pending =
-            WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&authority, 0), mcap_permit());
+        let pending = WebPhysicalReceiptV1::from_lease_v1(issue(&authority, 0), mcap_permit());
         let budget = WebPhysicalCopyOverlapBudgetV1::new_unfrozen_phase_a_v1();
         let mut observed = Vec::new();
         let completed = process_explicit_copy_body_v1(pending, &body, &budget, |point| {
@@ -3072,16 +3071,15 @@ mod tests {
     #[test]
     fn web_zero_copy_handoff_borrows_payload_and_allocates_no_destination_before_decompression() {
         use crate::web_body_handoff::{
-            WEB_PHYSICAL_BODY_PHASE_A_CANDIDATE_PROFILE_V1, WebPendingPhysicalChunkReadV1,
-            WebPhysicalBodyProfileStatusV1, WebPhysicalBodySafePointV1, WebPhysicalBodyStrategyV1,
-            WebPhysicalCopyOverlapBudgetV1, process_zero_copy_body_v1,
+            WEB_PHYSICAL_BODY_PHASE_A_CANDIDATE_PROFILE_V1, WebPhysicalBodyProfileStatusV1,
+            WebPhysicalBodySafePointV1, WebPhysicalBodyStrategyV1, WebPhysicalCopyOverlapBudgetV1,
+            WebPhysicalReceiptV1, process_zero_copy_body_v1,
         };
 
         let fixture = web_handoff_fixture();
         let authority = build_authority(&fixture);
         let body = full_record(&fixture, 0);
-        let pending =
-            WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&authority, 0), mcap_permit());
+        let pending = WebPhysicalReceiptV1::from_lease_v1(issue(&authority, 0), mcap_permit());
         let budget = WebPhysicalCopyOverlapBudgetV1::new_unfrozen_phase_a_v1();
         let mut observed = Vec::new();
         reset_web_destination_allocation_attempts_for_test_v1();
@@ -3123,14 +3121,13 @@ mod tests {
     #[test]
     fn web_borrowed_boundary_binds_body_lease_profile_and_all_safe_points() {
         use crate::web_body_handoff::{
-            WebPendingPhysicalChunkReadV1, WebPhysicalBodySafePointV1, WebPhysicalBudgetProfileV1,
-            WebPhysicalCopyOverlapBudgetV1,
+            WebPhysicalBodySafePointV1, WebPhysicalBudgetProfileV1, WebPhysicalCopyOverlapBudgetV1,
+            WebPhysicalReceiptV1,
         };
 
         let fixture = web_handoff_fixture();
         let authority = build_authority(&fixture);
-        let pending =
-            WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&authority, 0), mcap_permit());
+        let pending = WebPhysicalReceiptV1::from_lease_v1(issue(&authority, 0), mcap_permit());
         let identity = pending.identity_v1().unwrap();
         let body = full_record(&fixture, 0);
         let borrowed = pending
@@ -3168,15 +3165,13 @@ mod tests {
     #[test]
     fn web_borrowed_boundary_rejects_wrong_length_and_profile() {
         use crate::web_body_handoff::{
-            WebPendingPhysicalChunkReadV1, WebPhysicalBudgetProfileV1,
-            WebPhysicalCompletionBindErrorV1,
+            WebPhysicalBudgetProfileV1, WebPhysicalCompletionBindErrorV1, WebPhysicalReceiptV1,
         };
 
         let fixture = web_handoff_fixture();
         let authority = build_authority(&fixture);
         let body = full_record(&fixture, 0);
-        let short =
-            WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&authority, 0), mcap_permit());
+        let short = WebPhysicalReceiptV1::from_lease_v1(issue(&authority, 0), mcap_permit());
         assert!(matches!(
             short.bind_borrowed_exact_body_v1(
                 &body[..body.len() - 1],
@@ -3185,7 +3180,7 @@ mod tests {
             Err(WebPhysicalCompletionBindErrorV1::CrossCombination)
         ));
         let wrong_profile =
-            WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&authority, 0), mcap_permit());
+            WebPhysicalReceiptV1::from_lease_v1(issue(&authority, 0), mcap_permit());
         assert!(matches!(
             wrong_profile
                 .bind_borrowed_exact_body_v1(&body, WebPhysicalBudgetProfileV1::TestMismatched,),
@@ -3195,7 +3190,7 @@ mod tests {
 
     #[test]
     fn web_exact_bind_surfaces_matching_non_authority_material_and_rejects_mismatch() {
-        use crate::web_body_handoff::WebPendingPhysicalChunkReadV1;
+        use crate::web_body_handoff::WebPhysicalReceiptV1;
         use re_mcap_web_contract::{CorrelationFactoryV1, match_correlation_v1};
 
         let fixture = web_handoff_fixture();
@@ -3205,7 +3200,7 @@ mod tests {
         // Same-pair: the Web permit and the MCAP permit come from one fresh pair. After exact
         // bind, the surfaced MCAP material must match the sibling Web half.
         let (_pair_a, web_a, mcap_a) = CorrelationFactoryV1::new_operation_v1();
-        let pending_a = WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&authority, 0), mcap_a);
+        let pending_a = WebPhysicalReceiptV1::from_lease_v1(issue(&authority, 0), mcap_a);
         let (_borrowed_a, mcap_a_material) = pending_a.bind_exact_body_v1(&body).unwrap();
         assert!(match_correlation_v1(web_a.into_material_v1(), mcap_a_material).is_ok());
 
@@ -3214,10 +3209,8 @@ mod tests {
         let authority_c = build_authority(&fixture);
         let (_pair_b, web_b, mcap_b) = CorrelationFactoryV1::new_operation_v1();
         let (_pair_c, _web_c, mcap_c) = CorrelationFactoryV1::new_operation_v1();
-        let pending_b =
-            WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&authority_b, 0), mcap_b);
-        let pending_c =
-            WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&authority_c, 0), mcap_c);
+        let pending_b = WebPhysicalReceiptV1::from_lease_v1(issue(&authority_b, 0), mcap_b);
+        let pending_c = WebPhysicalReceiptV1::from_lease_v1(issue(&authority_c, 0), mcap_c);
         let (_borrowed_b, _mcap_b_material) = pending_b.bind_exact_body_v1(&body).unwrap();
         let (_borrowed_c, mcap_c_material) = pending_c.bind_exact_body_v1(&body).unwrap();
         assert!(match_correlation_v1(web_b.into_material_v1(), mcap_c_material).is_err());
@@ -3226,17 +3219,15 @@ mod tests {
     #[test]
     fn web_header_revalidation_rejects_wrong_token_generation_and_profile_before_copy() {
         use crate::web_body_handoff::{
-            WebPendingPhysicalChunkReadV1, WebPhysicalBodyHandoffErrorV1,
-            WebPhysicalBodySafePointV1, WebPhysicalCopyOverlapBudgetV1,
-            process_explicit_copy_body_v1,
+            WebPhysicalBodyHandoffErrorV1, WebPhysicalBodySafePointV1,
+            WebPhysicalCopyOverlapBudgetV1, WebPhysicalReceiptV1, process_explicit_copy_body_v1,
         };
 
         for mismatch in ["attempt token", "source/read generation", "budget profile"] {
             let fixture = web_handoff_fixture();
             let authority = build_authority(&fixture);
             let body = full_record(&fixture, 0);
-            let pending =
-                WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&authority, 0), mcap_permit());
+            let pending = WebPhysicalReceiptV1::from_lease_v1(issue(&authority, 0), mcap_permit());
             let budget = WebPhysicalCopyOverlapBudgetV1::new_unfrozen_phase_a_v1();
             reset_web_destination_allocation_attempts_for_test_v1();
             let result = process_explicit_copy_body_v1(pending, &body, &budget, |point| {
@@ -3262,8 +3253,8 @@ mod tests {
     #[test]
     fn web_explicit_copy_overlap_accepts_exact_and_rejects_minus_one_before_copy() {
         use crate::web_body_handoff::{
-            WebPendingPhysicalChunkReadV1, WebPhysicalBodyHandoffErrorV1,
-            WebPhysicalCopyOverlapBudgetV1, process_explicit_copy_body_v1,
+            WebPhysicalBodyHandoffErrorV1, WebPhysicalCopyOverlapBudgetV1, WebPhysicalReceiptV1,
+            process_explicit_copy_body_v1,
         };
 
         let fixture = web_handoff_fixture();
@@ -3271,7 +3262,7 @@ mod tests {
         let body = full_record(&fixture, 0);
         let probe_budget = WebPhysicalCopyOverlapBudgetV1::new_unfrozen_phase_a_v1();
         let completed = process_explicit_copy_body_v1(
-            WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&authority, 0), mcap_permit()),
+            WebPhysicalReceiptV1::from_lease_v1(issue(&authority, 0), mcap_permit()),
             &body,
             &probe_budget,
             |_point| Ok(()),
@@ -3286,7 +3277,7 @@ mod tests {
         let exact_body = full_record(&exact_fixture, 0);
         let exact_budget = WebPhysicalCopyOverlapBudgetV1::new_for_test_v1(exact);
         let exact_completed = process_explicit_copy_body_v1(
-            WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&exact_authority, 0), mcap_permit()),
+            WebPhysicalReceiptV1::from_lease_v1(issue(&exact_authority, 0), mcap_permit()),
             &exact_body,
             &exact_budget,
             |_point| Ok(()),
@@ -3302,10 +3293,7 @@ mod tests {
         reset_web_destination_allocation_attempts_for_test_v1();
         assert!(matches!(
             process_explicit_copy_body_v1(
-                WebPendingPhysicalChunkReadV1::from_lease_v1(
-                    issue(&short_authority, 0),
-                    mcap_permit()
-                ),
+                WebPhysicalReceiptV1::from_lease_v1(issue(&short_authority, 0), mcap_permit()),
                 &short_body,
                 &short_budget,
                 |_point| Ok(()),
@@ -3319,9 +3307,8 @@ mod tests {
     #[test]
     fn web_stale_after_copy_never_reaches_decompression_scan_or_cache() {
         use crate::web_body_handoff::{
-            WebPendingPhysicalChunkReadV1, WebPhysicalBodyHandoffErrorV1,
-            WebPhysicalBodySafePointV1, WebPhysicalCopyOverlapBudgetV1,
-            process_explicit_copy_body_v1,
+            WebPhysicalBodyHandoffErrorV1, WebPhysicalBodySafePointV1,
+            WebPhysicalCopyOverlapBudgetV1, WebPhysicalReceiptV1, process_explicit_copy_body_v1,
         };
 
         let fixture = web_handoff_fixture();
@@ -3331,7 +3318,7 @@ mod tests {
         let mut observed = Vec::new();
         reset_web_destination_allocation_attempts_for_test_v1();
         let result = process_explicit_copy_body_v1(
-            WebPendingPhysicalChunkReadV1::from_lease_v1(issue(&authority, 0), mcap_permit()),
+            WebPhysicalReceiptV1::from_lease_v1(issue(&authority, 0), mcap_permit()),
             &body,
             &budget,
             |point| {

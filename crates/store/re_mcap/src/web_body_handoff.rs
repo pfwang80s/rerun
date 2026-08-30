@@ -171,30 +171,17 @@ pub struct WebPhysicalReceiptV1<'a> {
 }
 
 impl<'a> WebPhysicalReceiptV1<'a> {
-    pub(crate) fn issue_from_lease_v1(
-        lease: PhysicalChunkReadLease<'a, PendingHeaderValidation>,
-        permit: McapCorrelationPermitV1,
-    ) -> Self {
-        Self {
-            lease: Some(lease),
-            profile: WebPhysicalBudgetProfileV1::UnfrozenPhaseACandidate,
-            material: Some(permit.into_material_v1()),
-        }
-    }
-
-    pub fn identity_v1(
+    pub(crate) fn identity_v1(
         &self,
     ) -> Result<WebPhysicalPendingIdentityV1, WebPhysicalCompletionBindErrorV1> {
         let lease = self
             .lease
             .as_ref()
             .ok_or(WebPhysicalCompletionBindErrorV1::StaleLease)?;
-        let (source_generation, read_generation, canonical_ordinal, full_range) = lease
+        let (_source_generation, _read_generation, canonical_ordinal, full_range) = lease
             .web_completion_identity_parts_v1()
             .map_err(|_err| WebPhysicalCompletionBindErrorV1::StaleLease)?;
         Ok(WebPhysicalPendingIdentityV1 {
-            source_generation,
-            read_generation,
             canonical_ordinal: u32::try_from(canonical_ordinal)
                 .map_err(|_overflow| WebPhysicalCompletionBindErrorV1::IdentityOverflow)?,
             full_range_start: full_range.start,
@@ -239,7 +226,7 @@ impl<'a> WebPhysicalReceiptV1<'a> {
         ))
     }
 
-    pub fn bind_borrowed_exact_body_v1<'body>(
+    pub(crate) fn bind_borrowed_exact_body_v1<'body>(
         self,
         body: &'body [u8],
         profile: WebPhysicalBudgetProfileV1,
@@ -254,25 +241,23 @@ impl<'a> WebPhysicalReceiptV1<'a> {
         lease: PhysicalChunkReadLease<'a, PendingHeaderValidation>,
         permit: McapCorrelationPermitV1,
     ) -> Self {
-        Self::issue_from_lease_v1(lease, permit)
+        Self {
+            lease: Some(lease),
+            profile: WebPhysicalBudgetProfileV1::UnfrozenPhaseACandidate,
+            material: Some(permit.into_material_v1()),
+        }
     }
 }
 
-/// Compatibility alias retained until the coordinated R3 consumer migration removes the legacy
-/// concrete handoff boundary.
-pub type WebPendingPhysicalChunkReadV1<'a> = WebPhysicalReceiptV1<'a>;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WebPhysicalBudgetProfileV1 {
+pub(crate) enum WebPhysicalBudgetProfileV1 {
     UnfrozenPhaseACandidate,
     #[cfg(test)]
     TestMismatched,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WebPhysicalPendingIdentityV1 {
-    source_generation: u64,
-    read_generation: u64,
+pub(crate) struct WebPhysicalPendingIdentityV1 {
     canonical_ordinal: u32,
     full_range_start: u64,
     full_range_end_exclusive: u64,
@@ -280,23 +265,15 @@ pub struct WebPhysicalPendingIdentityV1 {
 }
 
 impl WebPhysicalPendingIdentityV1 {
-    pub const fn source_generation_v1(self) -> u64 {
-        self.source_generation
-    }
-
-    pub const fn read_generation_v1(self) -> u64 {
-        self.read_generation
-    }
-
-    pub const fn canonical_ordinal_v1(self) -> u32 {
+    pub(crate) const fn canonical_ordinal_v1(self) -> u32 {
         self.canonical_ordinal
     }
 
-    pub const fn full_range_v1(self) -> (u64, u64) {
+    pub(crate) const fn full_range_v1(self) -> (u64, u64) {
         (self.full_range_start, self.full_range_end_exclusive)
     }
 
-    pub const fn budget_profile_v1(self) -> WebPhysicalBudgetProfileV1 {
+    pub(crate) const fn budget_profile_v1(self) -> WebPhysicalBudgetProfileV1 {
         self.budget_profile
     }
 }

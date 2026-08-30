@@ -21,6 +21,8 @@ phase-a-benchmark = true
 js-sys.workspace = true
 parking_lot.workspace = true
 re_mcap = { workspace = true, features = ["testing"] }
+re_mcap_web_adapter = { workspace = true, features = ["phase_a"] }
+re_mcap_web_contract.workspace = true
 re_memory.workspace = true
 re_web.workspace = true
 serde = { workspace = true, features = ["derive"] }

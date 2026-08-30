@@ -5,7 +5,7 @@
 //! the raw body, the browser `Response`, the reader, the `AbortController`, the URL, the
 //! `ETag`, or the validator.
 
-use re_mcap_web_contract::WebCorrelationMaterialV1;
+use re_mcap_web_contract::{WebCorrelationMaterialV1, WebCorrelationPermitV1};
 
 mod private {
     /// Seals [`TransportBodyOwner`] so only this crate's authenticated body owners can
@@ -31,29 +31,28 @@ pub trait TransportBodyOwner: private::Sealed {
 ///
 /// # Construction
 ///
-/// In this substage the concrete Web-only issuer is deferred to the adapter substage, where
-/// the public issue seam gains a real production caller. Until then the receipt is
-/// constructed only by in-crate test code that has access to the private fields. The private
-/// fields keep downstream crates from constructing or decomposing the receipt.
+/// The receipt is issued by [`issue_transport_receipt_v1`], which requires an authenticated
+/// [`TransportBodyOwner`] plus a [`WebCorrelationPermitV1`]. The private fields keep
+/// downstream crates from constructing or decomposing the receipt.
 pub struct RemoteTransportReceiptV1<B: TransportBodyOwner> {
     body: B,
     material: WebCorrelationMaterialV1,
 }
 
-/// Opaque transport-receipt consumption error.
+/// Issues a transport receipt from an authenticated completed body owner and a Web
+/// correlation permit.
 ///
-/// The receipt itself never fabricates this error; it only forwards the callback's error
-/// transparently. It exposes no body, URL, `ETag`, or validator detail.
-///
-/// # Forward constraint
-///
-/// The type is `#[non_exhaustive]` with a private field, so downstream crates cannot
-/// construct it. The adapter substage must therefore provide an adapter-facing error
-/// construction/forwarding path (or map transport errors into its own opaque error) before
-/// physical-error handling can be composed.
-#[non_exhaustive]
-pub struct TransportReceiptErrorV1 {
-    _private: (),
+/// The permit is converted into non-authority correlation material. The body owner must
+/// implement the sealed [`TransportBodyOwner`] trait, so only this crate's authenticated
+/// owners (the strict-fetch `ExactLengthRangeBody` and the test mock) can be passed.
+/// Callers cannot supply a scalar, profile, range, generation, ordinal, `ETag`, URL, or token.
+#[must_use]
+pub fn issue_transport_receipt_v1<B: TransportBodyOwner>(
+    body: B,
+    permit: WebCorrelationPermitV1,
+) -> RemoteTransportReceiptV1<B> {
+    let material = permit.into_material_v1();
+    RemoteTransportReceiptV1 { body, material }
 }
 
 impl<B: TransportBodyOwner> RemoteTransportReceiptV1<B> {
@@ -71,10 +70,16 @@ impl<B: TransportBodyOwner> RemoteTransportReceiptV1<B> {
     ///
     /// Consuming the receipt by value prevents reuse: the receipt is moved into this method
     /// and cannot be called a second time.
-    pub fn consume_transport_v1<R>(
+    ///
+    /// # Error forwarding
+    ///
+    /// The callback's error type `E` is forwarded verbatim, so the adapter can run physical
+    /// processing inside the callback and map any physical bind/handoff error into its own
+    /// opaque error.
+    pub fn consume_transport_v1<R, E>(
         self,
-        callback: impl for<'body> FnOnce(&'body [u8]) -> Result<R, TransportReceiptErrorV1>,
-    ) -> Result<(R, WebCorrelationMaterialV1), TransportReceiptErrorV1> {
+        callback: impl for<'body> FnOnce(&'body [u8]) -> Result<R, E>,
+    ) -> Result<(R, WebCorrelationMaterialV1), E> {
         let Self { body, material } = self;
         let result = callback(body.as_slice());
         drop(body);
@@ -171,19 +176,10 @@ mod tests {
     assert_not_impl_any!(
         RemoteTransportReceiptV1<MockBodyOwner>: Clone, Copy, core::fmt::Debug, std::hash::Hash
     );
-    assert_not_impl_any!(TransportReceiptErrorV1: Clone, Copy, core::fmt::Debug, std::hash::Hash);
 
     fn issue_mock(data: Vec<u8>, log: DropLog) -> RemoteTransportReceiptV1<MockBodyOwner> {
         let (_pair, web_permit, _mcap_permit) = CorrelationFactoryV1::new_operation_v1();
-        let material = web_permit.into_material_v1();
-        RemoteTransportReceiptV1 {
-            body: MockBodyOwner::new(data, log),
-            material,
-        }
-    }
-
-    fn test_error() -> TransportReceiptErrorV1 {
-        TransportReceiptErrorV1 { _private: () }
+        issue_transport_receipt_v1(MockBodyOwner::new(data, log), web_permit)
     }
 
     #[test]
@@ -191,8 +187,8 @@ mod tests {
         let log = DropLog::default();
         let receipt = issue_mock(vec![1, 2, 3], log.clone());
         let (len, material) = receipt
-            .consume_transport_v1(|body| Ok::<_, TransportReceiptErrorV1>(body.len()))
-            .unwrap_or_else(|_| panic!("consume_transport_v1 should succeed"));
+            .consume_transport_v1(|body| Ok::<_, ()>(body.len()))
+            .unwrap_or_else(|()| panic!("consume_transport_v1 should succeed"));
         assert_eq!(len, 3);
         let _ = material;
     }
@@ -202,8 +198,8 @@ mod tests {
         let log = DropLog::default();
         let receipt = issue_mock(vec![7, 8, 9, 10], log.clone());
         let (seen, _material) = receipt
-            .consume_transport_v1(|body| Ok::<_, TransportReceiptErrorV1>(body.to_vec()))
-            .unwrap_or_else(|_| panic!("consume_transport_v1 should succeed"));
+            .consume_transport_v1(|body| Ok::<_, ()>(body.to_vec()))
+            .unwrap_or_else(|()| panic!("consume_transport_v1 should succeed"));
         assert_eq!(seen, vec![7, 8, 9, 10]);
     }
 
@@ -213,8 +209,8 @@ mod tests {
         let receipt = issue_mock(vec![1], log.clone());
         assert!(log.borrow().is_empty());
         let _ = receipt
-            .consume_transport_v1(|body| Ok::<_, TransportReceiptErrorV1>(body.len()))
-            .unwrap_or_else(|_| panic!("consume_transport_v1 should succeed"));
+            .consume_transport_v1(|body| Ok::<_, ()>(body.len()))
+            .unwrap_or_else(|()| panic!("consume_transport_v1 should succeed"));
         assert_eq!(&*log.borrow(), &["body", "accounting"]);
     }
 
@@ -231,7 +227,9 @@ mod tests {
     fn callback_error_is_transparent_and_material_is_consumed() {
         let log = DropLog::default();
         let receipt = issue_mock(vec![1], log.clone());
-        let result = receipt.consume_transport_v1(|_body| Err::<usize, _>(test_error()));
+        #[derive(Debug, PartialEq, Eq)]
+        struct TestError;
+        let result = receipt.consume_transport_v1(|_body| Err::<usize, _>(TestError));
         assert!(result.is_err());
         assert_eq!(&*log.borrow(), &["body", "accounting"]);
     }
