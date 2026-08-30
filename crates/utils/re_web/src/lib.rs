@@ -102,6 +102,12 @@
 //! use re_web::chrome_range;
 //! ```
 //!
+//! Strict producer-issued transport receipts are Web-only as well:
+//!
+//! ```compile_fail,ignore-wasm32
+//! use re_web::transport_receipt;
+//! ```
+//!
 //! Metadata-opening Range retry ownership is likewise Web-only and production-disarmed:
 //!
 //! ```compile_fail,ignore-wasm32
@@ -182,6 +188,8 @@ pub mod strict_open_handoff;
 pub mod strict_open_wire;
 #[cfg(target_arch = "wasm32")]
 pub mod strict_startup_handoff;
+#[cfg(target_arch = "wasm32")]
+pub mod transport_receipt;
 
 // Host builds compile the module only for its unit tests and do not publish it to consumers.
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -205,6 +213,10 @@ mod chrome_byob;
 // Host builds compile only the pure Range/header state machine for differential unit tests.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod chrome_range;
+
+// Host builds compile the transport receipt core only for its mock-owner unit tests.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod transport_receipt;
 
 // Host builds compile the compatibility ingress seam only for its unit tests and do not publish
 // it to consumers.

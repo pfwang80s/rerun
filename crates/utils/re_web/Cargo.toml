@@ -18,6 +18,9 @@ workspace = true
 [dependencies]
 pin-project-lite.workspace = true
 
+[dev-dependencies]
+static_assertions.workspace = true
+
 [package.metadata.docs.rs]
 all-features = true
 targets = ["wasm32-unknown-unknown"]
@@ -39,6 +42,7 @@ getrandom = { workspace = true, features = ["wasm_js"] }
 js-sys.workspace = true
 re_async.workspace = true
 re_log_types.workspace = true
+re_mcap_web_contract.workspace = true
 re_string_interner = { workspace = true, features = ["bounded_runtime_intern"] }
 sha2.workspace = true
 url.workspace = true
@@ -83,6 +87,7 @@ zeroize.workspace = true
 constant_time_eq.workspace = true
 hmac.workspace = true
 re_log_types.workspace = true
+re_mcap_web_contract.workspace = true
 re_string_interner = { workspace = true, features = ["bounded_runtime_intern"] }
 sha2.workspace = true
 url.workspace = true
