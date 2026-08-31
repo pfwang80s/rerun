@@ -23,7 +23,10 @@ pub use self::protobuf::McapProtobufDecoder;
 pub use self::raw::McapRawDecoder;
 pub use self::recording_info::McapRecordingInfoDecoder;
 pub use self::ros2::McapRos2Decoder;
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 pub(crate) use self::ros2::supports_builtin_semantic_schema;
 pub use self::ros2_reflection::McapRos2ReflectionDecoder;
 pub use self::schema::McapSchemaDecoder;
@@ -333,14 +336,20 @@ impl TopicFilter {
         self.include.is_empty() && self.exclude.is_empty()
     }
 
-    #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+    #[cfg(any(
+        all(test, not(target_arch = "wasm32")),
+        re_mcap_locked_remote_wasm_allocator_v1
+    ))]
     pub(crate) fn exact_include_patterns_for_remote_v1(
         &self,
     ) -> impl ExactSizeIterator<Item = &str> {
         self.include.iter().map(regex_lite::Regex::as_str)
     }
 
-    #[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+    #[cfg(any(
+        all(test, not(target_arch = "wasm32")),
+        re_mcap_locked_remote_wasm_allocator_v1
+    ))]
     pub(crate) fn exact_exclude_patterns_for_remote_v1(
         &self,
     ) -> impl ExactSizeIterator<Item = &str> {

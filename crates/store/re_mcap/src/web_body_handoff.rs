@@ -85,7 +85,7 @@ impl WebPhysicalCopyOverlapBudgetV1 {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) fn new_for_test_v1(max_simultaneous_overlap_bytes: u64) -> Self {
         Self {
             state: Arc::new(WebPhysicalCopyOverlapStateV1 {
@@ -133,7 +133,7 @@ impl WebPhysicalCopyOverlapBudgetV1 {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) fn usage_for_test_v1(&self) -> (u64, u64, u64) {
         let usage = *self.state.usage.lock();
         (
@@ -226,6 +226,7 @@ impl<'a> WebPhysicalReceiptV1<'a> {
         ))
     }
 
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) fn bind_borrowed_exact_body_v1<'body>(
         self,
         body: &'body [u8],
@@ -252,7 +253,7 @@ impl<'a> WebPhysicalReceiptV1<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WebPhysicalBudgetProfileV1 {
     UnfrozenPhaseACandidate,
-    #[cfg(test)]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     TestMismatched,
 }
 
@@ -264,6 +265,7 @@ pub(crate) struct WebPhysicalPendingIdentityV1 {
     budget_profile: WebPhysicalBudgetProfileV1,
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
 impl WebPhysicalPendingIdentityV1 {
     pub(crate) const fn canonical_ordinal_v1(self) -> u32 {
         self.canonical_ordinal
@@ -339,7 +341,7 @@ pub enum WebPhysicalBodyHandoffErrorV1 {
 }
 
 pub struct WebPhysicalScanCacheEntryV1<'a> {
-    inner: PhysicalChunkScanCacheEntry<'a>,
+    _inner: PhysicalChunkScanCacheEntry<'a>,
 }
 
 pub struct CompletedWebPhysicalBodyHandoffV1<'a> {
@@ -368,15 +370,15 @@ impl<'a> WebPhysicalScanCacheEntryV1<'a> {
         crate::remote_chunk_scan::PhysicalChunkMessageEvidenceV1<'a>,
         WebPhysicalBodyHandoffErrorV1,
     > {
-        self.inner
+        self._inner
             .consumer()
             .into_message_evidence_v1()
             .map_err(|_err| WebPhysicalBodyHandoffErrorV1::PhysicalScanFailed)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) fn is_current_for_test_v1(&self) -> bool {
-        self.inner.consumer().is_current()
+        self._inner.consumer().is_current()
     }
 }
 
@@ -430,7 +432,7 @@ pub(crate) fn process_zero_copy_body_v1<'a>(
         &mut revalidate,
     )?;
     Ok(CompletedWebPhysicalBodyHandoffV1 {
-        cache: Some(WebPhysicalScanCacheEntryV1 { inner: cache }),
+        cache: Some(WebPhysicalScanCacheEntryV1 { _inner: cache }),
         overlap: Some(overlap),
     })
 }
@@ -486,7 +488,7 @@ pub(crate) fn process_explicit_copy_body_v1<'a>(
         &mut revalidate,
     )?;
     Ok(CompletedWebPhysicalBodyHandoffV1 {
-        cache: Some(WebPhysicalScanCacheEntryV1 { inner: cache }),
+        cache: Some(WebPhysicalScanCacheEntryV1 { _inner: cache }),
         overlap: Some(overlap),
     })
 }

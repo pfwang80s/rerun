@@ -43,7 +43,10 @@ macro_rules! builtin_ros2_parsers {
 ///
 /// Remote assignment uses this only to fail closed while its exact-safe table is empty.
 /// It does not construct a parser or make the native registry available to the remote route.
-#[cfg(any(test, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 pub(crate) fn supports_builtin_semantic_schema(schema_name: &str) -> bool {
     macro_rules! recognizes_schema {
         ($($parser:ty => $registered:literal),+ $(,)?) => {
