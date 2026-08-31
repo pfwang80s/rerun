@@ -519,6 +519,17 @@ pub(crate) fn ensure_disarmed_test_profile_v1() {
     initialize_disarmed_v1(limits).expect("the disarmed interner profile is valid");
 }
 
+/// Serializes host tests that observe the process-wide runtime-intern module singleton.
+///
+/// `remote_mcap_runtime_intern_snapshot` reads a crate-wide global that concurrent tests also
+/// mutate (admission/intern insertion), so any `before`/`after` snapshot comparison must run under
+/// this lock or it races with sibling tests. Hold the returned guard for the whole test.
+#[cfg(test)]
+pub(crate) fn runtime_intern_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+    static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    LOCK.lock()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,6 +550,7 @@ mod tests {
 
     #[test]
     fn summary_census_redeems_domain_handles_before_typed_construction() {
+        let _rti_guard = crate::remote_runtime_intern::runtime_intern_test_guard();
         ensure_disarmed_test_profile_v1();
         let fixture = definitions("/mcap083/summary/topic", "mcap083.SummarySchema");
         let validated = crate::remote_summary::validated_summary_definitions_for_test(&fixture);
@@ -592,6 +604,7 @@ mod tests {
 
     #[test]
     fn equivalent_entity_path_raw_topics_redeem_the_same_census_domain() {
+        let _rti_guard = crate::remote_runtime_intern::runtime_intern_test_guard();
         ensure_disarmed_test_profile_v1();
 
         let identifiers = [
@@ -620,6 +633,7 @@ mod tests {
 
     #[test]
     fn duplicate_scalar_before_entity_path_is_not_redeemed_as_entity_path_raw() {
+        let _rti_guard = crate::remote_runtime_intern::runtime_intern_test_guard();
         ensure_disarmed_test_profile_v1();
 
         let identifiers = [
@@ -653,6 +667,7 @@ mod tests {
 
     #[test]
     fn intern_errors_are_classified_without_folding_internal_failures_into_census_limits() {
+        let _rti_guard = crate::remote_runtime_intern::runtime_intern_test_guard();
         assert_eq!(
             RemoteRuntimeInternAdmissionErrorV1::from_intern(
                 RemoteMcapRuntimeInternError::InvalidLimitProfile,
@@ -675,6 +690,7 @@ mod tests {
 
     #[test]
     fn chunk_descriptor_census_reuses_side_map_entries() {
+        let _rti_guard = crate::remote_runtime_intern::runtime_intern_test_guard();
         ensure_disarmed_test_profile_v1();
         let before = remote_mcap_runtime_intern_snapshot().unwrap();
         let descriptor =
@@ -698,6 +714,7 @@ mod tests {
 
     #[test]
     fn legacy_existing_summary_census_has_zero_missing_and_zero_burn() {
+        let _rti_guard = crate::remote_runtime_intern::runtime_intern_test_guard();
         ensure_disarmed_test_profile_v1();
         let topic = "/mcap083/legacy/existing";
         let schema = "mcap083.LegacySchema";
@@ -722,6 +739,7 @@ mod tests {
 
     #[test]
     fn census_failure_is_zero_partial_and_classified_by_phase() {
+        let _rti_guard = crate::remote_runtime_intern::runtime_intern_test_guard();
         ensure_disarmed_test_profile_v1();
         let before = remote_mcap_runtime_intern_snapshot().unwrap();
         let raw = (0..=REMOTE_RUNTIME_INTERN_CENSUS_LIMIT_V1)
@@ -756,6 +774,7 @@ mod tests {
 
     #[test]
     fn viewer_restart_does_not_refund_the_module_budget() {
+        let _rti_guard = crate::remote_runtime_intern::runtime_intern_test_guard();
         ensure_disarmed_test_profile_v1();
         let fixture = definitions("/mcap083/restart/topic", "mcap083.RestartSchema");
         let validated = crate::remote_summary::validated_summary_definitions_for_test(&fixture);
@@ -772,6 +791,7 @@ mod tests {
 
     #[test]
     fn legacy_insertion_between_prepare_and_commit_recomputes_in_lock() {
+        let _rti_guard = crate::remote_runtime_intern::runtime_intern_test_guard();
         ensure_disarmed_test_profile_v1();
         let topic = "/mcap083/revision/race";
         let schema = "mcap083.RevisionRaceSchema";
@@ -821,6 +841,7 @@ mod tests {
 
     #[test]
     fn manifest_parser_and_store_boundaries_require_runtime_ownership() {
+        let _rti_guard = crate::remote_runtime_intern::runtime_intern_test_guard();
         let manifest = include_str!("remote_manifest.rs");
         let parser = include_str!("remote_protobuf_descriptor.rs");
         let dispatch = include_str!("remote_chunk_dispatch.rs");
@@ -852,6 +873,7 @@ mod tests {
 
     #[test]
     fn undelayable_constructor_has_a_typed_rejection_before_domain_construction() {
+        let _rti_guard = crate::remote_runtime_intern::runtime_intern_test_guard();
         assert_eq!(
             reject_undelayable_constructor_v1(),
             RemoteRuntimeInternAdmissionErrorV1::ConstructorCannotBeDelayed
@@ -872,6 +894,7 @@ mod tests {
 
     #[test]
     fn actual_budget_failure_proof_runs_in_an_isolated_process() {
+        let _rti_guard = crate::remote_runtime_intern::runtime_intern_test_guard();
         run_ignored_proof_in_subprocess(
             "remote_runtime_intern::tests::actual_budget_failure_is_atomic_and_nonremote_construction_survives",
         );

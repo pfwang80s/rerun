@@ -1549,10 +1549,10 @@ impl PhysicalSourceResolutionBudgetV1 {
 
 /// Sealed lease-bound result of the complete MCAP-025 scan chain.
 pub struct AmbiguousPhysicalExtentResolutionV1<'a> {
-    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
-    scan: ValidatedPhysicalChunkScan<'a>,
-    #[cfg(not(re_mcap_locked_remote_wasm_allocator_v1))]
-    _marker: std::marker::PhantomData<&'a ()>,
+    // Held (never read) so the lease-owning scan output stays alive until the resolution is
+    // submitted; dropping it early would release the physical read lease and clear the live
+    // slot, breaking the strict in-order duplicate-live-read rejection.
+    _scan: ValidatedPhysicalChunkScan<'a>,
     binding: PhysicalChunkSourceBindingV1,
     canonical_ordinal: usize,
     extent: ValidatedPhysicalChunkExtent,
@@ -1580,13 +1580,8 @@ impl<'a> AmbiguousPhysicalExtentResolutionV1<'a> {
                 return Err(PhysicalSourceResolutionErrorV1::AmbiguousExtentNotZero);
             }
         }
-        #[cfg(not(re_mcap_locked_remote_wasm_allocator_v1))]
-        let _scan = scan;
         Ok(Self {
-            #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
-            scan,
-            #[cfg(not(re_mcap_locked_remote_wasm_allocator_v1))]
-            _marker: std::marker::PhantomData,
+            _scan: scan,
             binding,
             canonical_ordinal,
             extent,

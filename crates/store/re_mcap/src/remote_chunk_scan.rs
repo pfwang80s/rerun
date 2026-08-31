@@ -4086,7 +4086,7 @@ mod tests {
         }
 
         let production = include_str!("remote_chunk_scan.rs")
-            .split("#[cfg(test)]\nmod tests")
+            .split("#[cfg(test)]\n#[cfg(not(target_arch = \"wasm32\"))]\nmod tests")
             .next()
             .unwrap();
         let borrowed_channel_pass = production
@@ -4585,7 +4585,7 @@ mod tests {
     fn api_shape_has_no_metadata_crc_range_or_box_rebinding_constructor() {
         let source = include_str!("remote_chunk_scan.rs");
         let production = source
-            .split("#[cfg(test)]\nmod tests")
+            .split("#[cfg(test)]\n#[cfg(not(target_arch = \"wasm32\"))]\nmod tests")
             .next()
             .expect("production source precedes tests");
         for forbidden in [
