@@ -4,7 +4,18 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use re_mcap_web_contract::{McapCorrelationMaterialV1, McapCorrelationPermitV1};
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    rerun_mcap_phase_a_proof_v1,
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
+use re_mcap_web_contract::McapCorrelationMaterialV1;
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    rerun_mcap_phase_a_proof_v1,
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
+use re_mcap_web_contract::McapCorrelationPermitV1;
 
 use crate::remote_chunk_scan::{
     PendingHeaderValidation, PhysicalChunkReadLease, PhysicalChunkScanCacheEntry,
@@ -166,11 +177,26 @@ impl Drop for WebPhysicalCopyOverlapReservationV1 {
 /// Move-only physical authority issued from a live canonical MCAP read lease.
 pub struct WebPhysicalReceiptV1<'a> {
     lease: Option<PhysicalChunkReadLease<'a, PendingHeaderValidation>>,
+    #[cfg(any(
+        all(test, not(target_arch = "wasm32")),
+        rerun_mcap_phase_a_proof_v1,
+        re_mcap_locked_remote_wasm_allocator_v1
+    ))]
     profile: WebPhysicalBudgetProfileV1,
+    #[cfg(any(
+        all(test, not(target_arch = "wasm32")),
+        rerun_mcap_phase_a_proof_v1,
+        re_mcap_locked_remote_wasm_allocator_v1
+    ))]
     material: Option<McapCorrelationMaterialV1>,
 }
 
 impl<'a> WebPhysicalReceiptV1<'a> {
+    #[cfg(any(
+        all(test, not(target_arch = "wasm32")),
+        rerun_mcap_phase_a_proof_v1,
+        re_mcap_locked_remote_wasm_allocator_v1
+    ))]
     pub(crate) fn identity_v1(
         &self,
     ) -> Result<WebPhysicalPendingIdentityV1, WebPhysicalCompletionBindErrorV1> {
@@ -192,6 +218,11 @@ impl<'a> WebPhysicalReceiptV1<'a> {
 
     /// Consumes the receipt, validates a body for physical processing, and surfaces the
     /// non-authority MCAP correlation material for the future adapter match step.
+    #[cfg(any(
+        all(test, not(target_arch = "wasm32")),
+        rerun_mcap_phase_a_proof_v1,
+        re_mcap_locked_remote_wasm_allocator_v1
+    ))]
     pub fn bind_exact_body_v1<'body>(
         mut self,
         body: &'body [u8],
@@ -238,6 +269,11 @@ impl<'a> WebPhysicalReceiptV1<'a> {
         self.bind_exact_body_v1(body).map(|(body, _material)| body)
     }
 
+    #[cfg(any(
+        all(test, not(target_arch = "wasm32")),
+        rerun_mcap_phase_a_proof_v1,
+        re_mcap_locked_remote_wasm_allocator_v1
+    ))]
     pub(crate) fn from_lease_v1(
         lease: PhysicalChunkReadLease<'a, PendingHeaderValidation>,
         permit: McapCorrelationPermitV1,
@@ -251,6 +287,11 @@ impl<'a> WebPhysicalReceiptV1<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    rerun_mcap_phase_a_proof_v1,
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 pub(crate) enum WebPhysicalBudgetProfileV1 {
     UnfrozenPhaseACandidate,
     #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -262,6 +303,11 @@ pub(crate) struct WebPhysicalPendingIdentityV1 {
     canonical_ordinal: u32,
     full_range_start: u64,
     full_range_end_exclusive: u64,
+    #[cfg(any(
+        all(test, not(target_arch = "wasm32")),
+        rerun_mcap_phase_a_proof_v1,
+        re_mcap_locked_remote_wasm_allocator_v1
+    ))]
     budget_profile: WebPhysicalBudgetProfileV1,
 }
 
@@ -363,7 +409,7 @@ impl<'a> CompletedWebPhysicalBodyHandoffV1<'a> {
 }
 
 impl<'a> WebPhysicalScanCacheEntryV1<'a> {
-    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+    #[cfg(any(all(test, not(target_arch = "wasm32")), rerun_mcap_phase_a_proof_v1))]
     pub(crate) fn into_message_evidence_for_phase_a_measurement_v1(
         self,
     ) -> Result<

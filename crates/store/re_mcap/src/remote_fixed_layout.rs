@@ -207,7 +207,7 @@ impl PreparedFixedLayout {
         };
 
         Ok(ValidatedFixedLayout {
-            object_len: self.object_len,
+            _object_len: self.object_len,
             header_body_range: self.header_body_range,
             summary_range: self.summary_start..self.data_end_and_summary_range.end,
             summary_bytes,
@@ -222,7 +222,7 @@ impl PreparedFixedLayout {
 ///
 /// Summary collections remain unparsed.
 pub struct ValidatedFixedLayout<'a> {
-    object_len: u64,
+    _object_len: u64,
     header_body_range: Range<u64>,
     summary_range: Range<u64>,
     summary_bytes: &'a [u8],
@@ -245,8 +245,13 @@ impl std::fmt::Debug for ValidatedFixedLayout<'_> {
 }
 
 impl<'a> ValidatedFixedLayout<'a> {
+    #[cfg(any(
+        all(test, not(target_arch = "wasm32")),
+        rerun_mcap_phase_a_proof_v1,
+        re_mcap_locked_remote_wasm_allocator_v1
+    ))]
     pub(crate) const fn object_len(&self) -> u64 {
-        self.object_len
+        self._object_len
     }
 
     /// The exact Header body range.

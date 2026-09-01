@@ -531,8 +531,7 @@ struct PhysicalChunkSourceEvidence<'a> {
     decompression_budget: ChunkDecompressionBudget,
     scan_budget: PhysicalChunkScanBudget,
     state: Arc<Mutex<PhysicalChunkAuthorityState>>,
-    remote_object:
-        Option<Arc<Mutex<crate::remote_physical_resolution::RemotePhysicalObjectStateV1>>>,
+    remote_object: Option<Arc<Mutex<crate::remote_physical_seam::RemotePhysicalObjectStateV1>>>,
     _authority_reservation: PhysicalChunkAuthorityReservation,
 }
 
@@ -630,12 +629,11 @@ impl PreparedPhysicalChunkAuthorityContextV1 {
 pub(crate) struct PhysicalChunkSourceBindingV1 {
     state: Arc<Mutex<PhysicalChunkAuthorityState>>,
     source_generation: NonZeroU64,
-    remote_object:
-        Option<Arc<Mutex<crate::remote_physical_resolution::RemotePhysicalObjectStateV1>>>,
+    remote_object: Option<Arc<Mutex<crate::remote_physical_seam::RemotePhysicalObjectStateV1>>>,
 }
 
 pub(super) struct BoundPhysicalChunkObjectIdentityV1 {
-    pub(super) state: Arc<Mutex<crate::remote_physical_resolution::RemotePhysicalObjectStateV1>>,
+    pub(super) state: Arc<Mutex<crate::remote_physical_seam::RemotePhysicalObjectStateV1>>,
     pub(super) generation: NonZeroU64,
 }
 

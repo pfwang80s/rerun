@@ -12,6 +12,11 @@
 use crate::remote_fixed_layout::{RemoteMcapSlice, ValidatedFixedLayout};
 
 pub(crate) mod ambiguous_zero;
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    rerun_mcap_phase_a_proof_v1,
+    re_mcap_locked_remote_wasm_allocator_v1
+))]
 pub(crate) use ambiguous_zero::{
     AmbiguousChunkClassification, PreparedAmbiguousZeroAggregateReservations,
     PreparedAmbiguousZeroBodyPlan, PreparedAmbiguousZeroResolutionSeed,

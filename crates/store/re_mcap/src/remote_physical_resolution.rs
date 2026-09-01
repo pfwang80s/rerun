@@ -7,7 +7,6 @@ use std::alloc::Layout;
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use parking_lot::Mutex;
 use re_log_types::TimeInt;
@@ -26,193 +25,27 @@ use crate::remote_summary::{
     PreparedAmbiguousZeroResolutionSeed,
 };
 use crate::remote_time::{RawMcapTime, canonicalize_raw_mcap_time};
-use re_mcap_web_contract::McapCorrelationPermitV1;
 
-static NEXT_REMOTE_OBJECT_GENERATION_V1: AtomicU64 = AtomicU64::new(1);
+// Always-compiled physical seam types (moved to remote_physical_seam to keep the
+// adapter/remote_chunk_scan seam dependency-neutral with respect to the full resolution graph).
+pub(crate) use crate::remote_physical_seam::{
+    AggregateResolutionBudgetStateV1, AggregateResolutionBudgetUsageV1,
+    AggregateResolutionReservationV1, BoundRemoteObjectReadV1,
+    BoundResolvedPhysicalSourceAuthorityV1, CanonicalIntervalV1, CanonicalPhysicalExtentV1,
+    RemoteObjectConsistencyClassV1, RemoteObjectReadIssuerV1, RemotePhysicalObjectBindingV1,
+    RemotePhysicalObjectLifetimeV1, RemotePhysicalObjectStateV1,
+    RemotePhysicalSourceRegistryLeaseV1, RemotePhysicalSourceRegistryStateV1,
+    ResolutionClassificationV1, ResolvedCanonicalPhysicalLayoutV1,
+};
+pub use crate::remote_physical_seam::{
+    PhysicalSourceResolutionErrorV1, ResolvedPhysicalSourceAuthorityV1,
+};
 
 // Test-only fault injection used to prove that allocations after the aggregate claim roll back
 // the claim and all lower reservations. This is compiled out of every production build.
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_POST_CLAIM_ALLOCATION_V1: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum RemoteObjectConsistencyClassV1 {
-    StrongValidator = 1,
-    DeploymentAssumed = 2,
-}
-
-pub(crate) struct RemotePhysicalObjectStateV1 {
-    open: bool,
-    generation: NonZeroU64,
-    content_length: NonZeroU64,
-    consistency: RemoteObjectConsistencyClassV1,
-}
-
-/// Opaque lower projection of one fresh Web remote-object owner.
-///
-/// It is intentionally non-`Clone`; URL and validator bytes never cross this boundary.
-pub struct RemotePhysicalObjectBindingV1 {
-    state: Arc<Mutex<RemotePhysicalObjectStateV1>>,
-}
-
-/// One borrowed byte view signed by the currently open remote object owner.
-///
-/// Callers cannot construct this token from a naked slice or `Box<[u8]>`; all fixed-layout,
-/// Summary, and `MessageIndex` parsers consume it while it remains nested in the enclosing owner.
-pub(crate) struct BoundRemoteObjectReadV1<'a> {
-    object: Arc<Mutex<RemotePhysicalObjectStateV1>>,
-    slice: crate::remote_fixed_layout::RemoteMcapSlice<'a>,
-}
-
-/// Sealed upper-transport issuer for reads produced by the matching validator owner.
-///
-/// The lower MCAP layer can only consume and match this evidence; it cannot bless caller-provided
-/// byte slices itself.
-struct RemoteObjectReadIssuerV1 {
-    object: Arc<Mutex<RemotePhysicalObjectStateV1>>,
-}
-
-impl std::fmt::Debug for RemotePhysicalObjectBindingV1 {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RemotePhysicalObjectBindingV1")
-            .field("identity", &"<opaque fresh-per-open>")
-            .finish_non_exhaustive()
-    }
-}
-
-impl RemotePhysicalObjectBindingV1 {
-    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
-    fn issue(
-        content_length: NonZeroU64,
-        consistency: RemoteObjectConsistencyClassV1,
-    ) -> Result<Self, PhysicalSourceResolutionErrorV1> {
-        let generation = NEXT_REMOTE_OBJECT_GENERATION_V1
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |current| current.checked_add(1),
-            )
-            .map_err(|_current| PhysicalSourceResolutionErrorV1::GenerationExhausted)
-            .and_then(|value| {
-                NonZeroU64::new(value).ok_or(PhysicalSourceResolutionErrorV1::GenerationExhausted)
-            })?;
-        Ok(Self {
-            state: Arc::new(Mutex::new(RemotePhysicalObjectStateV1 {
-                open: true,
-                generation,
-                content_length,
-                consistency,
-            })),
-        })
-    }
-
-    #[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
-    fn issue_for_phase_a_measurement_v1(
-        content_length: NonZeroU64,
-        consistency: RemoteObjectConsistencyClassV1,
-    ) -> Result<Self, PhysicalSourceResolutionErrorV1> {
-        Self::issue(content_length, consistency)
-    }
-
-    #[cfg(test)]
-    fn issue_for_test(
-        content_length: NonZeroU64,
-        consistency: RemoteObjectConsistencyClassV1,
-    ) -> Result<Self, PhysicalSourceResolutionErrorV1> {
-        Self::issue_for_phase_a_measurement_v1(content_length, consistency)
-    }
-
-    fn ensure_open(&self) -> Result<(), PhysicalSourceResolutionErrorV1> {
-        if self.state.lock().open {
-            Ok(())
-        } else {
-            Err(PhysicalSourceResolutionErrorV1::ObjectClosed)
-        }
-    }
-
-    fn content_length(&self) -> NonZeroU64 {
-        self.state.lock().content_length
-    }
-
-    fn generation(&self) -> NonZeroU64 {
-        self.state.lock().generation
-    }
-
-    #[cfg(test)]
-    fn identity_for_test(&self) -> (NonZeroU64, NonZeroU64, RemoteObjectConsistencyClassV1) {
-        let state = self.state.lock();
-        (state.generation, state.content_length, state.consistency)
-    }
-}
-
-impl RemoteObjectReadIssuerV1 {
-    fn issue_v1<'a>(
-        &self,
-        slice: crate::remote_fixed_layout::RemoteMcapSlice<'a>,
-    ) -> Result<BoundRemoteObjectReadV1<'a>, PhysicalSourceResolutionErrorV1> {
-        if !self.object.lock().open {
-            return Err(PhysicalSourceResolutionErrorV1::ObjectClosed);
-        }
-        let end = slice
-            .offset()
-            .checked_add(
-                u64::try_from(slice.bytes().len())
-                    .map_err(|_overflow| PhysicalSourceResolutionErrorV1::ArithmeticOverflow)?,
-            )
-            .ok_or(PhysicalSourceResolutionErrorV1::ArithmeticOverflow)?;
-        if end > self.object.lock().content_length.get() {
-            return Err(PhysicalSourceResolutionErrorV1::ObjectLengthMismatch);
-        }
-        Ok(BoundRemoteObjectReadV1 {
-            object: Arc::clone(&self.object),
-            slice,
-        })
-    }
-}
-
-impl<'a> BoundRemoteObjectReadV1<'a> {
-    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
-    fn offset(&self) -> u64 {
-        self.slice.offset()
-    }
-
-    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
-    fn bytes(&self) -> &'a [u8] {
-        self.slice.bytes()
-    }
-
-    fn into_slice_v1(
-        self,
-        expected: &RemotePhysicalObjectBindingV1,
-    ) -> Result<crate::remote_fixed_layout::RemoteMcapSlice<'a>, PhysicalSourceResolutionErrorV1>
-    {
-        if !Arc::ptr_eq(&self.object, &expected.state) {
-            return Err(PhysicalSourceResolutionErrorV1::ObjectBindingMismatch);
-        }
-        expected.ensure_open()?;
-        Ok(self.slice)
-    }
-}
-
-struct RemotePhysicalObjectLifetimeV1 {
-    state: Arc<Mutex<RemotePhysicalObjectStateV1>>,
-}
-
-impl Drop for RemotePhysicalObjectLifetimeV1 {
-    fn drop(&mut self) {
-        self.state.lock().open = false;
-    }
-}
-
-struct RemotePhysicalSourceRegistryStateV1;
-
-struct RemotePhysicalSourceRegistryLeaseV1 {
-    #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
-    state: Arc<RemotePhysicalSourceRegistryStateV1>,
 }
 
 struct RemotePhysicalEvidenceProfileV1 {
@@ -743,31 +576,10 @@ impl<'a, ValidatorOwner> BoundPreparedPhysicalSourceResolutionV1<'a, ValidatorOw
     }
 }
 
-pub struct BoundResolvedPhysicalSourceAuthorityV1<'a, ValidatorOwner> {
-    inner: ResolvedPhysicalSourceAuthorityV1<'a>,
-    object_lifetime: RemotePhysicalObjectLifetimeV1,
-    validator_owner: PhantomData<ValidatorOwner>,
-}
-
 impl<ValidatorOwner> BoundResolvedPhysicalSourceAuthorityV1<'_, ValidatorOwner> {
     pub(crate) fn source_v1(&self) -> ResolvedRemotePhysicalSourceRefV1<'_, '_> {
         let _keep_object_open = &self.object_lifetime;
         ResolvedRemotePhysicalSourceRefV1 { inner: &self.inner }
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl<'a, ValidatorOwner> BoundResolvedPhysicalSourceAuthorityV1<'a, ValidatorOwner> {
-    /// Exposes the resolved physical source authority for the Web adapter's
-    /// `issue_physical_receipt_v1` seam.
-    ///
-    /// The lease and selector types remain `pub(crate)`; this exposes only the
-    /// receipt-issuing authority handle. The returned borrow keeps the bound object
-    /// lifetime alive, so the remote object stays open while the authority is held.
-    #[cfg(target_arch = "wasm32")]
-    pub fn resolved_authority_v1(&self) -> &ResolvedPhysicalSourceAuthorityV1<'a> {
-        let _keep_object_open = &self.object_lifetime;
-        &self.inner
     }
 }
 
@@ -1004,44 +816,7 @@ impl ResolvedRemotePhysicalSourceUnitMetadataRefV1<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CanonicalPhysicalExtentV1 {
-    KnownEmpty,
-    Known { start: TimeInt, end: TimeInt },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CanonicalIntervalV1 {
-    start: TimeInt,
-    end: TimeInt,
-    canonical_ordinal: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ResolutionClassificationV1 {
-    Pending,
-    KnownEmpty,
-    NonEmpty { start: TimeInt, end: TimeInt },
-}
-
-/// Immutable layout retained by the resolved authority and available only by borrow.
-pub struct ResolvedCanonicalPhysicalLayoutV1 {
-    classifications: Box<[ResolutionClassificationV1]>,
-    intervals: Box<[CanonicalIntervalV1]>,
-    prefix_max_end: Box<[TimeInt]>,
-    interval_count: usize,
-    extent: CanonicalPhysicalExtentV1,
-}
-
 impl ResolvedCanonicalPhysicalLayoutV1 {
-    pub fn canonical_extent_v1(&self) -> CanonicalPhysicalExtentV1 {
-        self.extent
-    }
-
-    pub fn canonical_chunk_count_v1(&self) -> usize {
-        self.classifications.len()
-    }
-
     pub(crate) fn canonical_classification_v1(
         &self,
         canonical_ordinal: usize,
@@ -1119,20 +894,6 @@ impl ResolvedCanonicalPhysicalLayoutV1 {
             interval_count: count,
             extent,
         }
-    }
-
-    pub fn intersecting_ordinals_v1(
-        &self,
-        query_start: TimeInt,
-        query_end: TimeInt,
-    ) -> impl Iterator<Item = usize> + '_ {
-        let intervals = &self.intervals[..self.interval_count];
-        let upper = intervals.partition_point(|interval| interval.start <= query_end);
-        let lower = self.prefix_max_end[..upper].partition_point(|max_end| *max_end < query_start);
-        intervals[lower..upper]
-            .iter()
-            .filter(move |interval| interval.end >= query_start)
-            .map(|interval| interval.canonical_ordinal)
     }
 }
 
@@ -1343,23 +1104,6 @@ impl FullResolutionAdmissionCensusV1 {
     }
 }
 
-struct AggregateResolutionBudgetStateV1 {
-    max_active: u64,
-    max_retained_bytes: u64,
-    usage: Mutex<AggregateResolutionBudgetUsageV1>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct AggregateResolutionBudgetUsageV1 {
-    active: u64,
-    retained_bytes: u64,
-}
-
-struct AggregateResolutionReservationV1 {
-    state: Arc<AggregateResolutionBudgetStateV1>,
-    retained_bytes: u64,
-}
-
 /// Move-only token proving that aggregate admission succeeded.  Child allocations may only be
 /// consumed while this token is held.
 pub(crate) struct AggregateResolutionTransactionV1 {
@@ -1382,14 +1126,6 @@ impl AggregateResolutionTransactionV1 {
         PreparedPhysicalChunkAuthorityClaimV1,
     ) {
         (self.reservation, self.authority_claim)
-    }
-}
-
-impl Drop for AggregateResolutionReservationV1 {
-    fn drop(&mut self) {
-        let mut usage = self.state.usage.lock();
-        usage.active -= 1;
-        usage.retained_bytes -= self.retained_bytes;
     }
 }
 
@@ -1974,77 +1710,13 @@ impl<'a> PreparedPhysicalSourceResolutionV1<'a> {
     }
 }
 
-pub struct ResolvedPhysicalSourceAuthorityV1<'a> {
-    object: RemotePhysicalObjectBindingV1,
-    authority: PhysicalChunkSourceAuthority<'a>,
-    source_binding: PhysicalChunkSourceBindingV1,
-    layout: ResolvedCanonicalPhysicalLayoutV1,
-    _reservation: AggregateResolutionReservationV1,
-    _registry: RemotePhysicalSourceRegistryLeaseV1,
-    _aggregate_reservations: PreparedAmbiguousZeroAggregateReservations,
-}
-
-impl<'a> ResolvedPhysicalSourceAuthorityV1<'a> {
+// The layout_v1 locked-only projection lives here (full-graph), while the struct + seam
+// methods moved to remote_physical_seam.
+impl ResolvedPhysicalSourceAuthorityV1<'_> {
     #[cfg(re_mcap_locked_remote_wasm_allocator_v1)]
     pub(crate) fn layout_v1(&self) -> &ResolvedCanonicalPhysicalLayoutV1 {
         &self.layout
     }
-    pub(crate) fn issue_lease_v1(
-        &self,
-        ordinal: usize,
-    ) -> Result<PhysicalChunkReadLease<'a, PendingHeaderValidation>, PhysicalSourceResolutionErrorV1>
-    {
-        self.object.ensure_open()?;
-        self.source_binding
-            .ensure_current_v1()
-            .map_err(PhysicalSourceResolutionErrorV1::Physical)?;
-        let selector = self
-            .authority
-            .select(ordinal)
-            .map_err(PhysicalSourceResolutionErrorV1::Physical)?;
-        self.authority
-            .issue(selector)
-            .map_err(PhysicalSourceResolutionErrorV1::Physical)
-    }
-
-    /// Issues a producer-issued physical receipt for one canonical chunk read.
-    ///
-    /// The adapter-facing seam revalidates the live object/source binding, selects the
-    /// canonical chunk by ordinal, and issues a live read lease before consuming the MCAP
-    /// correlation permit. The returned [`crate::web_body_handoff::WebPhysicalReceiptV1`]
-    /// keeps the lease and the physical identity private, so the adapter never names the
-    /// lease, the selector, the raw body, the cache, the reservation, or the scalar identity.
-    pub fn issue_physical_receipt_v1(
-        &self,
-        ordinal: usize,
-        permit: McapCorrelationPermitV1,
-    ) -> Result<crate::web_body_handoff::WebPhysicalReceiptV1<'a>, PhysicalSourceResolutionErrorV1>
-    {
-        let lease = self.issue_lease_v1(ordinal)?;
-        Ok(crate::web_body_handoff::WebPhysicalReceiptV1::from_lease_v1(lease, permit))
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PhysicalSourceResolutionErrorV1 {
-    ArithmeticOverflow,
-    GenerationExhausted,
-    ReservationLimitExceeded,
-    AllocationFailed,
-    ObjectClosed,
-    ObjectLengthMismatch,
-    ObjectBindingMismatch,
-    RegistryBindingMismatch,
-    PhysicalSourceBindingMismatch,
-    InvalidPlan,
-    InvalidFixedLayout,
-    InvalidTemporalValue,
-    OutOfOrderResolution,
-    ResolutionComplete,
-    ResolutionIncomplete,
-    AlreadyFinalized,
-    AmbiguousExtentNotZero,
-    Physical(PhysicalChunkValidationError),
 }
 
 fn retained_layout_bytes(count: u64) -> Result<u64, PhysicalSourceResolutionErrorV1> {
@@ -2064,7 +1736,7 @@ fn try_filled<T: Clone>(count: usize, value: T) -> Result<Vec<T>, PhysicalSource
     Ok(output)
 }
 
-#[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+#[cfg(any(all(test, not(target_arch = "wasm32")), rerun_mcap_phase_a_proof_v1))]
 pub mod phase_a_measurement;
 
 #[cfg(test)]
@@ -3976,7 +3648,10 @@ mod tests {
 
         let forbidden_artifact_issuer = ["issue_for_verified", "_artifact_v1"].concat();
         assert!(!source.contains(&forbidden_artifact_issuer));
-        assert!(source.contains("#[cfg(test)]\n    fn issue_for_test("));
+        let seam_source = include_str!("remote_physical_seam.rs");
+        assert!(seam_source.contains(
+            "#[cfg(all(test, not(target_arch = \"wasm32\")))]\n    pub(crate) fn issue_for_test("
+        ));
         assert!(
             !source.contains("#[cfg(re_mcap_locked_remote_wasm_allocator_v1)]\n    pub fn issue")
         );

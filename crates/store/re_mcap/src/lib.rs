@@ -100,7 +100,7 @@ const RECORD_HEADER_LEN: usize = 1 + std::mem::size_of::<u64>();
 #[cfg(any(target_arch = "wasm32", test))]
 pub mod web_body_handoff;
 
-#[cfg(any(test, all(target_arch = "wasm32", rerun_mcap_phase_a_proof_v1)))]
+#[cfg(any(all(test, not(target_arch = "wasm32")), rerun_mcap_phase_a_proof_v1))]
 pub use remote_physical_resolution::phase_a_measurement;
 
 #[cfg(target_arch = "wasm32")]
@@ -149,7 +149,11 @@ mod remote_chunk_scan;
 
 // Exactly-once MCAP-023/025 ownership coordinator. The public Wasm surface exposes only opaque,
 // sealed owner types needed by the future Viewer adapter; constructors remain artifact-gated.
-#[cfg(target_arch = "wasm32")]
+// Always-compiled physical seam types referenced by remote_chunk_scan and the adapter.
+#[cfg(any(target_arch = "wasm32", test))]
+mod remote_physical_seam;
+
+#[cfg(any(rerun_mcap_phase_a_proof_v1, re_mcap_locked_remote_wasm_allocator_v1))]
 pub mod remote_physical_resolution;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
