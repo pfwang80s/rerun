@@ -4,8 +4,6 @@
 //! A future Chrome adapter may provide an exact full-record body, but it cannot construct a read
 //! identity, report Chunk metadata, or bypass the pending-header transition defined here.
 
-#![allow(dead_code)]
-
 use std::alloc::Layout;
 #[cfg(test)]
 use std::cell::RefCell;
@@ -1201,11 +1199,50 @@ impl Drop for PhysicalChunkSourceAuthority<'_> {
     }
 }
 
+/// Identity-bound revalidation token retained while a physical body crosses safe points.
+///
+/// This token is created only from a live read lease and rechecks the source generation, read
+/// generation, canonical ordinal, and owner state without exposing those fields to callers.
+pub(super) struct PhysicalChunkReadRevalidationV1<'a> {
+    shared: Arc<PhysicalChunkSourceEvidence<'a>>,
+    canonical_ordinal: usize,
+    source_generation: NonZeroU64,
+    read_generation: NonZeroU64,
+}
+
+impl PhysicalChunkReadRevalidationV1<'_> {
+    pub(super) fn ensure_current_v1(&self) -> Result<(), PhysicalChunkValidationError> {
+        if self.source_generation != self.shared.source_generation.0 {
+            return Err(PhysicalChunkValidationError::StaleSourceGeneration);
+        }
+        let state = self.shared.state.lock();
+        if !state.open {
+            return Err(PhysicalChunkValidationError::SourceClosed);
+        }
+        match state.slots.get(self.canonical_ordinal) {
+            Some(PhysicalChunkSlot::Live { generation }) if *generation == self.read_generation => {
+                Ok(())
+            }
+            _ => Err(PhysicalChunkValidationError::StaleReadGeneration),
+        }
+    }
+}
+
 impl<'a, State> PhysicalChunkReadLease<'a, State> {
     fn core(&self) -> &PhysicalChunkReadLeaseCore<'a> {
         self.core
             .as_ref()
             .expect("a live physical-Chunk lease retains its core")
+    }
+
+    pub(super) fn revalidation_v1(&self) -> PhysicalChunkReadRevalidationV1<'a> {
+        let core = self.core();
+        PhysicalChunkReadRevalidationV1 {
+            shared: Arc::clone(&core.shared),
+            canonical_ordinal: core.canonical_ordinal,
+            source_generation: core.source_generation,
+            read_generation: core.read_generation,
+        }
     }
 
     pub(super) fn ensure_current(&self) -> Result<(), PhysicalChunkValidationError> {
@@ -3068,6 +3105,46 @@ mod tests {
     }
 
     #[test]
+    fn web_physical_identity_revalidation_stops_after_each_safe_point() {
+        use crate::web_body_handoff::{
+            WebPhysicalBodyHandoffErrorV1, WebPhysicalBodySafePointV1,
+            WebPhysicalCopyOverlapBudgetV1, WebPhysicalReceiptV1, process_explicit_copy_body_v1,
+        };
+
+        let cases = [
+            WebPhysicalBodySafePointV1::BeforeHeaderValidation,
+            WebPhysicalBodySafePointV1::AfterPayloadCopy,
+            WebPhysicalBodySafePointV1::AfterExactDecompression,
+            WebPhysicalBodySafePointV1::AfterPhysicalScan,
+            WebPhysicalBodySafePointV1::BeforeCachePublication,
+        ];
+
+        for invalidate_at in cases {
+            let fixture = web_handoff_fixture();
+            let authority = build_authority(&fixture);
+            let body = full_record(&fixture, 0);
+            let receipt = WebPhysicalReceiptV1::from_lease_v1(issue(&authority, 0), mcap_permit());
+            let budget = WebPhysicalCopyOverlapBudgetV1::new_unfrozen_phase_a_v1();
+            let mut observed = Vec::new();
+            let result = process_explicit_copy_body_v1(receipt, &body, &budget, |point| {
+                observed.push(point);
+                if point == invalidate_at {
+                    authority.close();
+                }
+                Ok(())
+            });
+            assert!(matches!(
+                result,
+                Err(WebPhysicalBodyHandoffErrorV1::RevalidationFailed(point))
+                    if point == invalidate_at
+            ));
+            assert_eq!(observed.last().copied(), Some(invalidate_at));
+            assert_eq!(budget.usage_for_test_v1().0, 0);
+            assert_eq!(budget.usage_for_test_v1().1, 0);
+        }
+    }
+
+    #[test]
     fn web_zero_copy_handoff_borrows_payload_and_allocates_no_destination_before_decompression() {
         use crate::web_body_handoff::{
             WEB_PHYSICAL_BODY_PHASE_A_CANDIDATE_PROFILE_V1, WebPhysicalBodyProfileStatusV1,
@@ -3115,6 +3192,45 @@ mod tests {
         assert!(cache.is_current_for_test_v1());
         assert_eq!(budget.usage_for_test_v1(), (0, 0, high_water));
         drop(cache);
+    }
+
+    #[test]
+    fn web_zero_copy_revalidation_rejects_after_payload_transfer_callback() {
+        use crate::web_body_handoff::{
+            WebPhysicalBodyHandoffErrorV1, WebPhysicalBodySafePointV1,
+            WebPhysicalCopyOverlapBudgetV1, WebPhysicalReceiptV1, process_zero_copy_body_v1,
+        };
+
+        let fixture = web_handoff_fixture();
+        let authority = build_authority(&fixture);
+        let body = full_record(&fixture, 0);
+        let receipt = WebPhysicalReceiptV1::from_lease_v1(issue(&authority, 0), mcap_permit());
+        let budget = WebPhysicalCopyOverlapBudgetV1::new_unfrozen_phase_a_v1();
+        let mut observed = Vec::new();
+        let result = process_zero_copy_body_v1(receipt, &body, &budget, |point| {
+            observed.push(point);
+            if point == WebPhysicalBodySafePointV1::AfterPayloadTransfer {
+                authority.close();
+            }
+            Ok(())
+        });
+
+        assert!(matches!(
+            result,
+            Err(WebPhysicalBodyHandoffErrorV1::RevalidationFailed(
+                WebPhysicalBodySafePointV1::AfterPayloadTransfer
+            ))
+        ));
+        assert_eq!(
+            observed,
+            [
+                WebPhysicalBodySafePointV1::BeforeHeaderValidation,
+                WebPhysicalBodySafePointV1::AfterPayloadTransfer,
+            ]
+        );
+        let (_, _, high_water) = budget.usage_for_test_v1();
+        assert!(high_water > 0);
+        assert_eq!(budget.usage_for_test_v1(), (0, 0, high_water));
     }
 
     #[test]
@@ -3213,6 +3329,68 @@ mod tests {
         let (_borrowed_b, _mcap_b_material) = pending_b.bind_exact_body_v1(&body).unwrap();
         let (_borrowed_c, mcap_c_material) = pending_c.bind_exact_body_v1(&body).unwrap();
         assert!(match_correlation_v1(web_b.into_material_v1(), mcap_c_material).is_err());
+    }
+
+    #[test]
+    fn web_receipt_rejects_stale_source_and_does_not_consume_fresh_claim() {
+        use crate::web_body_handoff::{WebPhysicalCompletionBindErrorV1, WebPhysicalReceiptV1};
+
+        let fixture = web_handoff_fixture();
+        let authority = build_authority(&fixture);
+        let body = full_record(&fixture, 0);
+        let stale = WebPhysicalReceiptV1::from_lease_v1(issue(&authority, 0), mcap_permit());
+
+        authority.shared.state.lock().slots[0] = PhysicalChunkSlot::Vacant { last_generation: 1 };
+        let fresh = issue(&authority, 0);
+        assert_eq!(fresh.core().read_generation.get(), 2);
+
+        assert!(matches!(
+            stale.bind_exact_body_v1(&body),
+            Err(WebPhysicalCompletionBindErrorV1::StaleLease)
+        ));
+        assert!(matches!(
+            authority.shared.state.lock().slots[0],
+            PhysicalChunkSlot::Live { generation } if generation.get() == 2
+        ));
+        drop(fresh);
+    }
+
+    #[test]
+    fn web_receipt_rejects_closed_source_before_body_validation() {
+        use crate::web_body_handoff::{WebPhysicalCompletionBindErrorV1, WebPhysicalReceiptV1};
+
+        let fixture = web_handoff_fixture();
+        let authority = build_authority(&fixture);
+        let body = full_record(&fixture, 0);
+        let receipt = WebPhysicalReceiptV1::from_lease_v1(issue(&authority, 0), mcap_permit());
+        authority.close();
+
+        assert!(matches!(
+            receipt.bind_exact_body_v1(&body),
+            Err(WebPhysicalCompletionBindErrorV1::StaleLease)
+        ));
+    }
+
+    #[test]
+    fn web_receipt_wrong_length_fails_without_partial_budget_effect() {
+        use crate::web_body_handoff::{
+            WebPhysicalBodyHandoffErrorV1, WebPhysicalCopyOverlapBudgetV1, WebPhysicalReceiptV1,
+            process_explicit_copy_body_v1,
+        };
+
+        let fixture = web_handoff_fixture();
+        let authority = build_authority(&fixture);
+        let body = full_record(&fixture, 0);
+        let budget = WebPhysicalCopyOverlapBudgetV1::new_for_test_v1(u64::MAX);
+        let receipt = WebPhysicalReceiptV1::from_lease_v1(issue(&authority, 0), mcap_permit());
+        assert!(matches!(
+            process_explicit_copy_body_v1(receipt, &body[..body.len() - 1], &budget, |_point| {
+                Ok(())
+            }),
+            Err(WebPhysicalBodyHandoffErrorV1::HeaderValidationFailed
+                | WebPhysicalBodyHandoffErrorV1::RevalidationFailed(_))
+        ));
+        assert_eq!(budget.usage_for_test_v1(), (0, 0, 0));
     }
 
     #[test]

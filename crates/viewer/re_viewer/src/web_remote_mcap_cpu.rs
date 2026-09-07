@@ -1,7 +1,5 @@
 //! Production-disarmed Web remote-MCAP Fetch completion and CPU work driver.
 
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::marker::PhantomData;
 use std::sync::Arc;

@@ -4,7 +4,6 @@
 //! validation plan and one-shot executable adapter and returns an all-or-nothing terminal
 //! payload.  Callers must publish the returned payload only after the terminal state is complete.
 
-#![allow(dead_code)]
 #![allow(
     clippy::ignored_unit_patterns,
     clippy::map_err_ignore,

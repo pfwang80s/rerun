@@ -47,17 +47,31 @@ mod texture_readback;
 mod ui;
 #[cfg(any(target_arch = "wasm32", test))]
 mod web_remote_mcap_activation;
+#[cfg(target_arch = "wasm32")]
+mod web_remote_mcap_adapter;
 #[cfg(any(target_arch = "wasm32", test))]
 mod web_remote_mcap_cache_query;
 #[cfg(any(target_arch = "wasm32", test))]
 mod web_remote_mcap_consumer;
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(any(
+    test,
+    all(
+        target_arch = "wasm32",
+        any(rerun_mcap_phase_a_proof_v1, re_mcap_locked_remote_wasm_allocator_v1)
+    ),
+))]
 mod web_remote_mcap_cpu;
 #[cfg(any(target_arch = "wasm32", test))]
 mod web_remote_mcap_data_query;
 #[cfg(any(target_arch = "wasm32", test))]
 mod web_remote_mcap_failure;
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(any(
+    test,
+    all(
+        target_arch = "wasm32",
+        any(rerun_mcap_phase_a_proof_v1, re_mcap_locked_remote_wasm_allocator_v1)
+    ),
+))]
 mod web_remote_mcap_frame_driver;
 #[cfg(any(target_arch = "wasm32", test))]
 mod web_remote_mcap_memory;

@@ -97,10 +97,17 @@
 /// eight-byte little-endian `u64` body length.
 const RECORD_HEADER_LEN: usize = 1 + std::mem::size_of::<u64>();
 
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    all(rerun_mcap_phase_a_proof_v1, feature = "web_adapter"),
+    re_mcap_locked_remote_wasm_allocator_v1,
+))]
 pub mod web_body_handoff;
 
-#[cfg(any(all(test, not(target_arch = "wasm32")), rerun_mcap_phase_a_proof_v1))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    all(rerun_mcap_phase_a_proof_v1, feature = "web_adapter"),
+))]
 pub use remote_physical_resolution::phase_a_measurement;
 
 #[cfg(target_arch = "wasm32")]
@@ -118,7 +125,14 @@ mod info;
 mod recover;
 
 /// Checked raw-time types for the Web remote-MCAP path.
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(
+    all(
+        target_arch = "wasm32",
+        rerun_mcap_phase_a_proof_v1,
+        feature = "web_adapter"
+    ),
+    all(target_arch = "wasm32", re_mcap_locked_remote_wasm_allocator_v1),
+))]
 pub mod remote_time;
 
 // Host builds compile this Web-only module only for its unit tests.
@@ -126,7 +140,14 @@ pub mod remote_time;
 mod remote_time;
 
 /// Checked fixed-layout and checksum validation for Web remote-MCAP inputs.
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(
+    all(
+        target_arch = "wasm32",
+        rerun_mcap_phase_a_proof_v1,
+        feature = "web_adapter"
+    ),
+    all(target_arch = "wasm32", re_mcap_locked_remote_wasm_allocator_v1),
+))]
 pub mod remote_fixed_layout;
 
 // Host builds compile this Web-only module only for its unit tests.
@@ -134,26 +155,45 @@ pub mod remote_fixed_layout;
 mod remote_fixed_layout;
 
 // The first remote Summary parsing stage remains crate-private and production-disarmed.
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    all(rerun_mcap_phase_a_proof_v1, feature = "web_adapter"),
+    re_mcap_locked_remote_wasm_allocator_v1,
+))]
 mod remote_summary;
 
 // Exact-output decompression remains crate-private and production-disarmed until the remote
 // resource profile and physical Chunk scanner are sealed.
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    all(rerun_mcap_phase_a_proof_v1, feature = "web_adapter"),
+    re_mcap_locked_remote_wasm_allocator_v1,
+))]
 mod remote_decompression;
 
 // Physical Chunk authority, header validation, and semantic scanning remain crate-private and
 // production-disarmed until the Chrome body-owner adapter and remote resource profile are sealed.
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    all(rerun_mcap_phase_a_proof_v1, feature = "web_adapter"),
+    re_mcap_locked_remote_wasm_allocator_v1,
+))]
 mod remote_chunk_scan;
 
 // Exactly-once MCAP-023/025 ownership coordinator. The public Wasm surface exposes only opaque,
 // sealed owner types needed by the future Viewer adapter; constructors remain artifact-gated.
 // Always-compiled physical seam types referenced by remote_chunk_scan and the adapter.
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32")),
+    all(rerun_mcap_phase_a_proof_v1, feature = "web_adapter"),
+    re_mcap_locked_remote_wasm_allocator_v1,
+))]
 mod remote_physical_seam;
 
-#[cfg(any(rerun_mcap_phase_a_proof_v1, re_mcap_locked_remote_wasm_allocator_v1))]
+#[cfg(any(
+    all(rerun_mcap_phase_a_proof_v1, feature = "web_adapter"),
+    re_mcap_locked_remote_wasm_allocator_v1,
+))]
 pub mod remote_physical_resolution;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

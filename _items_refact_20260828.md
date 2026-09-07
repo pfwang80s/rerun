@@ -329,15 +329,29 @@ compile-fail 测试不得依赖删除生产代码，也不得通过放宽 stderr
 
 ---
 
-# 工作项 3 — 实现 trusted producer 与 non-forgeable token
+# 工作项 3 — 新增 `re_mcap_web_adapter` 并实现 trusted producer 与 non-forgeable token
 
 ## 目的
 
-将 concrete Web transport owner 与 MCAP physical owner 的组合责任放入 `re_viewer`，消除下游对 scalar identity 和 concrete owner 的依赖。
+`re_mcap_web_adapter` 是唯一同时依赖 `re_web` 与 `re_mcap` 的 Web remote-MCAP 跨层组合层；`re_viewer`只消费该crate返回的opaque operation/result。`re_viewer`为其他既有非 remote功能保留的直接crate依赖不属于本路径，必须在实现记录中单独标识，不能用于remote owner组合。
 
 ## William 实施内容
 
-trusted producer 必须位于 `re_viewer`，因为它是唯一同时依赖 `re_web` 和 `re_mcap` 的产品层。
+trusted producer 必须位于 `re_mcap_web_adapter`。
+
+该工作项必须同时：
+
+- 新增workspace crate和Cargo依赖；
+- adapter crate登记为workspace member并更新`ARCHITECTURE.md` crate表；同时必须按仓库指导完成FigJam架构图更新、PNG上传和生成HTML回写，相关命令和凭据/网络限制写入handoff；
+- remote-MCAP路径的依赖必须严格为 `re_viewer → re_mcap_web_adapter → {re_web, re_mcap}`，而 `re_web ↛ re_mcap`、`re_mcap ↛ re_web`；任何其他`re_viewer`直接依赖须标记为unrelated existing dependency；
+- adapter的Cargo必须使用显式profile features和optional target dependencies：默认`consumer_contract`不启用`re_web`/`re_mcap`，`phase_a`仅在`all(target_arch = "wasm32", feature = "phase_a")`启用，`locked`仅在`all(target_arch = "wasm32", feature = "locked", re_mcap_locked_remote_wasm_allocator_v1)`启用；locked cfg只能由外部attestation/build workflow提供；必须以`cargo metadata`和三份`cargo tree`实际输出验证consumer/Phase A负向依赖，不能以Rust cfg alone声称排除full graph；
+  - **direction-b reconciliation**：adapter 的 `phase_a` 不再 gate 在 `rerun_mcap_phase_a_proof_v1` 上（该 cfg 是 `re_mcap/build.rs` 发出的 per-crate cfg，不传播到 adapter crate；否则 producer 永远不编译）。Phase-A proof attestation 由 proof consumer（`test_mcap_phase_a_chrome`）的 `#![cfg(all(target_arch = "wasm32", rerun_mcap_phase_a_proof_v1))]` 强制。
+- WI-03必须使用带`--target wasm32-unknown-unknown`的`cargo tree -e features`并执行fail-closed断言：consumer tree不得出现`re_web`、`re_mcap`、`feature "phase_a"`或`feature "locked"`；Phase-A tree必须出现`re_web`、`re_mcap`和`feature "phase_a"`且不得出现`feature "locked"`、decoder assignment、manifest、dispatch、runtime-intern或`PhysicalChunkDispatchDecode`；locked tree只有在`RERUN_LOCKED_ATTESTATION_V1=1`外部attestation环境执行，必须出现`feature "locked"`和完整implementation依赖，未设置attestation的locked命令及Phase-A解析locked feature均必须非零退出。
+
+- Phase A只使用`all(target_arch = "wasm32", feature = "phase_a")`（direction-b reconciliation：proof attestation 由 proof consumer 强制），不编译或调用dispatch/decode/runtime-intern，且该cfg不能启用locked cfg；
+- locked adapter/full graph只使用`all(target_arch = "wasm32", feature = "locked", re_mcap_locked_remote_wasm_allocator_v1)`，该cfg只能由外部attestation/build workflow提供；
+- host tests使用`cfg(test)`完整图，test-only constructor不得泄漏到product Wasm；
+- 让 `re_viewer` 依赖adapter的opaque contract，而不是两侧concrete owner；ordinary product依赖必须显式`default-features = false, features = ["consumer_contract"]`；Phase A和locked必须分别使用`features = ["phase_a"]`与`features = ["locked"]`并保存`cargo metadata`/`cargo tree`负向依赖审计；
 
 producer 必须：
 
@@ -372,9 +386,16 @@ producer 必须：
 - 若 Phase A 测量必须观察数值，只在精确 Phase A cfg 下提供测试/measurement-only API；
 - 不复制一份 structurally similar type 来绕过 type identity 或 lifetime 问题。
 
-## 必须添加测试
+## WI-03/WI-05边界与前置条件
 
-- stale source generation 在 consume 前失败；
+WI-03必须在本工作项内完成adapter producer及其profile-separated API，并提供compile/source-shape断言证明Phase-A-facing adapter不能导入或调用decoder、dispatch、manifest或runtime-intern graph；Phase A cfg不能别名locked cfg，`PhysicalChunkDispatchDecode`不能进入Phase A executable path。
+WI-03的安全性不得依赖WI-05未来迁移才能成立。
+- 完成 WI-03 后，WI-05 只能迁移 `re_viewer` consumer-side scheduling/translation adapter 和 Viewer 模块入口；不得补足或重新定义 WI-03 的 producer 安全前置条件。
+- `re_viewer` 中的 Phase-A/locked adapter 仅是 consumer-side scheduling/translation adapter；不得依赖 `re_web`/`re_mcap` concrete owner API，不得定义或持有 body、lease、cache、reservation、registry、slot、decoder、manifest、dispatch 或 runtime-intern owner。
+- 所有跨层 producer、owner binding、Drop、rollback、revalidation 和 registry/slot 逻辑只能位于 `re_mcap_web_adapter`。
+- WI-05 的 owner/Drop 测试只能通过 producer-issued opaque operation/result 验证，不得在 Viewer 重新实现 owner 生命周期。
+
+
 - stale read generation 在 consume 前失败；
 - stale operation generation 在 consume 前失败；
 - wrong ordinal 失败；
@@ -402,13 +423,19 @@ producer 必须：
 
 ## Commit manifest
 
-只允许：
+Work Item 03的独立commit允许包含：
 
-- trusted producer/registry/token 实现；
-- 对应 private owner 拆分；
-- operation/result API；
-- ownership、revalidation、Drop 和 rollback 测试；
-- 必要 module/export 修改。
+- 新增 `re_mcap_web_adapter` crate的Cargo和源文件；
+- `Cargo.toml` workspace member和dependency更新；
+- `ARCHITECTURE.md` crate表更新；
+- 按 `ARCHITECTURE.md` 指导完成FigJam架构图人工更新、PNG上传和生成HTML回写；执行`pixi run upload-image --name architecture_diagram`，若需要credentials/network必须在handoff中记录，未执行时不得标记该项完成；
+- adapter的Cargo/profile dependency audit证据：`cargo metadata --no-deps --format-version 1`、consumer/Phase A/locked三份`cargo tree`及jq负向/正向检查；
+- producer/operation/ownership/revalidation/Drop/rollback测试；
+- 本工作项计划状态和必要handoff文档。
+
+WI-03实现不能在本修订计划未经Dafee复审通过前开始；当前状态必须保持design correction complete — review pending，所有实现项保持pending。
+
+必须排除 `/data/demo`、LFS fixture、生成物、raw logs、target/session/temp文件和无关dirty/untracked路径。
 
 ---
 
@@ -508,28 +535,30 @@ crates/store/re_mcap/src/web_body_physical_owner.rs
 
 ## William 实施内容
 
+- `re_viewer` 内的 Phase-A/locked **consumer-side scheduling/translation adapter** 只消费 `re_mcap_web_adapter` 签发的 opaque operation/result/status/error；它不是 owner adapter。
+- 该 consumer-side adapter 不得依赖 `re_web` 或 `re_mcap` 的 concrete owner API。
+- 它不得定义或持有 body、lease、cache、reservation、registry、slot、decoder、manifest、dispatch 或 runtime-intern owner。
+- 所有跨层 producer、owner binding、Drop、rollback、revalidation 和 registry/slot 逻辑只能位于 `re_mcap_web_adapter`。
+- `re_viewer` common CPU 不直接引用 `web_body_handoff`、`remote_chunk_scan` 或 phase measurement concrete owner。
+- Phase-A consumer-side scheduling/translation adapter 只能调度 opening、MessageIndex、physical validation 和必要 BYOB copy 的 opaque results；`PhysicalChunkDispatchDecode` 不得进入 Phase-A executable path。
+- locked consumer-side scheduling/translation adapter 只能消费 locked opaque results，不持有完整 graph。
+- host tests只能通过 producer-issued opaque operation/result验证owner/Drop行为，不得在Viewer重新实现owner生命周期。
+
 在 `crates/viewer/re_viewer/src/lib.rs` 中：
 
 - ordinary common scheduler 使用 opaque operation/result/status/error contract；
-- Phase A module 使用：
+- Phase-A consumer-side adapter 使用：
   ```rust
   #[cfg(all(target_arch = "wasm32", rerun_mcap_phase_a_proof_v1))]
   ```
-- locked adapter 使用：
+- locked consumer-side adapter 使用：
   ```rust
   #[cfg(all(target_arch = "wasm32", re_mcap_locked_remote_wasm_allocator_v1))]
   ```
 - host tests 使用精确的 `cfg(test)` 入口；
-- 不以 `any(target_arch = "wasm32", test)` 让 ordinary、Phase A、locked 和 host 共用完整 concrete graph。
+- 不以 `any(target_arch = "wasm32", test)` 让 ordinary、Phase-A、locked 和 host 共用完整 concrete graph。
 
-在 `web_remote_mcap_cpu.rs` 中：
 
-- common CPU 不直接引用 `web_body_handoff`、`remote_chunk_scan` 或 phase measurement concrete owner；
-- ordinary product 只持有 opaque operation；
-- Phase A adapter 只能执行 opening、MessageIndex、physical validation、必要 BYOB copy；
-- `PhysicalChunkDispatchDecode` 不得进入 Phase A executable path；
-- locked adapter 保持完整 graph 和 attestation boundary；
-- 不使用 public scalar identity 重建 operation/result。
 
 ## 必须测试
 
@@ -1128,7 +1157,7 @@ git diff --cached --quiet
 |---|---|---|---|---|---|
 | 1 | Git 边界、模块图、四 profile baseline | baseline complete — review required; gates failed as recorded | — | FAIL — corrections recorded | `/data/tools/refact-20260828-work-item-01/`; `handoff/william-refact-work-item-01-baseline.md`; `handoff/william-refact-work-item-01-baseline-fix.md` |
 | 2 | 纯 opaque cross-crate contract | implemented — bounded contract validations pass; locked verifier baseline and host clippy remain failed on pre-existing `re_string_interner`/dormant-graph issues; review required | — | pending | `/data/tools/mcap114-work-item-02-final/`; `handoff/william-refact-work-item-02-lint-validation-fix.md` |
-| 3 | trusted producer 与 non-forgeable token | pending | — | pending | — |
+| 3 | trusted producer 与 non-forgeable token | design correction complete — locked wrapper guard order, consumer positive feature assertion, consumer-only Viewer adapter boundary, and mandatory ARCHITECTURE diagram work recorded; Dafee re-review pending; implementation pending | — | re-review pending | `_refact_20260828.md`; `handoff/william-refact-wi03-plan-medium-fix.md` |
 | 4 | re_mcap physical graph profile 拆分 | pending | — | pending | — |
 | 5 | Viewer common/Phase A/locked adapter 隔离 | pending | — | pending | — |
 | 6 | re_web Chrome Range transport contract | pending | — | pending | — |
@@ -1151,7 +1180,7 @@ git diff --cached --quiet
 
 1. **当前 concrete cross-crate seam 尚未满足设计要求。**
    证据：`crates/viewer/re_viewer/src/web_remote_mcap_cpu.rs:1363-1531` 直接命名并持有 `re_mcap::web_body_handoff` 的 pending lease、bind error、handoff error、overlap budget 和 scan cache entry。
-   最小修复：先完成 `re_viewer` trusted producer 与 opaque operation/result seam，再迁移 Viewer ordinary CPU；不得以 public scalar identity/accessor 替代。
+   最小修复：先完成 `re_mcap_web_adapter` trusted producer 与 opaque operation/result seam，再迁移 Viewer ordinary CPU；不得以 public scalar identity/accessor 替代。
 
 2. **`re_mcap` physical module 的 Wasm cfg 过宽，ordinary product 可能加载 dormant/full physical graph。**
    证据：`crates/store/re_mcap/src/lib.rs:121-129` 对 `remote_chunk_scan` 使用 `any(target_arch = "wasm32", test)`，`remote_physical_resolution` 在 Wasm 下直接 public；`remote_physical_resolution.rs` 顶部直接依赖完整 `remote_chunk_scan`、decompression、summary graph。
@@ -1222,3 +1251,34 @@ git diff --cached --quiet
 - **High：** Viewer 入口仍广泛使用 `any(target_arch = "wasm32", test)`，无法证明四 profile 图隔离。
 - **Medium：** Phase A CPU work kind 仍包含 dispatch/decode 变体，需要 locked-only 拆分或 source-shape/compile-fail 证明。
 - **Medium：** 当前没有本次运行的 Git status、profile、Chrome 或 `/data/demo` gate 证据，旧计划状态不应被视为当前通过。
+## Dafee BLOCK remediation — implementation prerequisite (design only)
+
+- [x] 新增独立 workspace crate `crates/store/re_mcap_web_contract`（contract-only阶段已实现；见 `handoff/william-mcap114-contract-implementation.md`）。
+- [ ] contract实现后请求独立 Dafee contract review；无 Blocker/High/Medium前不得继续 `re_web`/`re_mcap` producer seam。
+- [x] 冻结唯一依赖图：`re_web → re_mcap_web_contract`、`re_mcap → re_mcap_web_contract`、`re_mcap_web_adapter → {re_mcap_web_contract,re_web,re_mcap}`、`re_viewer → re_mcap_web_adapter`，且两 owning crates互不依赖。
+- [x] 冻结 contract禁止依赖/类型：Web owner、HTTP、URL、Response、stream、body、Abort、ETag、MCAP parser、lease、cache、reservation、Store、decoder、manifest、dispatch、runtime intern、Viewer、secret-bearing或可序列化身份。
+- [x] 冻结 `CorrelationPairV1`、`WebCorrelationPermitV1`、`McapCorrelationPermitV1`、correlation material及non-authority `MatchedCorrelationV1`；private fields、non-Clone/non-Copy、无scalar constructor/projection/serialization；matching不提供producer authority。
+- [!] 旧producer-witness/join-proof authority设计已被C+B v2 supersede；active rule见本文件末尾correction。
+- [x] 明确 contract不宣称仅凭类型完成cross-source检查；contract仅负责non-authority correlation matching；两侧producer负责private-owner receipt与runtime revalidation；adapter消费两份真实receipt。
+- [x] 冻结 Prepared→BodyBound→HeaderValidated→CacheReservationValidated→Consumed→ResultPublished→Released状态、owner、允许操作、revalidation、rollback及Drop顺序；同步callback不可逃逸，跨async只能owned transfer。
+- [x] 冻结 Phase A唯一四阶段：`byob_copy` → `opening_parse` → `message_index_parse` → `physical_validation`；明确输入/输出、允许依赖/副作用及禁止dispatch/decode/decoder/manifest/Store/locked路径。
+- [x] 修正 locked audit语义：环境变量仅fail-closed preflight marker；真实接受必须有build.rs/re_build_tools external-attestation artifact及source/target/profile/commit binding；记录missing/invalid/mismatch及forbidden-hit negative tests。
+- [x] 修正 `assert_absent`为显式if/return非零，禁止 `grep ... && exit 1 || true`。
+- [x] 扩展 ARCHITECTURE artifact checklist：crate table、graph、无reverse edge、PNG/FigJam版本、upload output、HTML round-trip和上传/写回失败fail-closed。
+- [x] 设计修正完成后已获 Dafee contract-substage authorization（`dafee-mcap114-contract-authorization-final-review.md` PASS）；contract-only crate已实现，独立 Dafee contract review待执行。
+
+## C+B hybrid authority correction v2 — contract + re_web receipt implemented; re_mcap receipt implemented, review pending
+
+- [x] 旧 contract-only placeholder/public issuance/always-Err join已回退；当前 workspace不含 `re_mcap_web_contract`。
+- [x] contract-only crate已实现：dependency-neutral `CorrelationFactoryV1`/`CorrelationPairV1`/move-only `WebCorrelationPermitV1`/`McapCorrelationPermitV1`/material/`MatchedCorrelationV1`/`CorrelationMismatchV1`，仅非authority matching；未实现producer receipt issuance。
+- [x] public factory可创建unused pair，但不授予authority；所有字段private，禁止Clone/Copy/Debug/Hash/serialization、scalar constructor/projection/token/raw bytes。
+- [x] consuming match只证明same-pair material并拒绝mismatch/replay/duplicate/missing；`MatchedCorrelationV1`不能独立授权operation。
+- [x] producer authenticity仅来自 `re_web`/`re_mcap`各自private-owner receipt；contract material不能构造receipt。
+- [x] semantic revalidation由owning producers在issue/consume/safe points执行。
+- [x] adapter必须消费两份authentic receipt并执行non-authority matching；保持body/lease/cache/reservation/revalidation/Drop/rollback及`re_web ↛ re_mcap`、`re_mcap ↛ re_web`。
+- [x] clean Dafee design review → contract non-authority crate（已实现）→ contract review → re_web receipt → review → re_mcap receipt → review → adapter → Viewer/Phase-A migration。
+- [x] contract implementation Dafee review通过（PASS）；contract-only commit `ef9cecb679`。
+- [x] `re_web` transport receipt substage已实现：`transport_receipt.rs`（wasm32 pub + host test private）、`RemoteTransportReceiptV1<B: TransportBodyOwner>`、sealed `TransportBodyOwner`、opaque `TransportReceiptErrorV1`、`pub(crate)` issuer、one-shot non-escape `consume_transport_v1`；见 `handoff/william-re_web-receipt-substage.md`。
+- [x] `re_web` receipt Dafee review通过（PASS）；re_web receipt commit `63df0709ba`。
+- [x] `re_mcap` physical receipt substage已实现：`WebPhysicalReceiptV1` 增加 `material: Option<McapCorrelationMaterialV1>`；`issue_from_lease_v1`/`from_lease_v1` 消费 `McapCorrelationPermitV1`；`bind_exact_body_v1` 返回 `(WebBorrowedPhysicalChunkBodyV1, McapCorrelationMaterialV1)`；legacy `bind_borrowed_exact_body_v1` 适配；Phase-A/测试调用点传递 permit；见 `handoff/william-re_mcap-receipt-substage.md`。
+- [ ] `re_mcap` receipt Dafee review通过前不得实现adapter或Viewer/Phase-A migration，也不得commit。R1 visibility partial，R2 partial，R3 blocked，`production_disarmed`。

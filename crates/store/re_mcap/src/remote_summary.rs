@@ -7,7 +7,6 @@
 
 // This module is intentionally production-disarmed until the remaining remote-MCAP parsing
 // stages seal its input capability and consume its evidence.
-#![allow(dead_code)]
 
 use crate::remote_fixed_layout::{RemoteMcapSlice, ValidatedFixedLayout};
 

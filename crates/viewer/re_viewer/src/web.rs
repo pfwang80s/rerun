@@ -155,6 +155,9 @@ pub struct WebHandle {
     /// measured production profile is installed; disarmed dispatch falls back to `ViewerOpenUrl`.
     compatibility_remote_mcap: Rc<RefCell<CompatibilityRemoteMcapSingletonV1>>,
 
+    /// Storage-free opaque adapter consumer retained by the Web handle while production is disarmed.
+    _remote_mcap_adapter: crate::web_remote_mcap_adapter::RemoteMcapAdapterConsumerV1,
+
     /// A dedicated smart channel used by the [`WebHandle::add_rrd_from_bytes`] API.
     ///
     /// This exists because the direct bytes API is expected to submit many small RRD chunks
@@ -211,11 +214,19 @@ impl WebHandle {
         let connection_registry =
             re_redap_client::ConnectionRegistry::new_with_stored_credentials();
 
+        let remote_mcap_adapter =
+            crate::web_remote_mcap_adapter::RemoteMcapAdapterConsumerV1::new_disarmed_v1();
+        debug_assert_eq!(
+            remote_mcap_adapter.status_v1(),
+            re_mcap_web_adapter::consumer_contract::AdapterOperationStatusV1::Disarmed
+        );
+
         Ok(Self {
             runner: eframe::WebRunner::new(),
             compatibility_remote_mcap: Rc::new(RefCell::new(
                 CompatibilityRemoteMcapSingletonV1::new_disarmed_v1(),
             )),
+            _remote_mcap_adapter: remote_mcap_adapter,
             log_senders: Default::default(),
             connection_registry,
             app_options: app_options.unwrap_or_default(),

@@ -5,8 +5,6 @@
 //! public facade. It consumes only the MCAP-093 requested/committed navigation types and leaves
 //! wiring to the future frame driver.
 
-#![allow(dead_code)]
-
 use std::collections::BTreeSet;
 
 use re_log_types::{Duration, TimeInt};

@@ -24,12 +24,9 @@ const STRICT_STARTUP_MAX_BATCH_ITEMS_V1: usize = 64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StrictStartupCapabilityGateV1 {
     /// The measured capability is installed; the startup handoff may proceed.
-    #[cfg_attr(
-        not(target_arch = "wasm32"),
-        expect(
-            dead_code,
-            reason = "the armed variant is only reached by the future measured capability bridge"
-        )
+    #[expect(
+        dead_code,
+        reason = "the armed variant is only reached by the future measured capability bridge"
     )]
     Armed,
     /// The capability is not installed; strict startup is disarmed.
@@ -54,6 +51,10 @@ pub(crate) enum RedactedStrictStartupErrorCodeV1 {
     UnsupportedFormat,
     ResourceLimitExceeded,
     BatchTooLarge,
+    #[expect(
+        dead_code,
+        reason = "the capability-unavailable code is returned by the disarmed Web startup bridge"
+    )]
     CapabilityUnavailable,
 }
 

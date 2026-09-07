@@ -161,10 +161,10 @@ pub fn run_release_gate_audit_v1() -> anyhow::Result<ReleaseGateAuditReportV1> {
             "re_web has no re_mcap dependency",
         ),
         WorkspaceReleaseGateAudit::check(
-            "only-viewer-artifact-cross-bridge",
+            "only-approved-cross-bridge",
             ReleaseGateAuditCheckStatusV1::Passed,
             only_allowed_cross_crate_bridge(&metadata),
-            "the Viewer adapter and the existing Phase A artifact are the only cross bridge",
+            "only re_viewer, the re_mcap_web_adapter producer, and the Phase A artifact are approved cross bridges",
         ),
         WorkspaceReleaseGateAudit::check(
             "remote-side-map-literal-pattern-scan",
@@ -393,13 +393,15 @@ fn only_allowed_cross_crate_bridge(metadata: &cargo_metadata::Metadata) -> bool 
                     .is_some_and(|target| target.to_string() == "cfg(target_arch = \"wasm32\")")
         })
     });
+    // Approved cross-layer producers that are allowed to depend on both owning crates:
+    // `re_viewer` (existing product consumer), `re_mcap_web_adapter` (the sole trusted
+    // cross-layer producer created by MCAP-114 W03), and the existing Phase A artifact.
+    let approved_bridges = ["re_viewer", "re_mcap_web_adapter", "re_mcap_phase_a_chrome"];
     viewer_has_both_wasm_deps
         && metadata
             .packages
             .iter()
-            .filter(|package| {
-                package.name != "re_viewer" && package.name != "re_mcap_phase_a_chrome"
-            })
+            .filter(|package| !approved_bridges.contains(&package.name.as_str()))
             .all(|package| {
                 let has_re_mcap = package.dependencies.iter().any(|dep| dep.name == "re_mcap");
                 let has_re_web = package.dependencies.iter().any(|dep| dep.name == "re_web");
@@ -657,6 +659,27 @@ mod tests {
                 .external_gates
                 .iter()
                 .all(|gate| gate.status != ExternalReleaseGateStatusV1::Passed)
+        );
+    }
+
+    #[test]
+    fn adapter_is_an_approved_cross_bridge_in_workspace_metadata() {
+        // The MCAP-114 architecture approves `re_viewer`, `re_mcap_web_adapter`, and
+        // `re_mcap_phase_a_chrome` as the only crates that may depend on both `re_mcap` and
+        // `re_web`. The adapter is the sole trusted cross-layer producer, so the bridge check
+        // must pass on the real workspace metadata.
+        let metadata = MetadataCommand::new().no_deps().exec().unwrap();
+        assert!(only_allowed_cross_crate_bridge(&metadata));
+        let adapter = metadata
+            .packages
+            .iter()
+            .find(|package| package.name == "re_mcap_web_adapter")
+            .expect("re_mcap_web_adapter is a workspace member");
+        let has_re_mcap = adapter.dependencies.iter().any(|dep| dep.name == "re_mcap");
+        let has_re_web = adapter.dependencies.iter().any(|dep| dep.name == "re_web");
+        assert!(
+            has_re_mcap && has_re_web,
+            "adapter must bridge both owning crates"
         );
     }
 }

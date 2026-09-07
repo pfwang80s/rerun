@@ -5,8 +5,6 @@
 //! source-bound recognition capability once, and retains that exact owner and every matching
 //! reservation in the assignment result.
 
-#![allow(dead_code)]
-
 use std::alloc::Layout;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

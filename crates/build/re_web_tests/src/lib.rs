@@ -3,7 +3,7 @@
 pub mod resource_assertions;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub mod deterministic_async;
+pub mod file_backed_fixture;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mcap_range_server;
 #[cfg(not(target_arch = "wasm32"))]

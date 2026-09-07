@@ -77,6 +77,7 @@ struct WebTestPackage {
     path: PathBuf,
     redap_server: bool,
     mcap_range_server: bool,
+    file_backed_range_server: bool,
     phase_a_benchmark: bool,
     browsers: Vec<Browser>,
 }
@@ -229,6 +230,10 @@ fn discover_packages(package_filter: Option<&str>) -> anyhow::Result<Vec<WebTest
                     .into_std_path_buf(),
                 redap_server: metadata_bool(&package.metadata, "redap-server")?,
                 mcap_range_server: metadata_bool(&package.metadata, "mcap-range-server")?,
+                file_backed_range_server: metadata_bool(
+                    &package.metadata,
+                    "file-back-range-server",
+                )?,
                 phase_a_benchmark: metadata_bool(&package.metadata, "phase-a-benchmark")?,
                 browsers: metadata_browsers(&package.metadata)?,
             })
@@ -283,7 +288,9 @@ fn metadata_browsers(metadata: &serde_json::Value) -> anyhow::Result<Vec<Browser
 }
 
 async fn run_package(args: &Args, package: &WebTestPackage) -> anyhow::Result<()> {
-    if args.no_headless && (package.redap_server || package.mcap_range_server) {
+    if args.no_headless
+        && (package.redap_server || package.mcap_range_server || package.file_backed_range_server)
+    {
         // Interactive mode parses `WASM_BINDGEN_TEST_ADDRESS` as a socket address, so it
         // cannot carry the native-server URL query parameters used by headless tests.
         bail!(
@@ -309,6 +316,14 @@ async fn run_package(args: &Args, package: &WebTestPackage) -> anyhow::Result<()
         )
     } else if package.mcap_range_server {
         Some(re_web_tests::mcap_range_server::McapRangeTestServer::spawn().await?)
+    } else {
+        None
+    };
+    let file_backed_range_server = if package.file_backed_range_server {
+        Some(
+            re_web_tests::file_backed_fixture::FileBackedFixtureServer::spawn_chrome_fixture_v1()
+                .await?,
+        )
     } else {
         None
     };
@@ -349,6 +364,15 @@ async fn run_package(args: &Args, package: &WebTestPackage) -> anyhow::Result<()
             server.object_addr().port()
         ));
     }
+    if let Some((server, entry)) = &file_backed_range_server {
+        // The file-backed object is served by the loopback object origin; the browser test
+        // reconstructs the object URL from the port and numeric id (never a caller path).
+        address_parameters.push(format!(
+            "file_backed_object_port={}",
+            server.object_addr().port()
+        ));
+        address_parameters.push(format!("file_backed_object_id={}", entry.id));
+    }
     if address_parameters.is_empty() {
         command.env_remove("WASM_BINDGEN_TEST_ADDRESS");
     } else {
@@ -362,6 +386,9 @@ async fn run_package(args: &Args, package: &WebTestPackage) -> anyhow::Result<()
 
     if let Some(server) = server {
         server.shutdown_and_wait().await;
+    }
+    if let Some((server, _entry)) = file_backed_range_server {
+        server.shutdown().await;
     }
     if let Some(server) = mcap_range_server {
         let artifact_result = (|| -> anyhow::Result<()> {
@@ -405,6 +432,7 @@ mod tests {
             path: PathBuf::from("fixture"),
             redap_server: false,
             mcap_range_server: false,
+            file_backed_range_server: false,
             phase_a_benchmark: false,
             browsers,
         }
@@ -414,10 +442,15 @@ mod tests {
     fn native_server_metadata_requires_booleans() {
         let absent = serde_json::json!({});
         assert!(!metadata_bool(&absent, "mcap-range-server").expect("absent is false"));
+        assert!(!metadata_bool(&absent, "file-back-range-server").expect("absent is false"));
         let enabled = serde_json::json!({
             "rerun": { "web-test": { "mcap-range-server": true } }
         });
         assert!(metadata_bool(&enabled, "mcap-range-server").expect("boolean metadata"));
+        let file_enabled = serde_json::json!({
+            "rerun": { "web-test": { "file-back-range-server": true } }
+        });
+        assert!(metadata_bool(&file_enabled, "file-back-range-server").expect("boolean metadata"));
 
         for invalid in [
             serde_json::json!(null),

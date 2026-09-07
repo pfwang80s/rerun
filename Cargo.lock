@@ -9568,6 +9568,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "re_mcap_file_backed_chrome"
+version = "0.36.0-alpha.1+dev"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+]
+
+[[package]]
 name = "re_mcap_phase_a_chrome"
 version = "0.36.0-alpha.1+dev"
 dependencies = [
@@ -9592,6 +9602,7 @@ dependencies = [
 name = "re_mcap_web_adapter"
 version = "0.36.0-alpha.1+dev"
 dependencies = [
+ "re_build_tools",
  "re_mcap",
  "re_mcap_web_contract",
  "re_web",
@@ -11013,6 +11024,7 @@ dependencies = [
  "re_log_encoding",
  "re_log_types",
  "re_mcap",
+ "re_mcap_web_adapter",
  "re_memory",
  "re_memory_view",
  "re_mutex",

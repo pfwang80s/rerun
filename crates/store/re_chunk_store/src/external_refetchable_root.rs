@@ -1,7 +1,10 @@
 //! Production-disarmed Web remote-MCAP external root origins.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(any(test, feature = "remote_mcap_test"))]
+use std::sync::atomic::AtomicU64;
 
 use re_chunk::{Chunk, ChunkId};
 use re_log_types::StoreId;
@@ -12,6 +15,7 @@ use crate::{
     ChunkStoreEvent,
 };
 
+#[cfg(any(test, feature = "remote_mcap_test"))]
 static NEXT_WEB_REMOTE_MCAP_STORE_TOKEN_V1: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, PartialEq, Eq)]

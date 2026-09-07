@@ -3,8 +3,6 @@
 //! Every Summary and Chunk unit enters the MCAP-012 side-map transaction before a manifest,
 //! executable parser, or Store mutation can be constructed.
 
-#![allow(dead_code)]
-
 use re_chunk::{EntityPath, TimelineName};
 use re_log_types::EntityPathPart;
 use re_sdk_types::{ArchetypeName, ComponentIdentifier};

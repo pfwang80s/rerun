@@ -4,17 +4,9 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-#[cfg(any(
-    all(test, not(target_arch = "wasm32")),
-    rerun_mcap_phase_a_proof_v1,
-    re_mcap_locked_remote_wasm_allocator_v1
-))]
+#[cfg(any(target_arch = "wasm32", all(test, not(target_arch = "wasm32"))))]
 use re_mcap_web_contract::McapCorrelationMaterialV1;
-#[cfg(any(
-    all(test, not(target_arch = "wasm32")),
-    rerun_mcap_phase_a_proof_v1,
-    re_mcap_locked_remote_wasm_allocator_v1
-))]
+#[cfg(any(target_arch = "wasm32", all(test, not(target_arch = "wasm32"))))]
 use re_mcap_web_contract::McapCorrelationPermitV1;
 
 use crate::remote_chunk_scan::{
@@ -177,26 +169,14 @@ impl Drop for WebPhysicalCopyOverlapReservationV1 {
 /// Move-only physical authority issued from a live canonical MCAP read lease.
 pub struct WebPhysicalReceiptV1<'a> {
     lease: Option<PhysicalChunkReadLease<'a, PendingHeaderValidation>>,
-    #[cfg(any(
-        all(test, not(target_arch = "wasm32")),
-        rerun_mcap_phase_a_proof_v1,
-        re_mcap_locked_remote_wasm_allocator_v1
-    ))]
+    #[cfg(any(target_arch = "wasm32", all(test, not(target_arch = "wasm32"))))]
     profile: WebPhysicalBudgetProfileV1,
-    #[cfg(any(
-        all(test, not(target_arch = "wasm32")),
-        rerun_mcap_phase_a_proof_v1,
-        re_mcap_locked_remote_wasm_allocator_v1
-    ))]
+    #[cfg(any(target_arch = "wasm32", all(test, not(target_arch = "wasm32"))))]
     material: Option<McapCorrelationMaterialV1>,
 }
 
 impl<'a> WebPhysicalReceiptV1<'a> {
-    #[cfg(any(
-        all(test, not(target_arch = "wasm32")),
-        rerun_mcap_phase_a_proof_v1,
-        re_mcap_locked_remote_wasm_allocator_v1
-    ))]
+    #[cfg(any(target_arch = "wasm32", all(test, not(target_arch = "wasm32"))))]
     pub(crate) fn identity_v1(
         &self,
     ) -> Result<WebPhysicalPendingIdentityV1, WebPhysicalCompletionBindErrorV1> {
@@ -218,11 +198,7 @@ impl<'a> WebPhysicalReceiptV1<'a> {
 
     /// Consumes the receipt, validates a body for physical processing, and surfaces the
     /// non-authority MCAP correlation material for the future adapter match step.
-    #[cfg(any(
-        all(test, not(target_arch = "wasm32")),
-        rerun_mcap_phase_a_proof_v1,
-        re_mcap_locked_remote_wasm_allocator_v1
-    ))]
+    #[cfg(any(target_arch = "wasm32", all(test, not(target_arch = "wasm32"))))]
     pub fn bind_exact_body_v1<'body>(
         mut self,
         body: &'body [u8],
@@ -251,7 +227,7 @@ impl<'a> WebPhysicalReceiptV1<'a> {
             WebBorrowedPhysicalChunkBodyV1 {
                 receipt: self,
                 body,
-                identity,
+                _identity: identity,
             },
             material,
         ))
@@ -269,11 +245,7 @@ impl<'a> WebPhysicalReceiptV1<'a> {
         self.bind_exact_body_v1(body).map(|(body, _material)| body)
     }
 
-    #[cfg(any(
-        all(test, not(target_arch = "wasm32")),
-        rerun_mcap_phase_a_proof_v1,
-        re_mcap_locked_remote_wasm_allocator_v1
-    ))]
+    #[cfg(any(target_arch = "wasm32", all(test, not(target_arch = "wasm32"))))]
     pub(crate) fn from_lease_v1(
         lease: PhysicalChunkReadLease<'a, PendingHeaderValidation>,
         permit: McapCorrelationPermitV1,
@@ -287,11 +259,7 @@ impl<'a> WebPhysicalReceiptV1<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(any(
-    all(test, not(target_arch = "wasm32")),
-    rerun_mcap_phase_a_proof_v1,
-    re_mcap_locked_remote_wasm_allocator_v1
-))]
+#[cfg(any(target_arch = "wasm32", all(test, not(target_arch = "wasm32"))))]
 pub(crate) enum WebPhysicalBudgetProfileV1 {
     UnfrozenPhaseACandidate,
     #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -303,11 +271,7 @@ pub(crate) struct WebPhysicalPendingIdentityV1 {
     canonical_ordinal: u32,
     full_range_start: u64,
     full_range_end_exclusive: u64,
-    #[cfg(any(
-        all(test, not(target_arch = "wasm32")),
-        rerun_mcap_phase_a_proof_v1,
-        re_mcap_locked_remote_wasm_allocator_v1
-    ))]
+    #[cfg(any(target_arch = "wasm32", all(test, not(target_arch = "wasm32"))))]
     budget_profile: WebPhysicalBudgetProfileV1,
 }
 
@@ -331,7 +295,7 @@ impl WebPhysicalPendingIdentityV1 {
 pub struct WebBorrowedPhysicalChunkBodyV1<'a, 'body> {
     receipt: WebPhysicalReceiptV1<'a>,
     body: &'body [u8],
-    identity: WebPhysicalPendingIdentityV1,
+    _identity: WebPhysicalPendingIdentityV1,
 }
 
 impl<'a> WebBorrowedPhysicalChunkBodyV1<'a, '_> {
@@ -341,7 +305,6 @@ impl<'a> WebBorrowedPhysicalChunkBodyV1<'a, '_> {
         mut revalidate: impl FnMut(WebPhysicalBodySafePointV1) -> Result<(), ()>,
     ) -> Result<CompletedWebPhysicalBodyHandoffV1<'a>, WebPhysicalBodyHandoffErrorV1> {
         process_zero_copy_body_v1(self.receipt, self.body, overlap_budget, |point| {
-            let _identity = self.identity;
             revalidate(point)
         })
     }
@@ -352,7 +315,6 @@ impl<'a> WebBorrowedPhysicalChunkBodyV1<'a, '_> {
         mut revalidate: impl FnMut(WebPhysicalBodySafePointV1) -> Result<(), ()>,
     ) -> Result<CompletedWebPhysicalBodyHandoffV1<'a>, WebPhysicalBodyHandoffErrorV1> {
         process_explicit_copy_body_v1(self.receipt, self.body, overlap_budget, |point| {
-            let _identity = self.identity;
             revalidate(point)
         })
     }
@@ -434,8 +396,19 @@ pub(crate) fn process_zero_copy_body_v1<'a>(
     overlap_budget: &WebPhysicalCopyOverlapBudgetV1,
     mut revalidate: impl FnMut(WebPhysicalBodySafePointV1) -> Result<(), ()>,
 ) -> Result<CompletedWebPhysicalBodyHandoffV1<'a>, WebPhysicalBodyHandoffErrorV1> {
+    let revalidation = receipt
+        .lease
+        .as_ref()
+        .expect("a live physical receipt retains its lease")
+        .revalidation_v1();
     let checkpoint = |point, revalidate: &mut dyn FnMut(_) -> Result<(), ()>| {
-        revalidate(point).map_err(|()| WebPhysicalBodyHandoffErrorV1::RevalidationFailed(point))
+        revalidation
+            .ensure_current_v1()
+            .map_err(|_error| WebPhysicalBodyHandoffErrorV1::RevalidationFailed(point))?;
+        revalidate(point).map_err(|()| WebPhysicalBodyHandoffErrorV1::RevalidationFailed(point))?;
+        revalidation
+            .ensure_current_v1()
+            .map_err(|_error| WebPhysicalBodyHandoffErrorV1::RevalidationFailed(point))
     };
     checkpoint(
         WebPhysicalBodySafePointV1::BeforeHeaderValidation,
@@ -489,8 +462,19 @@ pub(crate) fn process_explicit_copy_body_v1<'a>(
     overlap_budget: &WebPhysicalCopyOverlapBudgetV1,
     mut revalidate: impl FnMut(WebPhysicalBodySafePointV1) -> Result<(), ()>,
 ) -> Result<CompletedWebPhysicalBodyHandoffV1<'a>, WebPhysicalBodyHandoffErrorV1> {
+    let revalidation = receipt
+        .lease
+        .as_ref()
+        .expect("a live physical receipt retains its lease")
+        .revalidation_v1();
     let checkpoint = |point, revalidate: &mut dyn FnMut(_) -> Result<(), ()>| {
-        revalidate(point).map_err(|()| WebPhysicalBodyHandoffErrorV1::RevalidationFailed(point))
+        revalidation
+            .ensure_current_v1()
+            .map_err(|_error| WebPhysicalBodyHandoffErrorV1::RevalidationFailed(point))?;
+        revalidate(point).map_err(|()| WebPhysicalBodyHandoffErrorV1::RevalidationFailed(point))?;
+        revalidation
+            .ensure_current_v1()
+            .map_err(|_error| WebPhysicalBodyHandoffErrorV1::RevalidationFailed(point))
     };
     checkpoint(
         WebPhysicalBodySafePointV1::BeforeHeaderValidation,

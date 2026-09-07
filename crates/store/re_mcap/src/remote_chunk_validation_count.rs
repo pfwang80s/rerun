@@ -3,7 +3,6 @@
 //! This stage consumes only MCAP-025 message evidence and the sealed MCAP-029 manifest owner.
 //! It never constructs a parser, Arrow builder, or local decoder initializer.
 
-#![allow(dead_code)]
 #![allow(clippy::map_err_ignore)]
 
 use std::alloc::Layout;

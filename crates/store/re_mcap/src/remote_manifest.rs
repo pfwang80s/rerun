@@ -3,8 +3,6 @@
 //! This module is production-disarmed. It deliberately performs no payload decoding or Store
 //! publication; it only freezes identities and bounded registration metadata for later decode.
 
-#![allow(dead_code)]
-
 use re_chunk::ChunkId;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

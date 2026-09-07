@@ -1,7 +1,5 @@
 //! Deterministic, bounded pre-splitting for Web remote-MCAP Store insertion.
 
-#![allow(dead_code)]
-
 use std::ops::Range;
 
 use re_byte_size::SizeBytes as _;

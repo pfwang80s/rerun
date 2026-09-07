@@ -1,7 +1,5 @@
 //! Atomic partition/root registration for production-disarmed Web remote-MCAP Stores.
 
-#![allow(dead_code)]
-
 use std::collections::BTreeSet;
 
 use ahash::{HashMap, HashSet};

@@ -11,5 +11,12 @@
 #[cfg(feature = "consumer_contract")]
 pub mod consumer_contract;
 
-#[cfg(all(feature = "phase_a", target_arch = "wasm32"))]
+#[cfg(any(
+    all(feature = "phase_a", target_arch = "wasm32"),
+    all(
+        feature = "locked",
+        target_arch = "wasm32",
+        re_mcap_web_adapter_locked_attested_v1
+    )
+))]
 pub mod phase_a;

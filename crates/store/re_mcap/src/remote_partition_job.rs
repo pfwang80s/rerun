@@ -4,8 +4,6 @@
 //! Store facade. It consumes complete partition outcomes and the matching window-demand phase
 //! owners, then applies the existing atomic registration and bounded Store insertion seam.
 
-#![allow(dead_code)]
-
 use std::collections::BTreeSet;
 use std::sync::Arc;
 

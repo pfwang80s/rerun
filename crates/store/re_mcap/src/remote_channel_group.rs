@@ -3,8 +3,6 @@
 //! This consumes the complete move-only MCAP-028 assignment owner. It cannot accept raw Summary
 //! or schema bytes, and the result keeps all MCAP-026/027/028 reservations alive.
 
-#![allow(dead_code)]
-
 use std::alloc::Layout;
 use std::cmp::Ordering;
 use std::ops::Range;

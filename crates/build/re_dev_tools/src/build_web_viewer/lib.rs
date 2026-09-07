@@ -469,9 +469,18 @@ pub fn build(
         if no_default_features {
             command.arg("--no-default-features");
         }
+        // The verifier artifact is the full locked graph: it must compile the re_mcap locked
+        // consumer modules (and their runtime-interner dependency) so the stage anchors are
+        // exported. These re_mcap features are added only to this verifier-only child; the
+        // ordinary product build below does not enable them.
+        let mut verifier_features = String::new();
         if !features.is_empty() {
-            command.arg(format!("--features={features}"));
+            verifier_features.push_str(features);
+            verifier_features.push(',');
         }
+        verifier_features
+            .push_str("re_mcap/web_adapter,re_mcap/rerun_mcap_locked_remote_wasm_allocator_v1");
+        command.arg(format!("--features={verifier_features}"));
         if timings {
             command.arg("--timings");
         }

@@ -5,7 +5,6 @@
 //! validates every descriptor wire byte before its first input-dependent allocation, and retains
 //! the opaque post-EOF source/policy authority in the combined result.
 
-#![allow(dead_code)]
 #![allow(clippy::type_complexity)]
 #![expect(
     clippy::map_err_ignore,

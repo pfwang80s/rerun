@@ -4,8 +4,6 @@
 //! coordinator, or Store mutation side effects. It computes the disjunct physical-window demand
 //! sets and then expands the two read-required layers into immutable partition identities.
 
-#![allow(dead_code)]
-
 use ahash::HashSet;
 
 use re_chunk_store::{ChunkStore, WebRemoteMcapRootCapabilityV1};

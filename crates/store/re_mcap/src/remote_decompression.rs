@@ -6,7 +6,6 @@
 
 // This module is intentionally production-disarmed until the remote resource profile is sealed
 // and the physical Chunk scanner consumes `ExactOutputChunk` directly.
-#![allow(dead_code)]
 
 use std::sync::Arc;
 

@@ -1,7 +1,5 @@
 //! Incremental canonical indexed extent and loaded-range coverage for Web remote MCAP.
 
-#![allow(dead_code)]
-
 use std::alloc::Layout;
 
 use re_log_types::{AbsoluteTimeRange, TimeInt};

@@ -5,7 +5,6 @@
 //! Instead it validates every observed ROS 2 schema before the first allocation, then materializes
 //! a fixed set of contiguous arenas containing only borrowed source spans.
 
-#![allow(dead_code)]
 #![allow(
     clippy::elidable_lifetime_names,
     clippy::unnested_or_patterns,

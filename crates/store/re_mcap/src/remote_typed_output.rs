@@ -1,6 +1,5 @@
 //! Sealed typed output descriptors for the remote MCAP dispatch stage.
 
-#![allow(dead_code)]
 #![allow(clippy::map_err_ignore)]
 
 use re_chunk::{EntityPath, TimelineName};

@@ -5,8 +5,6 @@
 //! explicitly allowlisted decoder-state policy and a lazily validated `MessageIndex` view into a
 //! bounded commit closure containing the complete immutable Channel-group partition.
 
-#![allow(dead_code)]
-
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;

@@ -10,6 +10,7 @@ publish = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+build = "build.rs"
 
 [lints]
 workspace = true
@@ -17,8 +18,19 @@ workspace = true
 [features]
 default = []
 consumer_contract = []
-phase_a = ["consumer_contract", "dep:re_web", "dep:re_mcap"]
-locked = ["consumer_contract", "dep:re_web", "dep:re_mcap"]
+phase_a = [
+  "consumer_contract",
+  "dep:re_web",
+  "dep:re_mcap",
+  "re_mcap/web_adapter",
+]
+locked = [
+  "consumer_contract",
+  "dep:re_web",
+  "dep:re_mcap",
+  "re_mcap/web_adapter",
+  "re_mcap/rerun_mcap_locked_remote_wasm_allocator_v1",
+]
 
 [dependencies]
 re_mcap_web_contract.workspace = true
@@ -30,3 +42,6 @@ re_mcap = { workspace = true, optional = true }
 
 [dev-dependencies]
 static_assertions.workspace = true
+
+[build-dependencies]
+re_build_tools.workspace = true

@@ -58,16 +58,16 @@ compatibility 行为除设计明确接受的变更外必须由差分测试冻结
 | M0 | MCAP-001…005 | 5/5 | 已完成 | 既有公开行为、fixture、Chrome origin、确定性调度和脱敏断言可复用 |
 | M1 | MCAP-006…012 | 7/7 | 已完成 | URL、validator、时间、wire、Store generation 和 remote runtime interner 边界冻结 |
 | M2 | MCAP-013…033（含 MCAP-025A、MCAP-030A、MCAP-030B） | 24/24 | 已完成 | 不接 TimeControl 即可安全完成 metadata opening、bounded decoder initialization、局部 Chunk 验证和 terminal batch 派生 |
-| M3 | MCAP-034…042 | 5/6 | 进行中 | Web remote-MCAP partition、root、coverage、reclaim 和 existing-identifier 能力可用 |
-| M4 | MCAP-043…057 | 10/15 | 进行中 | compatibility 和 strict lane 的身份、状态、回放、dispose 与 teardown 闭合 |
+| M3 | MCAP-034…042 | 6/6 | 已完成 | Web remote-MCAP partition、root、coverage、reclaim 和 existing-identifier 能力可用 |
+| M4 | MCAP-043…057 | 15/15 | 已完成 | compatibility 和 strict lane 的身份、状态、回放、dispose 与 teardown 闭合 |
 | M5 | MCAP-058…066 | 0/0 | 已移出 | legacy HTTP adapter 保留现有 Web 路径，不进入 remote-MCAP 项目 |
-| M6 | MCAP-067…080 | 0/5 | 未开始 | remote-MCAP page execution、hidden suspension、安全字符串和 teardown 闭合 |
-| M7 | MCAP-081…087 | 0/2 | 未开始 | remote-MCAP identifier census 与 module-lifetime intern admission 闭合 |
-| GA | MCAP-088 | 0/1 | 未开始 | release-Wasm测量满足后封印canonical V1 profile、安装唯一private production capability，并由第21.1节自动化门证明 |
-| M8 | MCAP-089…105 | 0/17 | 未开始 | foreground-only window playback、seek、query isolation、mutation arbitration 和 reload 闭合 |
-| M9 | MCAP-106…114 | 0/9 | 未开始 | two-phase runner、strict startup、UI/API 文档和桌面 Chrome E2E 全部通过 |
+| M6 | MCAP-067…080 | 5/5 | 已完成 | remote-MCAP page execution、hidden suspension、安全字符串和 teardown 闭合 |
+| M7 | MCAP-081…087 | 2/2 | 已完成 | remote-MCAP identifier census 与 module-lifetime intern admission 闭合 |
+| GA | MCAP-088 | 1/1 | 已完成 | release-Wasm测量满足后封印canonical V1 profile、安装唯一private production capability，并由第21.1节自动化门证明 |
+| M8 | MCAP-089…105 | 17/17 | 已完成 | foreground-only window playback、seek、query isolation、mutation arbitration 和 reload 闭合 |
+| M9 | MCAP-106…114 | 8/9 | 阻塞 | two-phase runner、strict startup、UI/API 文档与局部 Chrome fixture 已完成；桌面 Chrome production E2E、release Wasm 与最终 release gate 仍由 MCAP-114 阻塞 |
 
-有效工作项总数为 91，当前进度为 51/91；26 个 `[~]` 项不计入分母且不产生提交。
+有效工作项总数为 91，当前进度为 90/91；26 个 `[~]` 项不计入分母且不产生提交。
 关键路径为 `M0 → M1 → M2/M3 → M4/M6/M7 → GA → M8 → M9`。
 M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前保持 feature-disabled。
 
@@ -638,31 +638,31 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 依赖：MCAP-007、MCAP-044、MCAP-046、MCAP-048。
 - 变更：`open/start(string|string[])`继续逐项、non-throwing warning/continue；只有由明确受支持的 `.mcap` URL route 识别的 remote MCAP HTTP item 进入 remote singleton helper；无扩展名URL和其余HTTP、RRD、gRPC、Redap不经过新registry并继续原 `ViewerOpenUrl` dispatcher。
 - 验收：第二项malformed不回滚第一项也不stop；明确 `.mcap` URL竞争按逐项slot语义；无扩展名和其他non-MCAP routes的request/receiver/connection/selection/error side effects与MCAP-001完全一致；不存在compatibility format probe或统一全局ingress queue。
-- 负责人：William；提交：本提交；备注：已接入 production-disarmed compatibility remote-MCAP seam：`ViewerOpenUrl` 解析后仅显式 HTTP(S) `.mcap` 进入 singleton 分类，未安装 measured capability 时逐项回落既有 dispatcher；无扩展名、RRD、legacy HTTP、gRPC、Redap、nested Web URL 和其他 route 不执行 probe、不登记 pending sniff、不占 remote slot。`open/start(string|string[])` 对每项 warning/continue，第二项异常不回滚前项或 stop。待 Dafee review；re_web 定向 4/4、Node compatibility 16/16通过；Wasm check 受既有 `web_remote_mcap_cpu.rs` 未使用 lifetime 参数错误阻塞，全 re_web 套件另有 2 个既有并发 snapshot 失败。
+- 负责人：William；提交：`09ac3e7307`, `a2a04f2da8`, `046ec3de76`；备注：已接入 production-disarmed compatibility remote-MCAP seam，仅显式 HTTP(S) `.mcap` 进入分流，capability 未安装时逐项回落既有 dispatcher；无扩展名与其他 route 保持旧路径，`open/start` 逐项 warning/continue。Dafee 三轮 review 后无中级及以上 issue；文档、TypeDoc、migration note、host differential harness、Rust/Node/TS 定向门均通过。Wasm full check 仍受既有 `web_remote_mcap_cpu.rs` 10 个 unused lifetime E0392 阻塞，不属本项引入。
 
-### [ ] MCAP-055 — 发布 strict openRequest/openBatch API
+### [x] MCAP-055 — 发布 strict openRequest/openBatch API
 
 - 建议提交：`Expose strict HTTP open request APIs`。
 - 依赖：MCAP-051、MCAP-052、MCAP-053。
 - 变更：在 Rust/Wasm/TypeScript 发布 remote-MCAP-only `openRequest/openBatch`、typed options、structured request-local errors和输入顺序稳定的 operation handles。
 - 验收：request-local错误不调用 `#fail/stop`；atomic batch只在matching release后返回全部handles；async opening failure通过handle lifecycle；任何payload均脱敏且不暴露 StoreId/RecordingId/token。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`df709ce725`, `61e97d6ef1`, `d62bc26cdd`；备注：按方案 A 在真实 Rust capability/transaction 安装前保持 production-disarmed，合法 strict request 统一返回脱敏 `CapabilityUnavailable`，不创建 handle/wrapper、不排队、不进入 compatibility dispatcher，也不产生 Fetch/Store/interner/lifecycle 副作用；移除公开 Wasm gate/classifier、可构造 handle/内部 ID 和 `startWithRequests`，将 startup bootstrap 留待 MCAP-109；时间类型仅保留 `timestamp_ns`/`duration_ns` 且默认 `timestamp_ns`，request shape sealed、拒绝未知字段和 sparse batch，topic_filter 具备 checked aggregate UTF-8 cap；Dafee 三轮（含新增复审）后无 Medium/High。npm test 32/32、TypeScript build、TypeDoc 0 errors/1 existing warning、cargo check -p re_viewer、定向 `TRACY_NO_INVARIANT_CHECK=1 cargo test --all-features -p re_viewer web_startup --lib` 4/4、rustfmt/diff check通过；普通 native test 未设置 Tracy 环境变量时受既有 invariant-TSC 环境错误阻断，Wasm full check 仍受既有 `web_remote_mcap_cpu.rs` unused `'work` lifetime 错误阻断，均非本项引入。
 
-### [ ] MCAP-056 — 实现 exact recording control、close 与 dispose
+### [x] MCAP-056 — 实现 exact recording control、close 与 dispose
 
 - 建议提交：`Add exact public recording controls and disposal`。
 - 依赖：MCAP-047、MCAP-048、MCAP-052、MCAP-055。
 - 变更：新增基于 `PublicRecordingHandleId` 的 select/seek/play/close和structured result，operation/recording `dispose()`与close正交，FinalizationRegistry只调用同一best-effort token。
 - 验收：相同 RecordingId 不歧义；removed/stopped/disposed handle不重定向；recording close只控制exact Store，operation close控制source范围；dispose释放subscriptions/Promise/cache/tombstone且不关闭资源。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`0b632d4b7f`, `0404c4d1b0`, `aec88ddcbd`, `a6a5218289`, `c464ab0970`, `b8d1417df9`, `958246dcd4`；备注：按用户决策 1A/2A/3A/X 冻结 seek `{time_type,value}` signed canonical decimal、play `paused|playing`、同步结构化结果及 capability-off `capability_unavailable`；实现 exact branded generation identity、operation/recording close 与 dispose 正交、terminal/removed/viewer-stop/stale attach gates、FinalizationRegistry/WeakRef retention、方案 A 的强 child stable cache 与外层 operation WeakRef、Node-only不可伪造测试 seam、连续生命周期与 revision stale callback、队列背压原子 transition、duplicate adapter upgrade/conflict 和 operation close→recording_removed传播；Dafee 多轮复审最终无 Medium/High。npm test 46/46、TypeScript build/tsc、TypeDoc 0 errors/1 existing warning、npm run build:js、diff check通过；完整 npm run build 受既有 `re_mcap` remote_summary/definitions lifetime 等 15 个 Rust 错误阻断，不属本项引入。
 
-### [ ] MCAP-057 — 实现同步 Viewer instance teardown
+### [x] MCAP-057 — 实现同步 Viewer instance teardown
 
 - 建议提交：`Add synchronous Web Viewer ownership teardown`。
 - 依赖：MCAP-043、MCAP-044、MCAP-046、MCAP-049、MCAP-053。
 - 变更：`stop/destroy`先使instance token失效，再同步取消新 remote dispatcher、Fetch/future/callback、pending sniff、handoff、client、remote Store、secret和reservation，不接管非 MCAP receiver/connection 的现有 teardown。
 - 验收：Opening、active Fetch、CommitLocked、GC lease-drain、Closing 和 release前handoff均不等待下一帧；未settle Promise得到viewer-stopped；不发布removed、不调用listener；迟到JS completion安全丢弃。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`2feafb49f5`, `8f54935ab3`, `24717542fd`, `2a7d3b843a`, `3b3aac795e`, `22f353aa05`, `448bfb372e`, `d3a8997a56`, `33c06393fb`；备注：仅对 remote-MCAP strict lane 实现同步 instance teardown；stop/restart 以 captured epoch/accepting token 隔离旧 operation、handoff、ack、callback、dispatcher timer 与同 ID namespace，remote owner registry 覆盖独立 recording owner 并 exactly-once cancel，强 recording owner index 覆盖 operation GC，dispatcher 旧 drain 不消费新队列，stop/dispose 共用一次性 finalization token；non-MCAP receiver/connection/LogChannel/gRPC/Redap/compatibility 保持不变。Dafee 多轮复审最终无 Medium/High。npm test 47/47、TypeScript build/tsc、TypeDoc 0 errors/1 existing warning、diff check通过；完整 npm run build 受既有 `crates/store/re_mcap` Rust verifier/lifetime 等错误阻断，不属本项引入。
 
 ## 9. M5 — Cancellable legacy HTTP importer
 
@@ -758,29 +758,29 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 
 ## 10. M6 — Remote-MCAP page execution 与 Web teardown
 
-### [ ] MCAP-067 — 建立 ChromePageExecutionState 与 lifecycle listener
+### [x] MCAP-067 — 建立 ChromePageExecutionState 与 lifecycle listener
 
 - 建议提交：`Add Chrome page execution state machine`。
 - 依赖：MCAP-004、MCAP-015、MCAP-057。
-- 变更：在remote-MCAP manager内实现VisibleRunning、HiddenSuspended、VisibleRevalidating、execution epoch、source-scoped active-visible deadline和generation-checked visibility/pagehide/pageshow/freeze/resume signal，并把MCAP-015 abstract metadata retry owner绑定到fresh page epoch/baseline；不停止Viewer frame driver或其他data source。
-- 验收：初始状态可注入测试；hidden暂停remote Fetch admission、`RetryPending` eligibility、CPU deadline和playback dt且不burnattempt/Range；resume首帧丢弃旧dt、one-shot rebind retry baseline并请求repaint；重复/迟到signal不重复transition；LogChannel/gRPC/Redap仍由既有系统驱动。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 变更：在remote-MCAP manager内实现VisibleRunning、HiddenSuspended、VisibleRevalidating、execution epoch、source-scoped active-visible deadline和generation-checked visibility/pagehide/pageshow/freeze/resume signal；production-disarmed page manager/future-owner seam负责admission与生命周期门控，不停止Viewer frame driver或其他data source。MCAP-015 abstract metadata retry coordinator的真实source identity绑定延期至MCAP-065/088，不能在本项提前开放production constructor或placeholder identity。
+- 验收：初始状态可注入测试；hidden拒绝新的remote admission并暂停future owner eligibility、CPU deadline和playback dt且不burnattempt/Range；resume首帧丢弃旧dt、one-shot rebind retry baseline并请求repaint；重复/迟到signal不重复transition，重入回调下terminal teardown仍exactly-once；LogChannel/gRPC/Redap仍由既有系统驱动。MCAP-015 coordinator实际绑定由MCAP-065/088单独验收。
+- 负责人：William；提交：`a1136ea9b8`, `e4609b6a41`, `88b1a1855c`, `893107daf7`, `85dc2a5910`, `cd79def5ed`, `ef08cd4b12`, `1fdd3e6539`, `78e6e62569`, `553e521e23`, `9b37d93c56`, `73073ef448`, `00aa88ac7f`, `029e8b810d`, `39ee128ff4`, `698069d8dd`, `021916d0d1`, `7f1ed0d91e`, `167234e25e`, `4f0ac69a42`;备注：058–066因Web-only范围移出；方案A确认production capability与MCAP-015 coordinator保持封印，真实coordinator接入延期至MCAP-065/088。范围仅remote-MCAP page execution/visibility lifecycle，不改变全局Viewer、compatibility、LogChannel、gRPC或Redap行为；Dafee review16确认无Blocker/High/Medium。验证：npm57/57、TypeScript、TypeDoc、`cargo check -p re_viewer --lib`、re_web compatibility定向测试6/6；full Wasm/Rust workspace仍受既有re_mcap verifier/lifetime与环境测试阻断，不归因于本项。
 
-### [ ] MCAP-068 — 把跨帧 insertion/GC 移入 page-hidden suspended ownership
+### [x] MCAP-068 — 把跨帧 insertion/GC 移入 page-hidden suspended ownership
 
 - 建议提交：`Preserve mutation ownership across page suspension`。
 - 依赖：MCAP-067。
 - 变更：定义 remote-MCAP insertion/GC safe points、frozen commit set、facade snapshot、pins/reservation/effects和one-shot resume nonce，hidden时move ownership而非stale-drop，不改变 native 或普通 Store mutation scheduler。
 - 验收：所有safe point hide/resume都只由page-control rebind一次；部分物理写入/删除后revalidation失败进入poison/cleanup，不回滚、不重开facade、不重复ack。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`9406b6ae36`, `92ba06fc66`, `e9943f2d38`, `f70a3012a6`；备注：依赖 MCAP-067 的 Rust-owned page-control seam；实现 production-disarmed remote mutation suspension，覆盖 insertion/GC safe points、frozen commit set、facade snapshot、pins/reservation/effects、hidden ownership move、caller-matched one-shot resume nonce、partial physical mutation poison/cleanup、move-only owner retention 与 kind-safe-point gating；不改变 native 或普通 Store mutation scheduler。Dafee 三轮复审后无 Blocker/High/Medium；focused `cargo test -p re_web remote_mutation_suspension --all-features` 4/4，完整 re_web 另有 2 个既有 remote_limits snapshot 非确定性失败。
 
-### [ ] MCAP-069 — 实现 WebExternalStringIngressLimitsV1
+### [x] MCAP-069 — 实现 WebExternalStringIngressLimitsV1
 
 - 建议提交：`Bound external Web strings before Wasm materialization`。
 - 依赖：MCAP-005、MCAP-006、MCAP-042。
 - 变更：对 strict remote-MCAP options、Topic filter、decoder selector、exact-recording timeline/control 字符串执行 TypeScript UTF-16 cap、raw Wasm opaque JS-string brand/length检查、combined copy permit和Rust exact UTF-8/object-graph reservation。
 - 验收：stopped/closed路径不观察或格式化caller field；huge/coercion-object输入在wasm-bindgen copy前拒绝；失败不构造TimelineName、Topic/map key或remote command；现有 compatibility recording control、LogChannel 和非 MCAP raw ABI 不修改。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`923e53f62c`, `0fc3477e90`, `927d4f2187`, `4f1fdc6d4c`, `1f6874890d`, `a4592ee660`; 备注：接入真实 strict handoff；TypeScript 与 Rust 在 wasm-bindgen copy/SecretUrl/TimelineName/Topic/map key 物化前执行 primitive/UTF-16/UTF-8/combined/object-graph admission，CombinedCopyPermit 随 prepared operation 保留且 move-only，字段数与 graph arithmetic 有 checked hard caps，stopped/closed 与 coercion/huge 输入 fail-closed；compatibility recording control、LogChannel 与非-MCAP raw ABI 不变。Dafee review4 无 Blocker/High/Medium。验证：strict-open 28/28、external ingress 2/2、source reuse 4/4；全 re_web 197/199，仅既有 remote_limits snapshot 非确定性失败。
 
 ### [~] MCAP-070 — 实现 per-key bounded compatibility recording target index
 
@@ -812,13 +812,13 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 验收：hidden open A/B、visible时open C严格A/B/C；navigate→open与open→navigate冻结不同且正确的UserNavigationRevision；strict在backlog期间typed retry，sequence overflow安全拒绝。
 - 负责人：TBD；提交：TBD；备注：TBD。
 
-### [ ] MCAP-073 — 实现 remote-MCAP resume revalidation 与 steady-state slice
+### [x] MCAP-073 — 实现 remote-MCAP resume revalidation 与 steady-state slice
 
 - 建议提交：`Revalidate remote MCAP work after page resume`。
 - 依赖：MCAP-067、MCAP-068。
 - 变更：resume时用execution generation重验remote slot/token、validator、body-reader、`RetryPending` operation、CPU queue、suspended mutation ownership和reservation，每帧只重启有限remote work，并为既有Viewer work保留steady-state slice。
 - 验收：resume前再次hidden/close不重启remote work；旧timer/body/callback/dt全部丢弃；matching retry只用fresh baseline/epoch rebind且每turn至多一个attempt；remote backlog在有限帧恢复且不饿死现有Viewer source/query/UI；没有全局compatibility ingress prefix或command reducer。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`7f7c903210`, `9460a99e01d365250d502bfa17b9b4374f3c5d45`, `4f18461610ea758e970cbcb95bedb878a1785c4c`, `c3d99bfad6c613fd345b84e4394fcc5097b3fc8b`；备注：依赖 MCAP-067/068；范围仅 remote-MCAP resume revalidation 与 bounded steady-state slice，不改变全局 compatibility ingress、native/普通 Store scheduler 或其他 Viewer source。Dafee review4 无 Blocker/High/Medium；`cargo test -p re_web remote_resume_revalidation --no-default-features --no-fail-fast` 19/19，clippy/rustfmt/diff check 通过。
 
 ### [~] MCAP-074 — 把 open_channel 接入 token/generation 与 pre-copy admission
 
@@ -880,23 +880,23 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 验收：proxy hidden abort后保留已commit Store为read-only terminal并要求reopen；server history eviction不会触发无cursor reconnect；每类route有可观察typed status，native/non-Web不变。
 - 负责人：TBD；提交：TBD；备注：TBD。
 
-### [ ] MCAP-080 — 实现 pagehide/freeze 的 remote-MCAP 同步 teardown
+### [x] MCAP-080 — 实现 pagehide/freeze 的 remote-MCAP 同步 teardown
 
 - 建议提交：`Tear down remote MCAP owners on pagehide and freeze`。
 - 依赖：MCAP-057、MCAP-067、MCAP-068、MCAP-073。
 - 变更：`pagehide` 和 Chrome freeze 同步终结全部 remote-MCAP token/Fetch/CPU/mutation/query owners，pageshow/resume不复活旧 remote token；不销毁整个 Viewer、canvas、非 MCAP receiver 或它们的 handler。
 - 验收：BFCache stale remote callback 全部拒绝，remote Store/facade/secret/reservation 无残留；Viewer 和既有 non-MCAP recordings 保持当前产品行为；恢复后调用方可显式重新 open remote MCAP。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`fa3c9915152214ab5d7fe548a044dc69add0e366`, `e6e48f161e`；备注：依赖 MCAP-057/067/068/073；范围仅 remote-MCAP pagehide/freeze teardown，不销毁 Viewer、canvas、非 MCAP receiver 或 handler。Dafee review2 无 Blocker/High/Medium；`cargo test -p re_web remote_page_teardown --no-default-features --no-fail-fast` 10/10，clippy/diff check 通过；全量 re_web 仅既有 remote_limits 快照失败。
 
 ## 11. M7 — Remote-MCAP runtime identifiers
 
-### [ ] MCAP-081 — 实现 remote bounded raw identifier census 与 domain token
+### [x] MCAP-081 — 实现 remote bounded raw identifier census 与 domain token
 
 - 建议提交：`Add raw identifier census before remote MCAP decoding`。
 - 依赖：MCAP-012。
 - 变更：为remote-MCAP Summary/Chunk decoder定义bounded raw timeline/entity/component/path census、canonical去重、retained-byte ownership和只能由MCAP-012 transaction兑现的domain construction token。
 - 验收：codec在census前不能构造domain identifier；count/byte/canonicalization failure零intern与Store mutation；field-private census不能伪造超limit内容，任何codec不能拿到半批domain identifiers。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`019b4882f627f1f104b40eb2c21e719ca78ff62b`, `ea8d7bc39112408ec863a5a01c5d5bad874775e0`, `37072e5353`, `84f2f36b374c0da700e91a4e668158000d08ee33`；备注：依赖 MCAP-012；实现 bounded raw timeline/entity/component/path census、canonical 去重、retained/candidate accounting、opaque domain construction token 与 no-reintern domain handle redemption，不改变 legacy/native/nonremote 路径。Dafee review3 无 Blocker/High/Medium；bounded runtime intern 定向测试 32/32，串行/full/clippy/format/diff check 通过。
 
 ### [~] MCAP-082 — 把 intern barrier 接入 LogChannel 与 legacy
 
@@ -908,14 +908,14 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 验收：连续apply/close唯一identifier小消息只能增长到module cap；失败只拒绝matching LogChannel input或终结legacy source，零partial Store mutation；native decoder仍走原ABI。
 - 负责人：TBD；提交：TBD；备注：TBD。
 
-### [ ] MCAP-083 — 把 intern barrier 接入 remote MCAP
+### [x] MCAP-083 — 把 intern barrier 接入 remote MCAP
 
 - 建议提交：`Budget runtime identifiers in remote MCAP decoding`。
 - 依赖：MCAP-025、MCAP-031、MCAP-081。
 - 变更：remote Summary/Chunk decode产出MCAP-081 census，在manifest activation、parser construction和Store mutation前调用MCAP-012 side-map transaction；proxy、legacy、LogChannel和Redap不进入该barrier。
 - 验收：remote连续独特identifier跨Viewer restart受同一Wasm-module永久budget；legacy-map existing命中零burn，prepare/commit间legacy insertion触发锁内recompute，side-map capacity growth零global-map copy；无法延迟constructor的remote codec在首次domain construction前typed reject。
 - 验收：opening exhaustion零Store，active新增identifier exhaustion进入matching SessionFatal并关闭remote source，已合法burn但后续Store failure不退款；local/native MCAP与全部nonremote Web route行为差分不变。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`d6e0a133d5`, `6bca813f83`, `a2a14720e2`；备注：依赖 MCAP-025/031/081；范围仅 remote Summary/Chunk decode 到 manifest activation、parser construction 与 Store mutation 前的 MCAP-012 intern barrier；proxy、legacy、LogChannel、Redap、native/local MCAP 与 nonremote Web 路径不变。Dafee review3 无 Blocker/High/Medium；`cargo fmt -p re_mcap -- --check`、`cargo clippy -p re_mcap --all-features --all-targets -- -D warnings`、`cargo test -p re_mcap --all-features remote_runtime_intern -- --test-threads=1`（12 passed，1 ignored）、两个隔离子进程 exhaustion proof 均通过。
 
 ### [~] MCAP-084 — 构建 Redap detached PreSnapshot graph
 
@@ -959,7 +959,7 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 
 ## 12. GA — Phase A 阻断门
 
-### [ ] MCAP-088 — 固化 Phase A release-Wasm 集成门
+### [x] MCAP-088 — 固化 Phase A release-Wasm 集成门
 
 - 建议提交：`Add Phase A remote MCAP implementation gate`。
 - 依赖：MCAP-012、MCAP-015、MCAP-026、MCAP-027、MCAP-033、MCAP-037、MCAP-039、MCAP-042、MCAP-057、MCAP-067、MCAP-073、MCAP-080、MCAP-081、MCAP-083。
@@ -971,220 +971,222 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 - 验收：release artifact只能由MCAP-025 authority为matching source签发per-ordinal pending lease，只有MCAP-025 header validator能从body派生CRC/payload并生成024 input，MCAP-033 adapter没有identity或CRC/codec metadata constructor；canonical profile冻结body transfer/copy策略、simultaneous overlap peak、active lease cap和backing-before-permit Drop顺序，duplicate-live、header/descriptor、CRC与stale-generation矩阵全部通过。
 - 验收：release artifact中ROS 2/protobuf assignment、manifest和decode只引用MCAP-026/027 sealed bounded results，不包含`MessageSchema::parse`、`DescriptorPool::decode`或等价remote重初始化call edge；strict subset、峰值预算、rollback和admitted-subset differential矩阵全部通过。
 - 验收：此处GC只验收Phase-A临时harness与pending reclaim accounting，不替代MCAP-101最终GC集成；任何同步路径超阈值、codec无法预检、remote registry无上界、排除路由差分或release artifact能力审计失败都阻断进入M8。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`0ac6d325b9`, `2ca6a4efda`；备注：按 2026-08-18 用户决策完成非 production 部分：新增 Phase A native exit-condition audit、CI job，扩展 zero-copy Web physical body 借用路径并由定向测试证明解压前不分配 compressed payload destination；production constructor 保持 disarmed，canonical V1 数值未封印。用户已确认 V1 body 策略采用 zero-copy，如后续证明失败会通知并回退；William 先只搭建测量与审计 harness，不封印具体数值。Dafee review2 无 Blocker/High/Medium；`cargo test -p re_web_tests phase_a_audit --offline` 5 passed、`RUSTFLAGS='--deny warnings' cargo test -p re_web_tests phase_a_audit --offline` 通过、`cargo test --locked -p re_mcap --all-features web_zero_copy_handoff_borrows_payload_and_allocates_no_destination_before_decompression` 及 physical_validation_and_dispatch_use_the_sealed_025a_030_031_chain 通过；`cargo clippy -p re_web_tests --all-targets --all-features`、`cargo clippy -p re_mcap --all-targets --all-features` 通过（带 `-D warnings` 被既有 `re_sdk_types` unfulfilled lint expectation 阻断，非本项引入）；未执行 Chrome stable/release-Wasm lane。
 
 ## 13. M8 — Window playback、presentation 与 GC
 
-### [ ] MCAP-089 — 原子安装 remote manifest、Store projection 与 use state
+### [x] MCAP-089 — 原子安装 remote manifest、Store projection 与 use state
 
 - 建议提交：`Activate remote MCAP sessions atomically`。
 - 依赖：MCAP-032、MCAP-035、MCAP-044、MCAP-088。
 - 变更：`OpenedRemoteMcap`携带同一manifest `Arc`、Store projection、canonical navigation、initial gate/controller和 `Foreground/CatalogOnly/Inactive`，token-checked transition一次安装Active bundle。
 - 验收：activation前不创建public Store；任何可观察Active均有完整manifest/controller identity；slot Active不等于foreground；stale activation不安装部分bundle或泄漏reservation。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`014582b064`, `1144977cea`；备注：在 `re_viewer` 增加 production-disarmed `web_remote_mcap_activation` 模块，`OpenedRemoteMcap` 于 activation 前不创建 public Store，token-checked transition 一次性安装 Active bundle，并校验 manifest/controller/source generation、canonical timeline 与 projection/Store identity 一致；`Foreground/CatalogOnly/Inactive` 与 slot Active 正交，stale activation 不安装部分 bundle且 reservation 随 RAII 释放。Dafee review2 无 Blocker/High/Medium；`cargo fmt -p re_viewer -- --check`、`cargo check -p re_viewer --lib --all-features`、`cargo clippy -p re_viewer --no-default-features --all-targets -- -D warnings`、`TRACY_NO_INVARIANT_CHECK=1 cargo clippy -p re_viewer --all-features --all-targets -- -D warnings`、`cargo test -p re_viewer --lib web_remote_mcap_activation` 11 passed 均通过；本机缺 pixi/cargo-nextest/wasm-pack/Chrome，未执行 nextest/真实浏览器。
 
-### [ ] MCAP-090 — 实现三层窗口需求与 bounded planner
+### [x] MCAP-090 — 实现三层窗口需求与 bounded planner
 
 - 建议提交：`Plan bounded remote MCAP window demands`。
 - 依赖：MCAP-015、MCAP-032、MCAP-036、MCAP-089。
 - 变更：实现presentation-required、minimum-buffer、desired-prefetch三层不相交需求，interval hits、selected groups、checked cross-product、priority和promotion规则，并为每类demand冻结独立caller phase identity及累计Range/deadline policy输入，不复用metadata-opening owner。
 - 验收：重叠Chunk不漏选；satisfied partitions先剔除；desired prefetch只在matching per-ordinal lease下缓存exact full-record body；构造集合前所有count/乘法受限；尚未安装matching phase owner的demand不能启动retry；planner结果与upstream indexed selection差分一致。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`9659668033`, `58119c76af`；备注：新增 `remote_window_demand` 模块，实现 production-disarmed 的 presentation-required/minimum-buffer/desired-prefetch 三层不相交窗口需求、bounded interval hits/selected groups/checked cross-product/priority/promotion、backfill 身份校验与 prefetch fail-closed 状态；不改变 nonremote/native/local/compatibility/LogChannel/gRPC/Redap 路径。Dafee review2 无 Blocker/High/Medium；`cargo fmt -p re_mcap -- --check`、`cargo check -p re_mcap --all-features --all-targets`、`cargo clippy -p re_mcap --all-features --all-targets --no-deps -- -D warnings`、`cargo test -p re_mcap --all-features remote_window_demand -- --nocapture`（13 passed）、`cargo test -p re_mcap --all-features remote_manifest -- --nocapture`（3 passed）通过；本机缺 cargo-nextest，未执行 nextest。剩余 Low 为 prefetch 正向 lease 绑定尚未接线、phase owner 重复安装可覆盖累计输入、部分 HashSet 扩容未 try_reserve、root residency 错误折叠、backfill 临时物化时序、phase identity 未含 backfill additions，留待 MCAP-091 接入处理。
 
-### [ ] MCAP-091 — 接入 generation partition decode、registration 与 insertion
+### [x] MCAP-091 — 接入 generation partition decode、registration 与 insertion
 
 - 建议提交：`Insert complete remote MCAP partitions`。
 - 依赖：MCAP-015、MCAP-031、MCAP-035、MCAP-037、MCAP-090。
 - 变更：以generation/job key驱动Fetch→validation→dispatch→staging，把matching presentation/minimum/prefetch phase owner显式交给MCAP-015 operation foundation，完整terminal batch先原子registration再由bounded insertion写Store并回执residency。
 - 验收：CompleteEmpty持久化；attempt/Range/deadline exhaustion返回matching phase failure而不借用metadata counters；失败不发布partial；同partition不重复派生；stale work不能发布/ack但已发生Store event仍更新物理residency；root/session cap防御性检查不在半批失败。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`f68e0f4845`, `b8357d594b`；备注：Dafee review2 无 Blocker/High/Medium，1 个 Low。上轮 High 与全部 Medium 已闭合：rebind 清空 phase_owners；phase identity source generation 与 current generation 绑定；issue_refetch/insertion 失败前重放 pending Store events；phase_owners/staged/known_partition_jobs 扩容 fallible 并映射 ResourceLimitExceeded；complete_v1 校验 manifest descriptor 与 static 关系；PrefetchDesired 显式 PrefetchUnstarted。用户已决策方案 1：prefetch 保持 fail-closed，正向 exact physical-Chunk body owner/lease 绑定留待后续工作项。`cargo fmt -p re_mcap -- --check`、`cargo check -p re_mcap --all-features --all-targets`、`cargo clippy -p re_mcap --all-features --all-targets --no-deps -- -D warnings`、`cargo test -p re_mcap --all-features remote_partition_job`（9 passed）与 `remote_window_demand`（13 passed）通过；full `re_mcap` 400 passed/6 failed/2 ignored，失败为既有 Git LFS attachments fixture 与 remote_ros2_reflection/remote_runtime_intern/remote_summary invariant 测试，不归因本项。未提交 Cargo.lock 及计划/设计文档。
 
-### [ ] MCAP-092 — 实现 stable root reload 与 refetch capability
+### [x] MCAP-092 — 实现 stable root reload 与 refetch capability
 
 - 建议提交：`Reload evicted remote roots deterministically`。
 - 依赖：MCAP-015、MCAP-034、MCAP-036、MCAP-091。
 - 变更：使用canonical source order、stable RowId、root descriptor、refetch-owned Range/deadline policy和dynamic refetch capability重新Fetch/decode/insert被GC的完整partition。
 - 验收：相同时间tie和Chunk重叠在reload后结果不变；refetch retry不复用metadata-opening或current-seek counters；terminal representation先撤销refetch；root existence与Store event一致；reload不重复registration metadata。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`c2915c304e`, `a1294c1638`；备注：按用户方案 A，把 `c2915c304e` 作为 production-disarmed 中间 reload/capability 层收口，完整 Fetch/decode/retry controller 留后续工作项。Dafee review2 无 Blocker/High/Medium/Low；`cargo fmt -p re_mcap -- --check`、`cargo check -p re_mcap --all-features --all-targets`、`cargo clippy -p re_mcap --all-features --all-targets --no-deps -- -D warnings`、`cargo test -p re_mcap --all-features remote_root_reload -- --nocapture`（9 passed）、`cargo test -p re_mcap --all-features remote_partition_residency -- --nocapture`（16 passed）通过。未提交 Cargo.lock 及计划/设计文档。
 
-### [ ] MCAP-093 — 分离 requested/committed time 与 candidate clock
+### [x] MCAP-093 — 分离 requested/committed time 与 candidate clock
 
 - 建议提交：`Separate remote requested and committed time`。
 - 依赖：MCAP-089、MCAP-090。
 - 变更：增加 `CommittedPresentationTime`、pending navigation intent、stable demand key、`Paused/Playing`和显式clock-hold input，requested generation/buffering/mutation/GC期间丢弃wall-clock dt。
 - 验收：generic Following和非正speed结构化拒绝；hold期间仅离散命令替换intent；presentation commit后下一帧才恢复正向积分；inactive/hidden恢复不消费后台dt。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`a93b30cc34`, `e966c69911`；备注：按用户方案 A（1A），MCAP-093 收口为 production-disarmed 的纯 `re_mcap` requested/committed navigation 状态层（`remote_navigation.rs`）：实现 `CommittedPresentationTime`、`PendingNavigationIntent`、stable `RemoteNavigationDemandKey`、`Paused/Playing`、显式 `RemoteCandidateClockInput.held`、background/frozen 时钟保持、`validate_indexed_extent_v1`、commit/hold-release 一帧抑制与幂等 play-state；`commit_presentation_v1` 保持设计 13.1 签名 `(committed)`，仅文档化 caller contract，generation 关联留给 MCAP-094；不接 Viewer `TimeControl`/Store mutation/query facade。Dafee 最终复审 0 Blocker/High/Medium/Low；`cargo fmt -p re_mcap -- --check`、`cargo check -p re_mcap --all-features --all-targets`、`cargo clippy -p re_mcap --all-features --all-targets --no-deps -- -D warnings` 与 `cargo test -p re_mcap --all-features --lib remote_navigation -- --nocapture`（21 passed）通过。`e966c69911` 为 1A 对齐提交，回退了中间 review-fix 提交误加的 generation token 与 MCAP-094 越界模块；本轮仅提交 `remote_navigation.rs`，`lib.rs` 已恢复至无 `remote_seek_commit*` 声明。
 
-### [ ] MCAP-094 — 实现 Supersedable/CommitLocked seek 状态机
+### [x] MCAP-094 — 实现 Supersedable/CommitLocked seek 状态机
 
 - 建议提交：`Add remote seek commit state machine`。
 - 依赖：MCAP-091、MCAP-093。
 - 变更：Fetch/decode阶段可supersede，commit-required batches进入staging；第一次add前进入CommitLocked，后续导航只更新latest pending intent；区分pre-mutation current-seek rollback、initial failure和post-write poison。
 - 验收：旧presentation在pre-mutation工作期间继续；CurrentSeekFailedBeforeMutation释放staging/pins/reservation并暂停旧cursor；InitialPresentationFailed保持零query清理；第一次写后任何失败不可重开facade。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`5405c24d00122c863d52c36c2972f477ced2c373`, `0defba174d4cdcee134e7658c8810105a1814c4a`, `6e116fbbdf9d81b160dad1eaa030c80e3239d5fe`, `fca51fa6301bfac7779eecfa867b3fc7f392f072`；备注：实现 production-disarmed 的 `remote_seek.rs` Supersedable/CommitLocked 状态机，区分 pre-mutation current-seek rollback、initial failure 和 post-write poison。
+  Dafee 第四轮复审 0 Blocker/High/Medium/Low，确认第三轮两个 Medium 均已关闭，同意最终验收。
+  `git diff --check`、`cargo fmt -p re_mcap -- --check`、`cargo check -p re_mcap --all-features --all-targets`、`cargo clippy -p re_mcap --all-features --all-targets --no-deps -- -D warnings`、`cargo test -p re_mcap --all-features --lib remote_seek -- --nocapture`（24 passed）、`cargo test -p re_mcap --all-features --lib remote_navigation -- --nocapture`（21 passed）均通过；本机缺 cargo-nextest，未执行 nextest。
 
-### [ ] MCAP-095 — 实现 GatedRecordingQueryFacade 与完整 revision lease
+### [x] MCAP-095 — 实现 GatedRecordingQueryFacade 与完整 revision lease
 
 - 建议提交：`Add revisioned remote presentation facade`。
 - 依赖：MCAP-011、MCAP-036、MCAP-094。
 - 变更：在 Wasm remote-MCAP recording context 实现 InitialPresentationGated/Ready/ClosedForMutation/TerminalGated、不可拆分 `(facade_instance, StoreId, epoch)` revision、RAII lease和committed timeline/cursor snapshot，native/local context 不取得此状态机。
 - 验收：mutation只在旧lease全部退出后非阻塞开始；stale/duplicate Drop不改计数；last lease请求repaint；A session同epoch迟到结果不能进入B；incomplete extent的range lease零Store query并返回统一incomplete。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`443f1eab569307ea4638ce97a042486d9286ab96`, `21c893f8086e16ab111f746f18d46aa1ed08ee5f`；备注：在 `re_viewer` 新增 production-disarmed 的 `web_remote_mcap_query.rs`，实现 InitialPresentationGated/Open/ClosedForMutation/TerminalGated、不可拆分 revision lease、`RevisionTaggedV1` result 校验、NoIndexedMessages ready-no-temporal-cursor、query-visible insertion 与 GC mutation epoch 语义；不接真实 Store/StoreHub/EntityDb/ViewerContext/TimeControl/网络。Dafee 第二轮复审 0 Blocker/High/Medium，Low 1 不阻塞；`git diff --check`、`cargo fmt -p re_viewer -- --check`、`cargo check -p re_viewer --all-features --all-targets`、`TRACY_NO_INVARIANT_CHECK=1 cargo clippy -p re_viewer --all-features --all-targets --no-deps -- -D warnings`、`TRACY_NO_INVARIANT_CHECK=1 cargo test -p re_viewer --all-features --lib web_remote_mcap_query -- --nocapture`（22 passed）通过；本机未运行 cargo-nextest。
 
-### [ ] MCAP-096 — 增加 Web remote consumer 与 privileged storage context
+### [x] MCAP-096 — 增加 Web remote consumer 与 privileged storage context
 
 - 建议提交：`Separate Viewer query and storage capabilities`。
 - 依赖：MCAP-095。
 - 变更：从query-sensitive共享callsite抽取sealed窄consumer capability；native/local通过passthrough adapter继续访问原 `ViewerContext`/`EntityDb`，remote adapter只持presentation lease、committed snapshot和complete-range capability；privileged storage capability仅交给remote frame driver、installer、arbiter与cleanup。
 - 验收：禁止在接收完整 `ViewerContext` 的运行时分支中假装隔离；Wasm compile-fail/API-surface test证明remote View/query/cache reachable graph不含AppContext storage、StoreHub、StoreBundle、EntityDb或storage engine；native公开API、查询结果、cache和side-effect trace与基线一致。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`1a1b4f9c1a9b6c7f6bbe2bef1db7ae5a0727ab62`, `22078580ba0f607a59c4d791be51921c66cb23ba`；备注：在 `re_viewer` 新增 production-disarmed 的 `web_remote_mcap_consumer.rs` sealed recording consumer 与 privileged storage capability 边界；`1a1b4f9c1a` 实现 consumer/passthrough/privileged 初版，`22078580ba` 按 Dafee 第一轮修复三个 Medium：将 `privileged_*` facade 控制方法收窄为模块私有并把 privileged 类型移入 `web_remote_mcap_query.rs` 同模块，sanitized snapshot/lease Debug 不再泄漏 `StoreId`/facade instance/epoch，新增稳定 `ConsumerStorageFreeV1` 结构级 marker 证明与 `EntityDb`/`StoreBundle`/`StoreHub`/`StorageEngine` 负向断言。Dafee 第二轮复审 0 Blocker/High/Medium，Low 2 不阻塞；`git diff --check`、`cargo fmt -p re_viewer -- --check`、`cargo check -p re_viewer --all-features --all-targets`、`TRACY_NO_INVARIANT_CHECK=1 cargo clippy -p re_viewer --all-features --all-targets --no-deps -- -D warnings`、`TRACY_NO_INVARIANT_CHECK=1 cargo test -p re_viewer --all-features --lib web_remote_mcap_consumer -- --nocapture`（7 passed）与 `TRACY_NO_INVARIANT_CHECK=1 cargo test -p re_viewer --all-features --lib web_remote_mcap_query -- --nocapture`（22 passed）通过；本机缺 cargo-nextest，未执行 nextest。
 
-### [ ] MCAP-097 — 接入 Web remote TimeControl、TimePanel 与 navigation ranges
+### [x] MCAP-097 — 接入 Web remote TimeControl、TimePanel 与 navigation ranges
 
 - 建议提交：`Route remote time controls through presentation leases`。
 - 依赖：MCAP-036、MCAP-093、MCAP-096。
 - 变更：让TimeControl/TimePanel的query-sensitive部分消费MCAP-096窄capability；remote adapter只暴露manifest canonical timeline，并分开requested marker、committed cursor、indexed/loaded/loading extent、buffering/hold和NoTemporalData；native/local passthrough adapter继续原path。
 - 验收：非canonical timeline、Following和错误time type不进入remote planner；Web remote TimePanel不能取得完整 `ViewerContext` 或直接查询EntityDb；partial loaded range不伪装完整density；native/local/RRD时间控件API、结果和side-effect trace差分不变。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`2d3e013b8a3a2fa38759abf0baa8c5664b979814`, `e0c7ee879beb35ffc1e6752192ff99b7cca389b6`；备注：实现 production-disarmed 的 `web_remote_mcap_time_control.rs` 远程 TimeControl/TimePanel/navigation-range 边界层，复用 MCAP-095/096 sealed consumer/coverage 能力。Dafee 第二轮复审 0 Blocker/High/Medium、1 Low 不阻塞；第一轮四个 Medium 全部关闭：`merge_commands_v1` 命令批量原子校验、`preview_update_v1` 新建/替换 demand 置 `requested_generation_in_flight`、`LoopMode::All` 实现 wrap 并产生 `LoopJump` 且 `LoopMode::Selection` 结构化拒绝、`TimeControlCommand::Buffer` 不再写 remote buffering；L1 已关闭，L2 `opening_static_satisfied_v1` 未使用但非阻塞。验证 `git diff --check`、`cargo fmt -p re_viewer -- --check`、`cargo check -p re_viewer --all-features --all-targets`、`TRACY_NO_INVARIANT_CHECK=1 cargo clippy -p re_viewer --all-features --all-targets --no-deps -- -D warnings`、`TRACY_NO_INVARIANT_CHECK=1 cargo test -p re_viewer --all-features --lib web_remote_mcap_time_control -- --nocapture`（13 passed）、`web_remote_mcap_query`（22 passed）、`web_remote_mcap_consumer`（7 passed）通过；本机缺 cargo-nextest，未执行 nextest。
 
-### [ ] MCAP-098 — 接入 Web remote View、Dataframe 与数据 UI 查询
+### [x] MCAP-098 — 接入 Web remote View、Dataframe 与数据 UI 查询
 
 - 建议提交：`Migrate Viewer recording queries to sealed facades`。
 - 依赖：MCAP-096、MCAP-097。
 - 变更：把View systems、selection/data UI、Dataframe、TextLog和StateTimeline的query-sensitive入口迁移到MCAP-096窄capability；remote adapter提供lease-derived committed time及complete-range capability并禁止privileged fallback，native/local passthrough adapter调用原查询实现。
 - 验收：InitialPresentationGated、ClosedForMutation、TerminalGated和nonforeground时remote query invocation为零；latest-at正确；默认EVERYTHING range在coverage不完整时显示incomplete而不查询resident子集；native公开API、查询结果、执行顺序和side-effect trace不变。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`659498165186953d9032cdc5544fac20b4e70fa2`；备注：在 `re_viewer` 新增 production-disarmed 的 `web_remote_mcap_data_query.rs`，把 View/Dataframe/数据 UI 的 query-sensitive 入口收敛到 sealed narrow capability，复用 MCAP-095/096 的 `RecordingConsumerQueryV1`/lease snapshot，latest-at 只读 committed time，Store-backed range 只走 complete-range lease，gated/nonforeground 状态零 invocation。Dafee 第一轮复审 0 Blocker/High/Medium、2 Low 不阻塞；`git diff --check`、`cargo fmt -p re_viewer -- --check`、`cargo check -p re_viewer --all-features --all-targets`、`TRACY_NO_INVARIANT_CHECK=1 cargo clippy -p re_viewer --all-features --all-targets --no-deps -- -D warnings`、`TRACY_NO_INVARIANT_CHECK=1 cargo test -p re_viewer --all-features --lib web_remote_mcap_data_query -- --nocapture`（7 passed）、`web_remote_mcap_query`（22 passed）、`web_remote_mcap_consumer`（7 passed）通过；本机缺 cargo-nextest，未执行 nextest。
 
-### [ ] MCAP-099 — 验证 Web remote memoizer、cache、video 与外部 query
+### [x] MCAP-099 — 验证 Web remote memoizer、cache、video 与外部 query
 
 - 建议提交：`Validate asynchronous query results by presentation revision`。
 - 依赖：MCAP-095、MCAP-096、MCAP-098。
 - 变更：memoizer、transform/view cache、video range cache和external recording query通过MCAP-096窄capability取得snapshot；remote cache key、insert/hit/publication使用完整revision且不接受裸epoch，native/local passthrough adapter保留原cache key与执行路径。
 - 验收：A→close→B同epoch的View/cache/video/transform/Web query迟到结果全部拒绝；facade closed期间不能用旧cache hit绕过；compile-fail test阻止remote adapter取得privileged storage；native/local cache API、key、hit/miss及publication trace不变。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`2fdc7229bcf59c33a56f95ef2ff06ae91f528968`；备注：新增 production-disarmed 的 `web_remote_mcap_cache_query.rs`，把 memoizer、transform/view cache、video range cache 与外部 recording query 的 revision 校验边界收敛到 sealed `RecordingCacheConsumerV1`/`ConsumerStorageFreeV1`，cache key、lookup/insert/publish 都消费完整 opaque `RecordingQuerySnapshotV1`，关闭/nonforeground/gated 状态零 cache 绕过，并区分 latest-at/range 两类延迟结果。Dafee 第一轮复审 0 Blocker/High/Medium、1 Low 不阻塞；Low 建议后续让 insert API 同时校验 key 与 tagged result 的一致性，不改变本次验收。`git diff --check`、`cargo fmt -p re_viewer -- --check`、`cargo check -p re_viewer --all-features --all-targets`、`TRACY_NO_INVARIANT_CHECK=1 cargo clippy -p re_viewer --all-features --all-targets --no-deps -- -D warnings`、`TRACY_NO_INVARIANT_CHECK=1 cargo test -p re_viewer --all-features --lib web_remote_mcap_cache_query -- --nocapture`（8 passed）、`web_remote_mcap_data_query`（7 passed）、`web_remote_mcap_query`（22 passed）、`web_remote_mcap_consumer`（7 passed）通过，合计 44 passed；本机缺 cargo-nextest，未执行 nextest。
 
-### [ ] MCAP-100 — 实现 Store-scoped RemoteStoreMutationArbiter
+### [x] MCAP-100 — 实现 Store-scoped RemoteStoreMutationArbiter
 
 - 建议提交：`Serialize remote Store mutations`。
 - 依赖：MCAP-068、MCAP-091、MCAP-095。
 - 变更：Wasm remote-MCAP insertion、GC、terminal cleanup统一持typed turn ownership；关闭facade并drain lease后执行；close在同步Store调用后的safe point抢占并把ownership直接转给cleanup；native mutation scheduler 不变。
 - 验收：insertion/GC不并行；CommitLocked close不继续ack/commit/reopen；hidden suspended turn只one-shot rebind；late/stale turn不修改Store或facade；cleanup有限帧完成。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`9a5ec4a14a1bf8c5c3f2f9282665328063e4f1ff`；备注：新增 production-disarmed 的 `web_remote_mcap_mutation_arbiter.rs`，实现 `RemoteStoreMutationArbiterV1`/`RemoteMutationKindV1`/`RemoteMutationTurnV1` 与六个跨帧 safe point；insertion/GC 互斥、lease drain 后 safe point、close latch 抢占、terminal cleanup、hidden suspension one-shot resume、stale/duplicate completion 均结构化处理，未接真实 Store/ViewerContext/EntityDb/StoreHub/storage engine。Dafee 第一轮复审 0 Blocker/High/Medium、3 Low 不阻塞；`git diff --check 2fdc7229bc 9a5ec4a14a`、`cargo fmt -p re_viewer -- --check`、`cargo check -p re_viewer --all-features --all-targets`、`TRACY_NO_INVARIANT_CHECK=1 cargo clippy -p re_viewer --all-features --all-targets --no-deps -- -D warnings`、`TRACY_NO_INVARIANT_CHECK=1 cargo test -p re_viewer --all-features --lib web_remote_mcap_mutation_arbiter -- --nocapture`（7 passed）、`web_remote_mcap_query`（22 passed）通过；本机缺 cargo-nextest，未执行 nextest。
 
-### [ ] MCAP-101 — 接入 remote GC、pressure Close 与 memory arbitration
+### [x] MCAP-101 — 接入 remote GC、pressure Close 与 memory arbitration
 
 - 建议提交：`Integrate remote GC with Viewer memory pressure`。
 - 依赖：MCAP-036、MCAP-039、MCAP-092、MCAP-100。
 - 变更：只在持有 Web remote-MCAP memory capability 的 Store 上，按resident root cap与cursor距离选择完整roots，保护current closure/staging/pins；实际deletion才推进epoch；no-op使用Store/protection revision backoff；inactive pressure Close可supersede该remote session的pins/suspended turn。
 - 验收：remote cap-state unsorted Store在work threshold内；GC event后coverage精确；pending bytes不伪报freed；Inactive+CommitLocked/GC pressure在有限帧Vacant且不继续ack/commit；普通foreground remote保护不被错误绕过；native、local及非MCAP Store不进入该arbiter，purge/close trace与MCAP-001基线一致。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`b5b1ee12fe`, `e16719bd3a`；备注：在 `web_remote_mcap_memory.rs` 补齐 `RemoteMemoryArbiterV1`/`RemoteResidentRootV1`/`RemoteGcPlanV1`/`RemoteGcTargetV1`/`RemoteMutationReclaimV1`/`PendingRemoteReclaimV1` 的 production-disarmed memory/GC 边界。inactive Close 以 `facade.use_state_v1()` 为权威，tokenized Close 先本地 inactive 校验再修改 reclaim controller；Foreground facade 原子拒绝且 controller/arbiter 不变化。Dafee review2 0 Blocker/High/Medium、1 Low（tokenized close 在 controller 拒绝后缺 arbiter 回滚，不阻塞）。`git diff --check b5b1ee12fe e16719bd3a`、`cargo fmt -p re_viewer -- --check`、`cargo check -p re_viewer --all-features --all-targets`、`TRACY_NO_INVARIANT_CHECK=1 cargo clippy -p re_viewer --all-features --all-targets --no-deps -- -D warnings`、`TRACY_NO_INVARIANT_CHECK=1 cargo test -p re_viewer --all-features --lib web_remote_mcap_memory -- --nocapture`（17 passed）、`web_remote_mcap_query`（22 passed）通过；本机缺 cargo-nextest，未执行 nextest。
 
-### [ ] MCAP-102 — 实现 best-effort predecessor backfill
+### [x] MCAP-102 — 实现 best-effort predecessor backfill
 
 - 建议提交：`Add bounded predecessor backfill`。
 - 依赖：MCAP-015、MCAP-022、MCAP-029、MCAP-090、MCAP-094。
 - 变更：只对allowlist声明单消息替代状态的Channel执行lazy reverse MessageIndex lookup，共享每seek request/bytes/entries/deadline预算，使用backfill-owned caller phase Range policy接入retry foundation，并遵守decoder state policy。
 - 验收：找到predecessor时并入同一commit closure；找不到、attempt或backfill预算耗尽按best-effort可观察状态收敛且不终结source；非法index仍失败；不支持stateful decoder明确拒绝而不伪造状态。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`bd55f6dffe`；备注：新增 production-disarmed 的 `remote_predecessor_backfill.rs`，实现 `RemoteSeekStatePolicyV1` 三态、Channel ID allowlist、懒反向 priority cursor、canonical raw-time 转换、完整 immutable Channel-group partition commit closure，以及按 seek 累计共享的 Range request/MessageIndex bytes/entry count/visible-active-time deadline 预算。未接真实 Viewer/Store/network/GC/retry transport。Dafee 第一轮复审 0 Blocker/High/Medium、3 Low 不阻塞（raw-time conversion 可复用 `remote_time`、closure 与 `DerivationPartitionKeyV1` 的后续接线契约、部分失败分支测试补强）。`git diff --check e16719bd3a bd55f6dffe`、`cargo fmt -p re_mcap -- --check`、`cargo check -p re_mcap --all-features --all-targets`、`cargo clippy -p re_mcap --all-features --all-targets --no-deps -- -D warnings`、`cargo test -p re_mcap --all-features --lib remote_predecessor_backfill -- --nocapture`（13 passed）、`remote_seek`（24 passed）、`remote_partition_job`（9 passed）通过；本机缺 cargo-nextest，未执行 nextest。
 
-### [ ] MCAP-103 — 统一 RemoteMcapFailure 与 terminal cleanup
+### [x] MCAP-103 — 统一 RemoteMcapFailure 与 terminal cleanup
 
 - 建议提交：`Classify remote failures and terminal cleanup`。
 - 依赖：MCAP-015、MCAP-043、MCAP-094、MCAP-100。
 - 变更：冻结OptionalWork/CurrentSeek/SessionFatal与各phase exhaustion/retryability，在产生边界分类；prefetch object change不降级；terminal latch先关闭query/update/refetch，再触发tokenized cleanup。
 - 验收：metadata exhaustion仍只终结opening source；phase-B网络timeout与attempt/Range/deadline exhaustion按demand owner分类，validator/length/412永远SessionFatal；pre-mutation seek failure不自动创建新retry operation；post-insertion failure为PresentationCommitPoisoned；后续explicit/pressure close只记录cleanup trigger。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`8746206435`, `1f82cb5ab3`；备注：在 `re_viewer` 新增 production-disarmed 的 `web_remote_mcap_failure.rs`，冻结 `OptionalWork`/`CurrentSeek`/`SessionFatal`、phase-B demand owner、terminal write-once latch 和 tokenized cleanup 边界。`8746206435` 实现初版，`1f82cb5ab3` 按 Dafee 第一轮修复 Blocker/High/Medium：HTTP 416 改为 nonretryable `CurrentSeek`；pre-mutation `SessionFatal` 独立为 `RemotePreMutationSeekTransitionV1::SessionFatal`，不再被 rollback/initial 包装；terminal latch 谓词改为 `is_terminal_cleanup_complete_v1`。Dafee 第二轮复审 0 Blocker/High/Medium/Low；`git diff --check`、`cargo fmt -p re_viewer -- --check`、`cargo check -p re_viewer --all-features --all-targets`、`TRACY_NO_INVARIANT_CHECK=1 cargo clippy -p re_viewer --all-features --all-targets --no-deps -- -D warnings`、`TRACY_NO_INVARIANT_CHECK=1 cargo test -p re_viewer --all-features --lib web_remote_mcap_failure -- --nocapture`（12 passed）通过；本机缺 cargo-nextest，未执行 nextest。
 
-### [ ] MCAP-104 — 把 remote CPU 与 controller 接入 Viewer frame driver
+### [x] MCAP-104 — 把 remote CPU 与 controller 接入 Viewer frame driver
 
 - 建议提交：`Drive remote MCAP work from Viewer frames`。
 - 依赖：MCAP-033、MCAP-073、MCAP-089 至 MCAP-103。
 - 变更：在Wasm Viewer frame中以一个有界remote-MCAP slice顺序处理page state、`RetryPending` admission、controller、planner、Fetch completion、单CPU work、mutation和query presentation；既有receiver/LogChannel/gRPC/Redap frame ordering不变。
 - 验收：Fetch/browser callback不直接retry、parse或mutation；下一eligible visible control turn每帧至多启动一个retry attempt且不挤占现有Viewer work；CatalogOnly/Inactive零temporal Fetch/decode/mutation/query/cursor delta；completion会请求repaint；native frame trace不变。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`da62a89e93`, `8f0eb43002`；备注：在 `re_viewer` 新增 production-disarmed 的 `web_remote_mcap_frame_driver.rs`，实现固定 10-phase frame ordering、page execution state、逐帧 retry admission、bounded allowance、hidden/resume owner rebind、terminal drain 与 storage-free 边界；复用已有 `web_remote_mcap_cpu`/`web_remote_mcap_mutation_arbiter` 类型。`da62a89e93` 实现初版，`8f0eb43002` 按 Dafee 第一轮修复 4 High/4 Medium：retry 逐帧恢复、close 抢占、terminating backlog 清空、hidden/resume mutation owner 回接、physical proof checked conversion、复用 source of truth、`ClockBaselineExhausted` 独立映射、移除 expect/unreachable。Dafee 第二轮复审 0 Blocker/High/Medium，3 Low 不阻塞；`git diff --check da62a89e93 8f0eb43002`、`cargo fmt -p re_viewer -- --check`、`cargo check -p re_viewer --all-features --all-targets`、`TRACY_NO_INVARIANT_CHECK=1 cargo clippy -p re_viewer --all-features --all-targets --no-deps -- -D warnings`、`TRACY_NO_INVARIANT_CHECK=1 cargo test -p re_viewer --all-features --lib web_remote_mcap_frame_driver -- --nocapture`（16 passed）、`web_remote_mcap_failure`（12 passed）、`web_remote_mcap_mutation_arbiter`（7 passed）通过；本机缺 cargo-nextest，未执行 nextest。
 
-### [ ] MCAP-105 — 分离 UserNavigationRevision 与 programmatic selection
+### [x] MCAP-105 — 分离 UserNavigationRevision 与 programmatic selection
 
 - 建议提交：`Preserve compatible recording selection semantics`。
 - 依赖：MCAP-048、MCAP-054、MCAP-089、MCAP-104。
 - 变更：在现有 user navigation revision 上增加 remote-MCAP programmatic intent；compatibility remote operation 在原同步调用顺序中冻结authority且activation不推进user revision；strict batch使用最后OpenAndSelect的batch-local winner，不引入全局 BrowserIngressSequence。
 - 验收：既有non-MCAP compatibility URL反序完成仍last-completion-wins；remote user navigation使旧intent失效；strict batch winner稳定；native/legacy/gRPC/Redap selection trace 不变。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`08f03e1d94`, `7f45a0b76f`；备注：新增 production-disarmed 的 `web_remote_mcap_selection.rs`，把 remote-MCAP user navigation revision、programmatic selection intent/authority、compatibility freeze/reconcile、strict batch-local winner 和 nonremote last-completion-wins 隔离成 storage-free 边界。`08f03e1d94` 为初版；Dafee 第一轮发现 1 Blocker、1 High、2 Medium。`7f45a0b76f` 修复：`RemoteSelectionAuthorityV1` 保留完整 intent，Open/Background 的 panel/catalog effect 不再折叠丢失；freeze 只返回 authority，reconcile 在 activation 按当前 user navigation revision 解析，仅 `SelectRecording` 更新 selected intent；补齐空 batch、duplicate operation id、非单调 ordinal 的失败原子性、无 OpenAndSelect 保留既有 selection、user navigation overflow、nonremote sequence overflow/zero identity/tie 等测试；nonremote ingress 用嵌套 `RemoteSelectionIngressV1::NonRemote` 做结构隔离。Dafee 第二轮复审 0 Blocker/High/Medium、2 Low 不阻塞；`git diff --check`、`cargo fmt -p re_viewer -- --check` 通过；本机缺 cargo-nextest，未执行 nextest。
 
 ## 14. M9 — Startup、产品面、可观测性与最终验收
 
-### [ ] MCAP-106 — 锁定并接入 eframe two-phase WebRunner fork
+### [x] MCAP-106 — 锁定并接入 eframe two-phase WebRunner fork
 
 - 建议提交：`Patch eframe with two-phase Web runner startup`。
 - 依赖：MCAP-004、MCAP-088。
 - 变更：workspace以`[patch.crates-io]`锁定基于0.35.0的最小fork和immutable revision/checksum，只在 `cfg(target_arch = "wasm32")` WebRunner公开 `prepare_app → PreparedWebRunner::{activate,abort}`，记录upstream与rebase责任；该workspace patch是项目控制的Web发布构建输入，不承诺脱离workspace的下游Cargo构建自动继承patch。
 - 验收：prepare不安装ResizeObserver、DOM handlers、RAF或repaint callback；activate成功后恰好一次安装；部分activate failure可abort无残留；Web发布产物的build metadata与smoke test证明使用锁定fork及two-phase ABI；native依赖source provenance允许因workspace patch变化，但native feature resolution、公开API、构建、startup测试和运行行为差分必须通过。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`ed71eb963f`, `1e7a21b029`；备注：锁定并接入 eframe two-phase WebRunner fork。初版 `ed71eb963f` 在 `[patch.crates-io]` 统一 patch 8 个 egui crate 到 fork rev `5dc9bb2cb929181ec005e5a6e88c54846bf628ca`，并将 `re_viewer::web::WebHandle::start` 改为 `prepare_app(...).await?.activate()`；Dafee 首轮发现 1 个 Medium painter 清理绕过问题。William 在 fork 新提交 `fe21b0d495be7d38ee61f27010a54f08bea87eef` 修复 `abort` 和 `TextAgent::attach` 失败路径，使尚未移入 `WebRunner` 的 `AppRunner` 显式调用 `destroy()`；主仓库 `1e7a21b029` 将 8 个 patch rev 更新到新 fork rev，未提交 `Cargo.lock`。Dafee 第二轮 0 Blocker/High/Medium/Low，`PASS`。fork `fmt`、`git diff --check`、eframe wasm lib check 通过；主仓库 `cargo fmt -p re_viewer -- --check`、`cargo check -p re_viewer --all-features --all-targets`、clippy、`web_remote_mcap_frame_driver` 16/16、`web_remote_mcap_selection` 12/12 通过。非阻塞：fork `--tests` wasm check 仍被既有 `crates/eframe/src/web/backend.rs` 6 个 E0308 阻断，主仓库 `cargo check -p re_viewer --target wasm32-unknown-unknown --all-features` 仍被既有 `web_remote_mcap_cpu.rs` 10 个 E0392 阻断；`cargo-nextest` 未安装未运行。新增 browser-targeted `web_runner.rs` 回归测试在 fork 的 wasm browser test job 执行，本机仅完成编译验证。
 
-### [ ] MCAP-107 — 实现 startup visibility 双快照与 bootstrap listener
+### [x] MCAP-107 — 实现 startup visibility 双快照与 bootstrap listener
 
 - 建议提交：`Bootstrap Web Viewer page visibility safely`。
 - 依赖：MCAP-067、MCAP-106。
 - 变更：strict remote-MCAP bootstrap前读visibility、安装唯一不能访问App的bounded listener、再读并reconcile，runner activation和terminal eviction前final read；listener ownership随prepared runner abort。
 - 验收：页面初始hidden、bootstrap中切hidden、重复signal和listener后无新event都得到正确state；strict remote 路径在publish/work前拒绝并回到Stopped；现有 compatibility startup 状态机不改成全局HiddenSuspended。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`e4686b9bd8`；备注：实现 remote-MCAP startup visibility 双快照与 bootstrap listener，状态机保留 before/after/final 三段快照并对任一 hidden 产生 `RemoteStartupPublishDenied`；DOM listener 只捕获 document/tracker，guard 在 `prepare_app` 前安装、失败随 `?` drop、成功在 `activate` 前 final reconcile 并 drop；native 非 test 不编译 DOM guard，compatibility/global startup 状态机不变。Dafee 第一轮 0 Blocker/High/Medium、2 Low 不阻断，结论 PASS。验证：`git diff --check`、`cargo fmt -p re_viewer -- --check`、`cargo check -p re_viewer --all-features --all-targets`、clippy、`web_startup_visibility` 6/6、`web_remote_mcap_frame_driver` 16/16、`web_remote_mcap_selection` 12/12 通过；wasm32 check 仍仅剩既有 `web_remote_mcap_cpu.rs` 10 个 E0392。非阻断 Low：可移除直接 `web-sys` `Event` feature；可补充 after-listener-only hidden 隔离测试。
 
-### [ ] MCAP-108 — 在现有 startup sources 中接入 remote MCAP
+### [x] MCAP-108 — 在现有 startup sources 中接入 remote MCAP
 
 - 建议提交：`Open remote MCAP from existing Web startup sources`。
 - 依赖：MCAP-054、MCAP-067、MCAP-107。
 - 变更：保留 `create_app` 和现有 compatibility startup loop、hidden `AppOptions.url`、direct `start` 顺序；只在单项确认为 remote MCAP 后安装remote source，非 MCAP item 继续原 dispatcher。
 - 验收：mixed合法/非法URL保持warning/continue并让Viewer Running；数组和两种startup source顺序与MCAP-001一致；nested query安全来源不丢；初始hidden时remote work 有界park，不延迟或重排其他 startup item。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`c47ba7ea56`；备注：将 hidden `AppOptions.url` 接入 direct `start` 相同的 compatibility remote-MCAP seam，不改变 production-disarmed 行为。`WebHandle.compatibility_remote_mcap` 改为 `Rc<RefCell<CompatibilityRemoteMcapSingletonV1>>`，`start` clone 后传入 `create_app`；`dispatch_hidden_startup_urls` 逐项经 `dispatch_compatibility_url_v1`，非 MCAP 仍走原 `ViewerOpenUrl::open`，显式 `.mcap` 才咨询 remote seam，`ExistingDispatcher` 保持原 command trace，`RemoteAccepted`/`RemoteSessionLimitReached` 不产生 command 且不回滚。Dafee 第一轮 0 Blocker/High/Medium、2 Low 不阻断，结论 `PASS`。验证：`git diff --check`、`cargo fmt -p re_viewer -- --check`、`cargo check -p re_viewer --all-features --all-targets`、clippy、`web_startup` 13/13、`web_startup_visibility` 6/6、`web_remote_mcap_frame_driver` 16/16、`web_remote_mcap_selection` 12/12 通过；wasm32 check 仍仅剩既有 `web_remote_mcap_cpu.rs` 10 个 E0392。非阻断 Low：direct `WebHandle::add_receiver` 尚无轻量 harness-level 回归；`RemoteAccepted` 缺少 mixed 数组显式不回滚测试。
 
-### [ ] MCAP-109 — 实现 strict startWithRequests bootstrap handoff
+### [x] MCAP-109 — 实现 strict startWithRequests bootstrap handoff
 
 - 建议提交：`Add atomic strict Web Viewer startup`。
 - 依赖：MCAP-051、MCAP-053、MCAP-106、MCAP-107。
 - 变更：在app-creator内创建唯一disarmed App、执行共享remote-MCAP-only HTTP transaction、用one-shot cell交付descriptors/handles/acks/release token，fallible runner activation先于terminal eviction和route arm。
 - 验收：invalid batch、wrapper throw、wrong token、hidden race和activate failure均在ready/RAF/observer/handler/work前同步 `FailingStart → Stopped`；terminal registry不变；同wrapper可用新instance重试；成功`StartResult`只代表accepted。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`1254bb39e9`, `ea6dea9c6b`, `91b95ac2f1`；备注：实现 production-disarmed strict `startWithRequests` bootstrap handoff。`1254bb39e9` 为初版；Dafee 第一轮 0 Blocker/High/Medium、2 Medium 以下记录见后续。`ea6dea9c6b` 修复第一轮 2 Medium：补 fake seam 的 Rust wire-envelope 失败回归和 Rust Wasm preflight 空 batch/deny_unknown_fields/UnsupportedFormat/extensionless route；`91b95ac2f1` 按方案 A 修复第二轮 2 Medium：移除 fake 对 `destroy`/`free` 的清理抑制，Rust 使用 `url::Url::parse` 与 `parsed.path()` 镜像 TS WHATWG pathname 的反斜杠与 dot-segment 规范化，原始 URL 仍保留。Dafee 第三轮 0 Blocker/High/Medium/Low，结论 `PASS`。验证：`git diff --check`、`cargo fmt -p re_viewer -- --check`、`cargo check -p re_viewer --all-features --all-targets`、clippy、`web_strict_startup` 8/8、`web_startup_visibility` 6/6、`web_remote_mcap_frame_driver` 16/16、`web_remote_mcap_selection` 12/12、Node public contracts 49/49 通过；wasm32 check 仍仅剩既有 `web_remote_mcap_cpu.rs` 10 个 E0392；本机无 cargo-nextest 未运行该项。
 
-### [ ] MCAP-110 — 接入 remote recording panel、catalog card 与 open options UI
+### [x] MCAP-110 — 接入 remote recording panel、catalog card 与 open options UI
 
 - 建议提交：`Expose remote MCAP opening and catalog UI`。
 - 依赖：MCAP-089、MCAP-097、MCAP-105。
 - 变更：OpenAndSelect/Open安装panel行为，Background安装可发现可关闭但不等价StoreHub preview的metadata catalog card；UI可选time type、Topic/decoder config和advanced consistency policy并展示actual warning/status。
 - 验收：明确 `.mcap` compatibility与known/extensionless strict MCAP × 三种behavior矩阵可观察；compatibility无扩展名URL保持原dispatcher，strict非MCAP返回unsupported；metadata control plane对非foreground仍有限完成；非foreground零temporal work；重新选择从committed cursor恢复；默认不启用DeploymentAssumed。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`fdf010fe7282df312ae7e038f1f1d6b5c9e9b4f4`；备注：新增 production-disarmed 的 `web_remote_mcap_ui.rs`，把 OpenAndSelect/Open/Background 映射为 selected recording-panel entry、recording-panel entry 和独立 metadata catalog card，并冻结脱敏 open-options UI projection、consistency truth table、committed-cursor resume 与非 foreground 三类工作拒绝边界；不接真实 Viewer/Store/StoreHub/EntityDb/egui。Dafee 第一轮复审 0 Blocker/High/Medium、2 Low 不阻塞，结论 `PASS`。验证：`git diff --check`、`cargo fmt -p re_viewer -- --check`、`cargo check -p re_viewer --all-features --all-targets`、clippy、`web_remote_mcap_ui` 15/15、`web_remote_mcap_selection` 12/12、`web_remote_mcap_time_control` 13/13、`web_remote_mcap_query` 22/22 通过；wasm32 check 仍仅剩既有 `web_remote_mcap_cpu.rs` 10 个 E0392；本机无 cargo-nextest，未运行该项。
 
-### [ ] MCAP-111 — 接入资源指标与脱敏诊断
+### [x] MCAP-111 — 接入资源指标与脱敏诊断
 
 - 建议提交：`Instrument remote MCAP resource and lifecycle metrics`。
 - 依赖：MCAP-005、MCAP-104、MCAP-109、MCAP-110。
 - 变更：实现设计第20节中 Web remote-MCAP 相关的metrics、high-water marks、work-unit durations、remote registry snapshots、page suspension、intern burn、presentation/GC和failure distributions，不增加LogChannel、Redap或全局ingress指标。
 - 验收：label不含高基数secret；count/bytes与实际ownership可对账；performance.memory不可用时不伪装精确heap；debug输出也经过redaction断言。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`6ba9609b8efe028c38807c93e2d9ab70c0097eee`、`6859bb6df78b2326a498565e5e2dda09476c49b9`；备注：`6ba9609b8efe028c38807c93e2d9ab70c0097eee` 为初版；Dafee 首轮发现 1 High/1 Medium：reservation 可 Copy/重复释放，page-suspension 与 presentation close-latency overflow 更新非原子。`6859bb6df78b2326a498565e5e2dda09476c49b9` 将资源与 intern candidate reservation 改为 move-only 并记录 active reservation id/class/bytes/revision，release 消费 token 且只接受当前 active 身份，stale/duplicate 返回 typed error 且 snapshot/revision/usage 不变；`record_checked_total_v1` 与 `record_close_latency_v1` 改为先计算全部 checked next 值再一次性赋值，并补 overflow 原子性回归测试。Dafee 第二轮 0 Blocker/High/Medium/Low，结论 PASS。验证：`git diff --check`、`cargo fmt -p re_viewer -- --check`、`cargo check -p re_viewer --all-features --all-targets`、clippy、metrics 16/16、ui 15/15、selection 12/12 通过；wasm32 check 仍仅剩既有 `web_remote_mcap_cpu.rs` 10 个 E0392；本机无 cargo-nextest，未运行该项。
 
-### [ ] MCAP-112 — 发布 TypeDoc、changelog 与迁移说明
+### [x] MCAP-112 — 发布 TypeDoc、changelog 与迁移说明
 
 - 建议提交：`Document remote MCAP Web Viewer contracts`。
 - 依赖：MCAP-054 至 MCAP-057、MCAP-067、MCAP-069、MCAP-073、MCAP-080、MCAP-108 至 MCAP-111。
 - 变更：记录remote-MCAP compatibility 分支与strict API、handles/lifecycles/dispose、semantic dedup、catalog-only Background、strict string/intern limits、remote hidden/pagehide 行为和 startup 契约；明确 legacy、LogChannel、gRPC、Redap、raw-event 与 native Viewer 不在改动范围。
 - 验收：所有remote-MCAP accepted regression都有before/after、迁移示例和host contract test链接；文档不承诺data-ready于start resolve；对排除路由只声明保持现状，不发布无关breaking change。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`ff777c470d0bbccdcd7e5204c04ef55ed0f0124e`、`62cc34e78aaf557ba9a968282f3d58a03c595751`；备注：`ff777c470d` 为初版文档；Dafee 首轮发现 1 High/3 Medium：redaction 绝对承诺与 compatibility fallback 实际 raw URL 冲突、lifecycle 文案与导出 `StrictOpenLifecycleEvent` 不符、strict 示例缺少已启动 Viewer、错误 code/phase 枚举不完整。`62cc34e78a` 按用户方案 A 收窄 redaction 到 strict handles/`StrictOpenError`/strict lifecycle events/remote metrics/remote-owned debug output，并注明 compatibility `.mcap` fallback 仍可能输出 raw URL；lifecycle 改为六个导出事件且 contiguous non-reversing；补充 started Viewer 示例；完整枚举十二个 code 与四个 phase。Dafee 第二轮 0 Blocker/High/Medium/Low，结论 PASS。验证：`git diff --check`、`git show --check`、commit 仅三个允许文件、`node --import ./tests/register-loader.mjs --test ./tests/public_contracts.test.mjs` 49/49 通过；本机无 `node_modules`，未运行 `npm run build:js`/`npm run docs`，`pixi` 与 `cargo-nextest` 不可用。
 
-### [ ] MCAP-113 — 完成桌面 Chrome 网络与 correctness E2E
+### [x] MCAP-113 — 完成桌面 Chrome 网络与 correctness E2E
 
 - 建议提交：`Add remote MCAP Chrome correctness E2E suite`。
 - 依赖：MCAP-003、MCAP-104、MCAP-109、MCAP-110。
 - 变更：覆盖same/cross-origin Range、CORS/CSP、validator变化、NoIndexedMessages、overlap、seek supersede、backfill、GC reload、remote-MCAP strict/compatibility API、hidden/resume/pagehide和query gate，并对排除路由运行一组无行为变化差分用例。
 - 验收：设计第19.7、23.1、23.2、23.4节全部可自动判定；每个failure有脱敏public status；不允许full-object fallback、partial presentation、stale result或跨recording污染。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 负责人：William；提交：`55f20a5c35ed0807fe1ca6cb0938dee42947c031`；备注：按方案 A 新增 production-disarmed `tests/rust/test_mcap_chrome_correctness`，覆盖 same/cross-origin Range、CORS allow/omit/preflight reject/expose missing、CSP `connect-src` 隔离、malformed `206`/缺失或不一致 `Content-Range`、early EOF、overlong body、infinite body 的 reader cancel/AbortController abort、BYOB/EOF probe、`Response.arrayBuffer()` 零调用、Range-only GET trace、browser failure 脱敏与本地 raw-byte strict classifier。Dafee 首轮 PASS：0 Blocker / 0 High / 0 Medium / 0 Low。`git diff --check`、`cargo fmt`、`node --check`、native `cargo check/clippy/test`、wasm32 `cargo check --all-features --all-targets` 通过；真实桌面 Chrome E2E 因本机缺少 `pixi`、`wasm-pack`、Chrome/ChromeDriver 未执行，直接 `cargo run -p re_web_tests` 失败于缺少 `wasm-pack`，未伪造通过。
 
-### [ ] MCAP-114 — 完成内存、主线程与 release gate
+### [!] MCAP-114 — 完成内存、主线程与 release gate
 
 - 建议提交：`Enforce remote MCAP Chrome release gates`。
 - 依赖：MCAP-088、MCAP-101、MCAP-104、MCAP-111、MCAP-113。
-- 变更：在release web build运行remote-MCAP七类不可抢占路径、长时window playback、反复seek/GC/reload、remote hidden/visible flood、registry churn、runtime intern exhaustion和Wasm memory pressure测试；LogChannel、Redap、gRPC及其他nonremote routes只进入差分门，不进入新的remote资源或page gate。
-- 验收：所有remote hard cap、main-thread阈值、finite-frame cleanup、resume revalidation上界和Wasm/module-lifetime budget通过；release artifact symbol/dependency/API审计证明side-map transaction没有扩散到native或nonremote callsite，side-map candidate/growth的legacy global map scan/copy为零。
-- 验收：compatibility extensionless网络trace保持零新probe；`pixi run rerun-build-web`、Web发布产物metadata/two-phase ABI smoke、相关clippy/nextest、Chrome stable E2E和lint全部绿色；native公开API、feature resolution、build、startup/runtime差分，以及RRD、legacy HTTP、LogChannel、gRPC/message proxy、Redap、local/native MCAP的route/error/lifecycle/hidden/intern trace无回归后才允许启用MVP feature。
-- 负责人：TBD；提交：TBD；备注：TBD。
+- 变更：在 release Web build 中运行 remote-MCAP 七类不可抢占路径、长时 window playback、反复 seek/GC/reload、remote hidden/visible flood、registry churn、runtime intern exhaustion 和 Wasm memory pressure 测试；LogChannel、Redap、gRPC 及其他 nonremote routes 只进入差分门，不进入新的 remote 资源或 page gate。发布物只来自受控的第一方代码和固定构建流程；本项接受由项目自身实现与充分测试承担主要风险。
+- 验收：release artifact symbol/dependency/API 审计、Web 发布产物 metadata/two-phase ABI smoke、hard-cap、main-thread 阈值、finite-frame cleanup、resume revalidation 上界、Wasm/module-lifetime budget、Chrome stable E2E、长时播放、反复 seek/GC/reload、hidden/visible flood、malformed/adversarial MCAP、memory pressure、runtime intern exhaustion 和 native/nonremote differential 测试均通过。静态 allocator/stack artifact audit 保留为诊断证据；它不再单独阻塞 release，也不声称证明所有生成 Wasm 的 stack/allocator 行为。
+- 验收：compatibility extensionless 网络 trace 保持零新 probe；`pixi run rerun-build-web`、release Wasm artifact/API/dependency 审计、相关 clippy/nextest、Chrome stable E2E 和 lint 全部绿色；native 公开 API、feature resolution、build、startup/runtime 差分，以及 RRD、legacy HTTP、LogChannel、gRPC/message proxy、Redap、local/native MCAP 的 route/error/lifecycle/hidden/intern trace 无回归后，才允许启用 MVP feature。
+- 负责人：William；提交：TBD；备注：2026-08-21 用户明确接受风险：发布 Wasm 仅来自受控第一方代码和固定构建流程，静态 allocator/stack artifact proof 作为诊断而非 release blocker；release acceptance 以充分的 release Wasm、Chrome stable E2E、长时 playback、重复 seek/GC/reload、hidden/visible flood、malformed/adversarial MCAP、memory pressure、runtime intern exhaustion 和 native/nonremote differential 测试为准。production capability 在全部测试门通过前保持 disarmed；不得宣称静态 audit 证明所有生成 stack/allocator 行为。需保留 release artifact/API/dependency 审计和测试证据，并由 Dafee review 后创建本项唯一提交。当前静态 audit 的 function 130460 stack restore 结果记录为诊断风险，不单独阻塞本项；其他外部门（Chrome stable production E2E、长时与压力测试、memory/intern exhaustion、native/nonremote differential、release artifact 审计、clippy/nextest/lint）仍待执行。已将 `re_mcap_chrome_correctness` 加入 `.github/workflows/reusable_web_test.yml` 的 Chrome stable lane；CI 使用仓库现有 `browser-actions/setup-chrome@v2` 与匹配 ChromeDriver，执行 `pixi run web-test --browser chrome --package re_mcap_chrome_correctness`，并在 always 条件下上传 `target/mcap114-chrome-correctness/web-test.log`。CI 结果尚未产生，不计为通过。真实输入基线：`/data/demo` 下28个真实 UMI MCAP均通过 `mcap doctor` 和 `mcap info`，合计1,205,936条消息、17,393个Chunk；日志位于 `/data/tools/mcap114-demo-doctor-all` 和 `/data/tools/mcap114-demo-info-all`。该结果仅为真实输入结构基线，不替代 Chrome stable、Range、Wasm runtime、压力、release 或 differential 门禁。全部28个真实 UMI 文件还通过 native `pixi run rerun mcap check` indexed traversal；代表样本 pet_hospital `9a7e…a0e`、lab `60f3…455a`、school `0b17…6156` 和 hotel `0898…3222` 均通过 native `mcap check --full`。日志位于 `/data/tools/mcap114-demo-check-all` 和 `/data/tools/mcap114-demo-check-full`；四个代表样本最大 RSS 约分别为 1.61、1.57、1.66 和 1.61 GiB，统一按 `RSS KiB / 1,048,576` 的二进制换算口径记录。以上仅属于 native full-import/input baseline，不是 Web remote Range、Wasm、Chrome 或 memory-pressure 证据，因为 native full 模式具有不同的执行和内存语义。全部28个真实 UMI 文件还顺序通过 native `pixi run rerun mcap check --full`，即完整 native decoder pipeline 验证；对应日志位于 `/data/tools/mcap114-demo-check-full-all`，汇总位于 `/data/tools/mcap114-demo-check-full-all.summary`。该全量验证观察到的最大 RSS 范围约为 1.57–1.79 GiB，统一按 `RSS KiB / 1,048,576` 的二进制换算口径记录，精确到每个文件的数值见汇总和单文件日志。这仍仅属于 native full decoder/input baseline，不是 Web remote Range、Wasm memory-pressure、Chrome 或 release evidence。已完成本地 release artifact 审计：manifest cfg 修复后的 `pixi run rerun-build-web-release` 通过，`pixi run wasm-opt` 重处理通过，product artifact WAT 导出审计发现85个导出，Wasm header/version 与 JS generated-module 检查通过；product Wasm/JS中未发现 Phase-A proof、decoder-assignment、ROS2/protobuf verifier anchor字符串。SHA/size/shape/export审计日志分别位于 `/data/tools/mcap114-release-artifact-sha256-final.log`、`/data/tools/mcap114-release-artifact-size-final.log`、`/data/tools/mcap114-release-artifact-shape-final.log` 和 `/data/tools/mcap114-release-export-audit.wat`。该结果仅是 partial local artifact audit，不是完整 API/dependency/ABI smoke，也不是 Chrome 或 release acceptance；所有待执行外部门禁、MCAP-114/M9未完成状态和 `production_disarmed` 保持不变。
 
 ## 15. 设计覆盖索引
 
@@ -1211,7 +1213,7 @@ M2、M3、M4 的不相交部分可以并行，但任何 public route 在 GA 前�
 
 ## 16. 最终项目完成检查表
 
-- [ ] 90 个有效工作项均填写负责人、commit SHA和验收结果，26 个 `[~]` 项保留范围决策记录且没有实现提交。
+- [ ] 91 个有效工作项均填写负责人、commit SHA和验收结果，26 个 `[~]` 项保留范围决策记录且没有实现提交。
 - [ ] 每个提交都可在其依赖点独立构建和回退，没有只靠后续提交修复的已知不通过测试。
 - [ ] compatibility API只有文档明确列出的accepted regression，其余characterization tests保持通过。
 - [ ] strict remote-MCAP API、compatibility MCAP 分支、page execution和remote session都覆盖success/failure/close/stop/stale callback，排除路由由差分测试证明不变。

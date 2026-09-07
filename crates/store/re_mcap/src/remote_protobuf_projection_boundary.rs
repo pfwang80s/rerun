@@ -1,7 +1,5 @@
 //! Neutral ownership boundary between bounded ROS 2 and future protobuf initialization.
 
-#![allow(dead_code)]
-
 use crate::remote_ros2_reflection::RemoteRos2ProjectionEofAuthorityV1;
 #[cfg(test)]
 use crate::remote_ros2_reflection::{RemoteRos2InitializationError, RemoteRos2RecognitionIterV1};

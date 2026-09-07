@@ -5,8 +5,6 @@
 //! already-registered [`crate::remote_partition_residency::RefetchableRootIndexV1`] identity and
 //! the exact external-root insertion seam.
 
-#![allow(dead_code)]
-
 use std::collections::BTreeSet;
 
 use re_chunk::ChunkId;

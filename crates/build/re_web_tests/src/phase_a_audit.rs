@@ -132,9 +132,9 @@ pub fn run_phase_a_audit_v1() -> anyhow::Result<PhaseAAuditReportV1> {
             "re_web has no re_mcap dependency",
         ),
         WorkspaceAudit::check(
-            "only-viewer-artifact-bridge",
+            "only-approved-cross-bridge",
             only_allowed_cross_crate_bridge(&metadata),
-            "re_viewer is the only production bridge for both Wasm crates",
+            "only re_viewer, the re_mcap_web_adapter producer, and the Phase A artifact are approved cross bridges",
         ),
         WorkspaceAudit::check(
             "re_mcap-source-no-re_web",
@@ -348,13 +348,15 @@ fn only_allowed_cross_crate_bridge(metadata: &cargo_metadata::Metadata) -> bool 
                     .is_some_and(|target| target.to_string() == "cfg(target_arch = \"wasm32\")")
         })
     });
+    // Approved cross-layer producers that are allowed to depend on both owning crates:
+    // `re_viewer` (existing product consumer), `re_mcap_web_adapter` (the sole trusted
+    // cross-layer producer created by MCAP-114 W03), and the existing Phase A artifact.
+    let approved_bridges = ["re_viewer", "re_mcap_web_adapter", "re_mcap_phase_a_chrome"];
     viewer_has_both_wasm_deps
         && metadata
             .packages
             .iter()
-            .filter(|package| {
-                package.name != "re_viewer" && package.name != "re_mcap_phase_a_chrome"
-            })
+            .filter(|package| !approved_bridges.contains(&package.name.as_str()))
             .all(|package| {
                 let has_re_mcap = package.dependencies.iter().any(|dep| dep.name == "re_mcap");
                 let has_re_web = package.dependencies.iter().any(|dep| dep.name == "re_web");
@@ -393,6 +395,7 @@ fn collect_source_files(root: &Path, files: &mut Vec<PathBuf>) {
 
 fn is_allowed_cross_crate_callsite(path: &Path) -> bool {
     path.starts_with("tests/rust/test_mcap_phase_a_chrome")
+        || path.starts_with("crates/mcap/re_mcap_web_adapter")
         || path.ends_with("crates/viewer/re_viewer/src/web_remote_mcap_cpu.rs")
 }
 
@@ -404,13 +407,13 @@ fn module_has_preceding_cfg(text: &str, module_line: &str, expected_cfg: &str) -
     module_preceding_cfg(&text[..position]).is_some_and(|cfg| cfg.contains(expected_cfg))
 }
 
-#[derive(Clone, Copy)]
-struct ModuleDeclaration<'a> {
+#[derive(Clone)]
+struct ModuleDeclaration {
     public_external: bool,
-    cfg: Option<&'a str>,
+    cfg: Option<String>,
 }
 
-fn module_declarations<'a>(text: &'a str, module_name: &str) -> Vec<ModuleDeclaration<'a>> {
+fn module_declarations(text: &str, module_name: &str) -> Vec<ModuleDeclaration> {
     let needle = format!("mod {module_name};");
     let mut declarations = Vec::new();
     let mut remaining = text;
@@ -436,19 +439,38 @@ fn module_declarations_are_target_gated(text: &str, remote_modules: &[&str]) -> 
         !declarations.is_empty()
             && declarations.iter().all(|declaration| {
                 !declaration.public_external
-                    || declaration.cfg.and_then(cfg_expr_native_production_value) == Some(false)
+                    || declaration
+                        .cfg
+                        .as_deref()
+                        .and_then(cfg_expr_native_production_value)
+                        == Some(false)
             })
     })
 }
 
-fn module_preceding_cfg(text_before_module: &str) -> Option<&str> {
-    for line in text_before_module.lines().rev() {
-        let trimmed = line.trim();
+fn module_preceding_cfg(text_before_module: &str) -> Option<String> {
+    let lines: Vec<&str> = text_before_module.lines().collect();
+    let mut index = lines.len();
+    while index > 0 {
+        index -= 1;
+        let trimmed = lines[index].trim();
         if trimmed.is_empty() || trimmed.starts_with("//") {
             continue;
         }
         if let Some(cfg) = trim_cfg_attribute(trimmed) {
-            return Some(cfg);
+            return Some(cfg.to_owned());
+        }
+        if trimmed.starts_with("#[cfg(") {
+            // Multi-line attribute: join lines from this point until the attribute closes, then
+            // re-attempt the single-attribute parse on the joined form.
+            let mut joined = String::new();
+            for line in &lines[index..] {
+                joined.push_str(line.trim());
+                if let Some(cfg) = trim_cfg_attribute(&joined) {
+                    return Some(cfg.to_owned());
+                }
+            }
+            return None;
         }
         if is_rust_item_start(trimmed) {
             break;
@@ -506,8 +528,16 @@ fn is_public_constructor_line(line: &str) -> bool {
 
 fn cfg_expr_native_production_value(expr: &str) -> Option<bool> {
     let expr = expr.trim();
+    // Remote-only Cargo features and build-script-emitted cfgs are never present in the native
+    // production module tree; the disarmed release keeps them out of every product profile.
+    // Unknown keys remain None so a typo cannot silently widen the gate.
     match expr {
-        "test" | "target_arch = \"wasm32\"" | "target_arch = \"wasm64\"" => Some(false),
+        "test"
+        | "target_arch = \"wasm32\""
+        | "target_arch = \"wasm64\""
+        | "feature = \"web_adapter\""
+        | "rerun_mcap_phase_a_proof_v1"
+        | "re_mcap_locked_remote_wasm_allocator_v1" => Some(false),
         _ if expr.starts_with("all(") && expr.ends_with(')') => {
             let parts = split_top_level_cfg(&expr["all(".len()..expr.len() - 1]);
             parts
@@ -636,6 +666,19 @@ mod tests {
             "pub mod web_body_handoff;",
             "pub mod web_body_handoff;",
             "any(target_arch = \"wasm32\", test)"
+        ));
+
+        // Multi-line cfg attributes that gate a public remote module must be parsed as a whole
+        // and evaluated as absent from the native production tree.
+        let multiline = "\n#[cfg(any(\n    all(rerun_mcap_phase_a_proof_v1, feature = \"web_adapter\"),\n    re_mcap_locked_remote_wasm_allocator_v1,\n))]\npub mod remote_physical_resolution;";
+        assert!(module_has_preceding_cfg(
+            multiline,
+            "pub mod remote_physical_resolution;",
+            "re_mcap_locked_remote_wasm_allocator_v1"
+        ));
+        assert!(module_declarations_are_target_gated(
+            multiline,
+            &["remote_physical_resolution"]
         ));
     }
 

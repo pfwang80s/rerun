@@ -17,6 +17,8 @@ workspace = true
 [features]
 ## Enables reusable MCAP fixture builders for downstream tests.
 testing = ["dep:crc32fast", "dep:lz4_flex", "dep:zstd"]
+## Enables the narrow wasm adapter-facing physical receipt seam.
+web_adapter = []
 ## Keeps the bounded runtime-intern transaction compiled only for its disarmed proof feature.
 rerun_mcap_locked_remote_wasm_allocator_v1 = [
   "dep:re_string_interner",

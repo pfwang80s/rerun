@@ -5,8 +5,6 @@
 //! from the committed presentation time and keeps the candidate clock held while a generation is
 //! in flight or the session is frozen.
 
-#![allow(dead_code)]
-
 use re_log_types::{AbsoluteTimeRange, Duration, TimeInt, Timeline};
 
 use crate::remote_loaded_coverage::CanonicalIndexedExtentV1;
