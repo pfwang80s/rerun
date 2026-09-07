@@ -1,0 +1,45 @@
+name: Probe Chrome iframe (temporary)
+
+# One-off diagnostic workflow to answer: does re_mcap_chrome_test's controlled-iframe
+# harness hang on GitHub-hosted ubuntu-latest (standard runner) the same way it does in
+# the local container?  Uses only standard runners and no GCP workload identity, so it
+# can run on a personal fork.  TEMPORARY: delete after diagnosis.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  chrome-iframe-probe:
+    name: re_mcap_chrome_test controlled-iframe probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: prefix-dev/setup-pixi@v0.10.0
+        with:
+          pixi-version: v0.71.3
+
+      - name: Add wasm32 target (base rustup toolchain)
+        run: |
+          rustup target add wasm32-unknown-unknown
+
+      - name: Set up Chrome and ChromeDriver
+        uses: browser-actions/setup-chrome@v2
+        with:
+          chrome-version: stable
+          install-chromedriver: true
+
+      - name: Install wasm-pack / wasm-opt via pixi default env
+        run: pixi install
+
+      - name: Run Chrome MCAP Range fixture (controlled iframe path)
+        run: |
+          pixi run web-test --browser chrome --package re_mcap_chrome_test 2>&1 \
+            | tee /tmp/chrome-test.log
+        continue-on-error: true
+
+      - name: Show log tail
+        if: always()
+        run: |
+          tail -80 /tmp/chrome-test.log || true
