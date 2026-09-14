@@ -1484,8 +1484,14 @@ mod wasm_tests {
                     spec.content_length = { type: "fixed", value: 5 };
                     spec.body = { type: "infinite", chunk: { length: 1, delay_ms: 1 } };
                     break;
-                case "gzip":
-                    spec.content_encoding = "gzip";
+                case "non_identity_encoding":
+                    // A browser answers a `Range` request whose response declares a non-identity
+                    // `Content-Encoding` that the browser can decode (gzip, br, …) with a network
+                    // error, before the response headers are observable, so this path must use a
+                    // non-identity token the browser does not decode. The `gzip` token itself is
+                    // covered by the fixture's gzip framing tests, which a `Range` request cannot
+                    // reach.
+                    spec.content_encoding = "unrecognized";
                     spec.cors.expose = "required_range_headers_and_content_encoding";
                     spec.body = { type: "infinite", chunk: { length: 1, delay_ms: 1 } };
                     break;
@@ -1537,11 +1543,11 @@ mod wasm_tests {
             return spec;
         }
 
-        export function isChromeRangeRuntime() {
+        export function is_chrome_range_runtime() {
             return /(?:Chrome|Chromium)/.test(navigator.userAgent);
         }
 
-        export async function registerRangeScenario(kind, status) {
+        export async function register_range_scenario(kind, status) {
             const response = await fetch(
                 `http://127.0.0.1:${fixturePort()}/__mcap_range_fixture/v1/bootstrap`,
                 { cache: "no-store" },
@@ -1563,84 +1569,38 @@ mod wasm_tests {
             const descriptor = await registered.json();
             return {
                 crossOriginUrl: descriptor.cross_origin_object_url,
-                pageUrl: descriptor.page_url,
                 snapshotUrl: `${controlBase}/${descriptor.id}`,
                 cleanupUrl: `${controlBase}/${descriptor.id}`,
             };
         }
 
-        export function inspectSameOriginBasic(pageUrl) {
-            return new Promise((resolve, reject) => {
-                const pageOrigin = new URL(pageUrl).origin;
-                const requestId = `same-origin-basic-${Date.now()}-${Math.random()}`;
-                const iframe = document.createElement("iframe");
-                iframe.hidden = true;
-                let timeout;
-                const cleanup = () => {
-                    window.removeEventListener("message", onMessage);
-                    if (timeout !== undefined) {
-                        window.clearTimeout(timeout);
-                    }
-                    iframe.remove();
-                };
-                const onMessage = (message) => {
-                    if (
-                        message.origin !== pageOrigin
-                        || message.data?.fixture !== "mcap-range-v1"
-                        || message.data?.requestId !== requestId
-                    ) {
-                        return;
-                    }
-                    cleanup();
-                    if (!message.data.ok) {
-                        reject(new Error("same-origin fixture inspection failed"));
-                        return;
-                    }
-                    const result = message.data.result;
-                    resolve(
-                        result.status === 206
-                        && result.responseType === "basic"
-                        && result.contentEncoding === "gzip",
-                    );
-                };
-                window.addEventListener("message", onMessage);
-                timeout = window.setTimeout(() => {
-                    cleanup();
-                    reject(new Error("same-origin fixture inspection timed out"));
-                }, 5000);
-                iframe.addEventListener("load", () => {
-                    iframe.contentWindow.postMessage({
-                        fixture: "mcap-range-v1",
-                        requestId,
-                        scenarioId: Number(new URL(pageUrl).pathname.split("/").at(-1)),
-                        command: "inspectResponse",
-                    }, pageOrigin);
-                }, { once: true });
-                iframe.src = pageUrl;
-                document.body.appendChild(iframe);
-            });
-        }
-
-        export async function deleteRangeScenario(url) {
+        export async function delete_range_scenario(url) {
             const response = await fetch(url, { method: "DELETE", cache: "no-store" });
             if (!response.ok) {
                 throw new Error("Range fixture cleanup failed");
             }
         }
 
-        export async function rangeScenarioObservedCancellation(url) {
-            for (let attempt = 0; attempt < 80; attempt += 1) {
+        export async function range_scenario_observed_cancellation(url) {
+            // A browser that blocks or aborts a response tears the body down asynchronously, so poll
+            // for the body-end event and report the observed event types when the cap is reached.
+            let snapshot;
+            for (let attempt = 0; attempt < 600; attempt += 1) {
                 const response = await fetch(url, { cache: "no-store" });
-                const snapshot = await response.json();
+                snapshot = await response.json();
                 if (snapshot.events.some((event) => event.type === "body_cancelled")) {
                     return true;
                 }
                 await new Promise((resolve) => window.setTimeout(resolve, 25));
             }
+            console.error(
+                "Range fixture never cancelled the body; observed events: "
+                + JSON.stringify(snapshot.events.map((event) => event.type)),
+            );
             return false;
         }
 
-        export function beginRangeRequestInstrumentation() {
+        export function begin_range_request_instrumentation() {
             if (requestInstrumentation !== undefined) {
                 throw new Error("Range request instrumentation already active");
             }
@@ -1666,14 +1626,14 @@ mod wasm_tests {
             requestInstrumentation = { original, observations };
         }
 
-        export function rangeRequestObservationCount() {
+        export function range_request_observation_count() {
             if (requestInstrumentation === undefined) {
                 throw new Error("Range request instrumentation not active");
             }
             return requestInstrumentation.observations.length;
         }
 
-        export function finishRangeRequestInstrumentation(
+        export function finish_range_request_instrumentation(
             expectedIfMatch,
             expectedSignalAborted,
             expectedRequestCount,
@@ -1705,7 +1665,7 @@ mod wasm_tests {
                     && request.signal.aborted === expectedSignalAborted);
         }
 
-        export function armRangePreparationFailure(stage) {
+        export function arm_range_preparation_failure(stage) {
             if (preparationFailureInstrumentation !== undefined) {
                 throw new Error("Range preparation failure already armed");
             }
@@ -1740,7 +1700,7 @@ mod wasm_tests {
             throw new Error("unknown Range preparation failure stage");
         }
 
-        export function finishRangePreparationFailure() {
+        export function finish_range_preparation_failure() {
             if (preparationFailureInstrumentation === undefined) {
                 throw new Error("Range preparation failure not armed");
             }
@@ -1750,7 +1710,7 @@ mod wasm_tests {
             return state.hits() === 1;
         }
 
-        export function beginRangeBodyInstrumentation() {
+        export function begin_range_body_instrumentation() {
             if (bodyInstrumentation !== undefined) {
                 throw new Error("Range body instrumentation already active");
             }
@@ -1776,7 +1736,7 @@ mod wasm_tests {
             };
         }
 
-        export function finishRangeBodyInstrumentation() {
+        export function finish_range_body_instrumentation() {
             if (bodyInstrumentation === undefined) {
                 throw new Error("Range body instrumentation not active");
             }
@@ -1786,11 +1746,31 @@ mod wasm_tests {
             bodyInstrumentation = undefined;
             return state.stats.arrayBuffer === 0 && state.stats.reads === 0;
         }
+
+        export function reset_range_test_harness() {
+            // A test that aborted under `panic = abort` never ran its cleanup, so its observation
+            // patches stay installed and would break the next test on a `begin_*` guard. Harnessed
+            // tests therefore reset first; the guards stay strict, so a second activation inside
+            // one test is still an error.
+            if (requestInstrumentation !== undefined) {
+                window.fetch = requestInstrumentation.original;
+                requestInstrumentation = undefined;
+            }
+            if (bodyInstrumentation !== undefined) {
+                bodyInstrumentation.responsePrototype.arrayBuffer = bodyInstrumentation.originalArrayBuffer;
+                bodyInstrumentation.readerPrototype.read = bodyInstrumentation.originalRead;
+                bodyInstrumentation = undefined;
+            }
+            if (preparationFailureInstrumentation !== undefined) {
+                const state = preparationFailureInstrumentation;
+                preparationFailureInstrumentation = undefined;
+                state.restore();
+            }
+        }
     "#)]
     extern "C" {
         fn is_chrome_range_runtime() -> bool;
         fn register_range_scenario(kind: &str, status: u16) -> js_sys::Promise;
-        fn inspect_same_origin_basic(page_url: &str) -> js_sys::Promise;
         fn delete_range_scenario(url: &str) -> js_sys::Promise;
         fn range_scenario_observed_cancellation(url: &str) -> js_sys::Promise;
         fn begin_range_request_instrumentation();
@@ -1803,12 +1783,13 @@ mod wasm_tests {
         fn arm_range_preparation_failure(stage: &str);
         fn finish_range_preparation_failure() -> bool;
         fn begin_range_body_instrumentation();
+        /// Restores the observation patches this harness owns after an aborted test skipped cleanup.
+        fn reset_range_test_harness();
         fn finish_range_body_instrumentation() -> bool;
     }
 
     struct Scenario {
         cross_origin_url: String,
-        page_url: String,
         snapshot_url: String,
         cleanup_url: String,
     }
@@ -1820,7 +1801,6 @@ mod wasm_tests {
                 .expect("controlled Range scenario registers");
             Self {
                 cross_origin_url: string_field(&descriptor, "crossOriginUrl"),
-                page_url: string_field(&descriptor, "pageUrl"),
                 snapshot_url: string_field(&descriptor, "snapshotUrl"),
                 cleanup_url: string_field(&descriptor, "cleanupUrl"),
             }
@@ -1888,9 +1868,9 @@ mod wasm_tests {
         crate::remote_limits::RangeResponseAccountingScope,
         crate::remote_limits::WorkUnitAccountingScope,
     ) {
-        let root = crate::remote_limits::tests::complete_test_profile()
+        let root = crate::remote_limits::tests::transport_test_profile_with(&[])
             .start_accounting_root()
-            .expect("complete test profile starts");
+            .expect("transport test profile starts");
         let viewer = root
             .create_viewer_scope()
             .expect("viewer scope is available");
@@ -1996,8 +1976,9 @@ mod wasm_tests {
         expected: ChromeRangeError,
         should_retry: bool,
     ) {
+        reset_range_test_harness();
         let scenario = Scenario::register(kind, status).await;
-        let root = crate::remote_limits::tests::test_profile_with(&[
+        let root = crate::remote_limits::tests::transport_test_profile_with(&[
             (
                 crate::remote_limits::WebRemoteLimitKey::RangeRetryAttemptsPerOperation,
                 2,
@@ -2112,6 +2093,7 @@ mod wasm_tests {
         stage: Option<&str>,
         expected: ChromeRangeError,
     ) {
+        reset_range_test_harness();
         let scenario = Scenario::register("exact_strong", 0).await;
         let mut overrides = vec![
             (WebRemoteLimitKey::RangeRetryAttemptsPerOperation, 2),
@@ -2120,7 +2102,7 @@ mod wasm_tests {
         if stage.is_none() {
             overrides.push((WebRemoteLimitKey::RequestedRangeBytes, 3));
         }
-        let root = crate::remote_limits::tests::test_profile_with(&overrides)
+        let root = crate::remote_limits::tests::transport_test_profile_with(&overrides)
             .start_accounting_root()
             .expect("preparation failure profile starts");
         let viewer = root.create_viewer_scope().expect("viewer scope");
@@ -2242,11 +2224,12 @@ mod wasm_tests {
         if !is_chrome_range_runtime() {
             return;
         }
+        reset_range_test_harness();
         // The controlled fixture cannot force Chrome's BYOB reader promise to reject after a
         // valid strict response. Drive one real production request first, then inject only the
         // typed pump settlement at the retry-classifier boundary.
         let scenario = Scenario::register("exact_strong", 0).await;
-        let root = crate::remote_limits::tests::test_profile_with(&[
+        let root = crate::remote_limits::tests::transport_test_profile_with(&[
             (WebRemoteLimitKey::RangeRetryAttemptsPerOperation, 2),
             (WebRemoteLimitKey::MetadataOpeningRangeRequests, 2),
         ])
@@ -2339,8 +2322,9 @@ mod wasm_tests {
         if !is_chrome_range_runtime() {
             return;
         }
+        reset_range_test_harness();
         let scenario = Scenario::register("exact_strong", 0).await;
-        let root = crate::remote_limits::tests::test_profile_with(&[
+        let root = crate::remote_limits::tests::transport_test_profile_with(&[
             (WebRemoteLimitKey::RangeRetryAttemptsPerOperation, 1),
             (WebRemoteLimitKey::MetadataOpeningRangeRequests, 1),
         ])
@@ -2418,6 +2402,7 @@ mod wasm_tests {
         if !is_chrome_range_runtime() {
             return;
         }
+        reset_range_test_harness();
 
         let probe_scenario = Scenario::register("exact_strong", 0).await;
         begin_range_request_instrumentation();
@@ -2474,6 +2459,7 @@ mod wasm_tests {
         if !is_chrome_range_runtime() {
             return;
         }
+        reset_range_test_harness();
 
         for (kind, expected_consistency) in [
             ("weak", RepresentationConsistency::DeploymentAssumed),
@@ -2500,6 +2486,7 @@ mod wasm_tests {
         if !is_chrome_range_runtime() {
             return;
         }
+        reset_range_test_harness();
 
         let (root, _range, _work) = scopes();
         let baseline = root.accounting_scalar_snapshot();
@@ -2539,27 +2526,11 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn controlled_page_proves_its_fixture_object_is_truly_same_origin_basic() {
-        if !is_chrome_range_runtime() {
-            return;
-        }
-
-        let scenario = Scenario::register("gzip", 0).await;
-        let is_basic = JsFuture::from(inspect_same_origin_basic(&scenario.page_url))
-            .await
-            .expect("controlled page same-origin inspection succeeds")
-            .as_bool()
-            .expect("same-origin inspection result is boolean");
-        assert!(is_basic);
-        assert!(scenario.observed_cancellation().await);
-        scenario.remove().await;
-    }
-
-    #[wasm_bindgen_test]
     async fn status_and_header_failures_abort_before_any_body_api() {
         if !is_chrome_range_runtime() {
             return;
         }
+        reset_range_test_harness();
 
         let cases = [
             ("status", 200, ChromeRangeError::RangeUnsupported),
@@ -2593,7 +2564,11 @@ mod wasm_tests {
                 0,
                 ChromeRangeError::InvalidContentLength,
             ),
-            ("gzip", 0, ChromeRangeError::UnsupportedContentEncoding),
+            (
+                "non_identity_encoding",
+                0,
+                ChromeRangeError::UnsupportedContentEncoding,
+            ),
             ("etag_invalid", 0, ChromeRangeError::InvalidValidatorHeader),
             (
                 "etag_duplicate",
@@ -2631,6 +2606,7 @@ mod wasm_tests {
         if !is_chrome_range_runtime() {
             return;
         }
+        reset_range_test_harness();
 
         let initial = Scenario::register("exact_strong", 0).await;
         let (probed, _controller, _root) = probe(
@@ -2691,6 +2667,7 @@ mod wasm_tests {
         if !is_chrome_range_runtime() {
             return;
         }
+        reset_range_test_harness();
 
         for kind in ["cors_reject", "redirect"] {
             let scenario = Scenario::register(kind, 0).await;

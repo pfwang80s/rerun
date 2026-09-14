@@ -1190,11 +1190,11 @@ mod wasm_tests {
             }
         }
 
-        export function isChromeProductionPumpRuntime() {
+        export function is_chrome_production_pump_runtime() {
             return /(?:Chrome|Chromium)/.test(navigator.userAgent);
         }
 
-        export async function registerProductionPumpScenario(kind) {
+        export async function register_production_pump_scenario(kind) {
             const bootstrapResponse = await fetch(
                 `http://127.0.0.1:${productionPumpFixturePort()}/__mcap_range_fixture/v1/bootstrap`,
                 { cache: "no-store" },
@@ -1247,7 +1247,7 @@ mod wasm_tests {
             };
         }
 
-        export async function fetchProductionPumpResponse(url, signal) {
+        export async function fetch_production_pump_response(url, signal) {
             const response = await fetch(url, { cache: "no-store", signal });
             if (response.status !== 206) {
                 throw new Error("production pump fixture returned the wrong status");
@@ -1255,11 +1255,11 @@ mod wasm_tests {
             return response;
         }
 
-        export async function deleteProductionPumpScenario(url) {
+        export async function delete_production_pump_scenario(url) {
             await fetch(url, { method: "DELETE", cache: "no-store" });
         }
 
-        export async function waitForProductionPumpBodyCancellation(url) {
+        export async function wait_for_production_pump_body_cancellation(url) {
             for (let attempt = 0; attempt < 80; attempt += 1) {
                 const response = await fetch(url, { cache: "no-store" });
                 if (!response.ok) {
@@ -1274,7 +1274,7 @@ mod wasm_tests {
             return false;
         }
 
-        export function beginProductionPumpInstrumentation() {
+        export function begin_production_pump_instrumentation() {
             if (productionPumpInstrumentation !== undefined) {
                 throw new Error("production pump instrumentation is already active");
             }
@@ -1358,7 +1358,7 @@ mod wasm_tests {
             };
         }
 
-        export function beginProductionPumpActiveWindow() {
+        export function begin_production_pump_active_window() {
             if (productionPumpInstrumentation === undefined) {
                 throw new Error("production pump instrumentation is inactive");
             }
@@ -1370,7 +1370,7 @@ mod wasm_tests {
             stats.pumpActive = true;
         }
 
-        export function endProductionPumpActiveWindow() {
+        export function end_production_pump_active_window() {
             if (productionPumpInstrumentation === undefined) {
                 throw new Error("production pump instrumentation is inactive");
             }
@@ -1382,14 +1382,14 @@ mod wasm_tests {
             return stats.activeZeroTimeoutCalls;
         }
 
-        export function failNextProductionPumpRelease() {
+        export function fail_next_production_pump_release() {
             if (productionPumpInstrumentation === undefined) {
                 throw new Error("production pump instrumentation is inactive");
             }
             productionPumpInstrumentation.stats.failNextRelease = true;
         }
 
-        export function productionPumpInstrumentationSnapshot() {
+        export function production_pump_instrumentation_snapshot() {
             if (productionPumpInstrumentation === undefined) {
                 throw new Error("production pump instrumentation is inactive");
             }
@@ -1404,7 +1404,13 @@ mod wasm_tests {
             };
         }
 
-        export function finishProductionPumpInstrumentation() {
+        export function reset_production_pump_test_harness() {
+            // A test that aborted under `panic = abort` never ran its guard cleanup, so its patches
+            // stay installed and would break the next pumping test. The guard itself stays strict.
+            finish_production_pump_instrumentation();
+        }
+
+        export function finish_production_pump_instrumentation() {
             if (productionPumpInstrumentation === undefined) {
                 return;
             }
@@ -1441,6 +1447,8 @@ mod wasm_tests {
         fn fail_next_production_pump_release();
         fn production_pump_instrumentation_snapshot() -> JsValue;
         fn finish_production_pump_instrumentation();
+        /// Restores the observation patches this harness owns after an aborted test skipped cleanup.
+        fn reset_production_pump_test_harness();
     }
 
     struct ProductionPumpInstrumentationGuard;
@@ -1558,9 +1566,9 @@ mod wasm_tests {
         crate::remote_limits::RangeResponseAccountingScope,
         crate::remote_limits::WorkUnitAccountingScope,
     ) {
-        let root = crate::remote_limits::tests::complete_test_profile()
+        let root = crate::remote_limits::tests::transport_test_profile_with(&[])
             .start_accounting_root()
-            .expect("complete test profile starts");
+            .expect("transport test profile starts");
         let viewer = root
             .create_viewer_scope()
             .expect("viewer scope is available");
@@ -1791,6 +1799,7 @@ mod wasm_tests {
             return;
         }
 
+        reset_production_pump_test_harness();
         let instrumentation = ProductionPumpInstrumentationGuard::start();
         let (root, range, work) = scopes();
         let baseline = root.accounting_scalar_snapshot();

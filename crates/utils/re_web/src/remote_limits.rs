@@ -6928,6 +6928,40 @@ pub(crate) mod tests {
         ProductionWebRemoteLimitsV1 { values }
     }
 
+    /// Byte capacity that lets one prepared transport attempt fit inside the fabricated profile.
+    ///
+    /// The fabricated profile keeps a deliberately tiny fallback for unlisted byte keys so that
+    /// tests can exercise aggregate limits, so transport scenarios must raise the capacities their
+    /// own reservations consume: one output buffer, its BYOB scratch, their overlap, and one
+    /// parsed entity-tag.
+    pub(crate) const TRANSPORT_TEST_BYTE_CAP: u64 = 65_536;
+
+    /// [`test_profile_with`] extended with the byte capacities a transport scenario needs.
+    ///
+    /// Explicit `overrides` win over the transport capacities so a scenario can still force one
+    /// specific limit failure.
+    pub(crate) fn transport_test_profile_with(
+        overrides: &[(WebRemoteLimitKey, u64)],
+    ) -> ProductionWebRemoteLimitsV1 {
+        let mut values = complete_test_values();
+        for key in [
+            WebRemoteLimitKey::RequestedRangeBytes,
+            WebRemoteLimitKey::ByobPumpSliceBytes,
+            WebRemoteLimitKey::FetchWasmRawRetainedBytes,
+            WebRemoteLimitKey::ByobScratchBytes,
+            WebRemoteLimitKey::RangeJsWasmOverlapBytes,
+            WebRemoteLimitKey::RemoteInternalRetainedBytes,
+            WebRemoteLimitKey::RemoteValidatorRetainedBytes,
+        ] {
+            values[key.index()] = nz(TRANSPORT_TEST_BYTE_CAP);
+        }
+        for (key, value) in overrides {
+            values[key.index()] = nz(*value);
+        }
+        validate_complete_profile(&values).expect("test overrides preserve profile constraints");
+        ProductionWebRemoteLimitsV1 { values }
+    }
+
     fn assert_constraint_error(
         overrides: &[(WebRemoteLimitKey, u64)],
         expected: LimitProfileCompletionError,

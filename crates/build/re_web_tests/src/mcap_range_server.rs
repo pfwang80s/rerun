@@ -170,6 +170,8 @@ impl Default for CorsSpec {
 pub enum CorsAllowOrigin {
     #[default]
     PageOrigin,
+    /// Echoes the request's own `Origin` header (used by top-level, non-iframe browser tests).
+    RequestOrigin,
     Any,
     Omit,
     Mismatched,
@@ -287,7 +289,16 @@ pub enum ContentEncodingSpec {
     Omit,
     Identity,
     Gzip,
+    /// Declared but not framed, and unused by any test: a browser refuses a `br` response to a
+    /// `Range` request for the same reason it refuses `gzip`, and a `br` response to any other
+    /// request would need real brotli framing to be observable.
     Br,
+    /// A non-identity token the browser does not decode.
+    ///
+    /// Browsers refuse a non-identity `Content-Encoding` on a response to a `Range` request with a
+    /// network error, before any header can be observed, so the `Range` path can only exercise the
+    /// "declared non-identity encoding" branch with a token the browser passes through.
+    Unrecognized,
 }
 
 /// One deterministic HTTP response-body chunk.
@@ -1640,7 +1651,7 @@ fn object_response_inner(
         .map_err(|()| ProtocolError::capacity("event_log"))?;
 
     if *method == Method::OPTIONS {
-        return Ok(preflight_response(&state.shared, &scenario));
+        return Ok(preflight_response(&state.shared, &scenario, headers));
     }
     if *method == Method::HEAD {
         match scenario.spec.request.head {
@@ -1648,6 +1659,7 @@ fn object_response_inner(
                 return Ok(cors_response(
                     &state.shared,
                     &scenario.spec.cors,
+                    headers.get(axum::http::header::ORIGIN),
                     StatusCode::METHOD_NOT_ALLOWED.into_response(),
                 ));
             }
@@ -1655,6 +1667,7 @@ fn object_response_inner(
                 return Ok(cors_response(
                     &state.shared,
                     &scenario.spec.cors,
+                    headers.get(axum::http::header::ORIGIN),
                     StatusCode::NOT_IMPLEMENTED.into_response(),
                 ));
             }
@@ -1687,6 +1700,7 @@ fn object_response_inner(
         return Ok(cors_response(
             &state.shared,
             &scenario.spec.cors,
+            headers.get(axum::http::header::ORIGIN),
             redirect_response(&state.shared, state.role, id, scenario.spec.redirect),
         ));
     }
@@ -1708,6 +1722,7 @@ fn object_response_inner(
             effective_spec.body.clone(),
             effective_spec.object_seed,
             body_offset,
+            matches!(effective_spec.content_encoding, ContentEncodingSpec::Gzip),
         );
         Response::builder()
             .status(status)
@@ -1715,7 +1730,12 @@ fn object_response_inner(
             .expect("fixture response builder is valid")
     };
     apply_response_headers(&effective_spec, headers, response.headers_mut())?;
-    response = cors_response(&state.shared, &scenario.spec.cors, response);
+    response = cors_response(
+        &state.shared,
+        &scenario.spec.cors,
+        headers.get(axum::http::header::ORIGIN),
+        response,
+    );
     _ = scenario.record(FixtureEvent::ResponseStarted {
         status: status.as_u16(),
         ordinal: response_ordinal,
@@ -1723,7 +1743,11 @@ fn object_response_inner(
     Ok(response)
 }
 
-fn preflight_response(shared: &SharedState, scenario: &ScenarioState) -> Response {
+fn preflight_response(
+    shared: &SharedState,
+    scenario: &ScenarioState,
+    request: &HeaderMap,
+) -> Response {
     _ = scenario.record(FixtureEvent::Preflight {
         behavior: scenario.spec.cors.preflight,
     });
@@ -1751,7 +1775,12 @@ fn preflight_response(shared: &SharedState, scenario: &ScenarioState) -> Respons
         ACCESS_CONTROL_ALLOW_METHODS,
         HeaderValue::from_static("GET, HEAD, OPTIONS"),
     );
-    cors_response(shared, &scenario.spec.cors, response)
+    cors_response(
+        shared,
+        &scenario.spec.cors,
+        request.get(axum::http::header::ORIGIN),
+        response,
+    )
 }
 
 fn redirect_response(
@@ -1855,9 +1884,19 @@ fn apply_response_headers(
         }
         ContentEncodingSpec::Gzip => {
             headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+            // The body is gzip-framed, so the raw body length is not the encoded length and must
+            // not be advertised. A browser rejects a `gzip` response whose declared length does not
+            // match the encoded bytes before the checks under test can observe the header.
+            headers.remove(CONTENT_LENGTH);
         }
         ContentEncodingSpec::Br => {
             headers.insert(CONTENT_ENCODING, HeaderValue::from_static("br"));
+        }
+        ContentEncodingSpec::Unrecognized => {
+            headers.insert(
+                CONTENT_ENCODING,
+                HeaderValue::from_static(UNRECOGNIZED_ENCODING),
+            );
         }
     }
     append_etag_headers(headers, &spec.etag)?;
@@ -1884,11 +1923,13 @@ fn response_body(
     body_spec: BodySpec,
     seed: u8,
     body_offset: u64,
+    gzip: bool,
 ) -> Body {
     let mut server_shutdown = shared.server_shutdown.subscribe();
     let mut scenario_cancel = scenario.cancel_tx.subscribe();
     let stream = async_stream::stream! {
         let mut guard = BodyGuard::new(shared.clone(), scenario.clone(), permit);
+        let mut gzip_prologue_sent = false;
         _ = scenario.record(FixtureEvent::BodyStarted);
         match body_spec {
             BodySpec::Finite { chunks } => {
@@ -1902,7 +1943,9 @@ fn response_body(
                         chunk.length,
                     );
                     guard.sent = guard.sent.wrapping_add(u64::from(chunk.length));
-                    yield Ok::<Bytes, Infallible>(bytes);
+                    for framed in frame_gzip_body(gzip, &mut gzip_prologue_sent, bytes) {
+                        yield Ok::<Bytes, Infallible>(framed);
+                    }
                 }
                 guard.finish();
             }
@@ -1917,7 +1960,9 @@ fn response_body(
                         chunk.length,
                     );
                     guard.sent = guard.sent.wrapping_add(u64::from(chunk.length));
-                    yield Ok::<Bytes, Infallible>(bytes);
+                    for framed in frame_gzip_body(gzip, &mut gzip_prologue_sent, bytes) {
+                        yield Ok::<Bytes, Infallible>(framed);
+                    }
                 }
                 wait_for_cancel(&mut server_shutdown, &mut scenario_cancel).await;
             }
@@ -1931,11 +1976,53 @@ fn response_body(
                     chunk.length,
                 );
                 guard.sent = guard.sent.wrapping_add(u64::from(chunk.length));
-                yield Ok::<Bytes, Infallible>(bytes);
+                for framed in frame_gzip_body(gzip, &mut gzip_prologue_sent, bytes) {
+                    yield Ok::<Bytes, Infallible>(framed);
+                }
             },
         }
     };
     Body::from_stream(stream)
+}
+
+/// gzip member prologue: deflate, no optional fields, no filename or comment.
+const GZIP_PROLOGUE: [u8; 10] = [0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff];
+
+/// `Content-Encoding` token used by [`ContentEncodingSpec::Unrecognized`]: not `identity`, and not
+/// decodable by a browser, so a `Range` response can still be observed.
+const UNRECOGNIZED_ENCODING: &str = "x-unknown-encoding";
+
+/// Frames `payload` as deflate stored blocks that never carry `BFINAL`.
+///
+/// The fixture serves open-ended bodies for scenarios whose assertions need a cancellation to stay
+/// observable, and a terminated gzip member (final block, then CRC and ISIZE) would let a browser
+/// finish such a body before the client aborts. A finite gzip body therefore also ends on a
+/// truncated member; no test decodes one.
+fn gzip_stored_blocks(payload: &[u8]) -> Vec<u8> {
+    let blocks = payload.len() / u16::MAX as usize + 1;
+    let mut framed = Vec::with_capacity(payload.len() + 5 * blocks);
+    for block in payload.chunks(u16::MAX as usize) {
+        let length = block.len() as u16;
+        framed.push(0x00); // BFINAL = 0, BTYPE = 00 (stored)
+        framed.extend_from_slice(&length.to_le_bytes());
+        framed.extend_from_slice(&(!length).to_le_bytes());
+        framed.extend_from_slice(block);
+    }
+    framed
+}
+
+/// Prepends the gzip prologue once and frames every logical body chunk as stored blocks.
+fn frame_gzip_body(gzip: bool, prologue_sent: &mut bool, bytes: Bytes) -> Vec<Bytes> {
+    if !gzip {
+        return vec![bytes];
+    }
+    let mut framed = Vec::with_capacity(2);
+    if !*prologue_sent {
+        *prologue_sent = true;
+        framed.push(Bytes::from_static(&GZIP_PROLOGUE));
+    }
+    framed.push(Bytes::from(gzip_stored_blocks(&bytes)));
+    framed
 }
 
 async fn prepare_chunk(
@@ -2065,7 +2152,12 @@ fn pattern_bytes(seed: u8, offset: u64, length: u32) -> Bytes {
     Bytes::from(bytes)
 }
 
-fn cors_response(shared: &SharedState, cors: &CorsSpec, mut response: Response) -> Response {
+fn cors_response(
+    shared: &SharedState,
+    cors: &CorsSpec,
+    request_origin: Option<&HeaderValue>,
+    mut response: Response,
+) -> Response {
     match cors.allow_origin {
         CorsAllowOrigin::PageOrigin => {
             response.headers_mut().insert(
@@ -2073,6 +2165,13 @@ fn cors_response(shared: &SharedState, cors: &CorsSpec, mut response: Response) 
                 HeaderValue::from_str(&shared.origin(OriginRole::Page))
                     .expect("fixture page origin is valid"),
             );
+        }
+        CorsAllowOrigin::RequestOrigin => {
+            if let Some(origin) = request_origin {
+                response
+                    .headers_mut()
+                    .insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+            }
         }
         CorsAllowOrigin::Any => {
             response
@@ -2393,6 +2492,34 @@ mod tests {
     use reqwest::redirect::Policy;
 
     use super::*;
+
+    /// The two Chrome test packages each need their own copy of the top-level Range driver
+    /// because wasm-bindgen resolves `module = "/tests/..."` paths relative to the crate root,
+    /// and the packages are separate crates. Keep both copies byte-identical so the shared
+    /// scenario semantics cannot drift apart unnoticed.
+    #[test]
+    fn range_driver_copies_stay_byte_identical() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let fixture_path = root.join("tests/rust/test_mcap_chrome_fixture/tests/range_driver.js");
+        let correctness_path =
+            root.join("tests/rust/test_mcap_chrome_correctness/tests/range_driver.js");
+        let fixture = std::fs::read(&fixture_path)
+            .unwrap_or_else(|err| panic!("unreadable: {err}\nFile path: {fixture_path:?}"));
+        let correctness = std::fs::read(&correctness_path)
+            .unwrap_or_else(|err| panic!("unreadable: {err}\nFile path: {correctness_path:?}"));
+        assert!(!fixture.is_empty(), "range driver copy is empty");
+        let first_mismatch = fixture
+            .iter()
+            .zip(correctness.iter())
+            .position(|(left, right)| left != right);
+        assert!(
+            fixture == correctness,
+            "range_driver.js copies drifted: fixture={} bytes, correctness={} bytes, first mismatch at byte {:?}",
+            fixture.len(),
+            correctness.len(),
+            first_mismatch,
+        );
+    }
 
     struct ProofDir(tempfile::TempDir);
 
@@ -2865,6 +2992,256 @@ mod tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
+        server.shutdown().await;
+    }
+
+    /// A `gzip` scenario must stream a real gzip member, and that member must stay unterminated.
+    ///
+    /// A browser rejects a `Content-Encoding: gzip` response whose body is not gzip-framed, which
+    /// would surface as a fetch failure instead of the header checks the browser tests assert. A
+    /// terminated member would let the browser finish the body before a client aborts, which would
+    /// make the cancellation assertions unobservable.
+    #[test]
+    fn gzip_scenarios_stream_unterminated_stored_blocks() {
+        let payload = [1u8, 2, 3, 4];
+        let mut prologue_sent = false;
+        let first = frame_gzip_body(true, &mut prologue_sent, Bytes::copy_from_slice(&payload));
+        assert_eq!(
+            first.len(),
+            2,
+            "prologue and one stored block frame the first chunk"
+        );
+        assert_eq!(first[0].as_ref(), GZIP_PROLOGUE.as_slice());
+        assert_eq!(
+            first[1].as_ref(),
+            [0x00, 0x04, 0x00, 0xfb, 0xff, 1, 2, 3, 4],
+            "BFINAL stays clear and LEN/NLEN describe the payload"
+        );
+
+        let second = frame_gzip_body(true, &mut prologue_sent, Bytes::copy_from_slice(&payload));
+        assert_eq!(second.len(), 1, "the prologue is emitted exactly once");
+        assert_eq!(
+            second[0].as_ref()[0] & 0b0000_0111,
+            0x00,
+            "BFINAL stays clear"
+        );
+
+        let passthrough =
+            frame_gzip_body(false, &mut prologue_sent, Bytes::copy_from_slice(&payload));
+        assert_eq!(passthrough.len(), 1);
+        assert_eq!(passthrough[0].as_ref(), payload.as_slice());
+
+        // Blocks larger than a stored block are split, never silently truncated.
+        let large = vec![7u8; usize::from(u16::MAX) + 3];
+        let framed = gzip_stored_blocks(&large);
+        assert_eq!(framed.len(), large.len() + 2 * 5);
+        assert_eq!(framed[1..3], u16::MAX.to_le_bytes());
+        assert_eq!(framed[3..5], (!u16::MAX).to_le_bytes());
+        assert_eq!(
+            framed[5 + usize::from(u16::MAX)..][1..3],
+            3u16.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn gzip_encoding_replaces_the_raw_content_length() {
+        let spec = ScenarioSpec {
+            content_encoding: ContentEncodingSpec::Gzip,
+            ..ScenarioSpec::exact_range(64, 4)
+        };
+        let mut request = HeaderMap::new();
+        request.insert(RANGE, HeaderValue::from_static("bytes=0-3"));
+        let mut headers = HeaderMap::new();
+        apply_response_headers(&spec, &request, &mut headers).expect("headers apply");
+        assert_eq!(headers[CONTENT_ENCODING], "gzip");
+        assert!(
+            !headers.contains_key(CONTENT_LENGTH),
+            "the raw body length is not the encoded length"
+        );
+    }
+
+    /// The fixture must frame a `gzip` response body as a real gzip member, not only declare the
+    /// header: a browser rejects a `Content-Encoding: gzip` response whose body is not gzip-framed,
+    /// which would surface as a fetch failure instead of the encoding branch under test.
+    #[tokio::test]
+    async fn gzip_responses_are_framed_as_a_member_on_the_wire() {
+        let server = McapRangeTestServer::spawn().await.expect("spawn fixture");
+        let client = reqwest::Client::new();
+        let bootstrap = bootstrap(&client, &server).await;
+
+        let mut spec = ScenarioSpec::exact_range(64, 4);
+        spec.content_encoding = ContentEncodingSpec::Gzip;
+        spec.body = BodySpec::Infinite {
+            chunk: BodyChunkSpec {
+                length: 4,
+                delay_ms: 0,
+                wait_for_gate: None,
+            },
+        };
+        let descriptor = register_over_http(&client, &bootstrap, &spec).await;
+
+        let served = raw_chunked_body(&descriptor.cross_origin_object_url).await;
+        assert!(
+            served.starts_with(&GZIP_PROLOGUE),
+            "served body must begin with a gzip prologue: {served:?}"
+        );
+        let block = &served[GZIP_PROLOGUE.len()..];
+        assert!(block.len() >= 9, "stored block header is incomplete");
+        assert_eq!(block[0], 0x00, "BFINAL must stay clear");
+        assert_eq!(u16::from_le_bytes([block[1], block[2]]), 4);
+        assert_eq!(u16::from_le_bytes([block[3], block[4]]), !4u16);
+        assert_eq!(
+            &block[5..9],
+            pattern_bytes(0, 0, 4).as_ref(),
+            "the stored block carries the body bytes"
+        );
+        let next = &block[9..];
+        assert!(
+            next.len() >= 5,
+            "the member must continue past the first block"
+        );
+        assert_eq!(next[0], 0x00, "later blocks keep BFINAL clear too");
+        assert_eq!(u16::from_le_bytes([next[1], next[2]]), 4);
+
+        server.shutdown().await;
+    }
+
+    /// Reads a raw HTTP/1.1 response and returns its decoded chunked body.
+    ///
+    /// `reqwest` decodes a `gzip` response, and an unterminated member is exactly what it must not
+    /// have to decode here, so the framing is asserted on the wire bytes instead.
+    async fn raw_chunked_body(url: &str) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let authority_and_path = url.strip_prefix("http://").expect("fixture URL is http");
+        let (authority, path) = authority_and_path
+            .split_once('/')
+            .expect("fixture URL carries a path");
+        let mut stream = tokio::net::TcpStream::connect(authority)
+            .await
+            .expect("connect to fixture");
+        let request =
+            format!("GET /{path} HTTP/1.1\r\nHost: {authority}\r\nRange: bytes=0-3\r\n\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write raw request");
+
+        let mut served = Vec::new();
+        let mut decoded = Vec::new();
+        // The prologue plus two stored blocks of four bytes each, so the caller can also assert that
+        // the member continues past the first frame.
+        let needed = GZIP_PROLOGUE.len() + 2 * 9;
+        while decoded.len() < needed {
+            let mut chunk = [0u8; 1024];
+            let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+                .await
+                .expect("fixture responds within the raw read deadline")
+                .expect("raw response is readable");
+            assert!(read > 0, "fixture closed the raw response early");
+            served.extend_from_slice(&chunk[..read]);
+
+            // A read can split a chunk, so the body is parsed from scratch and the loop waits for
+            // whole frames instead of assuming that reads align with chunk boundaries.
+            let Some(separator) = served.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            decoded.clear();
+            let mut rest = &served[separator + 4..];
+            while let Some(line_end) = rest.windows(2).position(|window| window == b"\r\n") {
+                let size = usize::from_str_radix(
+                    std::str::from_utf8(&rest[..line_end])
+                        .expect("chunk size is ASCII")
+                        .split(';')
+                        .next()
+                        .expect("chunk size is present")
+                        .trim(),
+                    16,
+                )
+                .expect("chunk size is hexadecimal");
+                if size == 0 {
+                    break;
+                }
+                let data_start = line_end + 2;
+                if rest.len() < data_start + size + 2 {
+                    break;
+                }
+                decoded.extend_from_slice(&rest[data_start..data_start + size]);
+                rest = &rest[data_start + size + 2..];
+                if decoded.len() >= needed {
+                    break;
+                }
+            }
+        }
+        decoded
+    }
+
+    /// Only a declared `gzip` encoding reframes the body; any other non-identity token keeps the raw
+    /// bytes, which is what lets a `Range` response stay observable in a browser.
+    #[test]
+    fn unrecognized_encoding_is_declared_without_framing_the_body() {
+        let spec = ScenarioSpec {
+            content_encoding: ContentEncodingSpec::Unrecognized,
+            ..ScenarioSpec::exact_range(64, 4)
+        };
+        let mut request = HeaderMap::new();
+        request.insert(RANGE, HeaderValue::from_static("bytes=0-3"));
+        let mut headers = HeaderMap::new();
+        apply_response_headers(&spec, &request, &mut headers).expect("headers apply");
+        assert_eq!(headers[CONTENT_ENCODING], UNRECOGNIZED_ENCODING);
+        assert_ne!(headers[CONTENT_ENCODING], "identity");
+
+        let payload = Bytes::copy_from_slice(&[1u8, 2, 3, 4]);
+        let mut prologue_sent = false;
+        let framed = frame_gzip_body(false, &mut prologue_sent, payload.clone());
+        assert_eq!(framed.len(), 1);
+        assert_eq!(framed[0], payload);
+    }
+
+    /// WI-8 native compensation for the removed browser-level same-origin test.
+    ///
+    /// The deleted Wasm test proved, inside the fixture-hosted controlled page, that the object
+    /// is served from the page origin (`response.type === "basic"`). Natively that invariant is:
+    /// (a) the same-origin object URL sits under the fixture page origin and not the object
+    /// origin, and (b) a direct ranged request to it answers 206 with the scenario's declared
+    /// content encoding. The browser-only `response.type === "basic"` observation is recorded as
+    /// `not-covered` in `handoff/william-mcap114-wi8-reweb-sameorigin-demotion.md`.
+    #[tokio::test]
+    async fn same_origin_object_url_is_served_from_the_page_origin_with_declared_encoding() {
+        let server = McapRangeTestServer::spawn().await.expect("spawn fixture");
+        let client = reqwest::Client::new();
+        let bootstrap = bootstrap(&client, &server).await;
+
+        let mut spec = ScenarioSpec::exact_range(16, 1);
+        spec.content_encoding = ContentEncodingSpec::Gzip;
+        let descriptor = register_over_http(&client, &bootstrap, &spec).await;
+
+        assert!(
+            descriptor
+                .same_origin_object_url
+                .starts_with(&bootstrap.page_origin),
+            "same-origin object URL must live on the fixture page origin"
+        );
+        assert!(
+            !descriptor
+                .same_origin_object_url
+                .starts_with(&bootstrap.object_origin),
+            "same-origin object URL must not live on the object origin"
+        );
+
+        let response = client
+            .get(&descriptor.same_origin_object_url)
+            .header("range", "bytes=0-0")
+            .send()
+            .await
+            .expect("same-origin ranged response");
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[CONTENT_ENCODING], "gzip");
+        assert!(
+            !response.headers().contains_key(CONTENT_LENGTH),
+            "a gzip-framed response must not advertise the raw body length"
+        );
+
         server.shutdown().await;
     }
 

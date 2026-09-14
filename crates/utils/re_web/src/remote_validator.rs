@@ -767,8 +767,12 @@ impl fmt::Debug for BoundIfMatchHeadersOwner {
 #[cfg(target_arch = "wasm32")]
 impl Drop for BoundIfMatchHeadersOwner {
     fn drop(&mut self) {
-        drop(self.headers.take());
-        record_test_bound_headers_dropped_before_refund();
+        // Record only a real Headers-before-refund drop: a transferred owner already reported the
+        // event and reaches this point with no live Headers left.
+        if let Some(headers) = self.headers.take() {
+            drop(headers);
+            record_test_bound_headers_dropped_before_refund();
+        }
         drop(self.reservation.take());
     }
 }

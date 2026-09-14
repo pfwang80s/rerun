@@ -1208,7 +1208,7 @@ mod tests {
             return new Response(body, { status, headers });
         }
 
-        export function installFormatSniffFetch(mode) {
+        export function install_format_sniff_fetch(mode) {
             if (sniffHarness !== undefined) throw new Error("sniff harness already installed");
             const originalFetch = window.fetch;
             const responsePrototype = Response.prototype;
@@ -1281,30 +1281,30 @@ mod tests {
             };
         }
 
-        export function formatSniffStat(name) {
+        export function format_sniff_stat(name) {
             if (sniffHarness === undefined) throw new Error("sniff harness is not installed");
             return sniffHarness.stats[name];
         }
 
-        export function formatSniffRange() {
+        export function format_sniff_range() {
             if (sniffHarness === undefined) throw new Error("sniff harness is not installed");
             return sniffHarness.stats.range;
         }
 
-        export function formatSniffAllUrlsEqual() {
+        export function format_sniff_all_urls_equal() {
             if (sniffHarness === undefined) throw new Error("sniff harness is not installed");
             return sniffHarness.stats.urls.length > 0 &&
                 sniffHarness.stats.urls.every(url => url === sniffHarness.stats.urls[0]);
         }
 
-        export function formatSniffReaderCancelPrecedesAbort() {
+        export function format_sniff_reader_cancel_precedes_abort() {
             if (sniffHarness === undefined) throw new Error("sniff harness is not installed");
             const cancel = sniffHarness.stats.events.indexOf("reader_cancel");
             const abort = sniffHarness.stats.events.indexOf("signal_abort");
             return cancel >= 0 && abort > cancel;
         }
 
-        export function restoreFormatSniffFetch() {
+        export function restore_format_sniff_fetch() {
             if (sniffHarness === undefined) return;
             const state = sniffHarness;
             sniffHarness = undefined;
@@ -1314,7 +1314,7 @@ mod tests {
             state.readerPrototype.cancel = state.originalCancel;
         }
 
-        export function isChromeFormatSniffRuntime() {
+        export function is_chrome_format_sniff_runtime() {
             return /(?:Chrome|Chromium)/.test(navigator.userAgent);
         }
     "#)]
@@ -1366,7 +1366,7 @@ mod tests {
         attempt_limit: u64,
         range_limit: u64,
     ) -> (ChromeFormatSniffer, TestVisibleExecutionIssuer) {
-        let root = crate::remote_limits::tests::test_profile_with(&[
+        let root = crate::remote_limits::tests::transport_test_profile_with(&[
             (
                 crate::remote_limits::WebRemoteLimitKey::RangeRetryAttemptsPerOperation,
                 attempt_limit,
