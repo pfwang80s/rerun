@@ -106,7 +106,11 @@ jobs:
       - name: Set up Chrome and ChromeDriver
         uses: browser-actions/setup-chrome@v2
         with:
-          chrome-version: stable
+          # Pinned: `wasm-bindgen-test` 0.2.117 cannot load its test page on Chrome 153+ (the
+          # runner answers with a 404), so this lane breaks as soon as `stable` moves on. Bump
+          # this together with the `wasm-bindgen` version that the browser packages are built
+          # against. 152.0.7977.82 is the milestone verified to pass all three packages.
+          chrome-version: "152"
           install-chromedriver: true
 
       - name: Run Chrome MCAP Range browser tests
