@@ -213,13 +213,50 @@ pub fn configure_mcap_phase_a_proof_command_v1(
     command: &mut Command,
     toolchain: &RemoteWasmToolchainAttestationV1,
 ) -> anyhow::Result<()> {
-    configure_remote_ros2_verifier_command_v1(command, toolchain)?;
+    configure_remote_ros2_verifier_command_with_path_v1(
+        command,
+        toolchain,
+        std::env::var_os("PATH"),
+    )?;
+    configure_mcap_phase_a_proof_env_v1(command, toolchain)
+}
+
+/// Installs the hardened private MCAP Phase A environment without Cargo arguments.
+///
+/// A caller which launches a tool that forwards its own Cargo invocation (`wasm-pack test`, for
+/// example) cannot hand that tool Cargo's `--config` arguments. Such a caller puts the attested
+/// environment in place with this function and lets the tool build the child command.
+pub fn configure_mcap_phase_a_proof_env_v1(
+    command: &mut Command,
+    toolchain: &RemoteWasmToolchainAttestationV1,
+) -> anyhow::Result<()> {
+    configure_remote_ros2_verifier_env_with_path_v1(command, toolchain, std::env::var_os("PATH"))?;
     command.env_remove(REMOTE_ROS2_ARTIFACT_PROBE_ENV_V1);
     command.env(MCAP_PHASE_A_PROOF_ENV_V1, "1");
     Ok(())
 }
 
+/// Disables Cargo's compiler wrappers for a command that runs Cargo itself.
+fn configure_disabled_rustc_wrappers_v1(command: &mut Command) {
+    command.args([
+        "--config",
+        DISABLE_RUSTC_WRAPPER_CONFIG_V1,
+        "--config",
+        DISABLE_RUSTC_WORKSPACE_WRAPPER_CONFIG_V1,
+    ]);
+}
+
 fn configure_remote_ros2_verifier_command_with_path_v1(
+    command: &mut Command,
+    toolchain: &RemoteWasmToolchainAttestationV1,
+    ambient_path: Option<OsString>,
+) -> anyhow::Result<()> {
+    configure_remote_ros2_verifier_env_with_path_v1(command, toolchain, ambient_path)?;
+    configure_disabled_rustc_wrappers_v1(command);
+    Ok(())
+}
+
+fn configure_remote_ros2_verifier_env_with_path_v1(
     command: &mut Command,
     toolchain: &RemoteWasmToolchainAttestationV1,
     ambient_path: Option<OsString>,
@@ -245,12 +282,6 @@ fn configure_remote_ros2_verifier_command_with_path_v1(
         "CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_LINKER",
         toolchain.canonical_rust_lld_v1(),
     );
-    command.args([
-        "--config",
-        DISABLE_RUSTC_WRAPPER_CONFIG_V1,
-        "--config",
-        DISABLE_RUSTC_WORKSPACE_WRAPPER_CONFIG_V1,
-    ]);
 
     let mut path = vec![toolchain.canonical_toolchain_bin_v1().to_owned()];
     if let Some(ambient) = ambient_path {

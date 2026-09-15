@@ -142,7 +142,20 @@ jobs:
       - name: Build release-Wasm MCAP Phase A proof
         run: pixi run mcap-phase-a-proof-build
 
-      # The Phase A benchmark cannot run here: the measurement package only compiles with
-      # `RERUN_MCAP_PHASE_A_PROOF_V1=1`, which in turn demands the canonical encoded Rust flags
-      # plus the locked toolchain, and the `wasm-pack test` path applies those flags to host build
-      # scripts as well, where they fail to link. See `_items_mcap114_ci_lane.md` (WI-C6).
+      - name: Run Chrome MCAP Phase A benchmark
+        run: |
+          pixi run web-test --browser chrome --package re_mcap_phase_a_chrome \
+            --phase-a-proof-dir target/mcap-phase-a-proof-v1 \
+            --phase-a-artifact-out target/mcap-phase-a-evidence-v1.json
+
+      - name: Upload MCAP Phase A evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: mcap-phase-a-evidence-v1
+          path: |
+            target/mcap-phase-a-evidence-v1.json
+            target/mcap-phase-a-proof-v1/proof-manifest-v1.json
+            target/mcap-phase-a-proof-v1/re_mcap_phase_a_proof.js
+            target/mcap-phase-a-proof-v1/re_mcap_phase_a_proof_bg.wasm
+            target/mcap-phase-a-proof-v1/phase-a-fixture.mcap
+          if-no-files-found: error

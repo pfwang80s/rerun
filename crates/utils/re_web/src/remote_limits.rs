@@ -2065,13 +2065,107 @@ impl fmt::Debug for ProductionWebRemoteLimitsV1 {
     }
 }
 
+/// Aggregate budget of the Phase A measurement profile.
+///
+/// The measurement must not be limited by the product profile, so byte budgets, durations, and
+/// ratios are far above anything the measurement accounts for.
+#[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+const PHASE_A_MEASUREMENT_BUDGET_V1: u64 = 1 << 40;
+
+/// Entry count of the Phase A measurement profile.
+///
+/// Counting limits stay small because the profile constraints multiply counts by counts and by
+/// per-entry byte charges, so a generous count would have to be paired with a small per-entry
+/// charge in ways that no longer describe the measurement. The measurement chain opens one source
+/// and one range request, and creates six accounting scopes, so a few hundred entries are far more
+/// than it needs.
+#[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+const PHASE_A_MEASUREMENT_ENTRY_COUNT_V1: u64 = 1 << 8;
+
+/// Byte charge of one entry in the Phase A measurement profile.
+#[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+const PHASE_A_MEASUREMENT_ENTRY_BYTES_V1: u64 = 4 * 1024;
+
+/// Byte limits an entry count multiplies.
+///
+/// These cannot share [`PHASE_A_MEASUREMENT_BUDGET_V1`]: the profile constraints and the accounting
+/// path both multiply them by a count of entries, nodes, or records, and the product has to fit
+/// inside an aggregate byte budget.
+#[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+const PHASE_A_MEASUREMENT_ENTRY_BYTE_KEYS_V1: [WebRemoteLimitKey; 8] = [
+    WebRemoteLimitKey::AccountingScopeNodeBytes,
+    WebRemoteLimitKey::AccountingReservationRequestEntryBytes,
+    WebRemoteLimitKey::AccountingReleaseScratchEntryBytes,
+    WebRemoteLimitKey::AccountingUsageNodeBytes,
+    WebRemoteLimitKey::RemoteTerminalStatusBytes,
+    WebRemoteLimitKey::PromiseClosureBytesPerOperation,
+    WebRemoteLimitKey::DeferredEvictionDescriptorBytes,
+    WebRemoteLimitKey::SingleLifecycleEventBytes,
+];
+
+/// Count limits that have to dominate a sum or product of other count limits.
+///
+/// Each entry names the relation it satisfies; the accompanying test proves that the assembled
+/// profile satisfies every constraint on it.
+#[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+const PHASE_A_MEASUREMENT_DOMINATING_COUNTS_V1: [(WebRemoteLimitKey, u64); 8] = [
+    // Live status owners cover the strict sources, pending sniffs, and session slots.
+    (
+        WebRemoteLimitKey::OpenSourceLiveStatusOwners,
+        PHASE_A_MEASUREMENT_ENTRY_COUNT_V1 * 4,
+    ),
+    // Status slots cover the owners, terminal entries, eviction victims, and status claims.
+    (
+        WebRemoteLimitKey::OpenSourceStatusSlots,
+        PHASE_A_MEASUREMENT_ENTRY_COUNT_V1 * 16,
+    ),
+    // Recording handles cover the open operations times their recording subscriptions.
+    (WebRemoteLimitKey::PublicRecordingHandles, 1 << 16),
+    // The wrapper cache covers the operations plus every recording handle.
+    (WebRemoteLimitKey::WrapperCacheEntries, 1 << 17),
+    // Tombstone retainers outlive every recording handle.
+    (WebRemoteLimitKey::RemovedTombstoneRetainers, 1 << 16),
+    // Outstanding deliveries cover the worst-case lifecycle fan-out.
+    (WebRemoteLimitKey::LifecycleOutstandingDeliveries, 1 << 28),
+    // Listener error credits cover one error notification per delivered event.
+    (WebRemoteLimitKey::LifecycleListenerErrorCredits, 1 << 28),
+    // The TypeScript dispatcher owns the same worst-case fan-out.
+    (WebRemoteLimitKey::TypescriptDispatcherItems, 1 << 28),
+];
+
+/// Values of the Phase A measurement profile.
+///
+/// See [`PHASE_A_MEASUREMENT_ENTRY_COUNT_V1`] and [`PHASE_A_MEASUREMENT_DOMINATING_COUNTS_V1`]
+/// for why the counting and per-entry limits differ from [`PHASE_A_MEASUREMENT_BUDGET_V1`].
+#[cfg(any(test, rerun_mcap_phase_a_proof_v1))]
+fn phase_a_measurement_limit_values_v1() -> [NonZeroU64; WEB_REMOTE_LIMIT_COUNT] {
+    let budget =
+        NonZeroU64::new(PHASE_A_MEASUREMENT_BUDGET_V1).expect("the measurement budget is non-zero");
+    let mut values = [budget; WEB_REMOTE_LIMIT_COUNT];
+    for key in WebRemoteLimitKey::ALL {
+        if matches!(key.definition().unit, WebRemoteLimitUnit::Count) {
+            values[key.index()] = NonZeroU64::new(PHASE_A_MEASUREMENT_ENTRY_COUNT_V1)
+                .expect("the measurement entry count is non-zero");
+        }
+    }
+    let entry_bytes = NonZeroU64::new(PHASE_A_MEASUREMENT_ENTRY_BYTES_V1)
+        .expect("the measurement entry byte charge is non-zero");
+    for key in PHASE_A_MEASUREMENT_ENTRY_BYTE_KEYS_V1 {
+        values[key.index()] = entry_bytes;
+    }
+    for (key, value) in PHASE_A_MEASUREMENT_DOMINATING_COUNTS_V1 {
+        values[key.index()] =
+            NonZeroU64::new(value).expect("the measurement dominating count is non-zero");
+    }
+    values
+}
+
 impl ProductionWebRemoteLimitsV1 {
     #[cfg(rerun_mcap_phase_a_proof_v1)]
     pub(crate) fn start_phase_a_measurement_root_v1()
     -> Result<WasmModuleLimitAccountingRoot, ScopeAccountingError> {
-        let limit = NonZeroU64::new(1_u64 << 40).expect("the proof limit is non-zero");
         Self {
-            values: [limit; WEB_REMOTE_LIMIT_COUNT],
+            values: phase_a_measurement_limit_values_v1(),
         }
         .start_accounting_root_inner()
     }
@@ -6960,6 +7054,54 @@ pub(crate) mod tests {
         }
         validate_complete_profile(&values).expect("test overrides preserve profile constraints");
         ProductionWebRemoteLimitsV1 { values }
+    }
+
+    /// The Phase A measurement profile has to satisfy every profile constraint, and the whole
+    /// documented scope chain has to fit inside it.
+    ///
+    /// The profile constraints multiply counts by counts and by per-entry byte charges, so a
+    /// profile that simply raises every limit cannot satisfy them: an early version charged one
+    /// scope node as much as the entire module budget and the measurement failed to create its
+    /// second scope.
+    #[test]
+    fn phase_a_measurement_profile_fits_the_scope_chain() {
+        let values = phase_a_measurement_limit_values_v1();
+        let violations = LimitProfileConstraint::ALL
+            .into_iter()
+            .filter_map(|constraint| validate_profile_constraint(&values, constraint).err())
+            .collect::<Vec<_>>();
+        assert!(violations.is_empty(), "{violations:?}");
+        validate_complete_profile(&values)
+            .expect("the measurement profile satisfies every constraint");
+        assert!(
+            values[WebRemoteLimitKey::AccountingScopeNodesGlobal.index()].get() > 6,
+            "the measurement chain needs six scopes"
+        );
+
+        let root = ProductionWebRemoteLimitsV1 { values }
+            .start_accounting_root()
+            .expect("the measurement profile starts");
+        let viewer = root.create_viewer_scope().expect("viewer scope fits");
+        let source = viewer.create_source_scope().expect("source scope fits");
+        let session = source.create_session_scope().expect("session scope fits");
+        let range = session
+            .create_range_response_scope()
+            .expect("range response scope fits");
+        let work = range.create_work_unit_scope().expect("work scope fits");
+
+        // The accounting path multiplies byte limits by entry counts of its own, so a profile
+        // whose per-entry charges share the aggregate budget still fails here.
+        range
+            .prepare_body_pump_reservation(
+                &root,
+                &work,
+                RangeBodyPumpReservationSpec {
+                    output_bytes: nz(4 * 1024),
+                    scratch_bytes: nz(64 * 1024),
+                },
+            )
+            .and_then(|prepared| prepared.commit())
+            .expect("the measurement profile admits one body-pump reservation");
     }
 
     fn assert_constraint_error(

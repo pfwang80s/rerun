@@ -11273,6 +11273,7 @@ dependencies = [
  "futures",
  "parking_lot",
  "rand 0.9.4",
+ "re_build_tools",
  "re_server",
  "reqwest",
  "serde",

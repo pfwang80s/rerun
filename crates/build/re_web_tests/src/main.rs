@@ -2,6 +2,7 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::Command as StdCommand;
 use std::process::ExitCode;
 use std::str::FromStr as _;
 
@@ -340,7 +341,7 @@ async fn run_package(args: &Args, package: &WebTestPackage) -> anyhow::Result<()
     } else {
         None
     };
-    let mut command = Command::new("wasm-pack");
+    let mut command = StdCommand::new("wasm-pack");
     command.arg("test");
     if !args.no_headless {
         command.arg("--headless");
@@ -382,6 +383,23 @@ async fn run_package(args: &Args, package: &WebTestPackage) -> anyhow::Result<()
         );
     }
 
+    if package.phase_a_benchmark {
+        // The Phase A measurement build needs the attested Wasm flags and toolchain, but those
+        // flags are Wasm-only: setting them in this process would also reach the native build of
+        // this runner and of its build scripts, where the Wasm link argument is rejected. Scope
+        // them to the `wasm-pack` child, which forwards its environment to the Cargo build it runs.
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let toolchain =
+            re_build_tools::remote_wasm_contract::locked_remote_wasm_toolchain_attestation_v1(
+                &rustc,
+            )?;
+        re_build_tools::remote_wasm_contract::configure_mcap_phase_a_proof_env_v1(
+            &mut command,
+            &toolchain,
+        )?;
+    }
+
+    let mut command = Command::from(command);
     let status = command.status().await;
 
     if let Some(server) = server {
