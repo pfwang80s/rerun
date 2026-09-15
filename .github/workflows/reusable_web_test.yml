@@ -143,12 +143,16 @@ jobs:
         run: pixi run mcap-phase-a-proof-build
 
       - name: Run Chrome MCAP Phase A benchmark
+        id: phase-a-benchmark
         run: |
           pixi run web-test --browser chrome --package re_mcap_phase_a_chrome \
             --phase-a-proof-dir target/mcap-phase-a-proof-v1 \
             --phase-a-artifact-out target/mcap-phase-a-evidence-v1.json
 
       - name: Upload MCAP Phase A evidence
+        # Diagnostics matter most when the benchmark fails, so upload either way. A missing artifact
+        # is a failure only when the benchmark actually ran.
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: mcap-phase-a-evidence-v1
@@ -158,4 +162,4 @@ jobs:
             target/mcap-phase-a-proof-v1/re_mcap_phase_a_proof.js
             target/mcap-phase-a-proof-v1/re_mcap_phase_a_proof_bg.wasm
             target/mcap-phase-a-proof-v1/phase-a-fixture.mcap
-          if-no-files-found: error
+          if-no-files-found: ${{ steps.phase-a-benchmark.outcome == 'success' && 'error' || 'warn' }}
