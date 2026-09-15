@@ -434,6 +434,8 @@ mod web {
         map_validator_error, map_visible_status, parse_content_length, parse_content_range,
         validate_bound_validator,
     };
+    #[cfg(rerun_mcap_phase_a_proof_v1)]
+    use crate::chrome_byob::read_exact_range_body;
     use crate::chrome_byob::{
         BoundedPrefixBody, ExactLengthBodyCompletion, ExactLengthByobPumpConfig,
         ExactLengthByobPumpControl, ExactLengthByobPumpControlError, ExactLengthRangeBody,
@@ -1342,13 +1344,13 @@ mod web {
                 RequiredRangeResponseHeader::ContentRange,
             ),
         )?;
-        let parsed =
-            parse_content_range(&content_range).ok_or(ChromeRangeError::InvalidContentRange)?;
+        let parsed = parse_content_range(&JsAsciiHeaderInput(&content_range))
+            .ok_or(ChromeRangeError::InvalidContentRange)?;
         if parsed.start != requested.start || parsed.end_inclusive != requested.end_inclusive {
             return Err(ChromeRangeError::InvalidContentRange);
         }
         let content_length = raw_response_header(&response, "Content-Length")?
-            .and_then(|value| parse_content_length(&value))
+            .and_then(|value| parse_content_length(&JsAsciiHeaderInput(&value)))
             .ok_or(ChromeRangeError::InvalidContentLength)?;
         if content_length != requested.expected_bytes.get() {
             return Err(ChromeRangeError::InvalidContentLength);
