@@ -799,6 +799,58 @@ mod tests {
         );
     }
 
+    /// The environment-only variant exists for callers that run a tool forwarding its own Cargo
+    /// invocation, so it has to install the attested environment without adding arguments of its
+    /// own.
+    #[test]
+    fn phase_a_proof_env_only_variant_installs_the_environment_without_arguments() {
+        let toolchain = fake_toolchain(Path::new("/locked/sysroot"));
+        let mut command = Command::new("wasm-pack");
+        command.env(REMOTE_ROS2_ARTIFACT_PROBE_ENV_V1, "spoof");
+        command.env("RUSTFLAGS", "spoof");
+        configure_mcap_phase_a_proof_env_v1(&mut command, &toolchain).unwrap();
+
+        assert_eq!(
+            command.get_args().count(),
+            0,
+            "the environment-only variant must not add Cargo arguments"
+        );
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(OsStr::to_owned)))
+            .collect::<BTreeMap<_, _>>();
+        for (name, value) in canonical_environment(toolchain.canonical_rust_lld_v1()) {
+            // Cargo derives `RUSTC_LINKER` for build scripts from the target linker, so this variant
+            // removes it and installs the target linker only.
+            if name == "RUSTC_LINKER" {
+                assert_eq!(environment.get(OsStr::new(name)), Some(&None));
+                continue;
+            }
+            assert_eq!(environment.get(OsStr::new(name)), Some(&Some(value)));
+        }
+        assert_eq!(
+            environment.get(OsStr::new("RUSTC")),
+            Some(&Some(toolchain.canonical_rustc_v1().as_os_str().to_owned()))
+        );
+        assert_eq!(environment.get(OsStr::new("RUSTFLAGS")), Some(&None));
+        assert_eq!(
+            environment.get(OsStr::new(REMOTE_ROS2_ARTIFACT_PROBE_ENV_V1)),
+            Some(&None)
+        );
+        assert_eq!(
+            environment.get(OsStr::new(MCAP_PHASE_A_PROOF_ENV_V1)),
+            Some(&Some(OsString::from("1")))
+        );
+        let path = environment
+            .get(OsStr::new("PATH"))
+            .and_then(Option::as_ref)
+            .expect("the canonical toolchain directory leads PATH");
+        assert_eq!(
+            std::env::split_paths(path).next().as_deref(),
+            Some(toolchain.canonical_toolchain_bin_v1())
+        );
+    }
+
     #[test]
     fn product_command_preserves_cargo_home_wrappers_compiler_and_linker() {
         let mut command = Command::new("cargo");

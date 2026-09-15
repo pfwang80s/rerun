@@ -882,6 +882,18 @@ impl McapRangeTestServer {
                 && manifest.browser_family == "chrome-stable",
             "MCAP Phase A proof digest or build provenance mismatch"
         );
+        // The benchmark measures the artifact, not the checkout, so an artifact from another commit
+        // would silently measure older code. Edits that are not committed yet are not detected here,
+        // so the artifact still has to be rebuilt after changing `re_web`.
+        let checkout_commit = re_build_tools::git_commit_hash().map_err(|error| {
+            anyhow::anyhow!("failed to read the commit of this checkout: {error}")
+        })?;
+        anyhow::ensure!(
+            manifest.git_commit == checkout_commit,
+            "the MCAP Phase A proof artifact belongs to another commit\nArtifact commit: {}\nCheckout commit: {}",
+            manifest.git_commit,
+            checkout_commit
+        );
         Ok(Self::spawn_inner(Some(PhaseAProofArtifactV1 {
             module: Bytes::from(module),
             wasm: Bytes::from(wasm),
@@ -2533,6 +2545,10 @@ mod tests {
         }
 
         fn write_valid(&self) {
+            self.write_commit(&checkout_commit());
+        }
+
+        fn write_commit(&self, commit: &str) {
             let module = b"export default 1;";
             let wasm = b"wasm";
             let fixture = b"mcap";
@@ -2549,7 +2565,7 @@ mod tests {
                     "module_sha256": sha256_hex_v1(module),
                     "wasm_sha256": sha256_hex_v1(wasm),
                     "fixture_sha256": sha256_hex_v1(fixture),
-                    "git_commit": "4".repeat(40),
+                    "git_commit": commit,
                     "browser_family": "chrome-stable",
                 }))
                 .expect("serialize proof manifest"),
@@ -2562,6 +2578,10 @@ mod tests {
             std::fs::write(self.path().join("phase-a-fixture.mcap"), fixture)
                 .expect("write proof fixture");
         }
+    }
+
+    fn checkout_commit() -> String {
+        re_build_tools::git_commit_hash().expect("read the commit of this checkout")
     }
 
     fn valid_phase_a_evidence() -> PhaseAEvidenceV1 {
@@ -2581,7 +2601,7 @@ mod tests {
                 wasm_sha256: sha256_hex_v1(b"wasm"),
                 js_sha256: sha256_hex_v1(b"export default 1;"),
                 fixture_sha256: sha256_hex_v1(b"mcap"),
-                git_commit: "4".repeat(40),
+                git_commit: checkout_commit(),
                 browser_family: "chrome-stable".to_owned(),
                 chrome_version: "140.0.0.0".to_owned(),
             },
@@ -2663,6 +2683,22 @@ mod tests {
             "{}{}/control/scenarios/{}{}",
             bootstrap.page_origin, bootstrap.control_root, id.0, suffix
         )
+    }
+
+    /// The benchmark measures the artifact rather than the checkout, so an artifact that records a
+    /// different commit has to be rejected instead of quietly measuring older code.
+    #[tokio::test]
+    async fn phase_a_proof_from_another_commit_is_rejected() {
+        let proof_dir = ProofDir::new();
+        proof_dir.write_commit(&"4".repeat(40));
+        let Err(error) = McapRangeTestServer::spawn_with_phase_a_proof_v1(proof_dir.path()).await
+        else {
+            panic!("a proof artifact from another commit must be rejected");
+        };
+        assert!(
+            error.to_string().contains("another commit"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
