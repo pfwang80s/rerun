@@ -29,11 +29,15 @@ permissions:
   contents: "read"
   id-token: "write"
 
+# The web test jobs default to the 16-core runner used by upstream. Forks cannot use larger
+# runners (they need an organization plan), so `WEB_TEST_RUNNER` can override the label there.
+# `WEB_TEST_TIMEOUT_MINUTES` exists for the same reason: the same work takes longer on the
+# standard four-core runner.
 jobs:
   mcap-phase-a-native-exit-gate:
     name: MCAP Phase A native exit gate
-    timeout-minutes: 20
-    runs-on: ubuntu-latest-16-cores
+    timeout-minutes: ${{ vars.WEB_TEST_TIMEOUT_MINUTES || 20 }}
+    runs-on: ${{ vars.WEB_TEST_RUNNER || 'ubuntu-latest-16-cores' }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -52,8 +56,8 @@ jobs:
 
   web-test:
     name: Browser tests
-    timeout-minutes: 60
-    runs-on: ubuntu-latest-16-cores
+    timeout-minutes: ${{ vars.WEB_TEST_TIMEOUT_MINUTES || 60 }}
+    runs-on: ${{ vars.WEB_TEST_RUNNER || 'ubuntu-latest-16-cores' }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -83,8 +87,8 @@ jobs:
 
   chrome-mcap-range-test:
     name: Chrome MCAP Range fixture
-    timeout-minutes: 20
-    runs-on: ubuntu-latest-16-cores
+    timeout-minutes: ${{ vars.WEB_TEST_TIMEOUT_MINUTES || 20 }}
+    runs-on: ${{ vars.WEB_TEST_RUNNER || 'ubuntu-latest-16-cores' }}
     steps:
       - uses: actions/checkout@v6
         with:

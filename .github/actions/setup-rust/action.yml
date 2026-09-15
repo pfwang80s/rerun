@@ -54,6 +54,10 @@ runs:
       shell: bash --noprofile --norc -euo pipefail {0}
 
     - name: Set up GCP credentials
+      # Forks do not have the workload identity secrets, and `google-github-actions/auth` fails on
+      # empty inputs. Skipping the step (together with the GCS-backed sccache below) lets the CI
+      # still run there, at the cost of a cold build cache.
+      if: ${{ inputs.workload_identity_provider != '' && inputs.service_account != '' }}
       uses: google-github-actions/auth@v3
       with:
         workload_identity_provider: ${{ inputs.workload_identity_provider }}
@@ -79,6 +83,8 @@ runs:
         done
 
     - name: Set up sccache
+      # The GCS backend needs the credentials that the step above sets up.
+      if: ${{ inputs.workload_identity_provider != '' && inputs.service_account != '' }}
       shell: bash --noprofile --norc -euo pipefail {0}
       run: |
         "$GITHUB_ACTION_PATH/../../scripts/setup_sccache.sh" --version v0.14.0 --backend gcs
