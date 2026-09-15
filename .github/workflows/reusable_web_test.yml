@@ -87,7 +87,9 @@ jobs:
 
   chrome-mcap-range-test:
     name: Chrome MCAP Range fixture
-    timeout-minutes: 20
+    # This job builds the Wasm test targets of four packages plus the release-Wasm Phase A proof,
+    # and it runs without the shared build cache whenever the GCS credentials are unavailable.
+    timeout-minutes: 60
     runs-on: ${{ vars.WEB_TEST_RUNNER || 'ubuntu-latest-16-cores' }}
     steps:
       - uses: actions/checkout@v6
